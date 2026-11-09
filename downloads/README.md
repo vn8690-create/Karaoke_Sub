@@ -1,4 +1,14 @@
-# Bản vá trùng cổng Cover Studio
+# Cập nhật Karaoke Sub
+
+## Thêm mục Hướng dẫn sử dụng
+
+[Tải ZIP cập nhật hướng dẫn](https://github.com/vn8690-create/Karaoke_Sub/raw/refs/heads/main/downloads/Karaoke_Sub-cap-nhat-huong-dan.zip). Gói này kèm cả bản sửa trùng cổng.
+
+Dừng START, giải nén đè vào thư mục Karaoke_Sub đang dùng, chạy lại `windows\START.bat`, rồi nhấn **Ctrl+F5** trong trình duyệt. Nhấn **Hướng dẫn** ở góc trên; khi chưa có dự án, hướng dẫn tự hiện. Không cần SETUP lại, không thay thư viện/model/dự án.
+
+Đọc [hướng dẫn chi tiết](../docs/LOCAL-USAGE.md).
+
+## Chỉ sửa trùng cổng Cover Studio
 
 [Tải ZIP bản vá](https://github.com/vn8690-create/Karaoke_Sub/raw/refs/heads/main/downloads/Karaoke_Sub-sua-trung-cong.zip).
 

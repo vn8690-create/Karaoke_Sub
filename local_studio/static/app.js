@@ -28,6 +28,26 @@ function toast(message, error = false) {
   state.toastTimer = setTimeout(() => { box.hidden = true; }, error ? 11000 : 4500);
 }
 
+function showGuide(open, { scroll = false, focus = false } = {}) {
+  const panel = $("guide-panel");
+  panel.hidden = !open;
+  for (const id of ["help-toggle", "quick-help"]) $(id).setAttribute("aria-expanded", String(open));
+  if (open && scroll) panel.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+  if (focus) (open ? $("guide-title") : $("help-toggle")).focus({ preventScroll: true });
+}
+
+$("help-toggle").addEventListener("click", () => showGuide($("guide-panel").hidden, { scroll: true, focus: true }));
+$("quick-help").addEventListener("click", () => showGuide(true, { scroll: true, focus: true }));
+$("close-guide").addEventListener("click", () => showGuide(false, { focus: true }));
+document.querySelectorAll("[data-guide-target]").forEach((button) => {
+  button.addEventListener("click", () => {
+    showGuide(false);
+    const target = $(button.dataset.guideTarget);
+    target.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+    target.focus({ preventScroll: true });
+  });
+});
+
 async function api(path, options = {}) {
   const config = { ...options };
   if (config.body && !(config.body instanceof FormData)) {
@@ -593,6 +613,7 @@ async function initialize() {
     $("gpu-status").title = info.model_cache ? `Model cache: ${info.model_cache}` : "Chọn CUDA khi đã cài bản PyTorch hỗ trợ NVIDIA.";
     if (!info.ffmpeg || !info.ffprobe) toast("Chưa tìm thấy FFmpeg / FFprobe. Hãy chạy bộ cài trước khi tạo dự án.", true);
   } else { $("gpu-status").textContent = "Chưa kết nối máy chủ"; toast(`Không kiểm tra được hệ thống: ${results[0].reason.message}`, true); }
+  if (results[1].status === "fulfilled" && state.projects.length === 0) showGuide(true);
   if (results[1].status === "rejected") toast(`Không tải được dự án: ${results[1].reason.message}`, true);
 }
 initialize();

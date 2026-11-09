@@ -28,3 +28,10 @@ Các bài unittest dùng media tổng hợp và mock ASR ở lớp API để ổ
 - Trình duyệt chỉ mở khi health check khớp cả mã ứng dụng và mã phiên khởi động. Phản hồi từ Cover Studio, app khác hoặc phiên cũ không làm trình duyệt mở nhầm.
 - **23 bài unittest đạt**, gồm 7 hồi quy mới về trùng cổng, socket, health check và tiến trình Uvicorn thật.
 - Kiểm thử Chromium với dịch vụ giả lập chiếm cổng 8776: Karaoke Sub chạy tại **8777**, tải đúng giao diện; dịch vụ giả lập vẫn trả lời bình thường. Không dừng tiến trình hoặc đóng ứng dụng đang chiếm cổng.
+
+## Hướng dẫn trong ứng dụng — 2026-11-10
+
+- Nút **Hướng dẫn** và liên kết **Lần đầu sử dụng?** mở mục hướng dẫn 6 bước ngay trong giao diện, dùng được khi không có mạng. Hướng dẫn tự hiện khi chưa có dự án.
+- Chromium/Playwright đã kiểm tra mở/đóng, nút bắt đầu đưa con trỏ tới tên dự án, trạng thái `aria-expanded`, bàn phím Enter và phần hỏi đáp.
+- Mở hướng dẫn không làm mất tên/file đang chọn hoặc lời chưa lưu. Đã thử tạo dự án, thêm câu thủ công và lưu lời sau khi mở/đóng hướng dẫn.
+- Đã kiểm tra ở chiều rộng **1440, 390 và 320 px**, không tràn ngang trang hoặc khung hướng dẫn, không lỗi JavaScript. Các hướng dẫn không thay đổi luồng xử lý AI hay xuất video.

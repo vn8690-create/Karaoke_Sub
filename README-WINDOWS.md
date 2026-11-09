@@ -2,6 +2,8 @@
 
 Chế độ **Local Studio** bổ sung giao diện tiếng Việt để làm karaoke trên máy của bạn: tạo lời theo từng từ, sửa lời và mốc thời gian, tách vocal để lấy beat, hát thử, ghép video/ảnh nền và xuất MP4 hoặc phụ đề. Phần này chạy độc lập với backend cloud của dự án gốc, không cần tài khoản hay API key.
 
+**Đã mở được app và muốn làm bài đầu tiên?** Xem [hướng dẫn sử dụng từng bước](docs/LOCAL-USAGE.md), hoặc nhấn **Hướng dẫn** ở đầu giao diện. Trang này tập trung vào cài đặt và xử lý lỗi trên Windows.
+
 ## 1. Chuẩn bị
 
 - Windows 10/11 64-bit; Python **3.11 64-bit** từ [python.org](https://www.python.org/downloads/windows/). Khi cài, bật Python Launcher; có thể dùng `winget install --id Python.Python.3.11 --exact`.

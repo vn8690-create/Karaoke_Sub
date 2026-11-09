@@ -2,6 +2,8 @@
 
 Bản tùy biến từ [Nomad Karaoke / karaoke-gen](https://github.com/nomadkaraoke/karaoke-gen), dành cho **Windows 10/11 + NVIDIA RTX 3060**. Giao diện tiếng Việt, xử lý bài hát trên máy, không cần tài khoản hay API trả phí.
 
+**Mới sử dụng?** [Xem hướng dẫn từng bước: từ bài hát đến MP4 karaoke](docs/LOCAL-USAGE.md). Trong ứng dụng, nhấn **Hướng dẫn** ở đầu trang để xem cách dùng ngay tại chỗ.
+
 ![Giao diện Karaoke Studio local](docs/assets/local-studio.png)
 
 ## Bắt đầu trên Windows
