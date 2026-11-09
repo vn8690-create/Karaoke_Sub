@@ -1,0 +1,3 @@
+# This directory contains temporary recording sessions
+# Recordings are created when running tests with RECORD_FIXTURES=true
+# After review, approved fixtures are moved to the 'approved' directory

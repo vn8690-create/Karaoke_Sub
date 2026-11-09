@@ -1,0 +1,1857 @@
+"""
+Job management and queue operations.
+
+This module handles the complete job lifecycle including:
+- Job creation and initialization
+- State transitions and validation
+- Worker coordination (parallel audio + lyrics processing)
+- Progress tracking and timeline events
+- Error handling and retries
+"""
+import asyncio
+import logging
+import threading
+import uuid
+from datetime import datetime, timezone
+from typing import Awaitable, Callable, Optional, Dict, Any, List, TypeVar
+
+from backend.config import settings
+from backend.exceptions import InvalidStateTransitionError, InsufficientCreditsError
+from backend.models.job import Job, JobStatus, JobCreate, STATE_TRANSITIONS
+from backend.models.worker_log import WorkerLogEntry
+from backend.services.duration_reconciliation import reconcile_and_maybe_pause
+from backend.services.firestore_service import FirestoreService
+from backend.services.storage_service import StorageService
+from backend.utils.keyed_lock import job_lock
+
+
+logger = logging.getLogger(__name__)
+
+
+# Statuses a job sits in while its prep workers (audio separation + lyrics) run,
+# i.e. the states from which the lyrics→screens handoff may fire. Normal jobs
+# prep at DOWNLOADING; jobs that went through the audio editor prep at
+# AUDIO_EDIT_COMPLETE (the edit-submit endpoint triggers the workers without
+# passing back through DOWNLOADING).
+PREP_PHASE_STATUSES = frozenset({
+    JobStatus.DOWNLOADING,
+    JobStatus.AUDIO_EDIT_COMPLETE,
+})
+
+
+# state_data flag: this run's failure push was sent (see _failure_already_notified).
+FAILURE_PUSH_SENT_KEY = 'failure_push_sent'
+
+
+# ---------------------------------------------------------------- notification delivery
+#
+# Emails, pushes and idle-reminder scheduling are fire-and-forget: a state change
+# never waits for them. In the API server that is a task on the server's loop,
+# which lives on. A Cloud Run Job worker, though, runs its whole job inside
+# ``asyncio.run(...)``, which cancels every pending task when the job coroutine
+# returns, so a push scheduled by its last fail_job / transition never went out
+# (silently: CancelledError is not an Exception). Every send is tracked here and
+# worker entry points run their job through ``with_notification_drain`` (or await
+# ``drain_notifications``) so the sends finish, within a bounded wait, before the
+# loop closes. Module-level, not per instance: one worker builds several JobManagers.
+
+# How long a worker's drain waits for its notification tasks before giving up.
+# This bounds the coroutine wait only: a provider call already running in a
+# thread (asyncio.to_thread) can't be cancelled, and on Python 3.11 (prod)
+# asyncio.run's default-executor shutdown, and interpreter exit, wait for it
+# without limit. Exit time is really bounded by each call's own timeout (Web
+# Push WEBPUSH_TIMEOUT_S, Expo's httpx timeout, the Firestore/Postmark clients'
+# deadlines), so every provider call must keep one.
+NOTIFICATION_DRAIN_TIMEOUT_S = 10.0
+
+_pending_notification_tasks: "set[asyncio.Task]" = set()
+_pending_notification_threads: "set[threading.Thread]" = set()
+_pending_threads_lock = threading.Lock()
+# Job ids whose failure push is scheduled but not yet sent (see _failure_already_notified).
+_failure_push_in_flight: "set[str]" = set()
+
+T = TypeVar("T")
+
+
+def _schedule_notification(
+    make_coro: Callable[[], Awaitable[Any]],
+    label: str,
+    on_done: Optional[Callable[[], None]] = None,
+) -> None:
+    """Run ``make_coro()`` in the background and track it until it finishes.
+
+    Inside a running loop (API request, worker job) it becomes a task on that loop;
+    with no loop (sync code, e.g. a worker's ``asyncio.to_thread`` helper) it runs on
+    its own daemon thread. Never blocks the caller, never raises from the send.
+    ``on_done`` runs once the send has finished, failed or been cancelled (even a
+    task cancelled before its first step, whose coroutine body never runs).
+    """
+    async def guarded():
+        try:
+            await make_coro()
+        except Exception as e:
+            logger.error(f"Notification send failed ({label}): {e}")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None:
+        task = loop.create_task(guarded(), name=f"notification: {label}")
+        _pending_notification_tasks.add(task)
+        task.add_done_callback(_pending_notification_tasks.discard)
+        if on_done is not None:
+            task.add_done_callback(lambda _task: on_done())
+        return
+
+    def run_in_thread():
+        try:
+            asyncio.run(guarded())
+        finally:
+            if on_done is not None:
+                on_done()
+            with _pending_threads_lock:
+                _pending_notification_threads.discard(threading.current_thread())
+
+    thread = threading.Thread(target=run_in_thread, daemon=True, name=f"notification: {label}")
+    with _pending_threads_lock:
+        _pending_notification_threads.add(thread)
+    thread.start()
+
+
+async def drain_notifications(timeout_s: Optional[float] = None) -> bool:
+    """Wait for this process's pending notification sends, at most ``timeout_s``.
+
+    Call before a worker's event loop closes. Returns True when everything was sent
+    (or failed and was logged); on timeout logs a WARNING, cancels what is left and
+    returns False. Never raises from a send. Cancelling a task doesn't stop a
+    provider call already running in a thread (see NOTIFICATION_DRAIN_TIMEOUT_S).
+    """
+    if timeout_s is None:
+        timeout_s = NOTIFICATION_DRAIN_TIMEOUT_S
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    me = asyncio.current_task()
+    while True:
+        # A send may schedule another, so re-check until nothing is left.
+        tasks = [t for t in list(_pending_notification_tasks)
+                 if t.get_loop() is loop and not t.done() and t is not me]
+        with _pending_threads_lock:
+            threads = [th for th in _pending_notification_threads if th.is_alive()]
+        if not tasks and not threads:
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        if tasks:
+            await asyncio.wait(tasks, timeout=remaining)
+        else:
+            await asyncio.sleep(min(0.05, remaining))
+
+    logger.warning(
+        f"Gave up waiting for {len(tasks)} notification send(s) and {len(threads)} "
+        f"notification thread(s) after {timeout_s:.0f}s; exiting without them: "
+        f"{[t.get_name() for t in tasks] + [th.name for th in threads]}"
+    )
+    for t in tasks:
+        t.cancel()
+    return False
+
+
+async def with_notification_drain(job: Awaitable[T]) -> T:
+    """Await a worker's job coroutine, then drain its notifications (also on error).
+
+    Use as ``asyncio.run(with_notification_drain(process_x(job_id)))`` in a Cloud
+    Run Job entry point. The drain never raises and its wait is capped at
+    NOTIFICATION_DRAIN_TIMEOUT_S, so it can't change the job's result. A provider
+    call already running in a thread still finishes before the process exits;
+    its own timeout bounds that (see NOTIFICATION_DRAIN_TIMEOUT_S).
+    """
+    try:
+        return await job
+    finally:
+        try:
+            await drain_notifications()
+        except Exception as e:
+            logger.warning(f"Notification drain failed: {e}")
+
+
+def _cloud_run_retry_pending(state_data: Optional[Dict[str, Any]]) -> bool:
+    """True if the audio-download worker recorded an unexpired Cloud Run auto-retry marker."""
+    pending = (state_data or {}).get('cloud_run_retry_pending')
+    if not isinstance(pending, dict) or not pending.get('expires_at'):
+        return False
+    try:
+        expires_at = datetime.fromisoformat(str(pending['expires_at']).replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc)
+
+
+def _mask_email(email: str) -> str:
+    """Mask email for logging to protect PII. Shows first char + domain."""
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    if len(local) <= 1:
+        return f"*@{domain}"
+    return f"{local[0]}***@{domain}"
+
+
+class JobManager:
+    """Manager for job lifecycle and state."""
+    
+    def __init__(self):
+        """Initialize job manager with required services."""
+        self.firestore = FirestoreService()
+        self.storage = StorageService()
+    
+    @staticmethod
+    def _is_tenant_billed(tenant_id: Optional[str], user_email: Optional[str]) -> bool:
+        """True if this job is billed to a tenant (not consumer credits).
+
+        The tenant context can come from the client-controlled X-Tenant-ID
+        header, so a tenant id alone is NOT proof of membership: the user must
+        be allowed on that tenant's portal (its email/domain allowlist; an empty
+        allowlist admits admins only). Otherwise the job is charged normally.
+        """
+        if not tenant_id or not user_email:
+            return False
+        try:
+            from backend.services.tenant_service import get_tenant_service
+
+            config = get_tenant_service().get_tenant_config(tenant_id)
+        except Exception:
+            logger.exception(f"Tenant lookup failed for {tenant_id}; charging consumer credits")
+            return False
+        return bool(config and config.is_active and config.is_email_allowed(user_email))
+
+    def create_job(self, job_create: JobCreate, is_admin: bool = False) -> Job:
+        """
+        Create a new job with initial state PENDING.
+
+        Jobs start in PENDING state and transition to DOWNLOADING
+        when a worker picks them up.
+
+        Args:
+            job_create: Job creation parameters
+            is_admin: Whether the requesting user is an admin (bypasses credit checks)
+
+        Raises:
+            ValueError: If theme_id is not provided (all jobs require a theme)
+        """
+        # Check credits (skip for admins, and for tenant-portal jobs: tenants are
+        # billed under a separate commercial agreement, never consumer credits)
+        credits_to_charge = job_create.credits
+        charge_credits = (
+            bool(job_create.user_email)
+            and not is_admin
+            and not self._is_tenant_billed(job_create.tenant_id, job_create.user_email)
+        )
+        if charge_credits:
+            from backend.services.user_service import get_user_service
+            user_service = get_user_service()
+            credits_available = user_service.check_credits(job_create.user_email)
+            if credits_available < credits_to_charge:
+                raise InsufficientCreditsError(
+                    message="You're out of credits. Buy more to continue creating karaoke videos.",
+                    credits_available=credits_available,
+                    credits_required=credits_to_charge,
+                )
+
+        # Enforce theme requirement - all jobs must have a theme
+        # This prevents unstyled videos from ever being generated
+        if not job_create.theme_id:
+            raise ValueError(
+                "theme_id is required for all jobs. "
+                "Use get_theme_service().get_default_theme_id() to get the default theme."
+            )
+
+        job_id = str(uuid.uuid4())[:8]
+        
+        # Timezone-aware UTC so the serialized ISO string carries a "+00:00"
+        # offset. A naive datetime.utcnow() serializes with no offset, and the
+        # frontend's Date() parser then mis-reads it as local time.
+        now = datetime.now(timezone.utc)
+        job = Job(
+            job_id=job_id,
+            status=JobStatus.PENDING,  # New state machine starts with PENDING
+            progress=0,
+            created_at=now,
+            updated_at=now,
+            url=str(job_create.url) if job_create.url else None,
+            artist=job_create.artist,
+            title=job_create.title,
+            # User preferences
+            enable_cdg=job_create.enable_cdg,
+            enable_txt=job_create.enable_txt,
+            enable_youtube_upload=job_create.enable_youtube_upload,
+            youtube_description=job_create.youtube_description,
+            youtube_description_template=job_create.youtube_description_template,  # video_worker reads this
+            webhook_url=job_create.webhook_url,
+            user_email=job_create.user_email,
+            # Review autonomy ("auto" = skip review screens when confident)
+            review_mode=job_create.review_mode,
+            # Backing-vocals preference ("auto"=retain-where-safe | clean | review)
+            backing_preference=job_create.backing_preference,
+            # Translated lyrics beneath each line (None = off)
+            translation_language=job_create.translation_language,
+            # Distribution settings
+            brand_prefix=job_create.brand_prefix,
+            discord_webhook_url=job_create.discord_webhook_url,
+            dropbox_path=job_create.dropbox_path,
+            gdrive_folder_id=job_create.gdrive_folder_id,
+            # Theme configuration
+            theme_id=job_create.theme_id,
+            color_overrides=job_create.color_overrides,
+            style_params_gcs_path=job_create.style_params_gcs_path,
+            style_assets=job_create.style_assets,
+            # Two-phase workflow (Batch 6)
+            prep_only=job_create.prep_only,
+            finalise_only=job_create.finalise_only,
+            keep_brand_code=job_create.keep_brand_code,
+            # Request metadata (for tracking and filtering)
+            request_metadata=job_create.request_metadata,
+            # Tenant scoping
+            tenant_id=job_create.tenant_id,
+            # UI language the job was submitted in (admin-only signal)
+            locale=job_create.locale,
+            # Made-for-you order fields
+            made_for_you=job_create.made_for_you,
+            customer_email=job_create.customer_email,
+            customer_notes=job_create.customer_notes,
+            # Private (non-published) track mode
+            is_private=job_create.is_private,
+            # Capture creation-time decision params for observability
+            creation_params={
+                "is_private": job_create.is_private,
+                "is_admin": is_admin,
+                "created_from": job_create.request_metadata.get("created_from", "unknown"),
+            },
+            # Record how many credits were charged for this job (authoritative running total).
+            # When charging is bypassed (admin / no user_email / tenant portal), set
+            # credits_charged=0 and payment_bypassed=True so duration reconciliation
+            # short-circuits without pausing, charging, or refunding.
+            state_data=(
+                {"credits_charged": 0, "payment_bypassed": True}
+                if not charge_credits
+                else {"credits_charged": credits_to_charge}
+            ),
+        )
+
+        self.firestore.create_job(job)
+        logger.info(f"Created new job {job_id} with status PENDING")
+
+        # Deduct credits atomically (after job is persisted so we have job_id for transaction record)
+        if charge_credits:
+            from backend.services.user_service import get_user_service
+            user_service = get_user_service()
+            success, _remaining, deduct_msg = user_service.deduct_credits(
+                job_create.user_email, job_id, amount=credits_to_charge, reason="job_creation",
+                count_as_job_creation=True,
+            )
+            if not success:
+                # Deduction failed (e.g., race condition) - delete the job and raise error
+                logger.error(f"Credit deduction failed for job {job_id}: {deduct_msg}")
+                try:
+                    self.firestore.delete_job(job_id)
+                except Exception:
+                    logger.exception(f"Failed to delete job {job_id} after credit deduction failure")
+                raise InsufficientCreditsError(
+                    message="Failed to deduct credit. Please try again.",
+                    credits_available=0,
+                    credits_required=credits_to_charge,
+                )
+
+        return job
+    
+    def get_job(self, job_id: str) -> Optional[Job]:
+        """Get a job by ID."""
+        return self.firestore.get_job(job_id)
+    
+    def update_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        progress: Optional[int] = None,
+        message: Optional[str] = None,
+        **kwargs
+    ) -> None:
+        """Update job status with timeline tracking."""
+        self.firestore.update_job_status(
+            job_id=job_id,
+            status=status,
+            progress=progress,
+            message=message,
+            **kwargs
+        )
+    
+    def update_job(self, job_id: str, updates: Dict[str, Any]) -> None:
+        """Update job with arbitrary fields."""
+        self.firestore.update_job(job_id, updates)
+
+    def list_jobs_by_batch_id(self, batch_id: str, limit: int = 200) -> List[Job]:
+        """List all jobs in a Bulk Mode batch (state_data.batch_id == batch_id)."""
+        return self.firestore.list_jobs_by_batch_id(batch_id, limit=limit)
+    
+    def list_jobs(
+        self,
+        status: Optional[JobStatus] = None,
+        environment: Optional[str] = None,
+        client_id: Optional[str] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        user_email: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Job]:
+        """
+        List jobs with optional filtering.
+
+        Args:
+            status: Filter by job status
+            environment: Filter by request_metadata.environment (test/production/development)
+            client_id: Filter by request_metadata.client_id (customer identifier)
+            created_after: Filter jobs created after this datetime
+            created_before: Filter jobs created before this datetime
+            user_email: Filter by user_email (job owner)
+            tenant_id: Filter by tenant_id (white-label portal scoping)
+            limit: Maximum number of jobs to return
+
+        Returns:
+            List of Job objects matching filters
+        """
+        return self.firestore.list_jobs(
+            status=status,
+            environment=environment,
+            client_id=client_id,
+            created_after=created_after,
+            created_before=created_before,
+            user_email=user_email,
+            tenant_id=tenant_id,
+            limit=limit
+        )
+    
+    def list_jobs_summary(
+        self,
+        status: Optional[JobStatus] = None,
+        exclude_statuses: Optional[List[str]] = None,
+        environment: Optional[str] = None,
+        client_id: Optional[str] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        user_email: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List jobs with field projection (summary mode)."""
+        return self.firestore.list_jobs_summary(
+            status=status,
+            exclude_statuses=exclude_statuses,
+            environment=environment,
+            client_id=client_id,
+            created_after=created_after,
+            created_before=created_before,
+            user_email=user_email,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+
+    def delete_jobs_by_filter(
+        self,
+        environment: Optional[str] = None,
+        client_id: Optional[str] = None,
+        status: Optional[JobStatus] = None,
+        created_before: Optional[datetime] = None,
+        delete_files: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Delete multiple jobs matching filter criteria.
+        
+        CAUTION: This is a destructive operation. Use carefully.
+        
+        Args:
+            environment: Delete jobs with this environment (e.g., "test")
+            client_id: Delete jobs from this client
+            status: Delete jobs with this status
+            created_before: Delete jobs created before this datetime
+            delete_files: Also delete GCS files (default True)
+            
+        Returns:
+            Dict with deletion statistics
+        """
+        # First get matching jobs to delete their files
+        if delete_files:
+            jobs = self.firestore.list_jobs(
+                status=status,
+                environment=environment,
+                client_id=client_id,
+                created_before=created_before,
+                limit=10000  # High limit for deletion
+            )
+            
+            files_deleted = 0
+            for job in jobs:
+                # Delete files from various locations
+                try:
+                    # Delete uploads folder
+                    self.storage.delete_folder(f"uploads/{job.job_id}/")
+                    # Delete jobs folder
+                    self.storage.delete_folder(f"jobs/{job.job_id}/")
+                    files_deleted += 1
+                except Exception as e:
+                    logger.warning(f"Error deleting files for job {job.job_id}: {e}")
+        
+        # Delete the jobs from Firestore
+        deleted_count = self.firestore.delete_jobs_by_filter(
+            environment=environment,
+            client_id=client_id,
+            status=status,
+            created_before=created_before
+        )
+        
+        return {
+            'jobs_deleted': deleted_count,
+            'files_deleted': files_deleted if delete_files else 0
+        }
+    
+    def mark_job_error(self, job_id: str, error_message: str) -> None:
+        """Mark a job as errored."""
+        self.firestore.update_job_status(
+            job_id=job_id,
+            status=JobStatus.ERROR,
+            progress=0,
+            message=error_message,
+            error_message=error_message
+        )
+        logger.error(f"Job {job_id} marked as error: {error_message}")
+    
+    def get_output_urls(self, job_id: str) -> Dict[str, str]:
+        """Generate signed URLs (120 min) for a job's downloadable outputs.
+
+        Signs legacy ``job.output_files`` plus the final MP4 videos in
+        ``file_urls['finals']`` (keys ending ``_mp4``, e.g. ``lossy_720p_mp4``) -
+        current workers only populate the latter. ``output_files`` wins on key
+        collision. Signed URLs support HTTP Range, so clients can stream them.
+        Blobs are not existence-checked (a purged final yields a URL that 404s).
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return {}
+
+        urls: Dict[str, str] = {}
+        for file_type, gcs_path in (job.output_files or {}).items():
+            try:
+                urls[file_type] = self.storage.generate_signed_url(gcs_path, expiration_minutes=120)
+            except Exception as e:
+                logger.error(f"Error generating URL for {file_type}: {e}")
+
+        finals = (job.file_urls or {}).get("finals")
+        if isinstance(finals, dict):
+            for key, gcs_path in finals.items():
+                if not isinstance(key, str) or not isinstance(gcs_path, str):
+                    continue
+                if not key.endswith("_mp4") or key in urls or not gcs_path:
+                    continue
+                try:
+                    urls[key] = self.storage.generate_signed_url(gcs_path, expiration_minutes=120)
+                except Exception as e:
+                    # Signing is bounded per call (SIGNED_URL_TIMEOUT_S); if it
+                    # failed, IAM is likely stalled - don't stack more timeouts
+                    # onto this request.
+                    logger.error(f"Error generating URL for final {key}: {e}")
+                    break
+
+        return urls
+
+    def delete_job(self, job_id: str, delete_files: bool = True) -> None:
+        """Delete a job, its files, and its logs subcollection."""
+        job = self.get_job(job_id)
+
+        # Refund credit if job never completed (and wasn't already refunded via fail/cancel)
+        if job:
+            no_refund_statuses = [JobStatus.COMPLETE, JobStatus.PREP_COMPLETE, JobStatus.FAILED, JobStatus.CANCELLED]
+            if job.status not in no_refund_statuses:
+                self._refund_credit_for_job(job_id, job, reason="job_deleted")
+
+        if delete_files and job and job.output_files:
+            for gcs_path in job.output_files.values():
+                try:
+                    # ignore_missing: a job being deleted whose recorded file is
+                    # already gone is not an error, just skip it quietly.
+                    self.storage.delete_file(gcs_path, ignore_missing=True)
+                except Exception as e:
+                    logger.error(f"Error deleting file {gcs_path}: {e}")
+
+        # Delete logs subcollection first (must be done before deleting parent doc)
+        try:
+            deleted_logs = self.firestore.delete_logs_subcollection(job_id)
+            if deleted_logs > 0:
+                logger.info(f"Deleted {deleted_logs} log entries for job {job_id}")
+        except Exception as e:
+            logger.warning(f"Error deleting logs subcollection for job {job_id}: {e}")
+
+        # Delete audio edit sessions subcollection
+        try:
+            deleted_sessions = self.firestore.delete_audio_edit_sessions_subcollection(job_id)
+            if deleted_sessions > 0:
+                logger.info(f"Deleted {deleted_sessions} audio edit sessions for job {job_id}")
+        except Exception as e:
+            logger.warning(f"Error deleting audio edit sessions for job {job_id}: {e}")
+
+        self.firestore.delete_job(job_id)
+        logger.info(f"Deleted job {job_id}")
+    
+    def validate_state_transition(
+        self,
+        job_id: str,
+        new_status: JobStatus,
+        raise_on_invalid: bool = True
+    ) -> bool:
+        """
+        Validate that a state transition is legal.
+
+        Args:
+            job_id: Job ID
+            new_status: Target state
+            raise_on_invalid: If True, raise InvalidStateTransitionError on invalid
+                              transitions. If False, return False (legacy behavior).
+
+        Returns:
+            True if transition is valid
+
+        Raises:
+            InvalidStateTransitionError: If transition is invalid and raise_on_invalid=True
+            ValueError: If job not found and raise_on_invalid=True
+        """
+        job = self.get_job(job_id)
+        if not job:
+            error_msg = f"Job {job_id} not found"
+            logger.error(error_msg)
+            if raise_on_invalid:
+                raise ValueError(error_msg)
+            return False
+
+        current_status = job.status
+        valid_transitions = STATE_TRANSITIONS.get(current_status, [])
+
+        if new_status not in valid_transitions:
+            # Normalise both sides to their string values so the message reads
+            # 'downloading -> downloading' rather than the misleading
+            # 'downloading -> JobStatus.DOWNLOADING'. The asymmetry exists
+            # because Job.status is deserialised with use_enum_values=True
+            # (plain str) while new_status is typically an enum at call time.
+            from_value = current_status.value if hasattr(current_status, 'value') else str(current_status)
+            to_value = new_status.value if hasattr(new_status, 'value') else str(new_status)
+            error_msg = (
+                f"Invalid state transition for job {job_id}: "
+                f"{from_value} -> {to_value}. "
+                f"Valid transitions: {[s.value for s in valid_transitions]}"
+            )
+            logger.error(error_msg)
+
+            if raise_on_invalid:
+                raise InvalidStateTransitionError(
+                    message=error_msg,
+                    job_id=job_id,
+                    from_status=from_value,
+                    to_status=to_value,
+                    valid_transitions=[s.value for s in valid_transitions]
+                )
+            return False
+
+        return True
+
+    def transition_to_state(self, job_id: str, *args, **kwargs) -> bool:
+        """Validate + apply a status transition (see _transition_to_state_unlocked).
+
+        Serialized per job within this instance: route handlers run in the
+        threadpool, so two concurrent requests (e.g. a double-clicked Complete)
+        could otherwise both pass validation and both transition/trigger
+        workers. (They used to be serialized by running on the event loop.)
+        """
+        with job_lock(job_id):
+            return self._transition_to_state_unlocked(job_id, *args, **kwargs)
+
+    def _transition_to_state_unlocked(
+        self,
+        job_id: str,
+        new_status: JobStatus,
+        progress: Optional[int] = None,
+        message: Optional[str] = None,
+        state_data_updates: Optional[Dict[str, Any]] = None,
+        raise_on_invalid: bool = True,
+        timeline_metadata: Optional[Dict[str, Any]] = None,
+        notify: bool = True,
+        extra_updates: Optional[Dict[str, Any]] = None,
+        count_completion: bool = True,
+    ) -> bool:
+        """
+        Transition job to new state with validation.
+
+        Args:
+            job_id: Job ID
+            new_status: Target state
+            progress: Progress percentage (0-100)
+            message: Timeline message
+            state_data_updates: Updates to state_data field
+            raise_on_invalid: If True (default), raise InvalidStateTransitionError
+                              on invalid transitions. If False, return False silently.
+            timeline_metadata: Optional structured metadata to attach to the timeline event
+            notify: If False, skip the user email/push notifications for this
+                    transition (e.g. an admin re-render the admin didn't opt
+                    into announcing to the customer).
+            extra_updates: Additional Firestore field updates (dot paths allowed,
+                    e.g. ``{"state_data.admin_rerender": DELETE_FIELD}``) written
+                    in the SAME update as the status change.
+            count_completion: If False, don't increment the user's completed-jobs
+                    counter on COMPLETE (an admin re-render isn't a new job).
+
+        Returns:
+            True if transition succeeded, False if failed (only when raise_on_invalid=False)
+
+        Raises:
+            InvalidStateTransitionError: If transition is invalid and raise_on_invalid=True
+        """
+        if state_data_updates and any(
+            key == "state_data" or key.startswith("state_data.") for key in (extra_updates or {})
+        ):
+            # state_data_updates rewrites the whole state_data map; a dot-path
+            # write to state_data.* in the same Firestore update is a
+            # conflicting-path error (and would be ambiguous anyway).
+            raise ValueError(
+                "transition_to_state: pass state_data changes via state_data_updates OR "
+                "extra_updates['state_data.*'], not both"
+            )
+
+        if not self.validate_state_transition(job_id, new_status, raise_on_invalid=raise_on_invalid):
+            return False
+
+        updates = {
+            'status': new_status,
+            'updated_at': datetime.utcnow()
+        }
+
+        if progress is not None:
+            updates['progress'] = progress
+
+        # Generate review token when entering blocking states that need user action
+        # Tokens don't expire - they're job-scoped so low risk, and natural expiry happens when job completes
+        if new_status in (JobStatus.AWAITING_REVIEW, JobStatus.AWAITING_AUDIO_EDIT):
+            from backend.api.dependencies import generate_review_token
+            review_token = generate_review_token()
+            updates['review_token'] = review_token
+            updates['review_token_expires_at'] = None  # No expiry - token is job-scoped
+            logger.info(f"Generated review token for job {job_id} (no expiry)")
+
+        # If we have state_data_updates, merge them with existing state_data
+        merged_state_data = None
+        if state_data_updates:
+            job = self.get_job(job_id)
+            if job:
+                merged_state_data = {**job.state_data, **state_data_updates}
+
+        # Update job status (includes timeline event), passing state_data if present
+        extra = dict(extra_updates or {})
+        if merged_state_data is not None:
+            self.update_job_status(
+                job_id=job_id,
+                status=new_status,
+                progress=progress,
+                message=message,
+                timeline_metadata=timeline_metadata,
+                state_data=merged_state_data,
+                **extra,
+            )
+        else:
+            self.update_job_status(
+                job_id=job_id,
+                status=new_status,
+                progress=progress,
+                message=message,
+                timeline_metadata=timeline_metadata,
+                **extra,
+            )
+        
+        # Apply review token update separately if generated
+        if new_status == JobStatus.AWAITING_REVIEW and 'review_token' in updates:
+            self.firestore.update_job(job_id, {
+                'review_token': updates['review_token'],
+                'review_token_expires_at': updates['review_token_expires_at']
+            })
+
+        logger.info(f"Job {job_id} transitioned to {new_status}")
+
+        # Increment user's completed jobs counter on terminal success states
+        if new_status in (JobStatus.COMPLETE, JobStatus.PREP_COMPLETE) and not count_completion:
+            logger.info(f"Job {job_id}: completion not counted towards the user's jobs_completed")
+        elif new_status in (JobStatus.COMPLETE, JobStatus.PREP_COMPLETE):
+            try:
+                job = self.get_job(job_id)
+                if job and job.user_email:
+                    from backend.services.user_service import get_user_service
+                    user_service = get_user_service()
+                    user_service.increment_jobs_completed(job.user_email)
+                    try:
+                        from backend.services.conversion_emails import on_job_completed
+                        on_job_completed(job, user_service)
+                    except Exception:
+                        logger.exception(f"Failed to schedule conversion email for job {job_id}")
+            except Exception:
+                logger.exception(f"Failed to increment jobs_completed for job {job_id}")
+
+        # Trigger notifications asynchronously (fire-and-forget)
+        if notify:
+            self._trigger_state_notifications(job_id, new_status)
+        else:
+            logger.info(f"Job {job_id}: notifications suppressed for transition to {new_status}")
+
+        return True
+
+    def _trigger_state_notifications(self, job_id: str, new_status: JobStatus) -> None:
+        """
+        Trigger email and push notifications based on state transitions.
+
+        This is fire-and-forget - notification failures don't affect job processing.
+
+        Args:
+            job_id: Job ID
+            new_status: New job status
+        """
+        try:
+            # Get the job to access user info
+            job = self.get_job(job_id)
+            if not job or not job.user_email:
+                logger.debug(f"No user email for job {job_id}, skipping notifications")
+                return
+
+            # Job completion notification
+            if new_status == JobStatus.COMPLETE:
+                self._schedule_completion_email(job)
+                self._send_push_notification(job, "complete")
+
+            # Idle reminder scheduling for blocking states
+            elif new_status in [JobStatus.AWAITING_REVIEW, JobStatus.AWAITING_INSTRUMENTAL_SELECTION, JobStatus.AWAITING_AUDIO_EDIT, JobStatus.AWAITING_DURATION_CONFIRM]:
+                self._schedule_idle_reminder(job, new_status)
+                # Send push notification for blocking states
+                if new_status == JobStatus.AWAITING_AUDIO_EDIT:
+                    action_type = "audio_edit"
+                elif new_status == JobStatus.AWAITING_REVIEW:
+                    action_type = "lyrics"
+                elif new_status == JobStatus.AWAITING_DURATION_CONFIRM:
+                    action_type = "duration_confirm"
+                else:
+                    action_type = "instrumental"
+                self._send_push_notification(job, action_type)
+
+            # Failure: push only (no email / idle reminder). AWAITING_AUDIO_SELECTION
+            # is the normal interactive search step, not a problem, so it never pushes.
+            elif new_status == JobStatus.FAILED:
+                if _cloud_run_retry_pending(job.state_data):
+                    logger.info(f"Job {job_id}: failure push skipped, Cloud Run auto-retry pending")
+                    return
+                from backend.services.admin_rerender_service import suppress_customer_notifications
+                if suppress_customer_notifications(job):
+                    logger.info(f"Job {job_id}: failure push suppressed (quiet re-render)")
+                    return
+                # The run's marker (lets a second worker failing the same run skip a
+                # duplicate push) is written once the push was attempted, not when it
+                # is scheduled, so a send that never ran can't hide a later failure.
+                self._send_push_notification(
+                    job, "failed",
+                    after_send=lambda: self.firestore.update_job(
+                        job_id, {f'state_data.{FAILURE_PUSH_SENT_KEY}': True}),
+                )
+
+        except Exception as e:
+            # Never let notification failures affect job processing
+            logger.error(f"Error triggering notifications for job {job_id}: {e}")
+
+    def _schedule_completion_email(self, job: Job) -> None:
+        """
+        Schedule sending a job completion email.
+
+        For made-for-you orders, also transfers ownership from admin to customer.
+        Fire-and-forget (see _schedule_notification).
+        """
+        try:
+            from backend.services.job_notification_service import get_job_notification_service
+
+            notification_service = get_job_notification_service()
+
+            # Get youtube, dropbox URLs, and brand_code from state_data (may be None)
+            state_data = job.state_data or {}
+            youtube_url = state_data.get('youtube_url')
+            dropbox_url = state_data.get('dropbox_link')
+            brand_code = state_data.get('brand_code')
+            youtube_queued = state_data.get('youtube_upload_queued', False)
+
+            # For made-for-you orders, send to customer and transfer ownership
+            recipient_email = job.user_email
+            if job.made_for_you and job.customer_email:
+                recipient_email = job.customer_email
+                # Transfer ownership from admin to customer (non-blocking - email still goes out if this fails)
+                try:
+                    self.update_job(job.job_id, {'user_email': job.customer_email})
+                    logger.info(f"Transferred ownership of made-for-you job {job.job_id} to {_mask_email(job.customer_email)}")
+                except Exception as e:
+                    logger.error(f"Failed to transfer ownership for job {job.job_id}: {e}")
+
+            # Never send a delivery email without its files link (NOMAD-1800: Dropbox
+            # full -> customer got "[Dropbox URL not available]"). Hold it, flag the
+            # job, and post one actionable #alerts message instead.
+            from backend.services.delivery_guard import (
+                completion_email_hold_reason,
+                hold_completion_email,
+            )
+            hold = completion_email_hold_reason(job)
+            if hold:
+                hold_completion_email(self, job, hold, recipient_email)
+                return
+
+            # Create async task (fire-and-forget)
+            async def send_email():
+                await notification_service.send_job_completion_email(
+                    job_id=job.job_id,
+                    user_email=recipient_email,
+                    user_name=None,  # Could fetch from user service if needed
+                    artist=job.artist,
+                    title=job.title,
+                    youtube_url=youtube_url,
+                    dropbox_url=dropbox_url,
+                    brand_code=brand_code,
+                    is_private=getattr(job, 'is_private', False),
+                    youtube_queued=youtube_queued,
+                )
+
+            _schedule_notification(send_email, f"completion email {job.job_id}")
+            logger.info(f"Scheduled completion email for job {job.job_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to schedule completion email for job {job.job_id}: {e}")
+
+    def _schedule_idle_reminder(self, job: Job, new_status: JobStatus) -> None:
+        """
+        Schedule an idle reminder for a blocking state.
+
+        Records the timestamp when the blocking state was entered and
+        schedules a Cloud Tasks task after a state-specific delay:
+        - AWAITING_DURATION_CONFIRM: 15 minutes (900s) — user needs to confirm extra cost
+        - All other blocking states: default delay (IDLE_REMINDER_DELAY_SECONDS)
+        """
+        try:
+            # Record when we entered blocking state (for idle detection)
+            blocking_entered_at = datetime.utcnow().isoformat()
+
+            if new_status == JobStatus.AWAITING_AUDIO_EDIT:
+                action_type = "audio_edit"
+            elif new_status == JobStatus.AWAITING_REVIEW:
+                action_type = "lyrics"
+            elif new_status == JobStatus.AWAITING_DURATION_CONFIRM:
+                action_type = "duration_confirm"
+            else:
+                action_type = "instrumental"
+
+            # Update state_data with blocking state info. Dotted paths merge
+            # server-side — a read-modify-write of the whole map would clobber
+            # fields written since `job` was read (e.g. reconcile's
+            # pending_additional_credits / credits_charged just before this
+            # transition).
+            self.firestore.update_job(job.job_id, {
+                'state_data.blocking_state_entered_at': blocking_entered_at,
+                'state_data.blocking_action_type': action_type,
+                'state_data.reminder_sent': False,  # Set True after reminder is sent
+            })
+
+            # Schedule the idle reminder check via worker service.
+            # Duration-confirm uses 15-min delay; other states use the default.
+            from backend.services.worker_service import get_worker_service
+
+            # Capture action_type for the closure
+            _action_type = action_type
+
+            async def schedule_reminder():
+                worker_service = get_worker_service()
+                if _action_type == "duration_confirm":
+                    await worker_service.schedule_idle_reminder(job.job_id, delay_seconds=900)
+                else:
+                    await worker_service.schedule_idle_reminder(job.job_id)
+
+            _schedule_notification(schedule_reminder, f"idle reminder {job.job_id}")
+
+            logger.info(f"Scheduled idle reminder for job {job.job_id} ({action_type})")
+
+        except Exception as e:
+            logger.error(f"Failed to schedule idle reminder for job {job.job_id}: {e}")
+
+    # action_type -> (Expo kind, mobile deep-link path, i18n key prefix under pushNotifications)
+    _EXPO_ROUTES = {
+        "complete": ("ready", "/job/{id}", ("videoReadyTitle", "videoReadyBody")),
+        "lyrics": ("review", "/review/{id}", ("reviewLyricsTitle", "reviewLyricsBody")),
+        "duration_confirm": ("review", "/job/duration/{id}", ("confirmDurationTitle", "confirmDurationBody")),
+        "audio_edit": ("review", "/job/{id}", ("reviewLyricsTitle", "reviewLyricsBody")),
+        "instrumental": ("review", "/job/{id}", ("selectInstrumentalTitle", "selectInstrumentalBody")),
+        "failed": ("problems", "/job/{id}", ("jobProblemTitle", "jobProblemBody")),
+    }
+
+    def _send_expo_push(self, job: Job, action_type: str, stalled_download: bool = False) -> None:
+        """Send the mobile-app (Expo) push for a job event. Blocking; call from a worker thread."""
+        from backend.i18n import t
+        from backend.services.expo_push_service import get_expo_push_service
+
+        kind, path, (title_key, body_key) = self._EXPO_ROUTES[action_type]
+        if stalled_download:
+            body_key = "jobStalledBody"
+        locale = "en"  # like Web Push: job.locale is an admin signal, not a notification preference
+        get_expo_push_service().send(
+            job.user_email,
+            kind,
+            t(locale, f"pushNotifications.{title_key}"),
+            t(locale, f"pushNotifications.{body_key}", title=job.title or "", artist=job.artist or ""),
+            path.format(id=job.job_id),
+        )
+
+    def _send_push_notification(
+        self, job: Job, action_type: str, after_send: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """
+        Send push notifications (Web Push and mobile Expo push) for job state changes.
+
+        Fire-and-forget - failures don't affect job processing.
+
+        Args:
+            job: Job object
+            action_type: "complete", "lyrics", "instrumental", "audio_edit",
+                "duration_confirm" or "failed"
+            after_send: Optional blocking callback, run (in a worker thread) once
+                both channels were attempted.
+        """
+        try:
+            from backend.services.push_notification_service import get_push_notification_service
+
+            push_service = get_push_notification_service()
+            web_enabled = push_service.is_enabled()
+
+            stalled = bool((job.error_details or {}).get("code") == "audio_download_stalled")
+
+            # Build job dict for notification service
+            job_dict = {
+                "job_id": job.job_id,
+                "user_email": job.user_email,
+                "artist": job.artist,
+                "title": job.title,
+                "tenant_id": job.tenant_id or None,
+                "stalled_download": stalled,
+            }
+
+            async def send_notification():
+                await send_channels()
+                if after_send is not None:
+                    try:
+                        await asyncio.to_thread(after_send)
+                    except Exception as e:  # best-effort bookkeeping
+                        logger.warning(f"Post-push update failed for job {job.job_id}: {e}")
+
+            async def send_channels():
+                # Each channel is isolated so one failing cannot stop the other.
+                if web_enabled:
+                    try:
+                        if action_type == "complete":
+                            await push_service.send_completion_notification(job_dict)
+                        elif action_type == "failed":
+                            await push_service.send_problem_notification(job_dict)
+                        else:
+                            await push_service.send_blocking_notification(job_dict, action_type)
+                    except Exception as e:
+                        logger.error(f"Web push failed for job {job.job_id}: {e}")
+                # The mobile app is Nomad-only: a white-label tenant's job never
+                # reaches it (Web Push above is already tenant-scoped).
+                if job.tenant_id:
+                    return
+                try:
+                    await asyncio.to_thread(self._send_expo_push, job, action_type, stalled)
+                except Exception as e:
+                    logger.error(f"Expo push failed for job {job.job_id}: {e}")
+
+            on_done = None
+            if action_type == "failed":
+                # Until the send finishes (and its marker is written), this process
+                # treats the run's failure as notified: see _failure_already_notified.
+                _failure_push_in_flight.add(job.job_id)
+                on_done = lambda: _failure_push_in_flight.discard(job.job_id)  # noqa: E731
+            try:
+                _schedule_notification(send_notification, f"{action_type} push {job.job_id}", on_done)
+            except Exception:
+                _failure_push_in_flight.discard(job.job_id)
+                raise
+            logger.debug(f"Scheduled push notification for job {job.job_id} ({action_type})")
+
+        except Exception as e:
+            logger.error(f"Failed to send push notification for job {job.job_id}: {e}")
+
+    def record_review_started(
+        self,
+        job_id: str,
+        job_user_email: Optional[str],
+        reviewer_email: Optional[str],
+        is_admin: bool,
+    ) -> str:
+        """Record who opened the lyrics review first (AWAITING_REVIEW → IN_REVIEW).
+
+        ``state_data.review_started_by`` is "admin" when someone other than the
+        owner (the KJ / support) opened it, else "owner" (incl. review-token
+        links, which only the owner is sent). kjbox shows singers "the host has
+        already started reviewing" from it. Best-effort; returns the value.
+        """
+        is_owner = bool(
+            reviewer_email and job_user_email
+            and reviewer_email.lower() == job_user_email.lower()
+        )
+        by = "admin" if (is_admin and not is_owner) else "owner"
+        try:
+            self.update_job(job_id, {
+                "state_data.review_started_by": by,
+                "state_data.review_started_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            logger.warning(f"Job {job_id}: could not record review_started_by: {e}")
+        return by
+
+    def update_state_data(self, job_id: str, key: str, value: Any) -> None:
+        """
+        Update a specific key in the job's state_data field.
+
+        This is used by workers to store stage-specific metadata.
+        """
+        job = self.get_job(job_id)
+        if not job:
+            logger.error(f"Job {job_id} not found")
+            return
+
+        # Atomic nested-field write. Previously this copied the whole state_data
+        # map and re-persisted it, so two workers updating different keys
+        # concurrently could clobber each other (lost-update race). Writing a
+        # single dot-path field merges without touching sibling keys — same
+        # approach as update_processing_metadata.
+        self.update_job(job_id, {f"state_data.{key}": value})
+        logger.debug(f"Job {job_id} state_data updated: {key} = {value}")
+
+    def bump_worker_generation(self, job_id: str) -> Optional[int]:
+        """
+        Atomically increment the ``state_data.worker_generation`` fence.
+
+        Every trigger of a long-running render/video worker bumps this counter.
+        A worker captures the value at start; if it later differs, a newer run
+        has superseded it and its (now stale) result must be discarded rather
+        than written back or used to fail the job. See
+        :mod:`backend.workers.supersede`.
+
+        Returns the new generation, or ``None`` if the update failed (best-effort
+        — a failed bump must never block triggering the worker).
+        """
+        try:
+            from google.cloud.firestore_v1 import Increment
+            self.firestore.update_job(job_id, {
+                'state_data.worker_generation': Increment(1),
+            })
+            job = self.get_job(job_id)
+            new_generation = (job.state_data or {}).get('worker_generation') if job else None
+            logger.info(f"Job {job_id}: bumped worker_generation to {new_generation}")
+            return new_generation
+        except Exception as e:
+            # Never let a fence bump block worker dispatch — the status fence
+            # (Layer A) still protects against the reset race on its own.
+            logger.warning(f"Job {job_id}: failed to bump worker_generation: {e}")
+            return None
+
+    def update_processing_metadata(self, job_id: str, section: str, data) -> None:
+        """
+        Write data into processing_metadata[section] using Firestore dot-notation.
+
+        Each worker writes its own section once. This uses Firestore's nested
+        field update to avoid overwriting other workers' sections.
+
+        The section can use dot-notation for deeper nesting, e.g.
+        'timing.lyrics_worker_seconds' writes to processing_metadata.timing.lyrics_worker_seconds
+        without overwriting other timing entries.
+
+        Args:
+            job_id: Job ID
+            section: Metadata section path (e.g., 'transcription', 'timing.audio_worker_seconds')
+            data: Value to store (dict for sections, scalar for individual fields)
+        """
+        try:
+            self.firestore.update_job(job_id, {
+                f"processing_metadata.{section}": data,
+            })
+            logger.debug(f"Job {job_id} processing_metadata.{section} updated")
+        except Exception as e:
+            # Log but don't raise - metadata storage should never fail a job
+            logger.warning(f"Job {job_id}: Failed to update processing_metadata.{section}: {e}")
+
+    def delete_state_data_key(self, job_id: str, key: str) -> bool:
+        """
+        Delete a specific key from the job's state_data field.
+
+        Uses Firestore DELETE_FIELD to atomically remove the key.
+        This is used to clear worker progress markers, allowing workers
+        to re-run without skipping due to idempotency checks.
+
+        Args:
+            job_id: Job ID
+            key: The state_data key to delete (e.g., "render_progress")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        from google.cloud.firestore_v1 import DELETE_FIELD
+
+        try:
+            job_ref = self.firestore.db.collection("jobs").document(job_id)
+            job_ref.update({f"state_data.{key}": DELETE_FIELD})
+            logger.debug(f"Job {job_id}: Deleted state_data key '{key}'")
+            return True
+        except Exception as e:
+            logger.error(f"Job {job_id}: Failed to delete state_data key '{key}': {e}")
+            return False
+
+    def delete_state_data_keys(self, job_id: str, keys: List[str]) -> List[str]:
+        """
+        Delete multiple keys from the job's state_data field in a single operation.
+
+        Uses Firestore DELETE_FIELD to atomically remove the keys.
+
+        Args:
+            job_id: Job ID
+            keys: List of state_data keys to delete
+
+        Returns:
+            List of keys that were successfully deleted
+        """
+        from google.cloud.firestore_v1 import DELETE_FIELD
+
+        if not keys:
+            return []
+
+        try:
+            job_ref = self.firestore.db.collection("jobs").document(job_id)
+            update_payload = {f"state_data.{key}": DELETE_FIELD for key in keys}
+            job_ref.update(update_payload)
+            logger.info(f"Job {job_id}: Deleted state_data keys: {keys}")
+            return keys
+        except Exception as e:
+            logger.error(f"Job {job_id}: Failed to delete state_data keys {keys}: {e}")
+            return []
+    
+    def _refund_credit_for_job(self, job_id: str, job: Job, reason: str) -> bool:
+        """
+        Refund all credits charged for a job if eligible.
+
+        Reads the charge via ``job_credits.get_credits_charged`` (legacy jobs
+        lacking the field: 1 if create_job charged them, else 0) and refunds that many credits in a single
+        ``add_credits`` call.  Skips refund if: already refunded, no user
+        email, admin-owned job, or credits_charged == 0 (payment_bypassed).
+        Never raises — refund failure must not block the calling operation.
+
+        Returns:
+            True if credit was refunded, False otherwise.
+        """
+        try:
+            if job.credit_refunded:
+                logger.info(f"Credit already refunded for job {job_id}, skipping")
+                return False
+
+            if not job.user_email:
+                return False
+
+            from backend.services.auth_service import is_admin_email
+            from backend.services.user_service import get_user_service
+
+            if is_admin_email(job.user_email):
+                return False
+
+            # Determine how many credits to refund.  ``credits_charged`` is set
+            # at job creation (and updated on duration-confirm).  Jobs lacking
+            # the field resolve via job_credits.get_credits_charged (1 if
+            # create_job charged them, 0 for admin/tenant/no-email).
+            # payment_bypassed jobs have credits_charged=0 and are not refunded.
+            state_data = job.state_data or {}
+            # A re-run of an already-delivered track (storage-retention
+            # regenerate, admin/theme re-render) was paid for when it first
+            # completed — cancelling the re-run must not refund that credit.
+            if any(state_data.get(k) for k in ("regenerate", "admin_rerender", "theme_rerender")):
+                logger.info(f"Job {job_id}: cancelled re-run of a delivered track, skipping refund")
+                return False
+            # Same for a customer edit: "Edit" reopens a completed (delivered) track
+            # for review, so a delete/cancel/fail after it must not refund — otherwise
+            # complete → edit → delete returns the credit for a video already received.
+            if job.edit_count:
+                logger.info(f"Job {job_id}: edited track was already delivered, skipping refund")
+                return False
+            from backend.services.job_credits import get_credits_charged, is_payment_bypassed
+            credits_charged = 0 if is_payment_bypassed(job) else get_credits_charged(job)
+
+            if credits_charged == 0:
+                # Admin / payment-bypassed job — nothing to refund.
+                logger.info(f"Job {job_id}: credits_charged=0 (payment_bypassed), skipping refund")
+                return False
+
+            user_service = get_user_service()
+            refund_ok, new_balance, refund_msg = user_service.add_credits(
+                job.user_email, amount=credits_charged, reason=reason, job_id=job_id
+            )
+            if refund_ok:
+                # Mark job as refunded to prevent double-refund
+                self.update_job(job_id, {'credit_refunded': True})
+                logger.info(
+                    f"Refunded {credits_charged} credit(s) for {reason} job {job_id} "
+                    f"to {_mask_email(job.user_email)} (balance: {new_balance})"
+                )
+                return True
+            else:
+                logger.warning(f"Credit refund failed for job {job_id}: {refund_msg}")
+                return False
+        except Exception as e:
+            logger.warning(f"Error refunding credit for job {job_id}: {e}")
+            return False
+
+    def fail_job(self, job_id: str, error_message: str, error_details: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Mark a job as failed with error information.
+        
+        Args:
+            job_id: Job ID
+            error_message: Human-readable error message
+            error_details: Optional structured error details
+            
+        Returns:
+            True if successful
+        """
+        try:
+            already_notified = self._failure_already_notified(job_id)
+
+            # Update error fields
+            self.update_job(job_id, {
+                'error_message': error_message,
+                'error_details': error_details or {}
+            })
+            
+            # Use update_job_status which handles timeline
+            self.update_job_status(
+                job_id=job_id,
+                status=JobStatus.FAILED,
+                message=error_message
+            )
+            
+            # WARNING: the status write above sends the one job-failed alert (ops_alerts).
+            logger.warning(f"Job {job_id} failed: {error_message}")
+
+            # Auto-refund credit on failure
+            job = self.get_job(job_id)
+            if job:
+                self._refund_credit_for_job(job_id, job, reason="job_failed")
+
+            if not already_notified:
+                self._trigger_state_notifications(job_id, JobStatus.FAILED)
+
+            return True
+        except Exception as e:
+            logger.error(f"Error marking job {job_id} as failed: {e}")
+            return False
+
+    def update_file_url(self, job_id: str, category: str, file_type: str, url: str) -> None:
+        """
+        Update a file URL in the job's file_urls structure.
+        
+        Args:
+            job_id: Job ID
+            category: Category (e.g., "stems", "lyrics", "finals")
+            file_type: File type within category (e.g., "clean", "lrc", "lossless_4k_mp4")
+            url: GCS URL
+        """
+        job = self.get_job(job_id)
+        if not job:
+            logger.error(f"Job {job_id} not found")
+            return
+
+        # Atomic nested-field write. Previously this copied the whole file_urls
+        # map and re-persisted it, so two workers registering different files
+        # concurrently could clobber each other. That lost-update race dropped
+        # freshly-registered stems (e.g. backing_vocals vanishing while the
+        # audio + screens workers ran in parallel). Writing a single dot-path
+        # field merges without touching sibling entries.
+        self.update_job(job_id, {f"file_urls.{category}.{file_type}": url})
+        logger.debug(f"Job {job_id} file URL updated: {category}.{file_type}")
+    
+    def check_parallel_processing_complete(self, job_id: str) -> bool:
+        """
+        Check if lyrics processing is complete (sufficient for screen generation).
+
+        Audio separation is decoupled from the critical path — users can start
+        reviewing lyrics while separation continues in the background. The
+        instrumental review page handles the case where separation isn't done yet.
+
+        Returns:
+            True if lyrics are complete, False otherwise
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return False
+
+        lyrics_complete = job.state_data.get('lyrics_complete', False)
+
+        return lyrics_complete
+
+    async def start_job_processing(
+        self,
+        job_id: str,
+        progress: int = 15,
+        message: str = "Starting audio and lyrics processing"
+    ) -> None:
+        """
+        Transition job to DOWNLOADING and trigger audio + lyrics workers.
+
+        This is the single entry point for starting job processing after audio
+        is available. All handlers (file_upload, webhook, audio_search) should
+        use this method to ensure consistent state transitions.
+
+        The method:
+        1. Validates job exists and has input_media_gcs_path
+        2. Transitions to DOWNLOADING status (raises if invalid)
+        3. Triggers audio and lyrics workers in parallel
+
+        Args:
+            job_id: Job ID to start processing
+            progress: Progress percentage to set (default 15)
+            message: Timeline message (default "Starting audio and lyrics processing")
+
+        Raises:
+            InvalidStateTransitionError: If job can't transition to DOWNLOADING
+            ValueError: If job not found or missing input_media_gcs_path
+
+        Example:
+            # After downloading audio to GCS:
+            job_manager.update_job(job_id, {'input_media_gcs_path': audio_path})
+            await job_manager.start_job_processing(job_id)
+        """
+        import asyncio
+        from backend.services.worker_service import get_worker_service
+
+        job = self.get_job(job_id)
+        if not job:
+            raise ValueError(f"Job {job_id} not found")
+
+        if not job.input_media_gcs_path:
+            raise ValueError(
+                f"Job {job_id} missing input_media_gcs_path. "
+                "Audio must be downloaded to GCS before starting processing."
+            )
+
+        # Transition to DOWNLOADING - this will raise if invalid
+        self.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.DOWNLOADING,
+            progress=progress,
+            message=message
+        )
+
+        # "Edit audio first" was requested (e.g. a file upload with the audio-edit
+        # option ticked): park at the audio editor instead of starting workers.
+        # The editor's submit endpoint reconciles duration and triggers them —
+        # same as the audio-download flow, which parks before reconciling too.
+        if (job.state_data or {}).get('requires_audio_edit'):
+            from backend.workers.audio_download_worker import enter_audio_edit
+
+            # Editor asset pre-generation (transcode + waveform) is blocking I/O —
+            # keep it off the API event loop.
+            try:
+                await asyncio.to_thread(enter_audio_edit, self, job_id, job.input_media_gcs_path)
+            except Exception as e:
+                # Callers often run this as a background task — don't strand the
+                # job at DOWNLOADING with nothing to retry it.
+                logger.error(f"Job {job_id}: Audio edit preparation failed: {e}", exc_info=True)
+                await asyncio.to_thread(
+                    self.fail_job, job_id, f"Audio edit preparation failed: {e}"
+                )
+                raise
+            logger.info(f"Job {job_id}: Awaiting audio edit before processing")
+            return
+
+        # Reconcile credit charge against actual audio duration before triggering workers.
+        # Probes input_media_gcs_path (already set by the upload handler) via ffprobe.
+        # Returns True when the job is paused (AWAITING_DURATION_CONFIRM) or cancelled,
+        # in which case we must NOT start downstream workers.
+        if await reconcile_and_maybe_pause(job_id):
+            logger.info(f"Job {job_id}: Paused for duration confirmation (or cancelled); workers not started")
+            return
+
+        # Check if audio separation can be skipped
+        # Jobs with an existing instrumental (e.g. tenant uploads) don't need
+        # GPU-powered audio separation — saves 5-10 minutes of processing time
+        worker_service = get_worker_service()
+
+        if job.existing_instrumental_gcs_path:
+            logger.info(f"Job {job_id}: Skipping audio separation (existing instrumental provided)")
+            # Mark audio as immediately complete and only trigger lyrics worker
+            self.update_state_data(job_id, 'audio_complete', True)
+            await worker_service.trigger_lyrics_worker(job_id)
+            logger.info(f"Job {job_id}: Started processing (lyrics worker only, audio separation skipped)")
+        else:
+            # Trigger both workers in parallel
+            await asyncio.gather(
+                worker_service.trigger_audio_worker(job_id),
+                worker_service.trigger_lyrics_worker(job_id)
+            )
+            logger.info(f"Job {job_id}: Started processing (audio + lyrics workers triggered)")
+
+    def mark_audio_complete(self, job_id: str) -> None:
+        """
+        Mark audio processing as complete.
+
+        Audio completion is decoupled from the lyrics review path — it no longer
+        triggers screens. The instrumental review page polls for this flag.
+        """
+        self.update_state_data(job_id, 'audio_complete', True)
+        logger.info(f"Job {job_id}: Audio processing complete (separation finished)")
+
+    # Set by the video worker when review finished before stem separation did
+    # (the selected instrumental stem doesn't exist yet). The audio worker
+    # resumes the encode when separation completes; recover_stuck_jobs is the
+    # backstop. Before this, the video worker just failed its prerequisites 3x
+    # and the job sat at instrumental_selected forever (2026-10-17/18).
+    VIDEO_WAITING_FOR_STEMS_KEY = 'video_waiting_for_stems'
+
+    def park_video_for_stems(self, job_id: str) -> None:
+        """Record that the final encode is waiting for stem separation."""
+        self.update_job(job_id, {
+            f'state_data.{self.VIDEO_WAITING_FOR_STEMS_KEY}': True,
+            'message': 'Waiting for audio separation to finish; the final video starts automatically',
+        })
+
+    def claim_video_stems_wait(self, job_id: str) -> bool:
+        """Atomically clear the waiting flag; True for exactly one claimant."""
+        return self.firestore.claim_job_state_flag(job_id, self.VIDEO_WAITING_FOR_STEMS_KEY)
+
+    # Set by the screens worker when the lyrics would auto-ship but stems aren't
+    # separated yet. The job stays in GENERATING_SCREENS (no review link, no
+    # notification) so nobody opens the editor before the audio-worker re-score
+    # can auto-complete it. Before this, users opened review seconds after
+    # AWAITING_REVIEW and the re-score hit IN_REVIEW (wrong_status): ~1/3 of jobs
+    # never got a backing verdict and auto-eligible jobs went to a human
+    # (2026-10-29 re-evaluation). The value is the ISO time the hold started.
+    AUTO_REVIEW_HOLD_KEY = 'auto_review_waiting_for_stems'
+
+    def park_review_for_auto_check(self, job_id: str) -> None:
+        """Record that review is held until stems land for the auto-approval re-score."""
+        self.update_job(job_id, {
+            f'state_data.{self.AUTO_REVIEW_HOLD_KEY}': datetime.utcnow().isoformat(),
+            'message': 'Lyrics look good: finishing automatic checks once audio separation is done',
+        })
+
+    def claim_auto_review_hold(self, job_id: str) -> bool:
+        """Atomically clear the review hold; True for exactly one claimant."""
+        return self.firestore.claim_job_state_flag(job_id, self.AUTO_REVIEW_HOLD_KEY)
+
+    async def resume_video_if_waiting_for_stems(self, job_id: str) -> bool:
+        """Re-trigger the video worker for a job parked waiting on stems.
+
+        Called by the audio worker right after ``mark_audio_complete``. No-op
+        unless the video worker parked the job (flag set) and it's still in a
+        state the video worker accepts. Returns True iff a dispatch was issued.
+        """
+        if not self.claim_video_stems_wait(job_id):
+            return False
+        job = self.get_job(job_id)
+        if not job or job.status not in (JobStatus.INSTRUMENTAL_SELECTED, JobStatus.REVIEW_COMPLETE):
+            logger.info(f"Job {job_id}: stems ready but job is {getattr(job, 'status', None)}; not resuming video")
+            return False
+        from backend.services.worker_service import get_worker_service
+        logger.info(f"Job {job_id}: stems ready — resuming parked video worker")
+        return await get_worker_service().trigger_video_worker(job_id)
+
+    def mark_lyrics_complete(self, job_id: str) -> None:
+        """
+        Mark lyrics processing as complete.
+
+        Lyrics completion is the sole gate for screen generation and review
+        (audio separation runs independently in the background). This ONLY sets
+        the flag — the caller must then ``await advance_to_screens_if_ready()`` so
+        the screens dispatch is durable. A previous fire-and-forget
+        ``asyncio.create_task`` trigger was being cancelled when the lyrics Cloud
+        Run Job's event loop tore down, orphaning jobs at ``downloading`` with no
+        error (E2E job-orchestration stall incident, 2026-09).
+        """
+        self.update_state_data(job_id, 'lyrics_complete', True)
+
+    async def advance_to_screens_if_ready(self, job_id: str) -> bool:
+        """
+        Idempotently trigger the screens worker once lyrics processing is complete.
+
+        Awaited (not fire-and-forget) so the Cloud Task enqueue completes before
+        the calling worker's event loop tears down. Safe to call from BOTH the
+        lyrics worker (primary trigger) and the audio worker (fallback, in case
+        the lyrics trigger was lost): the status guard here plus the screens
+        worker's own idempotency make a double-trigger a harmless no-op.
+
+        Screen generation is gated on LYRICS only (audio separation is decoupled
+        so reviewers can start while it finishes), so this no-ops until lyrics are
+        done, and only fires while the job is still in its prep phase
+        (``downloading``, or ``audio_edit_complete`` for audio-edited jobs).
+
+        Returns:
+            True iff a screens dispatch was issued.
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return False
+        if not job.state_data.get('lyrics_complete', False):
+            # Lyrics not finished yet — whichever worker finishes lyrics triggers.
+            return False
+        if job.status not in PREP_PHASE_STATUSES:
+            # Already advanced past prep (or parked in a special state). Keeps the
+            # audio-worker fallback from re-triggering a job that already reached
+            # screens/review.
+            logger.info(
+                f"Job {job_id}: screens not (re)triggered — status={job.status} "
+                "(expected downloading or audio_edit_complete)"
+            )
+            return False
+        from backend.services.worker_service import get_worker_service
+        logger.info(f"Job {job_id}: lyrics complete — triggering screens worker (awaited)")
+        # Propagate the dispatch result: trigger_screens_worker returns False on a
+        # Cloud Tasks enqueue failure / HTTP error / timeout. Returning False here
+        # keeps recover_stuck_jobs from counting a failed re-trigger against its
+        # per-tick cap (which would delay other stalled jobs), and lets it retry.
+        return await get_worker_service().trigger_screens_worker(job_id)
+
+    def cancel_job(self, job_id: str, reason: Optional[str] = None, refund: bool = True) -> bool:
+        """
+        Cancel a job.
+        
+        Only jobs in non-terminal states can be cancelled. Serialized per job
+        within this instance so a double-clicked Cancel can't refund twice.
+
+        ``refund=False`` skips the built-in refund — for callers that have
+        already refunded the full charge themselves (duration over-limit,
+        duration-confirm expiry), so a failed ``credit_refunded`` write can't
+        lead to a second refund here.
+        """
+        with job_lock(job_id):
+            return self._cancel_job_unlocked(job_id, reason, refund=refund)
+
+    def _cancel_job_unlocked(self, job_id: str, reason: Optional[str], refund: bool = True) -> bool:
+        job = self.get_job(job_id)
+        if not job:
+            return False
+        
+        terminal_states = [JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.CANCELLED]
+        if job.status in terminal_states:
+            logger.warning(f"Cannot cancel job {job_id} in terminal state {job.status}")
+            return False
+        
+        message = f"Job cancelled{f': {reason}' if reason else ''}"
+        
+        self.update_job_status(
+            job_id=job_id,
+            status=JobStatus.CANCELLED,
+            message=message
+        )
+        
+        logger.info(f"Job {job_id} cancelled")
+
+        # Refund credit for cancelled job
+        if refund:
+            self._refund_credit_for_job(job_id, job, reason="job_cancelled")
+
+        return True
+
+    def mark_job_failed(
+        self,
+        job_id: str,
+        error_message: str,
+        error_details: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Mark a job as failed with error details.
+        
+        This replaces mark_job_error() with better error tracking.
+        """
+        updates = {
+            'error_message': error_message
+        }
+        
+        if error_details:
+            updates['error_details'] = error_details
+        
+        already_notified = self._failure_already_notified(job_id)
+        self.firestore.update_job_status(
+            job_id=job_id,
+            status=JobStatus.FAILED,
+            progress=0,
+            message=f"Failed: {error_message}",
+            **updates
+        )
+        # WARNING: the status write above sends the one job-failed alert (ops_alerts).
+        logger.warning(f"Job {job_id} failed: {error_message}")
+        if not already_notified:
+            self._trigger_state_notifications(job_id, JobStatus.FAILED)
+
+    def _failure_already_notified(self, job_id: str) -> bool:
+        """True if this run already failed AND its failure push went out.
+
+        Then a second worker failing the same job must not push again. A job that
+        is FAILED without the marker (e.g. a Cloud Run auto-retry attempt, which
+        runs while the job is still FAILED and whose first failure skipped the
+        push) still pushes. A manual retry moves the job out of FAILED, so a later
+        failure pushes again. While this process's failure push for the job is still
+        being sent (the marker is written only after it), it also counts as notified.
+        Best-effort: a read error counts as "not notified".
+        """
+        if job_id in _failure_push_in_flight:
+            return True  # this process is sending the run's failure push right now
+        try:
+            job = self.get_job(job_id)
+            return bool(
+                job and job.status == JobStatus.FAILED
+                and (job.state_data or {}).get(FAILURE_PUSH_SENT_KEY)
+            )
+        except Exception:
+            return False
+    
+    def increment_retry_count(self, job_id: str) -> int:
+        """
+        Increment retry count for a job.
+        
+        Returns:
+            New retry count
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return 0
+        
+        new_count = job.retry_count + 1
+        self.update_job(job_id, {'retry_count': new_count})
+        return new_count
+    
+    def append_worker_log(
+        self,
+        job_id: str,
+        worker: str,
+        level: str,
+        message: str,
+        max_logs: int = 500,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Append a log entry to the job's logs.
+
+        By default (USE_LOG_SUBCOLLECTION=true), logs are stored in a Firestore
+        subcollection (jobs/{job_id}/logs) to avoid the 1MB document size limit.
+
+        For backward compatibility (USE_LOG_SUBCOLLECTION=false), logs are stored
+        in the embedded worker_logs array using atomic ArrayUnion.
+
+        Args:
+            job_id: Job ID
+            worker: Worker name (audio, lyrics, screens, video, render, distribution)
+            level: Log level (DEBUG, INFO, WARNING, ERROR)
+            message: Log message
+            max_logs: Not used (kept for API compatibility)
+            metadata: Optional additional metadata dict
+        """
+        if settings.use_log_subcollection:
+            # New subcollection approach - avoids 1MB limit
+            log_entry = WorkerLogEntry.create(
+                job_id=job_id,
+                worker=worker,
+                level=level,
+                message=message,
+                metadata=metadata
+            )
+            self.firestore.append_log_to_subcollection(job_id, log_entry)
+        else:
+            # Legacy embedded array approach
+            log_entry = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'level': level,
+                'worker': worker,
+                'message': message[:1000]  # Truncate long messages
+            }
+            self.firestore.append_worker_log(job_id, log_entry)
+    
+    def get_worker_logs(
+        self,
+        job_id: str,
+        since_index: int = 0,
+        worker: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get worker logs for a job, optionally filtered by worker and index.
+
+        By default (USE_LOG_SUBCOLLECTION=true), logs are read from the
+        subcollection. Falls back to embedded array for older jobs.
+
+        Args:
+            job_id: Job ID
+            since_index: Return only logs after this index (for pagination)
+            worker: Filter by worker name (optional)
+
+        Returns:
+            List of log entries as dicts (in legacy format for API compatibility)
+        """
+        if settings.use_log_subcollection:
+            # Try subcollection first
+            subcollection_logs = self.firestore.get_logs_from_subcollection(
+                job_id=job_id,
+                offset=since_index,
+                worker=worker,
+                limit=500
+            )
+            if subcollection_logs:
+                # Convert to legacy format for API compatibility
+                return [log.to_legacy_dict() for log in subcollection_logs]
+            # Fall through to check embedded array for older jobs
+
+        # Embedded array approach (legacy jobs or fallback)
+        job = self.get_job(job_id)
+        if not job or not job.worker_logs:
+            return []
+
+        logs = [log.dict() if hasattr(log, 'dict') else log for log in job.worker_logs]
+
+        # Filter by index
+        if since_index > 0:
+            logs = logs[since_index:]
+
+        # Filter by worker
+        if worker:
+            logs = [log for log in logs if log.get('worker') == worker]
+
+        return logs
+
+    def get_worker_logs_count(self, job_id: str) -> int:
+        """
+        Get the total count of worker logs for a job.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            Total count of logs
+        """
+        if settings.use_log_subcollection:
+            # Try subcollection first
+            count = self.firestore.get_logs_count_from_subcollection(job_id)
+            if count > 0:
+                return count
+            # Fall through to check embedded array
+
+        # Embedded array (legacy jobs or fallback)
+        job = self.get_job(job_id)
+        if not job or not job.worker_logs:
+            return 0
+        return len(job.worker_logs)
+

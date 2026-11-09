@@ -1,0 +1,448 @@
+"""Tests for GCE encoding worker render-video endpoint and caching."""
+import hashlib
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Mock google.cloud.storage.Client before importing main.py to avoid
+# OSError in CI where GCP project is not configured
+patch("google.cloud.storage.Client", MagicMock()).start()
+
+
+class TestDownloadWithCache:
+    """Tests for the download_with_cache helper."""
+
+    def test_cache_miss_downloads_and_caches(self, tmp_path):
+        """On cache miss, downloads file and stores in cache."""
+        from backend.services.gce_encoding.main import download_with_cache
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        dest = tmp_path / "output.ttf"
+        gcs_uri = "gs://bucket/themes/nomad/font.ttf"
+
+        # Mock download to write a file
+        def fake_download(uri, path):
+            Path(path).write_bytes(b"font-data")
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs", side_effect=fake_download):
+            download_with_cache(gcs_uri, dest, cache_dir)
+
+        assert dest.read_bytes() == b"font-data"
+        # Verify cached copy exists
+        cache_key = hashlib.sha256(gcs_uri.encode()).hexdigest()
+        cached = cache_dir / cache_key
+        assert cached.exists()
+        assert cached.read_bytes() == b"font-data"
+
+    def test_cache_hit_skips_download(self, tmp_path):
+        """On cache hit with matching size, copies from cache without downloading."""
+        from backend.services.gce_encoding.main import download_with_cache
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        dest = tmp_path / "output.ttf"
+        gcs_uri = "gs://bucket/themes/nomad/font.ttf"
+
+        # Pre-populate cache
+        cache_key = hashlib.sha256(gcs_uri.encode()).hexdigest()
+        cached = cache_dir / cache_key
+        cached.write_bytes(b"cached-font-data")
+
+        # Mock blob.reload() to return matching size
+        mock_blob = MagicMock()
+        mock_blob.size = len(b"cached-font-data")
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs") as mock_dl, \
+             patch("backend.services.gce_encoding.main.storage_client") as mock_sc:
+            mock_sc.bucket.return_value = mock_bucket
+            download_with_cache(gcs_uri, dest, cache_dir)
+            mock_dl.assert_not_called()
+
+        assert dest.read_bytes() == b"cached-font-data"
+
+    def test_cache_hit_redownloads_on_size_mismatch(self, tmp_path):
+        """On cache hit with different size, re-downloads and updates cache."""
+        from backend.services.gce_encoding.main import download_with_cache
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        dest = tmp_path / "output.png"
+        gcs_uri = "gs://bucket/jobs/abc123/style/karaoke_background.png"
+
+        # Pre-populate cache with stale small file (simulates corrupt placeholder)
+        cache_key = hashlib.sha256(gcs_uri.encode()).hexdigest()
+        cached = cache_dir / cache_key
+        cached.write_bytes(b"x" * 106)  # 106 bytes like the corrupt placeholder
+
+        # GCS reports the correct larger size
+        mock_blob = MagicMock()
+        mock_blob.size = 2_800_000  # 2.8MB correct file
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+
+        new_content = b"correct-large-image-data"
+
+        def fake_download(uri, path):
+            Path(path).write_bytes(new_content)
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs", side_effect=fake_download) as mock_dl, \
+             patch("backend.services.gce_encoding.main.storage_client") as mock_sc:
+            mock_sc.bucket.return_value = mock_bucket
+            download_with_cache(gcs_uri, dest, cache_dir)
+            mock_dl.assert_called_once()
+
+        assert dest.read_bytes() == new_content
+        # Cache should be updated with new content
+        assert cached.read_bytes() == new_content
+
+    def test_cache_dir_none_downloads_directly(self, tmp_path):
+        """When cache_dir is None, downloads without caching."""
+        from backend.services.gce_encoding.main import download_with_cache
+
+        dest = tmp_path / "output.ttf"
+        gcs_uri = "gs://bucket/themes/nomad/font.ttf"
+
+        def fake_download(uri, path):
+            Path(path).write_bytes(b"font-data")
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs", side_effect=fake_download):
+            download_with_cache(gcs_uri, dest, cache_dir=None)
+
+        assert dest.read_bytes() == b"font-data"
+
+
+class TestRunRenderVideo:
+    """Tests for the run_render_video processing function."""
+
+    def _make_request(self, job_id="rv-test-001", output_prefix="gs://bucket/jobs/rv-test-001/output"):
+        from backend.services.gce_encoding.main import RenderVideoRequest
+        return RenderVideoRequest(
+            job_id=job_id,
+            original_corrections_gcs_path="gs://bucket/jobs/test/lyrics/corrections.json",
+            audio_gcs_path="gs://bucket/jobs/test/audio.flac",
+            output_gcs_prefix=output_prefix,
+            artist="Test Artist",
+            title="Test Song",
+        )
+
+    def _make_mock_outputs(self, tmp_path):
+        """Create mock OutputGenerator outputs with real files."""
+        mock_outputs = MagicMock()
+        mock_outputs.video = str(tmp_path / "with_vocals.mkv")
+        mock_outputs.ass = str(tmp_path / "karaoke.ass")
+        mock_outputs.lrc = str(tmp_path / "karaoke.lrc")
+        mock_outputs.corrected_txt = str(tmp_path / "corrected.txt")
+        for attr in ["video", "ass", "lrc", "corrected_txt"]:
+            Path(getattr(mock_outputs, attr)).write_bytes(b"fake")
+        return mock_outputs
+
+    def _run_with_mocks(self, job_id, work_dir, request, mock_outputs, tmp_path):
+        """Run run_render_video with all karaoke-gen wheel imports mocked."""
+        from backend.services.gce_encoding.main import run_render_video, jobs
+
+        jobs[job_id] = {
+            "job_id": job_id, "status": "pending", "progress": 0,
+            "error": None, "output_files": None, "metadata": None,
+        }
+
+        mock_correction_result = MagicMock(corrected_segments=[])
+        mock_gen = MagicMock()
+        mock_gen.generate_outputs.return_value = mock_outputs
+
+        import sys as _sys
+        fake_modules = {
+            "karaoke_gen.lyrics_transcriber.output.generator": MagicMock(
+                OutputGenerator=MagicMock(return_value=mock_gen),
+            ),
+            "karaoke_gen.lyrics_transcriber.output.countdown_processor": MagicMock(
+                CountdownProcessor=MagicMock(return_value=MagicMock(
+                    process=MagicMock(return_value=(mock_correction_result, str(work_dir / "audio.flac"), False, 0))
+                )),
+            ),
+            "karaoke_gen.lyrics_transcriber.types": MagicMock(
+                CorrectionResult=MagicMock(from_dict=MagicMock(return_value=mock_correction_result)),
+            ),
+            "karaoke_gen.lyrics_transcriber.correction.operations": MagicMock(),
+            "karaoke_gen.lyrics_transcriber.core.config": MagicMock(),
+            "karaoke_gen.style_loader": MagicMock(
+                load_styles_from_gcs=MagicMock(return_value=(str(tmp_path / "styles.json"), {})),
+            ),
+            "karaoke_gen.utils": MagicMock(
+                sanitize_filename=MagicMock(side_effect=lambda x: x.replace(" ", "_")),
+            ),
+        }
+
+        def fake_download(uri, path):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text("{}")
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs", side_effect=fake_download):
+            with patch("backend.services.gce_encoding.main.download_with_cache"):
+                with patch("backend.services.gce_encoding.main.upload_single_file_to_gcs") as mock_upload:
+                    with patch("backend.services.gce_encoding.main.subprocess"):
+                        with patch.dict(_sys.modules, fake_modules):
+                            run_render_video(job_id, work_dir, request)
+
+        return mock_upload
+
+    def test_sets_job_status_and_populates_output_files(self, tmp_path):
+        """run_render_video sets output_files and metadata."""
+        from backend.services.gce_encoding.main import jobs
+
+        job_id = "rv-test-001"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        request = self._make_request(job_id)
+        mock_outputs = self._make_mock_outputs(tmp_path)
+
+        self._run_with_mocks(job_id, work_dir, request, mock_outputs, tmp_path)
+
+        assert jobs[job_id]["output_files"] is not None
+        assert len(jobs[job_id]["output_files"]) == 4
+        assert jobs[job_id]["metadata"]["countdown_padding_added"] is False
+
+    def test_is_duet_propagates_into_output_config(self, tmp_path):
+        """When the request carries is_duet=True, OutputConfig must receive it
+        so SubtitlesGenerator emits per-singer ASS styles on the GCE worker."""
+        from backend.services.gce_encoding.main import run_render_video, jobs, RenderVideoRequest
+
+        job_id = "rv-test-duet"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        request = RenderVideoRequest(
+            job_id=job_id,
+            original_corrections_gcs_path="gs://bucket/jobs/test/lyrics/corrections.json",
+            audio_gcs_path="gs://bucket/jobs/test/audio.flac",
+            output_gcs_prefix="gs://bucket/jobs/test/output",
+            artist="Test", title="Song",
+            is_duet=True,
+        )
+        mock_outputs = self._make_mock_outputs(tmp_path)
+
+        jobs[job_id] = {
+            "job_id": job_id, "status": "pending", "progress": 0,
+            "error": None, "output_files": None, "metadata": None,
+        }
+
+        captured_configs = []
+
+        class _FakeOutputConfig:
+            def __init__(self, **kwargs):
+                captured_configs.append(kwargs)
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        mock_correction_result = MagicMock(corrected_segments=[])
+        mock_gen = MagicMock()
+        mock_gen.generate_outputs.return_value = mock_outputs
+
+        import sys as _sys
+        fake_modules = {
+            "karaoke_gen.lyrics_transcriber.output.generator": MagicMock(
+                OutputGenerator=MagicMock(return_value=mock_gen),
+            ),
+            "karaoke_gen.lyrics_transcriber.output.countdown_processor": MagicMock(
+                CountdownProcessor=MagicMock(return_value=MagicMock(
+                    process=MagicMock(return_value=(mock_correction_result, str(work_dir / "audio.flac"), False, 0))
+                )),
+            ),
+            "karaoke_gen.lyrics_transcriber.types": MagicMock(
+                CorrectionResult=MagicMock(from_dict=MagicMock(return_value=mock_correction_result)),
+            ),
+            "karaoke_gen.lyrics_transcriber.correction.operations": MagicMock(),
+            "karaoke_gen.lyrics_transcriber.core.config": MagicMock(OutputConfig=_FakeOutputConfig),
+            "karaoke_gen.style_loader": MagicMock(
+                load_styles_from_gcs=MagicMock(return_value=(str(tmp_path / "styles.json"), {})),
+            ),
+            "karaoke_gen.utils": MagicMock(
+                sanitize_filename=MagicMock(side_effect=lambda x: x.replace(" ", "_")),
+            ),
+        }
+
+        def fake_download(uri, path):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text("{}")
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs", side_effect=fake_download):
+            with patch("backend.services.gce_encoding.main.download_with_cache"):
+                with patch("backend.services.gce_encoding.main.upload_single_file_to_gcs"):
+                    with patch("backend.services.gce_encoding.main.subprocess"):
+                        with patch.dict(_sys.modules, fake_modules):
+                            run_render_video(job_id, work_dir, request)
+
+        assert captured_configs, "OutputConfig was never constructed"
+        assert captured_configs[0].get("is_duet") is True, (
+            f"is_duet=True from the request must propagate to OutputConfig, got: {captured_configs[0]}"
+        )
+
+    def test_is_duet_defaults_to_false_when_absent(self, tmp_path):
+        """RenderVideoRequest's is_duet field defaults to False."""
+        from backend.services.gce_encoding.main import RenderVideoRequest
+        req = RenderVideoRequest(
+            job_id="rv-default-duet",
+            original_corrections_gcs_path="gs://b/c.json",
+            audio_gcs_path="gs://b/a.flac",
+            output_gcs_prefix="gs://b/out",
+            artist="A", title="T",
+        )
+        assert req.is_duet is False
+
+    def test_uploads_all_output_files(self, tmp_path):
+        """run_render_video uploads video, ass, lrc, and txt to correct GCS paths."""
+        job_id = "rv-test-002"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        request = self._make_request(job_id, "gs://bucket/jobs/rv-test-002/output")
+        mock_outputs = self._make_mock_outputs(tmp_path)
+
+        mock_upload = self._run_with_mocks(job_id, work_dir, request, mock_outputs, tmp_path)
+
+        uploaded_gcs_paths = [call[0][1] for call in mock_upload.call_args_list]
+        assert "gs://bucket/jobs/rv-test-002/output/videos/with_vocals.mkv" in uploaded_gcs_paths
+        assert "gs://bucket/jobs/rv-test-002/output/lyrics/karaoke.ass" in uploaded_gcs_paths
+        assert "gs://bucket/jobs/rv-test-002/output/lyrics/karaoke.lrc" in uploaded_gcs_paths
+        assert "gs://bucket/jobs/rv-test-002/output/lyrics/corrected.txt" in uploaded_gcs_paths
+
+
+class TestEmptyCorrectionsValidation:
+    """Tests that empty/malformed corrections_updated.json is handled gracefully."""
+
+    def test_gce_worker_skips_empty_corrections(self, tmp_path):
+        """GCE worker falls back to base_result when corrections_updated.json is empty."""
+        import json
+        import sys as _sys
+        from backend.services.gce_encoding.main import RenderVideoRequest, run_render_video, jobs
+
+        job_id = "empty-corr-001"
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        request = RenderVideoRequest(
+            job_id=job_id,
+            original_corrections_gcs_path="gs://bucket/jobs/test/lyrics/corrections.json",
+            updated_corrections_gcs_path="gs://bucket/jobs/test/lyrics/corrections_updated.json",
+            audio_gcs_path="gs://bucket/jobs/test/audio.flac",
+            output_gcs_prefix="gs://bucket/jobs/test/output",
+            artist="Test",
+            title="Song",
+        )
+
+        jobs[job_id] = {
+            "job_id": job_id, "status": "pending", "progress": 0,
+            "error": None, "output_files": None, "metadata": None,
+        }
+
+        mock_correction_result = MagicMock(corrected_segments=[])
+        mock_gen = MagicMock()
+        mock_outputs = MagicMock()
+        mock_outputs.video = str(tmp_path / "v.mkv")
+        mock_outputs.ass = str(tmp_path / "k.ass")
+        mock_outputs.lrc = str(tmp_path / "k.lrc")
+        mock_outputs.corrected_txt = str(tmp_path / "c.txt")
+        for attr in ["video", "ass", "lrc", "corrected_txt"]:
+            Path(getattr(mock_outputs, attr)).write_bytes(b"fake")
+        mock_gen.generate_outputs.return_value = mock_outputs
+
+        mock_update = MagicMock()
+
+        fake_modules = {
+            "karaoke_gen.lyrics_transcriber.output.generator": MagicMock(
+                OutputGenerator=MagicMock(return_value=mock_gen),
+            ),
+            "karaoke_gen.lyrics_transcriber.output.countdown_processor": MagicMock(
+                CountdownProcessor=MagicMock(return_value=MagicMock(
+                    process=MagicMock(return_value=(mock_correction_result, str(work_dir / "audio.flac"), False, 0))
+                )),
+            ),
+            "karaoke_gen.lyrics_transcriber.types": MagicMock(
+                CorrectionResult=MagicMock(from_dict=MagicMock(return_value=mock_correction_result)),
+            ),
+            "karaoke_gen.lyrics_transcriber.correction.operations": MagicMock(
+                CorrectionOperations=MagicMock(update_correction_result_with_data=mock_update),
+            ),
+            "karaoke_gen.lyrics_transcriber.core.config": MagicMock(),
+            "karaoke_gen.style_loader": MagicMock(
+                load_styles_from_gcs=MagicMock(return_value=(str(tmp_path / "styles.json"), {})),
+            ),
+            "karaoke_gen.utils": MagicMock(
+                sanitize_filename=MagicMock(side_effect=lambda x: x.replace(" ", "_")),
+            ),
+        }
+
+        def fake_download(uri, path):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            if "corrections_updated" in uri:
+                # Empty dict — no "corrections" key (the bug scenario)
+                Path(path).write_text("{}")
+            else:
+                Path(path).write_text(json.dumps({"corrections": [], "corrected_segments": []}))
+
+        with patch("backend.services.gce_encoding.main.download_single_file_from_gcs", side_effect=fake_download):
+            with patch("backend.services.gce_encoding.main.download_with_cache"):
+                with patch("backend.services.gce_encoding.main.upload_single_file_to_gcs"):
+                    with patch("backend.services.gce_encoding.main.subprocess"):
+                        with patch.dict(_sys.modules, fake_modules):
+                            run_render_video(job_id, work_dir, request)
+
+        # update_correction_result_with_data should NOT have been called
+        mock_update.assert_not_called()
+
+
+class TestRenderVideoTranslations:
+    """Translated lyrics: the render request carries translations.json to apply."""
+
+    def test_translations_path_defaults_to_none(self):
+        from backend.services.gce_encoding.main import RenderVideoRequest
+
+        req = RenderVideoRequest(
+            job_id="j", original_corrections_gcs_path="gs://b/c.json", audio_gcs_path="gs://b/a.flac",
+            output_gcs_prefix="gs://b/jobs/j", artist="A", title="T",
+        )
+        assert req.translations_gcs_path is None
+
+    def test_translations_downloaded_and_applied(self, tmp_path):
+        import sys as _sys
+        from backend.services.gce_encoding.main import RenderVideoRequest
+
+        helper = TestRunRenderVideo()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        request = RenderVideoRequest(
+            job_id="rv-tr-001",
+            original_corrections_gcs_path="gs://bucket/jobs/t/lyrics/corrections.json",
+            audio_gcs_path="gs://bucket/jobs/t/audio.flac",
+            output_gcs_prefix="gs://bucket/jobs/t",
+            artist="A", title="T",
+            translations_gcs_path="gs://bucket/jobs/t/lyrics/translations.json",
+        )
+        translations_module = MagicMock()
+        with patch.dict(_sys.modules, {"karaoke_gen.lyrics_transcriber.output.translations": translations_module}):
+            helper._run_with_mocks("rv-tr-001", work_dir, request, helper._make_mock_outputs(tmp_path), tmp_path)
+        translations_module.load_and_apply_translations.assert_called_once()
+        assert translations_module.load_and_apply_translations.call_args[0][1] == str(work_dir / "translations.json")
+
+    def test_translation_download_failure_does_not_fail_render(self, tmp_path):
+        import sys as _sys
+        from backend.services.gce_encoding.main import RenderVideoRequest, jobs
+
+        helper = TestRunRenderVideo()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        request = RenderVideoRequest(
+            job_id="rv-tr-002", original_corrections_gcs_path="gs://b/jobs/t/lyrics/corrections.json",
+            audio_gcs_path="gs://b/jobs/t/audio.flac", output_gcs_prefix="gs://b/jobs/t", artist="A", title="T",
+            translations_gcs_path="gs://b/jobs/t/lyrics/translations.json",
+        )
+        translations_module = MagicMock()
+        translations_module.load_and_apply_translations.side_effect = FileNotFoundError("gone")
+        with patch.dict(_sys.modules, {"karaoke_gen.lyrics_transcriber.output.translations": translations_module}):
+            helper._run_with_mocks("rv-tr-002", work_dir, request, helper._make_mock_outputs(tmp_path), tmp_path)
+        assert jobs["rv-tr-002"]["status"] != "failed"
+        assert jobs["rv-tr-002"]["output_files"]

@@ -1,0 +1,15 @@
+# Local Studio only. Do not install the cloud-oriented root pyproject.toml.
+# Install torch/torchaudio from the correct CPU or CUDA index FIRST (windows/setup.ps1).
+torch==2.5.1
+torchaudio==2.5.1
+numpy==1.26.4
+# dtw-python >=1.6 requires NumPy 2, incompatible with this conservative audio stack.
+dtw-python==1.5.3
+whisper-timestamped==1.15.9
+openai-whisper==20250625
+demucs==4.0.1
+soundfile==0.13.1
+fastapi>=0.115.12,<1
+uvicorn>=0.34,<1
+python-multipart>=0.0.22,<1
+pydantic>=2.10,<3

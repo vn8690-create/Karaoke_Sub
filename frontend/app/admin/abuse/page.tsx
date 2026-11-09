@@ -1,0 +1,1030 @@
+"use client"
+
+import { useEffect, useMemo, useState } from "react"
+import { adminApi } from "@/lib/api"
+import type {
+  AbuseSuspiciousUser,
+  AbuseRelatedResponse,
+  AbuseRelatedUser,
+  AbuseCorrelationsResponse,
+  AbuseFingerprintCluster,
+  AbuseIpCluster,
+  AbuseClusterUser,
+} from "@/lib/api"
+import { useToast } from "@/hooks/use-toast"
+import { IpInfo } from "@/components/admin/ip-info"
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs"
+import {
+  Loader2,
+  Search,
+  Fingerprint,
+  Globe,
+  AlertTriangle,
+  ChevronRight,
+  ArrowLeft,
+  Users,
+  ExternalLink,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+} from "lucide-react"
+
+function formatDate(dateStr: string | null | undefined): string {
+  if (!dateStr) return "-"
+  try {
+    const d = new Date(dateStr)
+    return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
+  } catch {
+    return dateStr
+  }
+}
+
+function formatCents(cents: number): string {
+  if (cents === 0) return "$0"
+  return `$${(cents / 100).toFixed(2)}`
+}
+
+function truncate(str: string | null | undefined, len: number): string {
+  if (!str) return "-"
+  return str.length > len ? str.slice(0, len) + "..." : str
+}
+
+// =============================================================================
+// Sortable Table Header
+// =============================================================================
+
+type SortDir = "asc" | "desc"
+
+function SortableHeader({
+  label,
+  sortKey,
+  currentSort,
+  currentDir,
+  onSort,
+  className,
+}: {
+  label: string
+  sortKey: string
+  currentSort: string
+  currentDir: SortDir
+  onSort: (key: string) => void
+  className?: string
+}) {
+  const isActive = currentSort === sortKey
+  return (
+    <TableHead
+      className={`cursor-pointer select-none hover:text-foreground ${className || ""}`}
+      onClick={() => onSort(sortKey)}
+    >
+      <span className="flex items-center gap-1">
+        {label}
+        {isActive ? (
+          currentDir === "asc" ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />
+        ) : (
+          <ArrowUpDown className="w-3 h-3 opacity-30" />
+        )}
+      </span>
+    </TableHead>
+  )
+}
+
+function useSortableData<T>(items: T[], defaultKey: string, defaultDir: SortDir = "desc") {
+  const [sortKey, setSortKey] = useState(defaultKey)
+  const [sortDir, setSortDir] = useState<SortDir>(defaultDir)
+
+  const sorted = useMemo(() => {
+    const copy = [...items]
+    copy.sort((a, b) => {
+      const aVal = (a as any)[sortKey]
+      const bVal = (b as any)[sortKey]
+      if (aVal == null && bVal == null) return 0
+      if (aVal == null) return 1
+      if (bVal == null) return -1
+      if (typeof aVal === "number" && typeof bVal === "number") {
+        return sortDir === "asc" ? aVal - bVal : bVal - aVal
+      }
+      const aStr = String(aVal)
+      const bStr = String(bVal)
+      return sortDir === "asc" ? aStr.localeCompare(bStr) : bStr.localeCompare(aStr)
+    })
+    return copy
+  }, [items, sortKey, sortDir])
+
+  const toggleSort = (key: string) => {
+    if (key === sortKey) {
+      setSortDir(sortDir === "asc" ? "desc" : "asc")
+    } else {
+      setSortKey(key)
+      setSortDir("desc")
+    }
+  }
+
+  return { sorted, sortKey, sortDir, toggleSort }
+}
+
+// =============================================================================
+// Suspicious Accounts Table
+// =============================================================================
+
+function SuspiciousAccountsTab({
+  onInvestigate,
+}: {
+  onInvestigate: (email: string) => void
+}) {
+  const { toast } = useToast()
+  const [users, setUsers] = useState<AbuseSuspiciousUser[]>([])
+  const [loading, setLoading] = useState(true)
+  const [minJobs, setMinJobs] = useState(2)
+  const [maxSpend, setMaxSpend] = useState(0)
+  const { sorted, sortKey, sortDir, toggleSort } = useSortableData(users, "created_at", "desc")
+
+  const loadData = async () => {
+    try {
+      setLoading(true)
+      const result = await adminApi.getAbuseSuspicious({
+        min_jobs: minJobs,
+        max_spend: maxSpend,
+      })
+      setUsers(result.users)
+    } catch (err: any) {
+      toast({ title: "Error", description: err.message, variant: "destructive" })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadData()
+  }, [])
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <AlertTriangle className="w-5 h-5 text-amber-500" />
+          Suspicious Accounts
+        </CardTitle>
+        <CardDescription>
+          Accounts with many jobs but no spend — potential free-credit abusers
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="flex items-center gap-4 mb-4">
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-muted-foreground whitespace-nowrap">Min jobs:</label>
+            <Input
+              type="number"
+              value={minJobs}
+              onChange={(e) => setMinJobs(Number(e.target.value))}
+              className="w-20"
+              min={1}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-sm text-muted-foreground whitespace-nowrap">Max spend ($):</label>
+            <Input
+              type="number"
+              value={maxSpend / 100}
+              onChange={(e) => setMaxSpend(Math.round(Number(e.target.value) * 100))}
+              className="w-24"
+              min={0}
+              step={1}
+            />
+          </div>
+          <Button onClick={loadData} disabled={loading} size="sm">
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+            <span className="ml-1">Search</span>
+          </Button>
+          <span className="text-sm text-muted-foreground ml-auto">
+            {users.length} account{users.length !== 1 ? "s" : ""} found
+          </span>
+        </div>
+
+        {loading ? (
+          <div className="flex justify-center py-8">
+            <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+          </div>
+        ) : users.length === 0 ? (
+          <div className="text-center py-8 text-muted-foreground">
+            No suspicious accounts found with these filters.
+          </div>
+        ) : (
+          <div className="border rounded-lg overflow-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <SortableHeader label="Email" sortKey="email" currentSort={sortKey} currentDir={sortDir} onSort={toggleSort} />
+                  <SortableHeader label="Jobs" sortKey="total_jobs_created" currentSort={sortKey} currentDir={sortDir} onSort={toggleSort} className="text-right" />
+                  <SortableHeader label="Credits" sortKey="credits" currentSort={sortKey} currentDir={sortDir} onSort={toggleSort} className="text-right" />
+                  <SortableHeader label="Spent" sortKey="total_spent" currentSort={sortKey} currentDir={sortDir} onSort={toggleSort} className="text-right" />
+                  <TableHead>Feedback</TableHead>
+                  <SortableHeader label="Signup IP" sortKey="signup_ip" currentSort={sortKey} currentDir={sortDir} onSort={toggleSort} />
+                  <TableHead>Fingerprint</TableHead>
+                  <SortableHeader label="Created" sortKey="created_at" currentSort={sortKey} currentDir={sortDir} onSort={toggleSort} />
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {sorted.map((user) => (
+                  <TableRow key={user.email}>
+                    <TableCell className="font-mono text-xs max-w-[200px] truncate">
+                      {user.email}
+                    </TableCell>
+                    <TableCell className="text-right font-medium">
+                      {user.total_jobs_created}
+                      {user.total_jobs_completed > 0 && (
+                        <span className="text-muted-foreground text-xs ml-1">
+                          ({user.total_jobs_completed} done)
+                        </span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right">{user.credits}</TableCell>
+                    <TableCell className="text-right">
+                      {user.total_spent === 0 ? (
+                        <Badge variant="destructive" className="text-xs">$0</Badge>
+                      ) : (
+                        formatCents(user.total_spent)
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {user.has_submitted_feedback ? (
+                        <Badge variant="outline" className="text-xs">Yes</Badge>
+                      ) : (
+                        "-"
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <IpInfo ip={user.signup_ip} compact />
+                    </TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {truncate(user.device_fingerprint, 10)}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {formatDate(user.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => onInvestigate(user.email)}
+                        title="Investigate related accounts"
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// =============================================================================
+// Correlations Tab (primary view)
+// =============================================================================
+
+function ClusterUserRow({
+  user,
+  highlightUa,
+  onInvestigate,
+}: {
+  user: AbuseClusterUser
+  highlightUa: boolean
+  onInvestigate: (email: string) => void
+}) {
+  return (
+    <TableRow>
+      <TableCell className="font-mono text-xs max-w-[200px] truncate">
+        <a
+          href={`/admin/users/detail?email=${encodeURIComponent(user.email)}`}
+          className="hover:underline text-blue-400"
+        >
+          {user.email}
+        </a>
+      </TableCell>
+      <TableCell className="text-right font-medium">
+        {user.total_jobs_created}
+        {user.total_jobs_completed > 0 && (
+          <span className="text-muted-foreground text-xs ml-1">
+            ({user.total_jobs_completed} done)
+          </span>
+        )}
+      </TableCell>
+      <TableCell className="text-right">{user.credits}</TableCell>
+      <TableCell className="text-right">
+        {user.total_spent === 0 ? (
+          <Badge variant="destructive" className="text-xs">$0</Badge>
+        ) : (
+          formatCents(user.total_spent)
+        )}
+      </TableCell>
+      <TableCell>
+        <IpInfo ip={user.signup_ip} compact />
+      </TableCell>
+      <TableCell className="text-xs max-w-[200px] truncate" title={user.user_agent || undefined}>
+        {user.user_agent ? (
+          <span className={highlightUa ? "bg-yellow-500/20 text-yellow-300 px-1 py-0.5 rounded" : ""}>
+            {truncate(user.user_agent, 30)}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">-</span>
+        )}
+      </TableCell>
+      <TableCell className="text-xs text-muted-foreground">
+        {formatDate(user.created_at)}
+      </TableCell>
+      <TableCell>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => onInvestigate(user.email)}
+          title="Investigate related accounts"
+        >
+          <ChevronRight className="w-4 h-4" />
+        </Button>
+      </TableCell>
+    </TableRow>
+  )
+}
+
+function hasMatchingUserAgents(users: AbuseClusterUser[]): boolean {
+  const agents = users.map((u) => u.user_agent).filter(Boolean)
+  if (agents.length < 2) return false
+  return new Set(agents).size < agents.length
+}
+
+function getMatchingUaSet(users: AbuseClusterUser[]): Set<string> {
+  const counts: Record<string, number> = {}
+  for (const u of users) {
+    if (u.user_agent) {
+      counts[u.user_agent] = (counts[u.user_agent] || 0) + 1
+    }
+  }
+  return new Set(Object.keys(counts).filter((ua) => counts[ua] > 1))
+}
+
+function FingerprintClusterCard({
+  cluster,
+  onInvestigate,
+}: {
+  cluster: AbuseFingerprintCluster
+  onInvestigate: (email: string) => void
+}) {
+  const [expanded, setExpanded] = useState(true)
+  const uaMatches = hasMatchingUserAgents(cluster.users)
+  const matchingUas = getMatchingUaSet(cluster.users)
+
+  return (
+    <Card className="border-red-500/30">
+      <CardHeader className="pb-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Fingerprint className="w-4 h-4 text-red-500" />
+          <Badge variant="destructive" className="text-xs">{cluster.count} accounts</Badge>
+          <code className="text-xs bg-muted px-1.5 py-0.5 rounded font-mono">{cluster.fingerprint}</code>
+          {uaMatches && (
+            <Badge className="text-xs bg-yellow-500/20 text-yellow-300 border-yellow-500/30">
+              matching UA
+            </Badge>
+          )}
+          <ChevronRight className={`w-4 h-4 ml-auto transition-transform ${expanded ? "rotate-90" : ""}`} />
+        </CardTitle>
+      </CardHeader>
+      {expanded && (
+        <CardContent>
+          <div className="border rounded-lg overflow-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Email</TableHead>
+                  <TableHead className="text-right">Jobs</TableHead>
+                  <TableHead className="text-right">Credits</TableHead>
+                  <TableHead className="text-right">Spent</TableHead>
+                  <TableHead>Signup IP</TableHead>
+                  <TableHead>User Agent</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {cluster.users.map((user) => (
+                  <ClusterUserRow
+                    key={user.email}
+                    user={user}
+                    highlightUa={!!user.user_agent && matchingUas.has(user.user_agent)}
+                    onInvestigate={onInvestigate}
+                  />
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  )
+}
+
+function IpClusterCard({
+  cluster,
+  onInvestigate,
+}: {
+  cluster: AbuseIpCluster
+  onInvestigate: (email: string) => void
+}) {
+  const [expanded, setExpanded] = useState(true)
+  const uaMatches = hasMatchingUserAgents(cluster.users)
+  const matchingUas = getMatchingUaSet(cluster.users)
+
+  return (
+    <Card className="border-orange-500/30">
+      <CardHeader className="pb-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Globe className="w-4 h-4 text-orange-500" />
+          <Badge className="text-xs bg-orange-500/20 text-orange-300 border-orange-500/30">
+            {cluster.count} accounts
+          </Badge>
+          <IpInfo ip={cluster.ip} compact />
+          {uaMatches && (
+            <Badge className="text-xs bg-yellow-500/20 text-yellow-300 border-yellow-500/30">
+              matching UA
+            </Badge>
+          )}
+          <ChevronRight className={`w-4 h-4 ml-auto transition-transform ${expanded ? "rotate-90" : ""}`} />
+        </CardTitle>
+      </CardHeader>
+      {expanded && (
+        <CardContent>
+          <div className="border rounded-lg overflow-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Email</TableHead>
+                  <TableHead className="text-right">Jobs</TableHead>
+                  <TableHead className="text-right">Credits</TableHead>
+                  <TableHead className="text-right">Spent</TableHead>
+                  <TableHead>Signup IP</TableHead>
+                  <TableHead>User Agent</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {cluster.users.map((user) => (
+                  <ClusterUserRow
+                    key={user.email}
+                    user={user}
+                    highlightUa={!!user.user_agent && matchingUas.has(user.user_agent)}
+                    onInvestigate={onInvestigate}
+                  />
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  )
+}
+
+function CorrelationsTab({
+  onInvestigate,
+}: {
+  onInvestigate: (email: string) => void
+}) {
+  const { toast } = useToast()
+  const [data, setData] = useState<AbuseCorrelationsResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setLoading(true)
+        const result = await adminApi.getAbuseCorrelations()
+        setData(result)
+      } catch (err: any) {
+        toast({ title: "Error", description: err.message, variant: "destructive" })
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [])
+
+  if (loading) {
+    return (
+      <div className="flex justify-center py-12">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  if (!data) return null
+
+  const totalFpAccounts = data.fingerprint_clusters.reduce((sum: number, c: AbuseFingerprintCluster) => sum + c.count, 0)
+  const totalIpAccounts = data.ip_clusters.reduce((sum: number, c: AbuseIpCluster) => sum + c.count, 0)
+
+  return (
+    <div className="space-y-6">
+      {/* Fingerprint clusters */}
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <Fingerprint className="w-5 h-5 text-red-500" />
+          <h3 className="text-lg font-semibold">Shared Fingerprints</h3>
+          <Badge variant="destructive" className="text-xs">
+            {data.fingerprint_clusters.length} cluster{data.fingerprint_clusters.length !== 1 ? "s" : ""} ({totalFpAccounts} accounts)
+          </Badge>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Multiple accounts sharing the same device fingerprint — strong indicator of multi-accounting.
+        </p>
+        {data.fingerprint_clusters.length === 0 ? (
+          <Card>
+            <CardContent className="py-6 text-center text-muted-foreground">
+              No shared fingerprint clusters found.
+            </CardContent>
+          </Card>
+        ) : (
+          data.fingerprint_clusters.map((cluster) => (
+            <FingerprintClusterCard
+              key={cluster.fingerprint}
+              cluster={cluster}
+              onInvestigate={onInvestigate}
+            />
+          ))
+        )}
+      </div>
+
+      {/* IP clusters */}
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <Globe className="w-5 h-5 text-orange-500" />
+          <h3 className="text-lg font-semibold">Shared Signup IPs</h3>
+          <Badge className="text-xs bg-orange-500/20 text-orange-300 border-orange-500/30">
+            {data.ip_clusters.length} cluster{data.ip_clusters.length !== 1 ? "s" : ""} ({totalIpAccounts} accounts)
+          </Badge>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Multiple accounts from the same IP address — suspicious but could be a shared network (school, office, VPN).
+        </p>
+        {data.ip_clusters.length === 0 ? (
+          <Card>
+            <CardContent className="py-6 text-center text-muted-foreground">
+              No shared IP clusters found.
+            </CardContent>
+          </Card>
+        ) : (
+          data.ip_clusters.map((cluster) => (
+            <IpClusterCard
+              key={cluster.ip}
+              cluster={cluster}
+              onInvestigate={onInvestigate}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  )
+}
+
+// =============================================================================
+// Related Accounts Detail View
+// =============================================================================
+
+function RelatedAccountsView({
+  email,
+  onBack,
+  onInvestigate,
+}: {
+  email: string
+  onBack: () => void
+  onInvestigate: (email: string) => void
+}) {
+  const { toast } = useToast()
+  const [data, setData] = useState<AbuseRelatedResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setLoading(true)
+        const result = await adminApi.getAbuseRelated(email)
+        setData(result)
+      } catch (err: any) {
+        toast({ title: "Error", description: err.message, variant: "destructive" })
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [email])
+
+  if (loading) {
+    return (
+      <div className="flex justify-center py-12">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  if (!data) return null
+
+  const { user, related_by_ip, related_by_fingerprint } = data
+  const totalRelated = new Set([
+    ...related_by_ip.map((u) => u.email),
+    ...related_by_fingerprint.map((u) => u.email),
+  ]).size
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-3">
+        <Button variant="ghost" size="sm" onClick={onBack}>
+          <ArrowLeft className="w-4 h-4 mr-1" />
+          Back
+        </Button>
+        <h2 className="text-lg font-semibold">Investigating: {email}</h2>
+        {totalRelated > 0 && (
+          <Badge variant="destructive">{totalRelated} related account{totalRelated !== 1 ? "s" : ""}</Badge>
+        )}
+      </div>
+
+      {/* Target user info */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Account Details</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+            <div>
+              <span className="text-muted-foreground">Credits:</span>{" "}
+              <span className="font-medium">{user.credits}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Jobs:</span>{" "}
+              <span className="font-medium">{user.total_jobs_created}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Spent:</span>{" "}
+              <span className="font-medium">{formatCents(user.total_spent)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Created:</span>{" "}
+              <span className="font-medium">{formatDate(user.created_at)}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">Signup IP:</span>{" "}
+              <IpInfo ip={user.signup_ip} />
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">Fingerprint:</span>{" "}
+              <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{user.device_fingerprint || "unknown"}</code>
+            </div>
+          </div>
+          <div className="mt-3">
+            <Button variant="outline" size="sm" asChild>
+              <a href={`/admin/users/detail?email=${encodeURIComponent(email)}`}>
+                <ExternalLink className="w-3 h-3 mr-1" />
+                View full user profile
+              </a>
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Related by IP */}
+      <RelatedUsersCard
+        title="Same Signup IP"
+        icon={<Globe className="w-4 h-4 text-blue-500" />}
+        identifier={user.signup_ip}
+        identifierLabel="IP"
+        users={related_by_ip}
+        onInvestigate={onInvestigate}
+        emptyMessage="No other accounts from this IP address"
+      />
+
+      {/* Related by fingerprint */}
+      <RelatedUsersCard
+        title="Same Device Fingerprint"
+        icon={<Fingerprint className="w-4 h-4 text-purple-500" />}
+        identifier={user.device_fingerprint}
+        identifierLabel="Fingerprint"
+        users={related_by_fingerprint}
+        onInvestigate={onInvestigate}
+        emptyMessage="No other accounts with this fingerprint"
+      />
+    </div>
+  )
+}
+
+function RelatedUsersCard({
+  title,
+  icon,
+  identifier,
+  identifierLabel,
+  users,
+  onInvestigate,
+  emptyMessage,
+}: {
+  title: string
+  icon: React.ReactNode
+  identifier: string | null
+  identifierLabel: string
+  users: AbuseRelatedUser[]
+  onInvestigate: (email: string) => void
+  emptyMessage: string
+}) {
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base flex items-center gap-2">
+          {icon}
+          {title}
+          {users.length > 0 && (
+            <Badge variant="destructive" className="text-xs">{users.length}</Badge>
+          )}
+        </CardTitle>
+        {identifier && (
+          <CardDescription>
+            {identifierLabel}: <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{identifier}</code>
+          </CardDescription>
+        )}
+        {!identifier && (
+          <CardDescription className="text-amber-600">
+            No {identifierLabel.toLowerCase()} recorded (signed up before tracking was enabled)
+          </CardDescription>
+        )}
+      </CardHeader>
+      <CardContent>
+        {!identifier || users.length === 0 ? (
+          <p className="text-sm text-muted-foreground">{!identifier ? `Cannot check — no ${identifierLabel.toLowerCase()} data` : emptyMessage}</p>
+        ) : (
+          <div className="border rounded-lg overflow-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Email</TableHead>
+                  <TableHead className="text-right">Jobs</TableHead>
+                  <TableHead className="text-right">Spent</TableHead>
+                  <TableHead>Created</TableHead>
+                  <TableHead></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {users.map((user) => (
+                  <TableRow key={user.email}>
+                    <TableCell className="font-mono text-xs">{user.email}</TableCell>
+                    <TableCell className="text-right">{user.total_jobs_created}</TableCell>
+                    <TableCell className="text-right">
+                      {user.total_spent === 0 ? (
+                        <Badge variant="destructive" className="text-xs">$0</Badge>
+                      ) : (
+                        formatCents(user.total_spent)
+                      )}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {formatDate(user.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => onInvestigate(user.email)}
+                        title="Investigate this account"
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// =============================================================================
+// Lookup Tab (search by email, IP, or fingerprint)
+// =============================================================================
+
+function LookupTab({
+  onInvestigate,
+}: {
+  onInvestigate: (email: string) => void
+}) {
+  const { toast } = useToast()
+  const [query, setQuery] = useState("")
+  const [lookupType, setLookupType] = useState<"email" | "ip" | "fingerprint">("email")
+  const [results, setResults] = useState<AbuseRelatedUser[] | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const doLookup = async () => {
+    if (!query.trim()) return
+    try {
+      setLoading(true)
+      setResults(null)
+      if (lookupType === "email") {
+        onInvestigate(query.trim())
+        setLoading(false)
+        return
+      } else if (lookupType === "ip") {
+        const result = await adminApi.getAbuseByIp(query.trim())
+        setResults(result.users)
+      } else {
+        const result = await adminApi.getAbuseByFingerprint(query.trim())
+        setResults(result.users)
+      }
+    } catch (err: any) {
+      toast({ title: "Error", description: err.message, variant: "destructive" })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Search className="w-5 h-5" />
+          Lookup
+        </CardTitle>
+        <CardDescription>
+          Search by email, IP address, or device fingerprint
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <div className="flex items-center gap-2 mb-4">
+          <select
+            value={lookupType}
+            onChange={(e) => {
+              setLookupType(e.target.value as "email" | "ip" | "fingerprint")
+              setResults(null)
+            }}
+            className="h-9 rounded-md border bg-background px-3 text-sm"
+          >
+            <option value="email">Email</option>
+            <option value="ip">IP Address</option>
+            <option value="fingerprint">Fingerprint</option>
+          </select>
+          <Input
+            placeholder={
+              lookupType === "email" ? "user@example.com" :
+              lookupType === "ip" ? "1.2.3.4" : "fingerprint-id"
+            }
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && doLookup()}
+            className="max-w-sm"
+          />
+          <Button onClick={doLookup} disabled={loading || !query.trim()} size="sm">
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+            <span className="ml-1">Search</span>
+          </Button>
+        </div>
+
+        {results !== null && (
+          <>
+            <p className="text-sm text-muted-foreground mb-3">
+              {results.length} account{results.length !== 1 ? "s" : ""} found
+            </p>
+            {results.length > 0 && (
+              <div className="border rounded-lg overflow-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Email</TableHead>
+                      <TableHead className="text-right">Jobs</TableHead>
+                      <TableHead className="text-right">Spent</TableHead>
+                      <TableHead>IP</TableHead>
+                      <TableHead>Fingerprint</TableHead>
+                      <TableHead>Created</TableHead>
+                      <TableHead></TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {results.map((user) => (
+                      <TableRow key={user.email}>
+                        <TableCell className="font-mono text-xs">{user.email}</TableCell>
+                        <TableCell className="text-right">{user.total_jobs_created}</TableCell>
+                        <TableCell className="text-right">
+                          {user.total_spent === 0 ? (
+                            <Badge variant="destructive" className="text-xs">$0</Badge>
+                          ) : (
+                            formatCents(user.total_spent)
+                          )}
+                        </TableCell>
+                        <TableCell><IpInfo ip={user.signup_ip} compact /></TableCell>
+                        <TableCell className="font-mono text-xs">{truncate(user.device_fingerprint, 10)}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {formatDate(user.created_at)}
+                        </TableCell>
+                        <TableCell>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => onInvestigate(user.email)}
+                          >
+                            <ChevronRight className="w-4 h-4" />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// =============================================================================
+// Main Page
+// =============================================================================
+
+export default function AbuseInvestigationPage() {
+  const [activeTab, setActiveTab] = useState("correlations")
+  const [investigatingEmail, setInvestigatingEmail] = useState<string | null>(null)
+
+  const handleInvestigate = (email: string) => {
+    setInvestigatingEmail(email)
+  }
+
+  const handleBack = () => {
+    setInvestigatingEmail(null)
+  }
+
+  // If investigating a specific user, show the detail view
+  if (investigatingEmail) {
+    return (
+      <RelatedAccountsView
+        email={investigatingEmail}
+        onBack={handleBack}
+        onInvestigate={handleInvestigate}
+      />
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">Abuse Investigation</h1>
+        <p className="text-muted-foreground">
+          Find suspicious accounts and investigate cross-account abuse patterns
+        </p>
+      </div>
+
+      <Tabs value={activeTab} onValueChange={setActiveTab}>
+        <TabsList>
+          <TabsTrigger value="correlations">
+            <Users className="w-4 h-4 mr-1" />
+            Correlations
+          </TabsTrigger>
+          <TabsTrigger value="suspicious">
+            <AlertTriangle className="w-4 h-4 mr-1" />
+            Suspicious
+          </TabsTrigger>
+          <TabsTrigger value="lookup">
+            <Search className="w-4 h-4 mr-1" />
+            Lookup
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="correlations" className="space-y-6">
+          <CorrelationsTab onInvestigate={handleInvestigate} />
+        </TabsContent>
+
+        <TabsContent value="suspicious" className="space-y-6">
+          <SuspiciousAccountsTab onInvestigate={handleInvestigate} />
+        </TabsContent>
+
+        <TabsContent value="lookup" className="space-y-6">
+          <LookupTab onInvestigate={handleInvestigate} />
+        </TabsContent>
+      </Tabs>
+    </div>
+  )
+}

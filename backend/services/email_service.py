@@ -1,0 +1,3102 @@
+"""
+Email service for sending transactional emails.
+
+Supports multiple providers:
+- Postmark (production)
+- Console logging (for development/testing)
+
+Provider selection: POSTMARK_SERVER_TOKEN env var enables Postmark.
+"""
+import html
+import logging
+import os
+import re
+import smtplib
+import ssl
+import sys
+import time
+from abc import ABC, abstractmethod
+from email.message import EmailMessage
+from email.utils import formataddr
+from datetime import datetime, timedelta, timezone
+from typing import NamedTuple, Optional, List, Tuple
+from zoneinfo import ZoneInfo
+
+import requests
+
+from backend.config import get_settings, is_production
+from backend.services.fake_workers import fake_workers_enabled
+from backend.i18n import t, get_locale_prefix
+from karaoke_gen.utils import sanitize_filename
+
+
+logger = logging.getLogger(__name__)
+
+
+class SendResult(NamedTuple):
+    """Outcome of a provider send.
+
+    ``message_id`` is the provider's unique id for the sent message (Postmark's
+    ``MessageID``) when available — used to link a send to its Postmark record and
+    to dedupe the persisted ``email_log`` entry. ``None`` for providers that don't
+    expose one (console/preview).
+    """
+    success: bool
+    message_id: Optional[str] = None
+    # True when the send failed specifically because Postmark has the recipient
+    # marked inactive (hard bounce / spam complaint / manual suppression). This
+    # is expected, benign traffic (e.g. someone typing a junk address into the
+    # sign-in form), not an outage — callers log it at INFO, not ERROR.
+    suppressed: bool = False
+
+
+class EmailProvider(ABC):
+    """Abstract base class for email providers."""
+
+    @abstractmethod
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+    ) -> bool:
+        """
+        Send an email. Returns True if successful.
+
+        Args:
+            to_email: Recipient email address
+            subject: Email subject
+            html_content: HTML content
+            text_content: Plain text content (optional)
+            cc_emails: CC recipients (optional)
+            bcc_emails: BCC recipients (optional)
+            from_email_override: Override the default sender email (optional, for multi-tenant)
+        """
+        pass
+
+    def send_email_detailed(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+    ) -> SendResult:
+        """Send an email and report the provider message id when available.
+
+        Default implementation delegates to :meth:`send_email` and reports no
+        message id. Providers that expose one (Postmark) override this.
+        """
+        success = self.send_email(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            cc_emails=cc_emails,
+            bcc_emails=bcc_emails,
+            from_email_override=from_email_override,
+        )
+        return SendResult(success=success, message_id=None)
+
+
+class ConsoleEmailProvider(EmailProvider):
+    """
+    Development email provider that logs to console.
+
+    Useful for local development and testing.
+    """
+
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+    ) -> bool:
+        logger.info("=" * 60)
+        if from_email_override:
+            logger.info(f"FROM: {from_email_override}")
+        logger.info(f"EMAIL TO: {to_email}")
+        if cc_emails:
+            logger.info(f"CC: {', '.join(cc_emails)}")
+        if bcc_emails:
+            logger.info(f"BCC: {', '.join(bcc_emails)}")
+        logger.info(f"SUBJECT: {subject}")
+        logger.info("-" * 60)
+        logger.info(text_content or html_content)
+        logger.info("=" * 60)
+        if fake_workers_enabled():
+            # Local stack: keep a copy so E2E tests can read magic links / codes
+            # (GET /api/test/emails).
+            from backend.services.fake_workers.outbox import record_email
+
+            record_email(to_email, subject, html_content, text_content)
+        return True
+
+
+class PreviewEmailProvider(EmailProvider):
+    """
+    Email provider that captures HTML content for previewing.
+
+    Instead of sending emails, stores the HTML content for later retrieval.
+    Useful for generating email previews.
+    """
+
+    def __init__(self):
+        self.last_html: Optional[str] = None
+        self.last_subject: Optional[str] = None
+        self.last_to_email: Optional[str] = None
+
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+    ) -> bool:
+        self.last_to_email = to_email
+        self.last_subject = subject
+        self.last_html = html_content
+        return True
+
+    def get_last_html(self) -> Optional[str]:
+        """Get the HTML content from the last 'sent' email."""
+        return self.last_html
+
+
+class PostmarkEmailProvider(EmailProvider):
+    """
+    Postmark email provider for production.
+
+    Requires POSTMARK_SERVER_TOKEN environment variable. Sends via the
+    Postmark REST API directly (no SDK dependency).
+    """
+
+    API_URL = "https://api.postmarkapp.com/email"
+
+    # SMTP fallback for when Postmark's API edge blocks us. Since 2026-09-30 the
+    # edge has answered us-central1 Cloud Run egress IPs with a bare nginx HTML
+    # 403 for hours at a time, so retrying the API doesn't help; SMTP is served
+    # by separate infrastructure. Auth = server token as username and password.
+    SMTP_HOST = "smtp.postmarkapp.com"
+    SMTP_PORT = 587
+    SMTP_TIMEOUT = 15
+    MESSAGE_STREAM = "outbound"
+
+    # Seconds to sleep before each retry of a transient failure (429 / 5xx /
+    # connect timeout). Kept short: magic-link sends block the request.
+    RETRY_DELAYS = (1.0, 3.0)
+
+    @staticmethod
+    def _is_transient_failure(response: requests.Response) -> bool:
+        """True for failures worth retrying against the API: 429 or 5xx."""
+        status = response.status_code
+        return status == 429 or status >= 500
+
+    @staticmethod
+    def _is_edge_block(response: requests.Response) -> bool:
+        """True for a 403 without a JSON body: an IP-level block at Postmark's edge.
+
+        Postmark's own API errors (bad token, invalid payload, suppressed
+        recipient) come back as JSON and are verdicts on the request itself; a
+        bare HTML 403 never reached the API, so the message was not accepted and
+        it's safe to resend it over SMTP.
+        """
+        if response.status_code != 403:
+            return False
+        try:
+            response.json()
+        except ValueError:
+            return True
+        return False
+
+    def _post_with_retry(self, payload: dict) -> requests.Response:
+        """POST to Postmark, retrying transient failures with backoff.
+
+        Only connect-phase errors are retried among exceptions: a read timeout
+        may mean Postmark already accepted the message, and it has no
+        idempotency key, so retrying could send a duplicate.
+        """
+        attempts = len(self.RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.post(
+                    self.API_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "X-Postmark-Server-Token": self.server_token,
+                    },
+                    json=payload,
+                    timeout=10,
+                )
+            except requests.ConnectTimeout:
+                if attempt == attempts:
+                    raise
+                logger.warning(f"Postmark connect timeout (attempt {attempt}/{attempts}); retrying")
+            else:
+                if attempt == attempts or not self._is_transient_failure(response):
+                    return response
+                logger.warning(
+                    f"Postmark returned transient status {response.status_code} "
+                    f"(attempt {attempt}/{attempts}); retrying"
+                )
+            time.sleep(self.RETRY_DELAYS[attempt - 1])
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def __init__(self, server_token: str, from_email: str, from_name: str = "Nomad Karaoke"):
+        self.server_token = server_token
+        self.from_email = from_email
+        self.from_name = from_name
+        # Postmark MessageID of the most recent successful send, so the email_log
+        # chokepoint can link a persisted record to its Postmark message.
+        self.last_message_id: Optional[str] = None
+        # True when the most recent send failed because the recipient is
+        # suppressed by Postmark (see SendResult.suppressed). Lets the send
+        # chokepoint / route handlers downgrade the failure log from ERROR to
+        # INFO without threading a richer return type through every caller.
+        self.last_suppressed: bool = False
+
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+        message_stream: Optional[str] = None,
+    ) -> bool:
+        return self.send_email_detailed(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            cc_emails=cc_emails,
+            bcc_emails=bcc_emails,
+            from_email_override=from_email_override,
+            message_stream=message_stream,
+        ).success
+
+    def send_email_detailed(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+        message_stream: Optional[str] = None,
+    ) -> SendResult:
+        """Send via the Postmark API (SMTP fallback on edge blocks).
+
+        ``message_stream`` defaults to the transactional stream; promotional mail
+        passes "broadcast" (Postmark appends the unsubscribe link and suppresses
+        unsubscribed recipients on that stream).
+        """
+        self.last_suppressed = False
+        stream = message_stream or self.MESSAGE_STREAM
+        try:
+            sender_email = from_email_override or self.from_email
+            payload = {
+                "From": f'"{self.from_name}" <{sender_email}>',
+                "To": to_email,
+                "Subject": subject,
+                "HtmlBody": html_content,
+                "MessageStream": stream,
+            }
+            if text_content:
+                payload["TextBody"] = text_content
+
+            if cc_emails:
+                payload["Cc"] = ", ".join(_dedupe_emails(cc_emails))
+            if bcc_emails:
+                payload["Bcc"] = ", ".join(_dedupe_emails(bcc_emails))
+
+            try:
+                response = self._post_with_retry(payload)
+            except requests.ConnectTimeout:
+                # Never connected, so Postmark didn't accept it: safe to resend.
+                logger.warning("Postmark API connect timed out on every attempt; falling back to SMTP")
+                return self._send_via_smtp(to_email, subject, html_content, text_content,
+                                           cc_emails, bcc_emails, sender_email, stream)
+
+            if self._is_edge_block(response):
+                logger.warning(
+                    f"Postmark API edge returned HTML 403 for {to_email}; falling back to SMTP"
+                )
+                return self._send_via_smtp(to_email, subject, html_content, text_content,
+                                           cc_emails, bcc_emails, sender_email, stream)
+
+            if 200 <= response.status_code < 300:
+                cc_info = f" (CC: {', '.join(cc_emails)})" if cc_emails else ""
+                bcc_info = f" (BCC: {', '.join(bcc_emails)})" if bcc_emails else ""
+                logger.info(f"Email sent to {to_email}{cc_info}{bcc_info} via Postmark")
+                # Capture Postmark's MessageID so the send can be linked to its
+                # Postmark record and the persisted email_log entry deduped.
+                message_id = None
+                try:
+                    message_id = response.json().get("MessageID")
+                except ValueError:
+                    pass
+                self.last_message_id = message_id
+                return SendResult(success=True, message_id=message_id)
+
+            # Surface Postmark's structured error so we can see suppressions, invalid signature, etc.
+            try:
+                err = response.json()
+                # ErrorCode 406 (InactiveRecipient) = the address is suppressed
+                # (hard bounce / spam complaint / manual suppression). This is
+                # expected when someone enters a junk/placeholder address at the
+                # sign-in form — it is not an outage, so log it at INFO and flag
+                # it so callers don't raise a scary "failed to send" ERROR.
+                if response.status_code == 422 and err.get("ErrorCode") == 406:
+                    self.last_suppressed = True
+                    logger.info(
+                        f"Postmark skipped suppressed recipient {to_email} "
+                        f"(inactive: hard bounce / spam complaint / manual suppression)"
+                    )
+                    return SendResult(success=False, message_id=None, suppressed=True)
+                logger.error(
+                    f"Postmark returned status {response.status_code}: "
+                    f"ErrorCode={err.get('ErrorCode')} Message={err.get('Message')}"
+                )
+            except ValueError:
+                logger.error(f"Postmark returned status {response.status_code}: {response.text[:200]}")
+            return SendResult(success=False, message_id=None)
+
+        except requests.RequestException:
+            logger.exception("Failed to send email via Postmark")
+            return SendResult(success=False, message_id=None)
+
+    def _send_via_smtp(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str],
+        cc_emails: Optional[List[str]],
+        bcc_emails: Optional[List[str]],
+        sender_email: str,
+        message_stream: Optional[str] = None,
+    ) -> SendResult:
+        """Send through Postmark's SMTP endpoint (used when the API is unreachable).
+
+        SMTP returns no Postmark MessageID and can't report suppressed
+        recipients synchronously (Postmark logs those as bounces instead).
+        """
+        cc = _dedupe_emails(cc_emails) if cc_emails else []
+        bcc = _dedupe_emails(bcc_emails) if bcc_emails else []
+        try:
+            msg = EmailMessage()
+            msg["From"] = formataddr((self.from_name, sender_email))
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg["X-PM-Message-Stream"] = message_stream or self.MESSAGE_STREAM
+            if cc:
+                msg["Cc"] = ", ".join(cc)
+            if text_content:
+                msg.set_content(text_content)
+                msg.add_alternative(html_content, subtype="html")
+            else:
+                msg.set_content(html_content, subtype="html")
+
+            smtp = smtplib.SMTP(self.SMTP_HOST, self.SMTP_PORT, timeout=self.SMTP_TIMEOUT)
+            try:
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.login(self.server_token, self.server_token)
+                smtp.send_message(msg, to_addrs=[to_email, *cc, *bcc])
+            finally:
+                # A failed QUIT after an accepted send must not fail the send
+                # (a caller retry would then duplicate the email).
+                try:
+                    smtp.quit()
+                except (smtplib.SMTPException, OSError):
+                    smtp.close()
+        except (smtplib.SMTPException, OSError, ValueError):
+            # ValueError: EmailMessage rejects CR/LF in header values.
+            logger.exception(f"Failed to send email to {to_email} via Postmark SMTP fallback")
+            return SendResult(success=False, message_id=None)
+
+        logger.info(f"Email sent to {to_email} via Postmark SMTP fallback")
+        self.last_message_id = None
+        return SendResult(success=True, message_id=None)
+
+
+# Query params that carry single-use auth/capability tokens (magic-link sign-in,
+# lyrics/instrumental review access, referral codes). We persist a redacted copy
+# so the admin email-history log never becomes a store of live credentials — the
+# email still renders faithfully, only the secret value is masked.
+_SENSITIVE_QUERY_PARAM = re.compile(r"([?&](?:token|ref|review_token|instrumental_token)=)[^&\"'\s<]+", re.IGNORECASE)
+
+
+def _redact_sensitive_tokens(content: Optional[str]) -> Optional[str]:
+    """Mask token/ref query-param values in email content before persistence."""
+    if not content:
+        return content
+    return _SENSITIVE_QUERY_PARAM.sub(r"\1[REDACTED]", content)
+
+
+def _dedupe_emails(emails: List[str]) -> List[str]:
+    """Lowercase-normalize and deduplicate a list of email addresses, preserving order."""
+    seen = set()
+    out = []
+    for em in emails:
+        normalized = em.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(em.strip())
+    return out
+
+
+class EmailService:
+    """
+    High-level email service for sending transactional emails.
+
+    Automatically selects the appropriate provider based on configuration.
+    """
+
+    # Brand colors and assets for consistent email styling
+    BRAND_PRIMARY = "#ff7acc"  # Pink
+    BRAND_PRIMARY_HOVER = "#e066b3"  # Darker pink for hover states
+    BRAND_SECONDARY = "#ffdf6b"  # Yellow (accent)
+    BRAND_SUCCESS = "#22c55e"  # Green for success states (Tailwind green-500)
+    LOGO_URL = "https://beveradb.github.io/public-images/Nomad-Karaoke-Logo-small-indexed-websafe-rectangle.gif"
+
+    def __init__(self):
+        self.settings = get_settings()
+        self.provider = self._get_provider()
+        self.frontend_url = os.getenv("FRONTEND_URL", "https://gen.nomadkaraoke.com")
+        # After consolidation, buy URL is the same as frontend URL
+        self.buy_url = os.getenv("BUY_URL", self.frontend_url)
+        # Set by _log_and_send: True when the last send failed only because the
+        # recipient is Postmark-suppressed (benign — see SendResult.suppressed).
+        self.last_send_suppressed: bool = False
+
+    def _get_provider(self) -> EmailProvider:
+        """Get the configured email provider.
+
+        Postmark is used when POSTMARK_SERVER_TOKEN is set; otherwise falls
+        back to console logging (dev/test only).
+        """
+        postmark_token = os.getenv("POSTMARK_SERVER_TOKEN")
+        from_email = os.getenv("EMAIL_FROM", "gen@nomadkaraoke.com")
+        from_name = os.getenv("EMAIL_FROM_NAME", "Nomad Karaoke")
+
+        if postmark_token:
+            logger.info("Using Postmark email provider")
+            return PostmarkEmailProvider(postmark_token, from_email, from_name)
+
+        # In production a missing Postmark token used to silently fall back to
+        # console logging — every send "succeeded" while magic-link/completion/
+        # receipt emails vanished (users can't log in or get downloads). Fail
+        # loudly instead. (Fallback audit 2026-06-09, Theme 7.)
+        if is_production():
+            raise RuntimeError(
+                "POSTMARK_SERVER_TOKEN is not set in production. Refusing to "
+                "silently drop emails via the console provider — set the Postmark "
+                "token secret."
+            )
+
+        logger.warning("No email provider configured, using console logging (dev/test)")
+        return ConsoleEmailProvider()
+
+    def is_configured(self) -> bool:
+        """Check if a real email provider is configured (not just console logging)."""
+        return isinstance(self.provider, PostmarkEmailProvider)
+
+    def send_email(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+    ) -> bool:
+        """Send a raw email via the configured provider.
+
+        Thin passthrough for callers that need to send an ad-hoc/plain email
+        (e.g. internal failure alerts) without a dedicated template method.
+        Prefer a dedicated ``send_*`` template method for customer-facing mail.
+        """
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            cc_emails=cc_emails,
+            bcc_emails=bcc_emails,
+            from_email_override=from_email_override,
+            email_type="raw",
+        )
+
+    def _log_and_send(
+        self,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str] = None,
+        cc_emails: Optional[List[str]] = None,
+        bcc_emails: Optional[List[str]] = None,
+        from_email_override: Optional[str] = None,
+        email_type: Optional[str] = None,
+        message_stream: Optional[str] = None,
+    ) -> bool:
+        """Single send chokepoint: dispatch via the provider, then persist a
+        record of the send for the admin email-history view.
+
+        Every ``send_*`` template method routes through here so the persisted
+        ``email_log`` mirrors exactly what left the building. Persistence is
+        strictly best-effort — a Firestore failure must never break or delay a
+        real email send.
+        """
+        # Categorize by the calling send_* method name (e.g. send_magic_link →
+        # "magic_link") so the admin UI can group emails without threading an
+        # explicit type through every template method.
+        if email_type is None:
+            try:
+                caller = sys._getframe(1).f_code.co_name
+                email_type = caller[len("send_"):] if caller.startswith("send_") else caller
+            except Exception:
+                email_type = None
+
+        # Dispatch via the provider's public send_email (as keyword args) so
+        # callers/mocks that observe that method still see it. PostmarkEmailProvider
+        # records the returned MessageID on ``last_message_id`` for us to link the
+        # log entry.
+        # Only Postmark knows about message streams; dev providers ignore them.
+        stream_kwargs = (
+            {"message_stream": message_stream}
+            if message_stream and isinstance(self.provider, PostmarkEmailProvider)
+            else {}
+        )
+        success = self.provider.send_email(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            cc_emails=cc_emails,
+            bcc_emails=bcc_emails,
+            from_email_override=from_email_override,
+            **stream_kwargs,
+        )
+
+        # Mirror the provider's suppression flag so route handlers can tell a
+        # benign "recipient suppressed" failure (junk sign-in address) apart
+        # from a real send failure without threading a richer return type
+        # through every send_* method.
+        self.last_send_suppressed = getattr(self.provider, "last_suppressed", False)
+
+        # Only persist genuine outbound mail (Postmark). Console/preview providers
+        # are dev/test only and have no real inbox to reflect.
+        if success and isinstance(self.provider, PostmarkEmailProvider):
+            try:
+                self._record_sent_email(
+                    to_email=to_email,
+                    subject=subject,
+                    html_content=html_content,
+                    text_content=text_content,
+                    cc_emails=cc_emails,
+                    bcc_emails=bcc_emails,
+                    from_email=from_email_override or getattr(self.provider, "from_email", None),
+                    email_type=email_type,
+                    message_id=getattr(self.provider, "last_message_id", None),
+                    message_stream=message_stream or "outbound",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist email_log record (the email itself was sent OK)"
+                )
+
+        return success
+
+    def _record_sent_email(
+        self,
+        *,
+        to_email: str,
+        subject: str,
+        html_content: str,
+        text_content: Optional[str],
+        cc_emails: Optional[List[str]],
+        bcc_emails: Optional[List[str]],
+        from_email: Optional[str],
+        email_type: Optional[str],
+        message_id: Optional[str],
+        message_stream: str = "outbound",
+    ) -> None:
+        """Write one Firestore ``email_log`` doc mirroring a sent email.
+
+        Keyed by the Postmark MessageID when available (idempotent), else an
+        auto-id. Stores the rendered HTML so the admin UI can show older mail
+        after Postmark's ~45-day content retention expires — with single-use
+        auth/capability tokens redacted so the log never holds live credentials.
+        """
+        from backend.services.firestore_service import FirestoreService
+
+        db = FirestoreService().db
+        doc = {
+            "recipient": (to_email or "").strip().lower(),
+            "recipient_raw": to_email,
+            "cc": _dedupe_emails(cc_emails) if cc_emails else [],
+            "bcc": _dedupe_emails(bcc_emails) if bcc_emails else [],
+            "from_email": from_email,
+            "subject": subject,
+            "html_content": _redact_sensitive_tokens(html_content),
+            "text_content": _redact_sensitive_tokens(text_content),
+            "email_type": email_type,
+            "message_stream": message_stream,
+            "postmark_message_id": message_id,
+            "created_at": datetime.now(timezone.utc),
+        }
+        collection = db.collection("email_log")
+        if message_id:
+            collection.document(message_id).set(doc)
+        else:
+            collection.add(doc)
+
+    def build_magic_link_url(
+        self,
+        token: str,
+        locale: str = "en",
+        tenant_frontend_url: Optional[str] = None,
+        referral_code: Optional[str] = None,
+    ) -> str:
+        """Frontend URL that verifies a magic-link ``token`` (shared by the magic
+        link and login-code emails)."""
+        base_url = tenant_frontend_url or self.frontend_url
+        url = f"{base_url}{get_locale_prefix(locale)}/auth/verify?token={token}"
+        if referral_code:
+            url += f"&ref={referral_code}"
+        return url
+
+    def send_magic_link(
+        self,
+        email: str,
+        token: str,
+        sender_email: Optional[str] = None,
+        tenant_frontend_url: Optional[str] = None,
+        tenant_name: Optional[str] = None,
+        locale: str = "en",
+        referral_code: Optional[str] = None,
+    ) -> bool:
+        """
+        Send a magic link email for authentication.
+
+        Args:
+            email: User's email address
+            token: Magic link token
+            sender_email: Override sender email address (for multi-tenant)
+            tenant_frontend_url: Override frontend URL for tenant portals (e.g., https://vocalstar.nomadkaraoke.com)
+            tenant_name: Override brand name for tenant portals (e.g., "Vocal Star")
+
+        Returns:
+            True if email was sent successfully
+        """
+        magic_link_url = self.build_magic_link_url(
+            token, locale=locale, tenant_frontend_url=tenant_frontend_url, referral_code=referral_code,
+        )
+
+        brand_name = tenant_name or "Nomad Karaoke"
+        subject = t(locale, "emails.magicLink.subject", brand_name=brand_name)
+
+        extra_styles = """
+        .warning {
+            background-color: #fef3c7;
+            border: 1px solid #fcd34d;
+            border-radius: 4px;
+            padding: 12px;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+"""
+
+        referral_banner = (
+            '<div style="background: linear-gradient(135deg, #7c3aed10, #a855f710); '
+            'border: 1px solid #a855f730; border-radius: 8px; padding: 16px; margin: 16px 0; '
+            'text-align: center;">'
+            '<p style="color: #a855f7; font-weight: 600; margin: 0;">&#127873; '
+            'Your referral discount is waiting!</p>'
+            '<p style="color: #666; font-size: 14px; margin: 4px 0 0;">'
+            'Sign in to claim your discount on credit purchases</p></div>'
+            if referral_code else ""
+        )
+
+        content = f"""
+    <p>{t(locale, "emails.magicLink.greeting")}</p>
+
+    <p>{t(locale, "emails.magicLink.signInPrompt", brand_name=html.escape(brand_name))}</p>
+
+    <p style="text-align: center;">
+        <a href="{magic_link_url}" class="button">{t(locale, "emails.magicLink.signInButton")}</a>
+    </p>
+
+    {referral_banner}
+
+    <div class="warning">
+        ⏰ {t(locale, "emails.magicLink.expiryWarning")}
+    </div>
+
+    <p>{t(locale, "emails.magicLink.fallbackLink")}</p>
+    <p style="word-break: break-all; font-size: 14px; color: #666;">
+        {magic_link_url}
+    </p>
+
+    <p>{t(locale, "emails.magicLink.ignoreNote")}</p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = f"""
+{t(locale, "emails.magicLink.signInButton")}
+========================
+
+{t(locale, "emails.magicLink.signInPrompt", brand_name=brand_name)}
+{magic_link_url}
+
+{t(locale, "emails.magicLink.expiryWarning")}
+
+{t(locale, "emails.magicLink.ignoreNote")}
+
+---
+© {self._get_year()} {brand_name}
+"""
+
+        return self._log_and_send(
+            email, subject, html_content, text_content, from_email_override=sender_email
+        )
+
+    def send_kjbox_login_code(
+        self,
+        email: str,
+        code: str,
+        expiry_minutes: int,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send a 6-digit sign-in code for the kjbox karaoke-night singer page.
+
+        The singer types the code into the venue's singer page (they never visit
+        the gen website), so the email carries no link — just the code.
+
+        Returns:
+            True if email was sent successfully
+        """
+        subject = t(locale, "emails.kjboxLoginCode.subject", code=code)
+        safe_code = html.escape(code)
+
+        extra_styles = f"""
+        .code-box {{
+            background-color: #fdf2f8;
+            border: 2px solid {self.BRAND_PRIMARY};
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            margin: 24px 0;
+        }}
+        .code {{
+            font-size: 40px;
+            font-weight: 700;
+            letter-spacing: 10px;
+            font-family: 'SF Mono', Menlo, Consolas, monospace;
+            color: #111827;
+        }}
+"""
+
+        content = f"""
+    <p>{t(locale, "emails.kjboxLoginCode.greeting")}</p>
+
+    <p>{t(locale, "emails.kjboxLoginCode.intro")}</p>
+
+    <div class="code-box">
+        <div class="code">{safe_code}</div>
+    </div>
+
+    <p>{t(locale, "emails.kjboxLoginCode.expiry", minutes=expiry_minutes)}</p>
+
+    <p>{t(locale, "emails.kjboxLoginCode.ignoreNote")}</p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = f"""
+{t(locale, "emails.kjboxLoginCode.greeting")}
+
+{t(locale, "emails.kjboxLoginCode.intro")}
+
+    {code}
+
+{t(locale, "emails.kjboxLoginCode.expiry", minutes=expiry_minutes)}
+
+{t(locale, "emails.kjboxLoginCode.ignoreNote")}
+
+---
+© {self._get_year()} Nomad Karaoke
+"""
+
+        return self._log_and_send(email, subject, html_content, text_content)
+
+    def send_login_code(
+        self,
+        email: str,
+        code: str,
+        magic_link_url: str,
+        expiry_minutes: int,
+        locale: str = "en",
+        sender_email: Optional[str] = None,
+        tenant_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Send a gen sign-in email carrying BOTH a 6-digit code and a magic link.
+
+        The code suits a user signing in on another device / inside an app (type
+        it in); the link is one-click sign-in on the device that reads the email.
+        Either works and both are single-use (the code expires after
+        ``expiry_minutes``; the link after 24 hours).
+
+        Returns:
+            True if email was sent successfully
+        """
+        brand_name = tenant_name or "Nomad Karaoke"
+        subject = t(locale, "emails.loginCode.subject", brand_name=brand_name, code=code)
+        safe_code = html.escape(code)
+        safe_url = html.escape(magic_link_url, quote=True)
+
+        extra_styles = f"""
+        .code-box {{
+            background-color: #fdf2f8;
+            border: 2px solid {self.BRAND_PRIMARY};
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            margin: 24px 0;
+        }}
+        .code {{
+            font-size: 40px;
+            font-weight: 700;
+            letter-spacing: 10px;
+            font-family: 'SF Mono', Menlo, Consolas, monospace;
+            color: #111827;
+        }}
+"""
+
+        content = f"""
+    <p>{t(locale, "emails.loginCode.greeting")}</p>
+
+    <p>{t(locale, "emails.loginCode.intro")}</p>
+
+    <div class="code-box">
+        <div class="code">{safe_code}</div>
+    </div>
+
+    <p>{t(locale, "emails.loginCode.expiry", minutes=expiry_minutes)}</p>
+
+    <p>{t(locale, "emails.loginCode.orLink")}</p>
+
+    <p style="text-align: center;">
+        <a href="{safe_url}" class="button">{t(locale, "emails.loginCode.signInButton")}</a>
+    </p>
+
+    <p style="font-size: 14px; color: #666;">{t(locale, "emails.loginCode.linkExpiry")}</p>
+
+    <p>{t(locale, "emails.loginCode.ignoreNote")}</p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = f"""
+{t(locale, "emails.loginCode.greeting")}
+
+{t(locale, "emails.loginCode.intro")}
+
+    {code}
+
+{t(locale, "emails.loginCode.expiry", minutes=expiry_minutes)}
+
+{t(locale, "emails.loginCode.orLink")}
+{magic_link_url}
+
+{t(locale, "emails.loginCode.linkExpiry")}
+
+{t(locale, "emails.loginCode.ignoreNote")}
+
+---
+© {self._get_year()} {brand_name}
+"""
+
+        return self._log_and_send(
+            email, subject, html_content, text_content, from_email_override=sender_email
+        )
+
+    def send_credits_added(self, email: str, credits: int, total_credits: int, locale: str = "en") -> bool:
+        """
+        Send notification when credits are added to account.
+
+        Args:
+            email: User's email address
+            credits: Number of credits added
+            total_credits: New total credit balance
+
+        Returns:
+            True if email was sent successfully
+        """
+        subject = t(locale, "emails.creditsAdded.subject", credits=credits)
+
+        extra_styles = f"""
+        .credits-box {{
+            background-color: #ecfdf5;
+            border: 2px solid {self.BRAND_SUCCESS};
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            margin: 20px 0;
+        }}
+        .credits-number {{
+            font-size: 48px;
+            font-weight: bold;
+            color: {self.BRAND_SUCCESS};
+        }}
+"""
+
+        content = f"""
+    <p>{t(locale, "emails.creditsAdded.greatNews")}</p>
+
+    <p><strong>{t(locale, "emails.creditsAdded.creditsAddedMessage", credits=credits)}</strong></p>
+
+    <div class="credits-box">
+        <div>{t(locale, "emails.creditsAdded.yourBalance")}</div>
+        <div class="credits-number">{total_credits}</div>
+        <div>{t(locale, "emails.creditsAdded.credits")}</div>
+    </div>
+
+    <p>{t(locale, "emails.creditsAdded.eachCreditLets")}</p>
+    <ul>
+        <li>{t(locale, "emails.creditsAdded.featureVocalSeparation")}</li>
+        <li>{t(locale, "emails.creditsAdded.featureLyrics")}</li>
+        <li>{t(locale, "emails.creditsAdded.feature4k")}</li>
+        <li>{t(locale, "emails.creditsAdded.featureYoutube")}</li>
+    </ul>
+
+    <p style="text-align: center;">
+        <a href="{self.frontend_url}{get_locale_prefix(locale)}" class="button">{t(locale, "emails.creditsAdded.createButton")}</a>
+    </p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = f"""
+{t(locale, "emails.creditsAdded.creditsAddedMessage", credits=credits)}
+
+{t(locale, "emails.creditsAdded.yourBalance")} {total_credits} {t(locale, "emails.creditsAdded.credits")}
+
+{t(locale, "emails.creditsAdded.eachCreditLets")}
+
+{self.frontend_url}{get_locale_prefix(locale)}
+
+---
+© {self._get_year()} Nomad Karaoke
+"""
+
+        return self._log_and_send(email, subject, html_content, text_content)
+
+    def send_karaokehunt_conversion(
+        self,
+        email: str,
+        artist: str,
+        title: str,
+        variant: str,
+        login_url: str,
+        community_url: Optional[str] = None,
+        used_existing_credit: bool = False,
+        locale: str = "en",
+        is_new_user: bool = False,
+    ) -> bool:
+        """The email the retired KaraokeHunt app has promised its users for years
+        ("you should receive an email in 5-10 minutes"). One template, four
+        variants matching the conversion outcome:
+
+        - "job": their track is being generated right now
+        - "job_parked": we need them to pick the audio recording first
+        - "board": no credits, so the song went to the community requests board
+        - "community": a community karaoke version already exists — no job was
+          made; the main button IS the YouTube link
+        - "uninstall": they already used their one-time freebie — nothing was
+          processed; tell them to uninstall the app and use Gen directly
+
+        All first-time variants also carry the "uninstall the app, use
+        gen.nomadkaraoke.com from now on" note — the conversion is one-per-email.
+        """
+        esc_artist = html.escape(artist)
+        esc_title = html.escape(title)
+        subject = t(locale, "emails.karaokehuntConversion.subject",
+                    artist=artist, title=title)
+
+        intro = t(
+            locale,
+            "emails.karaokehuntConversion.uninstallIntro" if variant == "uninstall"
+            else "emails.karaokehuntConversion.intro",
+        )
+
+        if variant == "uninstall":
+            headline = t(locale, "emails.karaokehuntConversion.uninstallHeadline")
+            detail = t(locale, "emails.karaokehuntConversion.uninstallDetail",
+                       artist=esc_artist, title=esc_title)
+            detail_key = "uninstallDetail"
+            button_label = t(locale, "emails.karaokehuntConversion.signInLink")
+            button_url = login_url
+        elif variant == "community":
+            headline = t(locale, "emails.karaokehuntConversion.communityIntro")
+            detail = t(locale, "emails.karaokehuntConversion.communityDetail",
+                       artist=esc_artist, title=esc_title)
+            detail_key = "communityDetail"
+            button_label = t(locale, "emails.karaokehuntConversion.communityLinkText")
+            button_url = community_url or "https://gen.nomadkaraoke.com"
+        elif variant == "job_parked":
+            headline = t(locale, "emails.karaokehuntConversion.parkedIntro")
+            detail = t(locale, "emails.karaokehuntConversion.parkedDetail",
+                       artist=esc_artist, title=esc_title)
+            detail_key = "parkedDetail"
+            button_label = t(locale, "emails.karaokehuntConversion.pickButton")
+            button_url = login_url
+        elif variant == "board":
+            headline = t(locale, "emails.karaokehuntConversion.boardIntro")
+            detail = t(locale, "emails.karaokehuntConversion.boardDetail",
+                       artist=esc_artist, title=esc_title)
+            detail_key = "boardDetail"
+            button_label = t(locale, "emails.karaokehuntConversion.boardButton")
+            button_url = "https://requests.nomadkaraoke.com"
+        else:  # "job"
+            headline = t(locale, "emails.karaokehuntConversion.jobStarted")
+            detail = t(locale, "emails.karaokehuntConversion.jobDetail",
+                       artist=esc_artist, title=esc_title)
+            detail_key = "jobDetail"
+            button_label = t(locale, "emails.karaokehuntConversion.trackButton")
+            button_url = login_url
+
+        account_note = ""
+        if variant in ("job", "job_parked"):
+            if used_existing_credit:
+                account_note = t(locale, "emails.karaokehuntConversion.usedCreditNote")
+            else:
+                account_note = t(locale, "emails.karaokehuntConversion.newAccountNote")
+        elif variant == "community":
+            account_note = t(
+                locale,
+                "emails.karaokehuntConversion.communityCreditNoteNew" if is_new_user
+                else "emails.karaokehuntConversion.communityCreditNoteExisting",
+            )
+
+        community_block = ""
+        community_text = ""
+        if community_url and variant != "community":
+            community_block = f"""
+    <p>{t(locale, "emails.karaokehuntConversion.communityBonus")}<br>
+    <a href="{html.escape(community_url)}">{t(locale, "emails.karaokehuntConversion.communityLinkText")}</a></p>
+"""
+            community_text = (
+                f"\n{t(locale, 'emails.karaokehuntConversion.communityBonus')}\n"
+                f"{community_url}\n"
+            )
+
+        sign_in_line = ""
+        sign_in_text = ""
+        if variant in ("board", "community"):
+            # Board voting / using their credit both need them signed in.
+            sign_in_label = t(
+                locale,
+                "emails.karaokehuntConversion.trackButton" if variant == "board"
+                else "emails.karaokehuntConversion.signInLink",
+            )
+            sign_in_line = f"""
+    <p style="text-align: center;">
+        <a href="{login_url}">{sign_in_label}</a>
+    </p>
+"""
+            sign_in_text = f"\n{sign_in_label}: {login_url}\n"
+
+        # First-time variants carry the uninstall instruction; the "uninstall"
+        # variant IS that instruction, so it doesn't repeat it.
+        uninstall_note = ""
+        if variant != "uninstall":
+            uninstall_note = t(locale, "emails.karaokehuntConversion.uninstallNote")
+
+        content = f"""
+    <p>{intro}</p>
+
+    <p><strong>{headline}</strong></p>
+
+    <p>{detail}</p>
+
+    {f'<p>{account_note}</p>' if account_note else ''}
+
+    <p style="text-align: center;">
+        <a href="{button_url}" class="button">{button_label}</a>
+    </p>
+{sign_in_line}{community_block}
+    {f'<p><strong>{uninstall_note}</strong></p>' if uninstall_note else ''}
+
+    <p style="font-size: 13px; color: #6b7280;">{t(locale, "emails.karaokehuntConversion.whyEmail")}</p>
+"""
+
+        html_content = self._build_email_html(content, locale=locale)
+
+        text_content = f"""
+{intro}
+
+{headline}
+
+{t(locale, f"emails.karaokehuntConversion.{detail_key}", artist=artist, title=title)}
+
+{account_note}
+
+{button_label}: {button_url}
+{sign_in_text}{community_text}
+{uninstall_note}
+
+---
+{t(locale, "emails.karaokehuntConversion.whyEmail")}
+
+© {self._get_year()} Nomad Karaoke
+"""
+
+        return self._log_and_send(
+            email, subject, html_content, text_content,
+            email_type="karaokehunt_conversion",
+        )
+
+    def send_welcome_email(self, email: str, credits: int = 0, locale: str = "en") -> bool:
+        """
+        Send welcome email to new users.
+
+        Args:
+            email: User's email address
+            credits: Initial credit balance (if any)
+
+        Returns:
+            True if email was sent successfully
+        """
+        subject = t(locale, "emails.welcome.subject")
+
+        extra_styles = """
+        .credits-box {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 2px solid #e2b714;
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            margin: 24px 0;
+        }
+        .credits-box .credits-number {
+            font-size: 48px;
+            font-weight: bold;
+            color: #e2b714;
+            line-height: 1;
+        }
+        .credits-box .credits-label {
+            font-size: 16px;
+            color: #ccc;
+            margin-top: 4px;
+        }
+        .credits-box .credits-note {
+            font-size: 13px;
+            color: #999;
+            margin-top: 12px;
+        }
+        .feature {
+            display: flex;
+            align-items: flex-start;
+            margin: 16px 0;
+        }
+        .feature-icon {
+            font-size: 24px;
+            margin-right: 12px;
+        }
+"""
+
+        credits_box = ""
+        if credits > 0:
+            credits_box = f"""
+    <div class="credits-box">
+        <div class="credits-number">{credits}</div>
+        <div class="credits-label">{t(locale, "emails.welcome.freeCreditsLabel")}</div>
+        <div class="credits-note">{t(locale, "emails.welcome.freeCreditsNote")}</div>
+    </div>
+"""
+
+        content = f"""
+    <p>{t(locale, "emails.welcome.welcomeGreeting")}</p>
+
+    <p>{t(locale, "emails.welcome.turnAnySong")}</p>
+
+    {credits_box}
+
+    <p><strong>{t(locale, "emails.welcome.howItWorks")}</strong></p>
+
+    <div class="feature">
+        <span class="feature-icon">🎵</span>
+        <div>
+            <strong>{t(locale, "emails.welcome.step1Title")}</strong><br>
+            {t(locale, "emails.welcome.step1Desc")}
+        </div>
+    </div>
+
+    <div class="feature">
+        <span class="feature-icon">✨</span>
+        <div>
+            <strong>{t(locale, "emails.welcome.step2Title")}</strong><br>
+            {t(locale, "emails.welcome.step2Desc")}
+        </div>
+    </div>
+
+    <div class="feature">
+        <span class="feature-icon">✏️</span>
+        <div>
+            <strong>{t(locale, "emails.welcome.step3Title")}</strong><br>
+            {t(locale, "emails.welcome.step3Desc")}
+        </div>
+    </div>
+
+    <div class="feature">
+        <span class="feature-icon">🎬</span>
+        <div>
+            <strong>{t(locale, "emails.welcome.step4Title")}</strong><br>
+            {t(locale, "emails.welcome.step4Desc")}
+        </div>
+    </div>
+
+    <p style="text-align: center; font-size: 14px; color: #999; margin-top: 20px;">
+        {t(locale, "emails.welcome.feedbackBonus")}
+    </p>
+
+    <p style="text-align: center;">
+        <a href="{self.frontend_url}{get_locale_prefix(locale)}" class="button">{t(locale, "emails.welcome.getStartedButton")}</a>
+    </p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        credits_text = f"\n{t(locale, 'emails.welcome.freeCreditsNote')}: {credits}\n" if credits > 0 else ""
+
+        text_content = f"""
+{t(locale, "emails.welcome.welcomeGreeting")}
+
+{t(locale, "emails.welcome.turnAnySong")}
+{credits_text}
+{t(locale, "emails.welcome.howItWorks")}
+
+{t(locale, "emails.welcome.step1Title")}
+   {t(locale, "emails.welcome.step1Desc")}
+
+{t(locale, "emails.welcome.step2Title")}
+   {t(locale, "emails.welcome.step2Desc")}
+
+{t(locale, "emails.welcome.step3Title")}
+   {t(locale, "emails.welcome.step3Desc")}
+
+{t(locale, "emails.welcome.step4Title")}
+   {t(locale, "emails.welcome.step4Desc")}
+
+{t(locale, "emails.welcome.feedbackBonus")}
+
+{self.frontend_url}{get_locale_prefix(locale)}
+
+---
+© {self._get_year()} Nomad Karaoke
+"""
+
+        return self._log_and_send(email, subject, html_content, text_content)
+
+    def _get_year(self) -> int:
+        """Get current year for copyright notices."""
+        from datetime import datetime
+        return datetime.now().year
+
+    def _get_email_header(self, extra_header_content: str = "") -> str:
+        """Get the standard email header with logo.
+
+        Args:
+            extra_header_content: Optional extra content to add after the logo (e.g., beta badge)
+        """
+        return f"""
+    <div class="header">
+        <a href="https://nomadkaraoke.com"><img src="{self.LOGO_URL}" alt="Nomad Karaoke" /></a>
+        {extra_header_content}
+    </div>
+"""
+
+    def _get_email_footer(self, locale: str = "en") -> str:
+        """Get the standard email footer with support message and signature."""
+        return f"""
+    <p style="margin-top: 30px; font-style: italic; color: #666;">{t(locale, "emails.shared.footerHelp")}</p>
+
+    <div class="signature">
+        {self._get_email_signature()}
+    </div>
+"""
+
+    def _get_base_styles(self) -> str:
+        """Get base CSS styles shared by all emails."""
+        return f"""
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }}
+        .header {{
+            text-align: center;
+            padding: 20px 0;
+        }}
+        .header img {{
+            max-width: 180px;
+            height: auto;
+            border-radius: 10px;
+        }}
+        .button {{
+            display: inline-block;
+            background-color: {self.BRAND_PRIMARY};
+            color: white;
+            padding: 14px 28px;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            margin: 20px 0;
+        }}
+        .signature {{
+            margin-top: 30px;
+            padding-top: 20px;
+        }}
+"""
+
+    def _build_email_html(self, content: str, extra_styles: str = "", extra_header_content: str = "", locale: str = "en", trailing_content: str = "") -> str:
+        """Build a complete HTML email with standard header, footer, and styles.
+
+        Args:
+            content: The main body content of the email
+            extra_styles: Additional CSS styles specific to this email type
+            extra_header_content: Optional extra content to add in header (e.g., beta badge)
+            locale: Locale for footer localization
+
+        Returns:
+            Complete HTML email string
+        """
+        return f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        {self._get_base_styles()}
+        {extra_styles}
+    </style>
+</head>
+<body>
+    {self._get_email_header(extra_header_content)}
+
+    {content}
+
+    {self._get_email_footer(locale)}
+    {trailing_content}
+</body>
+</html>
+"""
+
+    def _get_email_signature(self) -> str:
+        """Get the HTML email signature for Nomad Karaoke."""
+        return """
+<table cellpadding="0" cellspacing="0" border="0" style="font-size: medium; font-family: Trebuchet MS;">
+    <tbody>
+        <tr>
+            <td>
+                <table cellpadding="0" cellspacing="0" border="0" style="font-size: medium; font-family: Trebuchet MS;">
+                    <tbody>
+                        <tr>
+                            <td style="vertical-align: top;">
+                                <table cellpadding="0" cellspacing="0" border="0"
+                                    style="font-size: medium; font-family: Trebuchet MS;">
+                                    <tbody>
+                                        <tr>
+                                            <td style="text-align: center;"><a
+                                                    href="https://www.linkedin.com/in/andrewbeveridge"
+                                                    target="_blank"><img
+                                                        src="https://beveradb.github.io/public-images/andrew-buildspace-circle-150px.png"
+                                                        role="presentation" style="display: block; max-width: 128px;"
+                                                        width="130"></a></td>
+                                        </tr>
+                                        <tr>
+                                            <td height="5"></td>
+                                        </tr>
+                                        <tr>
+                                            <td style="text-align: center;"><a href="https://nomadkaraoke.com"
+                                                    target="_blank"><img role="presentation" width="130"
+                                                        style="display: block; max-width: 130px; border-radius: 7px;"
+                                                        src="https://beveradb.github.io/public-images/Nomad-Karaoke-Logo-small-indexed-websafe-rectangle.gif"></a>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </td>
+                            <td width="10">
+                                <div></div>
+                            </td>
+                            <td style="padding: 0px; vertical-align: middle;">
+                                <h2 color="#000000"
+                                    style="margin: 0px; font-size: 18px; color: rgb(0, 0, 0); font-weight: 600;">
+                                    <span>Andrew</span><span>&nbsp;</span><span>Beveridge</span>
+                                </h2>
+                                <p color="#000000" font-size="medium"
+                                    style="margin: 0px; color: rgb(0, 0, 0); font-size: 14px; line-height: 22px;">
+                                    <span>Founder</span>
+                                </p>
+                                <p color="#000000" font-size="medium"
+                                    style="margin: 0px; font-weight: 500; color: rgb(0, 0, 0); font-size: 14px; line-height: 22px;">
+                                    <span>Nomad Karaoke
+                                        LLC</span>
+                                </p>
+                                <table cellpadding="0" cellspacing="0" border="0"
+                                    style="width: 100%; font-size: medium; font-family: Trebuchet MS; margin-top: 3px; margin-bottom: 3px;">
+                                    <tbody>
+                                        <tr>
+                                            <td color="#ff7acc" direction="horizontal" width="auto" height="15"
+                                                style="width: 100%; display: block; line-height:0; font-size:0;">
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td color="#ff7acc" direction="horizontal" width="auto" height="1"
+                                                style="width: 100%; border-bottom: 1px solid rgb(255, 122, 204); border-left: medium; display: block; line-height:0; font-size:0;">
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+
+                                <table cellpadding="0" cellspacing="0" border="0"
+                                    style="width: 100%; font-size: medium; font-family: Trebuchet MS; margin-top: 3px; margin-bottom: 3px;">
+                                    <tbody>
+                                        <tr>
+                                            <td style="text-align: center; line-height:0; font-size:0;">
+                                                <table cellpadding="0" cellspacing="0" border="0"
+                                                    style="display: inline-block; font-size: medium; font-family: Trebuchet MS;">
+                                                    <tbody>
+                                                        <tr style="text-align: center;">
+                                                            <td><a href="https://www.youtube.com/@nomadkaraoke"
+                                                                    color="#230a89"
+                                                                    style="display: inline-block; padding: 0px; background-color: rgb(35, 10, 137);"
+                                                                    target="_blank"><img
+                                                                        src="https://beveradb.github.io/public-images/youtube-icon-2x.png"
+                                                                        alt="youtube" color="#230a89" width="24"
+                                                                        style="background-color: rgb(35, 10, 137); max-width: 135px; display: block;"></a>
+                                                            </td>
+                                                            <td width="5">
+                                                                <div></div>
+                                                            </td>
+                                                            <td><a href="https://github.com/nomadkaraoke"
+                                                                    color="#230a89"
+                                                                    style="display: inline-block; padding: 0px; background-color: rgb(35, 10, 137);"
+                                                                    target="_blank"><img
+                                                                        src="https://beveradb.github.io/public-images/github-icon-2x.png"
+                                                                        alt="github" color="#230a89" width="24"
+                                                                        style="background-color: rgb(35, 10, 137); max-width: 135px; display: block;"></a>
+                                                            </td>
+                                                            <td width="5">
+                                                                <div></div>
+                                                            </td>
+                                                            <td><a href="https://www.linkedin.com/in/andrewbeveridge"
+                                                                    color="#230a89"
+                                                                    style="display: inline-block; padding: 0px; background-color: rgb(35, 10, 137);"
+                                                                    target="_blank"><img
+                                                                        src="https://beveradb.github.io/public-images/linkedin-icon-2x.png"
+                                                                        alt="linkedin" color="#230a89" width="24"
+                                                                        style="background-color: rgb(35, 10, 137); max-width: 135px; display: block;"></a>
+                                                            </td>
+                                                            <td width="5">
+                                                                <div></div>
+                                                            </td>
+                                                            <td><a href="https://twitter.com/beveradb" color="#230a89"
+                                                                    style="display: inline-block; padding: 0px; background-color: rgb(35, 10, 137);"><img
+                                                                        src="https://beveradb.github.io/public-images/twitter-icon-2x.png"
+                                                                        alt="twitter" color="#230a89" width="24"
+                                                                        style="background-color: rgb(35, 10, 137); max-width: 135px; display: block;"></a>
+                                                            </td>
+                                                            <td width="5">
+                                                                <div></div>
+                                                            </td>
+                                                            <td><a href="https://www.instagram.com/beveradb/"
+                                                                    color="#230a89"
+                                                                    style="display: inline-block; padding: 0px; background-color: rgb(35, 10, 137);"><img
+                                                                        src="https://beveradb.github.io/public-images/instagram-icon-2x.png"
+                                                                        alt="instagram" color="#230a89" width="24"
+                                                                        style="background-color: rgb(35, 10, 137); max-width: 135px; display: block;"></a>
+                                                            </td>
+                                                            <td width="5">
+                                                                <div></div>
+                                                            </td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                                <table cellpadding="0" cellspacing="0" border="0"
+                                    style="width: 100%; font-size: medium; font-family: Trebuchet MS; margin-top: 3px; margin-bottom: 3px;">
+                                    <tbody>
+                                        <tr>
+                                            <td color="#ff7acc" direction="horizontal" width="auto" height="1"
+                                                style="width: 100%; border-bottom: 1px solid rgb(255, 122, 204); border-left: medium; display: block; line-height:0; font-size:0;">
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td color="#ff7acc" direction="horizontal" width="auto" height="15"
+                                                style="width: 100%; display: block;">
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                                <table cellpadding="0" cellspacing="0" border="0"
+                                    style="font-size: medium; font-family: Trebuchet MS;">
+                                    <tbody>
+                                        <tr style="vertical-align: middle;" height="20">
+                                            <td width="30" style="vertical-align: middle;">
+                                                <table cellpadding="0" cellspacing="0" border="0"
+                                                    style="font-size: medium; font-family: Trebuchet MS;">
+                                                    <tbody>
+                                                        <tr>
+                                                            <td style="vertical-align: bottom;"><span color="#ff7acc"
+                                                                    width="11"
+                                                                    style="display: inline-block; background-color: rgb(255, 122, 204);"><img
+                                                                        src="https://beveradb.github.io/public-images/phone-icon-2x.png"
+                                                                        color="#ff7acc" alt="mobilePhone" width="13"
+                                                                        style="display: block; background-color: rgb(255, 122, 204);"></span>
+                                                            </td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </td>
+                                            <td style="padding: 0px; color: rgb(0, 0, 0);"><a href="tel:8036363267"
+                                                color="#000000"
+                                                style="text-decoration: none; color: rgb(0, 0, 0); font-size: 12px;"><span>+1 (803) 636-3267</span></a> | <a href="tel:07835171222"
+                                                color="#000000"
+                                                style="text-decoration: none; color: rgb(0, 0, 0); font-size: 12px;"><span>+44 07835171222</span></a></td>
+                                        </tr>
+                                        <tr style="vertical-align: middle;" height="20">
+                                            <td width="30" style="vertical-align: middle;">
+                                                <table cellpadding="0" cellspacing="0" border="0"
+                                                    style="font-size: medium; font-family: Trebuchet MS;">
+                                                    <tbody>
+                                                        <tr>
+                                                            <td style="vertical-align: bottom;"><span color="#ff7acc"
+                                                                    width="11"
+                                                                    style="display: inline-block; background-color: rgb(255, 122, 204);"><img
+                                                                        src="https://beveradb.github.io/public-images/email-icon-2x.png"
+                                                                        color="#ff7acc" alt="emailAddress" width="13"
+                                                                        style="display: block; background-color: rgb(255, 122, 204);"></span>
+                                                            </td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </td>
+                                            <td style="padding: 0px;"><a href="mailto:andrew@nomadkaraoke.com"
+                                                    color="#000000"
+                                                    style="text-decoration: none; color: rgb(0, 0, 0); font-size: 12px;"><span>andrew@nomadkaraoke.com</span></a>
+                                            </td>
+                                        </tr>
+                                        <tr style="vertical-align: middle;" height="20">
+                                            <td width="30" style="vertical-align: middle;">
+                                                <table cellpadding="0" cellspacing="0" border="0"
+                                                    style="font-size: medium; font-family: Trebuchet MS;">
+                                                    <tbody>
+                                                        <tr>
+                                                            <td style="vertical-align: bottom;"><span color="#ff7acc"
+                                                                    width="11"
+                                                                    style="display: inline-block; background-color: rgb(255, 122, 204);"><img
+                                                                        src="https://beveradb.github.io/public-images/link-icon-2x.png"
+                                                                        color="#ff7acc" alt="website" width="13"
+                                                                        style="display: block; background-color: rgb(255, 122, 204);"></span>
+                                                            </td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </td>
+                                            <td style="padding: 0px;"><a href="https://nomadkaraoke.com" target="_blank"
+                                                    color="#000000"
+                                                    style="text-decoration: none; color: rgb(0, 0, 0); font-size: 12px;"><span>nomadkaraoke.com</span></a>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </td>
+        </tr>
+    </tbody>
+</table>
+"""
+
+    def send_job_completion(
+        self,
+        to_email: str,
+        message_content: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        brand_code: Optional[str] = None,
+        cc_admin: bool = True,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send job completion email with the rendered template content.
+
+        Args:
+            to_email: User's email address
+            message_content: Pre-rendered message content (plain text)
+            artist: Artist name for subject line
+            title: Song title for subject line
+            brand_code: Release ID (e.g., "NOMAD-1178") for subject line
+            cc_admin: Whether to CC gen@nomadkaraoke.com
+
+        Returns:
+            True if email was sent successfully
+        """
+        # Build subject: "NOMAD-1178: Artist - Title (Your karaoke video is ready!)"
+        # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+        # that cause email header encoding issues (MIME headers use latin-1)
+        safe_artist = sanitize_filename(artist) if artist else None
+        safe_title = sanitize_filename(title) if title else None
+        if brand_code and safe_artist and safe_title:
+            subject = t(locale, "emails.jobCompletion.subjectWithBrand", brand_code=brand_code, artist=safe_artist, title=safe_title)
+        elif safe_artist and safe_title:
+            subject = t(locale, "emails.jobCompletion.subject", artist=safe_artist, title=safe_title)
+        else:
+            subject = t(locale, "emails.jobCompletion.subjectFallback")
+
+        extra_styles = """
+        .content {
+            white-space: pre-wrap;
+        }
+"""
+
+        content = f"""
+    <div class="content">{html.escape(message_content)}</div>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        cc_emails = ["gen@nomadkaraoke.com"] if cc_admin else None
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=message_content,
+            cc_emails=cc_emails,
+            bcc_emails=["done@nomadkaraoke.com"],
+        )
+
+    def send_action_reminder(
+        self,
+        to_email: str,
+        message_content: str,
+        action_type: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send action-needed reminder email.
+
+        Args:
+            to_email: User's email address
+            message_content: Pre-rendered message content (plain text)
+            action_type: Type of action needed ("lyrics" or "instrumental")
+            artist: Artist name for subject line
+            title: Song title for subject line
+
+        Returns:
+            True if email was sent successfully
+        """
+        # Build subject based on action type
+        if action_type == "lyrics":
+            if artist and title:
+                subject = t(locale, "emails.actionReminder.lyricsSubject", artist=artist, title=title)
+            else:
+                subject = t(locale, "emails.actionReminder.lyricsSubjectFallback")
+        elif action_type == "instrumental":
+            if artist and title:
+                subject = t(locale, "emails.actionReminder.instrumentalSubject", artist=artist, title=title)
+            else:
+                subject = t(locale, "emails.actionReminder.instrumentalSubjectFallback")
+        elif action_type == "audio_edit":
+            if artist and title:
+                subject = t(locale, "emails.actionReminder.audioEditSubject", artist=artist, title=title)
+            else:
+                subject = t(locale, "emails.actionReminder.audioEditSubjectFallback")
+        else:
+            if artist and title:
+                subject = t(locale, "emails.actionReminder.audioEditSubject", artist=artist, title=title)
+            else:
+                subject = t(locale, "emails.actionReminder.audioEditSubjectFallback")
+
+        extra_styles = """
+        .alert {
+            background-color: #fef3c7;
+            border: 1px solid #fcd34d;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .content {
+            white-space: pre-wrap;
+        }
+"""
+
+        content = f"""
+    <div class="alert">
+        ⏰ {t(locale, "emails.actionReminder.alertHeading")}
+    </div>
+
+    <div class="content">{html.escape(message_content)}</div>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=message_content,
+        )
+
+    def send_review_reminder(
+        self,
+        to_email: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        job_id: Optional[str] = None,
+        locale: str = "en",
+        review_url: Optional[str] = None,
+    ) -> bool:
+        """
+        Send 24h review reminder email with expiry warning.
+
+        Sent when a job has been awaiting review for 24 hours.
+        Offers help and warns that the job will expire in another 24 hours.
+
+        Args:
+            to_email: User's email address
+            artist: Artist name for subject line
+            title: Song title for subject line
+            job_id: Job ID for constructing the review link
+            review_url: Override link (e.g. a one-click sign-in link to the review
+                for kjbox jobs); defaults to the bare review URL
+
+        Returns:
+            True if email was sent successfully
+        """
+        if artist and title:
+            subject = t(locale, "emails.reviewReminder.subject", artist=artist, title=title)
+        else:
+            subject = t(locale, "emails.reviewReminder.subjectFallback")
+
+        locale_prefix = get_locale_prefix(locale)
+        if not review_url:
+            review_url = f"{self.frontend_url}{locale_prefix}/app/jobs#/{job_id}/review" if job_id else f"{self.frontend_url}{locale_prefix}/app"
+
+        extra_styles = """
+        .alert {
+            background-color: #fef3c7;
+            border: 1px solid #fcd34d;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .expiry-warning {
+            background-color: #fef2f2;
+            border: 1px solid #fca5a5;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+            color: #991b1b;
+        }
+        .review-btn {
+            display: inline-block;
+            background-color: #ff7acc;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 16px 0;
+        }
+"""
+
+        song_name = f" for <strong>{html.escape(artist)} - {html.escape(title)}</strong>" if artist and title else ""
+        song_name_text = f" for {artist} - {title}" if artist and title else ""
+
+        content = f"""
+    <div class="alert">
+        ⏰ {t(locale, "emails.reviewReminder.alertHeading")}
+    </div>
+
+    <p>{t(locale, "emails.reviewReminder.reminderIntro", song_name=song_name)}</p>
+
+    <p style="text-align: center;">
+        <a href="{html.escape(review_url)}" class="review-btn">{t(locale, "emails.reviewReminder.reviewButton")}</a>
+    </p>
+
+    <p>{t(locale, "emails.reviewReminder.reviewInstructions")}</p>
+
+    <p>{t(locale, "emails.reviewReminder.helpOffer")}</p>
+
+    <div class="expiry-warning">
+        ⚠️ {t(locale, "emails.reviewReminder.expiryWarning")}
+    </div>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = (
+            f"{t(locale, 'emails.reviewReminder.reminderIntro', song_name=song_name_text)}\n\n"
+            f"{t(locale, 'emails.reviewReminder.reviewButton')}: {review_url}\n\n"
+            f"{t(locale, 'emails.reviewReminder.helpOffer')}\n\n"
+            f"{t(locale, 'emails.reviewReminder.expiryWarning')}"
+        )
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+    # ------------------------------------------------------------------
+    # Free-to-paid conversion emails (backend/services/conversion_emails.py)
+    # ------------------------------------------------------------------
+
+    _CONVERSION_STYLES = """
+        .offer {
+            background-color: #fdf2f8;
+            border: 1px solid #ff7acc;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+            font-size: 18px;
+        }
+        .cta-btn {
+            display: inline-block;
+            background-color: #ff7acc;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 16px 0;
+        }
+        .legal {
+            margin-top: 24px;
+            font-size: 12px;
+            color: #999;
+        }
+"""
+
+    def _commercial_footer(self, locale: str) -> Tuple[str, str]:
+        """(html, text) legal footer for promotional mail on the broadcast stream.
+
+        Postmark appends the unsubscribe link itself on the broadcast stream.
+        """
+        why = t(locale, "emails.conversion.whyReceiving")
+        address = self.settings.commercial_email_postal_address
+        return (
+            f'<p class="legal">{html.escape(why)}<br>{html.escape(address)}</p>',
+            f"{why}\n{address}",
+        )
+
+    def send_conversion_offer(
+        self,
+        to_email: str,
+        artist: Optional[str],
+        title: Optional[str],
+        percent: int,
+        offer_hours: int,
+        buy_url: str,
+        made_for_you_url: str,
+        locale: str = "en",
+    ) -> bool:
+        """E1: first free video is done, here's a time-limited discount on credits."""
+        subject = t(locale, "emails.conversion.offerSubject")
+        song = f"{artist} - {title}" if artist and title else ""
+        intro_key = "emails.conversion.offerIntro" if song else "emails.conversion.offerIntroNoSong"
+        intro_html = t(locale, intro_key, song=f"<strong>{html.escape(song)}</strong>")
+        intro_text = t(locale, intro_key, song=song)
+        offer = t(locale, "emails.conversion.offerLine", percent=percent, hours=offer_hours)
+        legal_html, legal_text = self._commercial_footer(locale)
+
+        content = f"""
+    <p>{intro_html}</p>
+    <p>{t(locale, "emails.conversion.offerLead")}</p>
+    <div class="offer"><strong>{html.escape(offer)}</strong><br>
+        <span style="font-size: 14px;">{t(locale, "emails.conversion.offerAutoApplied")}</span></div>
+    <p style="text-align: center;">
+        <a href="{html.escape(buy_url)}" class="cta-btn">{t(locale, "emails.conversion.offerButton")}</a>
+    </p>
+    <p>{t(locale, "emails.conversion.madeForYouLine")} <a href="{html.escape(made_for_you_url)}">{t(locale, "emails.conversion.madeForYouLink")}</a></p>
+"""
+        text_content = (
+            f"{intro_text}\n\n{t(locale, 'emails.conversion.offerLead')}\n\n"
+            f"{offer}\n{t(locale, 'emails.conversion.offerAutoApplied')}\n\n"
+            f"{t(locale, 'emails.conversion.offerButton')}: {buy_url}\n\n"
+            f"{t(locale, 'emails.conversion.madeForYouLine')} {made_for_you_url}\n\n{legal_text}"
+        )
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=self._build_email_html(
+                content, self._CONVERSION_STYLES, locale=locale, trailing_content=legal_html
+            ),
+            text_content=text_content,
+            message_stream="broadcast",
+        )
+
+    def send_conversion_offer_reminder(
+        self,
+        to_email: str,
+        percent: int,
+        hours_left: int,
+        buy_url: str,
+        locale: str = "en",
+    ) -> bool:
+        """E2: the E1 discount ends soon."""
+        subject = t(locale, "emails.conversion.reminderSubject", percent=percent, hours=hours_left)
+        body = t(locale, "emails.conversion.reminderBody", percent=percent, hours=hours_left)
+        legal_html, legal_text = self._commercial_footer(locale)
+        content = f"""
+    <p>{html.escape(body)}</p>
+    <p style="text-align: center;">
+        <a href="{html.escape(buy_url)}" class="cta-btn">{t(locale, "emails.conversion.reminderButton")}</a>
+    </p>
+    <p>{t(locale, "emails.conversion.reminderNoPressure")}</p>
+"""
+        text_content = (
+            f"{body}\n\n{t(locale, 'emails.conversion.reminderButton')}: {buy_url}\n\n"
+            f"{t(locale, 'emails.conversion.reminderNoPressure')}\n\n{legal_text}"
+        )
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=self._build_email_html(
+                content, self._CONVERSION_STYLES, locale=locale, trailing_content=legal_html
+            ),
+            text_content=text_content,
+            message_stream="broadcast",
+        )
+
+    def send_review_last_chance(
+        self,
+        to_email: str,
+        artist: Optional[str],
+        title: Optional[str],
+        review_url: str,
+        hours_left: int,
+        locale: str = "en",
+    ) -> bool:
+        """R2: final nudge a few hours before an unreviewed job auto-expires (transactional)."""
+        song = f"{artist} - {title}" if artist and title else ""
+        if song:
+            subject = t(locale, "emails.reviewLastChance.subject", hours=hours_left, song=song)
+            intro_html = t(locale, "emails.reviewLastChance.intro", hours=hours_left, song=f"<strong>{html.escape(song)}</strong>")
+            intro_text = t(locale, "emails.reviewLastChance.intro", hours=hours_left, song=song)
+        else:
+            subject = t(locale, "emails.reviewLastChance.subjectFallback", hours=hours_left)
+            intro_html = intro_text = t(locale, "emails.reviewLastChance.introNoSong", hours=hours_left)
+        content = f"""
+    <p>{intro_html}</p>
+    <p style="text-align: center;">
+        <a href="{html.escape(review_url)}" class="cta-btn">{t(locale, "emails.reviewLastChance.button")}</a>
+    </p>
+    <p>{t(locale, "emails.reviewLastChance.howLong")}</p>
+    <p>{t(locale, "emails.reviewLastChance.refundNote")}</p>
+"""
+        text_content = (
+            f"{intro_text}\n\n{t(locale, 'emails.reviewLastChance.button')}: {review_url}\n\n"
+            f"{t(locale, 'emails.reviewLastChance.howLong')}\n\n{t(locale, 'emails.reviewLastChance.refundNote')}"
+        )
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=self._build_email_html(content, self._CONVERSION_STYLES, locale=locale),
+            text_content=text_content,
+        )
+
+    def send_duration_confirm_reminder(
+        self,
+        to_email: str,
+        job_id: Optional[str] = None,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        pending_credits: Optional[int] = None,
+        duration_seconds: Optional[int] = None,
+        confirm_url: Optional[str] = None,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send a 15-minute idle reminder email for jobs awaiting duration confirmation.
+
+        Sent when a job has been in AWAITING_DURATION_CONFIRM for 15 minutes without
+        the user confirming the extra cost.
+
+        Args:
+            to_email: User's email address
+            job_id: Job ID (used to build the confirm URL if not provided)
+            artist: Artist name for subject line
+            title: Song title for subject line
+            pending_credits: Number of additional credits required
+            duration_seconds: Actual duration of the song in seconds
+            confirm_url: Direct URL to the confirmation page
+            locale: User's locale (future: translated; currently English)
+
+        Returns:
+            True if email was sent successfully
+        """
+        if artist and title:
+            subject = f"Your karaoke job needs you to confirm the cost — {artist} - {title}"
+        else:
+            subject = "Your karaoke job needs you to confirm the cost"
+
+        extra_styles = """
+        .alert {
+            background-color: #fef3c7;
+            border: 1px solid #fcd34d;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .confirm-btn {
+            display: inline-block;
+            background-color: #ff7acc;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 16px 0;
+        }
+        .cost-box {
+            background-color: #f0f9ff;
+            border: 1px solid #93c5fd;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+        }
+"""
+
+        song_name = (
+            f" for <strong>{html.escape(artist)} — {html.escape(title)}</strong>"
+            if artist and title
+            else ""
+        )
+        song_name_text = f" for {artist} — {title}" if artist and title else ""
+
+        # Build cost detail line (best-effort — fields may be absent for older jobs)
+        if pending_credits is not None and duration_seconds is not None:
+            duration_mins = duration_seconds // 60
+            duration_secs = duration_seconds % 60
+            duration_str = f"{duration_mins}:{duration_secs:02d}"
+            cost_detail_html = (
+                f"<p>The song{song_name} turned out to be "
+                f"<strong>{duration_str}</strong> long and requires "
+                f"<strong>{pending_credits} additional credit"
+                f"{'s' if pending_credits != 1 else ''}</strong> to process.</p>"
+            )
+            cost_detail_text = (
+                f"The song{song_name_text} turned out to be {duration_str} long and "
+                f"requires {pending_credits} additional credit"
+                f"{'s' if pending_credits != 1 else ''} to process.\n"
+            )
+        elif pending_credits is not None:
+            cost_detail_html = (
+                f"<p>Processing{song_name} requires "
+                f"<strong>{pending_credits} additional credit"
+                f"{'s' if pending_credits != 1 else ''}</strong>.</p>"
+            )
+            cost_detail_text = (
+                f"Processing{song_name_text} requires {pending_credits} additional credit"
+                f"{'s' if pending_credits != 1 else ''}.\n"
+            )
+        else:
+            cost_detail_html = f"<p>Your karaoke job{song_name} requires a few extra credits to continue.</p>"
+            cost_detail_text = f"Your karaoke job{song_name_text} requires a few extra credits to continue.\n"
+
+        # TODO(i18n): translate subject/body once duration-confirm keys are added to
+        # backend/translations/{locale}.json.  URL already uses the locale prefix.
+        locale_prefix = get_locale_prefix(locale)
+        url_to_use = confirm_url or (
+            f"{self.frontend_url}{locale_prefix}/app/jobs#/{job_id}/review"
+            if job_id
+            else f"{self.frontend_url}{locale_prefix}/app"
+        )
+
+        content = f"""
+    <div class="alert">
+        ⏰ Your job is waiting for your confirmation
+    </div>
+
+    {cost_detail_html}
+
+    <p>Please visit your job to review the cost and confirm whether to continue processing.</p>
+
+    <p style="text-align: center;">
+        <a href="{html.escape(url_to_use)}" class="confirm-btn">Confirm cost &amp; continue</a>
+    </p>
+
+    <p>If you have any questions, just reply to this email — we're happy to help.</p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = (
+            f"Your karaoke job is waiting for your confirmation.\n\n"
+            f"{cost_detail_text}\n"
+            f"Please visit your job to confirm: {url_to_use}\n\n"
+            f"If you have any questions, just reply to this email — we're happy to help."
+        )
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+    def send_community_audio_selection_needed(
+        self,
+        to_email: str,
+        artist: str,
+        title: str,
+        job_id: str,
+        locale: str = "en",
+    ) -> bool:
+        """Ask the owner of a requests-board pick to choose its audio source.
+
+        Sent when the daily pick couldn't find one unmistakably correct source, so the job
+        waits in AWAITING_AUDIO_SELECTION for the owner to choose it in the gen UI.
+        """
+        subject = t(locale, "emails.communityAudioSelection.subject", artist=artist, title=title)
+        url = f"{self.frontend_url}{get_locale_prefix(locale)}/app/jobs#/{job_id}"
+        extra_styles = """
+        .alert { background-color: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px;
+                 padding: 16px; margin: 20px 0; text-align: center; }
+        .action-btn { display: inline-block; background-color: #ff7acc; color: #ffffff !important;
+                      text-decoration: none; padding: 12px 24px; border-radius: 8px;
+                      font-weight: bold; margin: 16px 0; }
+"""
+        intro = t(locale, "emails.communityAudioSelection.intro", artist=artist, title=title)
+        content = f"""
+    <div class="alert">{html.escape(t(locale, "emails.communityAudioSelection.heading"))}</div>
+    <p>{html.escape(intro)}</p>
+    <p style="text-align: center;">
+        <a href="{html.escape(url)}" class="action-btn">{html.escape(t(locale, "emails.communityAudioSelection.button"))}</a>
+    </p>
+    <p>{html.escape(t(locale, "emails.communityAudioSelection.help"))}</p>
+"""
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+        text_content = f"{intro}\n\n{url}\n\n{t(locale, 'emails.communityAudioSelection.help')}"
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+    def send_review_expired(
+        self,
+        to_email: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        credits_balance: int = 0,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send review expiry notification email.
+
+        Sent when a job is auto-cancelled after 48 hours in review.
+        Informs the user their credit has been refunded.
+
+        Args:
+            to_email: User's email address
+            artist: Artist name for subject line
+            title: Song title for subject line
+            credits_balance: User's current credit balance after refund
+
+        Returns:
+            True if email was sent successfully
+        """
+        if artist and title:
+            subject = t(locale, "emails.reviewExpired.subject", artist=artist, title=title)
+        else:
+            subject = t(locale, "emails.reviewExpired.subjectFallback")
+
+        extra_styles = """
+        .info-box {
+            background-color: #f0f9ff;
+            border: 1px solid #93c5fd;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .credit-badge {
+            display: inline-block;
+            background-color: #22c55e;
+            color: #ffffff;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-weight: bold;
+        }
+        .create-btn {
+            display: inline-block;
+            background-color: #ff7acc;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 16px 0;
+        }
+"""
+
+        song_name = f" for <strong>{html.escape(artist)} - {html.escape(title)}</strong>" if artist and title else ""
+        song_name_text = f" for {artist} - {title}" if artist and title else ""
+        credits_word = t(locale, "emails.reviewExpired.creditSingular") if credits_balance == 1 else t(locale, "emails.reviewExpired.creditPlural")
+
+        content = f"""
+    <div class="info-box">
+        {t(locale, "emails.reviewExpired.cancelNotice", song_name=song_name)}
+    </div>
+
+    <p>{t(locale, "emails.reviewExpired.refundNotice", credits_balance=credits_balance, credits_word=credits_word)}</p>
+
+    <p>{t(locale, "emails.reviewExpired.createNewPrompt")}</p>
+
+    <p style="text-align: center;">
+        <a href="{html.escape(self.frontend_url)}{get_locale_prefix(locale)}/app" class="create-btn">{t(locale, "emails.reviewExpired.createButton")}</a>
+    </p>
+
+    <p>{t(locale, "emails.reviewExpired.helpOffer")}</p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = (
+            f"{t(locale, 'emails.reviewExpired.cancelNotice', song_name=song_name_text)}\n\n"
+            f"{t(locale, 'emails.reviewExpired.refundNotice', credits_balance=credits_balance, credits_word=credits_word)}\n\n"
+            f"{self.frontend_url}{get_locale_prefix(locale)}/app\n\n"
+            f"{t(locale, 'emails.reviewExpired.helpOffer')}"
+        )
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+    def send_duration_confirm_expired(
+        self,
+        to_email: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        credits_refunded: int = 0,
+        locale: str = "en",
+        reason: str = "timeout",
+    ) -> bool:
+        """
+        Send duration-confirm cancellation notification email.
+
+        Two cancellation reasons are supported via the ``reason`` parameter:
+
+        - ``"timeout"`` (default): job was auto-cancelled after 48 hours in
+          AWAITING_DURATION_CONFIRM because the user never confirmed the extra cost.
+        - ``"over_limit"`` : job was immediately cancelled because the audio
+          duration exceeds the supported 60-minute ceiling.
+
+        Args:
+            to_email: User's email address
+            artist: Artist name for subject line
+            title: Song title for subject line
+            credits_refunded: Number of credits that were refunded
+            locale: User locale (reserved for future i18n; currently English)
+            reason: "timeout" or "over_limit" — controls the cancellation message
+
+        Returns:
+            True if email was sent successfully
+        """
+        if reason == "over_limit":
+            if artist and title:
+                subject = f"Your karaoke job was cancelled — audio exceeds 60 minutes ({artist} - {title})"
+            else:
+                subject = "Your karaoke job was cancelled — audio exceeds 60 minutes"
+        else:
+            if artist and title:
+                subject = f"Your karaoke job was cancelled — cost not confirmed in time ({artist} - {title})"
+            else:
+                subject = "Your karaoke job was cancelled — cost not confirmed in time"
+
+        extra_styles = """
+        .info-box {
+            background-color: #f0f9ff;
+            border: 1px solid #93c5fd;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        .credit-badge {
+            display: inline-block;
+            background-color: #22c55e;
+            color: #ffffff;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-weight: bold;
+        }
+        .create-btn {
+            display: inline-block;
+            background-color: #ff7acc;
+            color: #ffffff !important;
+            text-decoration: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin: 16px 0;
+        }
+"""
+
+        song_name = f" for <strong>{html.escape(artist)} - {html.escape(title)}</strong>" if artist and title else ""
+        song_name_text = f" for {artist} - {title}" if artist and title else ""
+        credits_word = "credit" if credits_refunded == 1 else "credits"
+
+        refund_notice_html = (
+            f"<p>We've refunded <span class=\"credit-badge\">{credits_refunded} {credits_word}</span> "
+            f"to your account.</p>"
+            if credits_refunded > 0
+            else "<p>Your account has been updated.</p>"
+        )
+        refund_notice_text = (
+            f"We've refunded {credits_refunded} {credits_word} to your account."
+            if credits_refunded > 0
+            else "Your account has been updated."
+        )
+
+        if reason == "over_limit":
+            cancel_reason_html = (
+                f"Your karaoke job{song_name} was automatically cancelled because the audio "
+                f"exceeds the supported 60-minute limit."
+            )
+            cancel_reason_text = (
+                f"Your karaoke job{song_name_text} was automatically cancelled because the "
+                f"audio exceeds the supported 60-minute limit."
+            )
+        else:
+            cancel_reason_html = (
+                f"Your karaoke job{song_name} was automatically cancelled because the extra cost "
+                f"was not confirmed within 48 hours."
+            )
+            cancel_reason_text = (
+                f"Your karaoke job{song_name_text} was automatically cancelled because the extra "
+                f"cost was not confirmed within 48 hours."
+            )
+
+        # TODO(i18n): translate subject/body once duration-confirm keys are added to
+        # backend/translations/{locale}.json.  URL already uses the locale prefix.
+        locale_prefix = get_locale_prefix(locale)
+        app_url = f"{self.frontend_url}{locale_prefix}/app"
+
+        content = f"""
+    <div class="info-box">
+        {cancel_reason_html}
+    </div>
+
+    {refund_notice_html}
+
+    <p>You can start a new job at any time — your credits are ready to use.</p>
+
+    <p style="text-align: center;">
+        <a href="{html.escape(app_url)}" class="create-btn">Create a new job</a>
+    </p>
+
+    <p>If you have any questions, just reply to this email — we're happy to help.</p>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        text_content = (
+            f"{cancel_reason_text}\n\n"
+            f"{refund_notice_text}\n\n"
+            f"You can start a new job at any time: {app_url}\n\n"
+            f"If you have any questions, just reply to this email — we're happy to help."
+        )
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+    def send_youtube_upload_complete(
+        self,
+        to_email: str,
+        message_content: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        brand_code: Optional[str] = None,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send follow-up email when a deferred YouTube upload completes.
+
+        Args:
+            to_email: User's email address
+            message_content: Pre-rendered message content (plain text)
+            artist: Artist name for subject line
+            title: Song title for subject line
+            brand_code: Release ID for subject line
+
+        Returns:
+            True if email was sent successfully
+        """
+        safe_artist = sanitize_filename(artist) if artist else None
+        safe_title = sanitize_filename(title) if title else None
+        if brand_code and safe_artist and safe_title:
+            subject = t(locale, "emails.youtubeUpload.subjectWithBrand", brand_code=brand_code, artist=safe_artist, title=safe_title)
+        elif safe_artist and safe_title:
+            subject = t(locale, "emails.youtubeUpload.subject", artist=safe_artist, title=safe_title)
+        else:
+            subject = t(locale, "emails.youtubeUpload.subjectFallback")
+
+        extra_styles = """
+        .content {
+            white-space: pre-wrap;
+        }
+"""
+
+        content = f"""
+    <div class="content">{html.escape(message_content)}</div>
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=message_content,
+            cc_emails=["gen@nomadkaraoke.com"],
+        )
+
+    def send_community_track_live(
+        self,
+        to_email: str,
+        message_content: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        locale: str = "en",
+    ) -> bool:
+        """Notify a voter that a community track they voted for is live on YouTube.
+
+        Sent (fanned out) to every up-voter when a requests-board pick publishes.
+        No cc to gen@ — this is a bulk voter notification, not an ops email.
+        """
+        safe_artist = sanitize_filename(artist) if artist else None
+        safe_title = sanitize_filename(title) if title else None
+        if safe_artist and safe_title:
+            subject = t(locale, "emails.communityTrackLive.subject", artist=safe_artist, title=safe_title)
+        else:
+            subject = t(locale, "emails.communityTrackLive.subjectFallback")
+
+        extra_styles = """
+        .content {
+            white-space: pre-wrap;
+        }
+"""
+        content = f"""
+    <div class="content">{html.escape(message_content)}</div>
+"""
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=message_content,
+        )
+
+    def send_community_existing_version(
+        self,
+        to_email: str,
+        message_content: str,
+        artist: Optional[str] = None,
+        title: Optional[str] = None,
+        locale: str = "en",
+    ) -> bool:
+        """Notify an up-voter that a requests-board pick was rejected because a good
+        community karaoke version already exists (with a link to it)."""
+        safe_artist = sanitize_filename(artist) if artist else None
+        safe_title = sanitize_filename(title) if title else None
+        if safe_artist and safe_title:
+            subject = t(locale, "emails.communityExistingVersion.subject", artist=safe_artist, title=safe_title)
+        else:
+            subject = t(locale, "emails.communityExistingVersion.subjectFallback")
+
+        extra_styles = """
+        .content {
+            white-space: pre-wrap;
+        }
+"""
+        content = f"""
+    <div class="content">{html.escape(message_content)}</div>
+"""
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=message_content,
+        )
+
+    def send_made_for_you_order_confirmation(
+        self,
+        to_email: str,
+        artist: str,
+        title: str,
+        job_id: str,
+        notes: Optional[str] = None,
+        locale: str = "en",
+    ) -> bool:
+        """
+        Send order confirmation email to customer for made-for-you orders.
+
+        Args:
+            to_email: Customer's email address
+            artist: Artist name
+            title: Song title
+            job_id: Order/job ID for reference
+            notes: Optional customer notes
+
+        Returns:
+            True if email was sent successfully
+        """
+        subject = t(locale, "emails.madeForYouConfirmation.subject", artist=artist, title=title)
+
+        extra_styles = """
+        .order-details {
+            background-color: #f8fafc;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .order-details h3 {
+            margin-top: 0;
+            color: #1e293b;
+        }
+        .order-details p {
+            margin: 8px 0;
+            color: #475569;
+        }
+        .highlight {
+            color: #059669;
+            font-weight: bold;
+        }
+"""
+
+        notes_html = ""
+        notes_text = ""
+        if notes:
+            notes_html = f"<p><strong>{t(locale, 'emails.madeForYouConfirmation.yourNotes')}</strong> {html.escape(notes)}</p>"
+            notes_text = f"\n{t(locale, 'emails.madeForYouConfirmation.yourNotes')} {notes}"
+
+        content = f"""
+    <h2>{t(locale, "emails.madeForYouConfirmation.thankYou")}</h2>
+
+    <div class="order-details">
+        <h3>{t(locale, "emails.madeForYouConfirmation.orderDetails")}</h3>
+        <p><strong>{t(locale, "emails.madeForYouConfirmation.orderId")}</strong> {html.escape(job_id)}</p>
+        <p><strong>{t(locale, "emails.madeForYouConfirmation.artist")}</strong> {html.escape(artist)}</p>
+        <p><strong>{t(locale, "emails.madeForYouConfirmation.title")}</strong> {html.escape(title)}</p>
+        {notes_html}
+    </div>
+
+    <p>{t(locale, "emails.madeForYouConfirmation.deliveryTime", hours=24)}</p>
+
+    <p>{t(locale, "emails.madeForYouConfirmation.deliveryNotice")}</p>
+
+    <p><strong>{t(locale, "emails.madeForYouConfirmation.noAction")}</strong></p>
+"""
+
+        text_content = f"""{t(locale, "emails.madeForYouConfirmation.thankYou")}
+
+{t(locale, "emails.madeForYouConfirmation.orderDetails")}:
+{t(locale, "emails.madeForYouConfirmation.orderId")} {job_id}
+{t(locale, "emails.madeForYouConfirmation.artist")} {artist}
+{t(locale, "emails.madeForYouConfirmation.title")} {title}{notes_text}
+
+{t(locale, "emails.madeForYouConfirmation.deliveryTime", hours=24)}
+
+{t(locale, "emails.madeForYouConfirmation.deliveryNotice")}
+
+{t(locale, "emails.madeForYouConfirmation.noAction")}
+"""
+
+        html_content = self._build_email_html(content, extra_styles, locale=locale)
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            bcc_emails=["done@nomadkaraoke.com"],
+        )
+
+    def send_made_for_you_admin_notification(
+        self,
+        to_email: str,
+        customer_email: str,
+        artist: str,
+        title: str,
+        job_id: str,
+        admin_login_token: str,
+        notes: Optional[str] = None,
+        audio_source_count: int = 0,
+    ) -> bool:
+        """
+        Send notification email to admin for new made-for-you orders.
+
+        Args:
+            to_email: Admin email address
+            customer_email: Customer's email address
+            artist: Artist name
+            title: Song title
+            job_id: Job ID for reference
+            admin_login_token: Token for one-click admin login
+            notes: Optional customer notes
+            audio_source_count: Number of audio sources found
+
+        Returns:
+            True if email was sent successfully
+        """
+        subject = f"Karaoke Order: {artist} - {title} [ID: {job_id}]"
+
+        extra_styles = """
+        .order-info {
+            background-color: #f8fafc;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .order-info p {
+            margin: 8px 0;
+        }
+        .action-button {
+            display: inline-block;
+            background-color: #2563eb;
+            color: white !important;
+            padding: 12px 24px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: bold;
+            margin-top: 16px;
+        }
+"""
+
+        notes_html = ""
+        notes_text = ""
+        if notes:
+            notes_html = f"<p><strong>Customer Notes:</strong> {html.escape(notes)}</p>"
+            notes_text = f"\nCustomer Notes: {notes}"
+
+        # Calculate deadline (24 hours from now, converted to Eastern Time)
+        deadline_utc = datetime.now(timezone.utc) + timedelta(hours=24)
+        eastern_tz = ZoneInfo("America/New_York")
+        deadline_eastern = deadline_utc.astimezone(eastern_tz)
+        # Use "ET" (Eastern Time) to be correct for both EST and EDT
+        deadline_str = deadline_eastern.strftime("%B %d, %Y at %I:%M %p") + " ET"
+
+        # Link to /app/ with admin login token for one-click access, deep-linked to the
+        # awaiting-audio-selection queue so the made-for-you order is shown immediately
+        # (made-for-you cards render there; the status param pre-selects the filter).
+        app_url = (
+            f"{self.frontend_url.rstrip('/')}/app/"
+            f"?admin_token={admin_login_token}&status=awaiting_audio_selection"
+        )
+
+        content = f"""
+    <div class="order-info">
+        <p><strong>Order / Job ID:</strong> {html.escape(job_id)}</p>
+        <p><strong>Customer:</strong> {html.escape(customer_email)}</p>
+        <p><strong>Artist:</strong> {html.escape(artist)}</p>
+        <p><strong>Title:</strong> {html.escape(title)}</p>
+        <p><strong>Audio Sources Found:</strong> {audio_source_count}</p>
+        {notes_html}
+        <p><strong>Deliver By:</strong> {deadline_str}</p>
+        <p style="margin-top: 16px;"><strong>Action Required:</strong> Select an audio source to start processing.</p>
+        <a href="{app_url}" class="action-button">Open Job</a>
+    </div>
+"""
+
+        text_content = f"""New Karaoke Order
+
+Order / Job ID: {job_id}
+Customer: {customer_email}
+Artist: {artist}
+Title: {title}
+Audio Sources Found: {audio_source_count}{notes_text}
+Deliver By: {deadline_str}
+
+Action Required: Select an audio source to start processing.
+
+Open Job: {app_url}
+"""
+
+        html_content = self._build_email_html(content, extra_styles)
+
+        return self._log_and_send(
+            to_email=to_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+
+    def send_feedback_notification(
+        self,
+        user_email: str,
+        overall_rating: int,
+        ease_of_use_rating: int,
+        lyrics_accuracy_rating: int,
+        correction_experience_rating: int,
+        what_went_well: Optional[str] = None,
+        what_could_improve: Optional[str] = None,
+        additional_comments: Optional[str] = None,
+        would_recommend: bool = True,
+        would_use_again: bool = True,
+    ) -> bool:
+        """
+        Send admin notification when a user submits product feedback.
+
+        Args:
+            user_email: Email of the user who submitted feedback
+            overall_rating: 1-5 star rating
+            ease_of_use_rating: 1-5 star rating
+            lyrics_accuracy_rating: 1-5 star rating
+            correction_experience_rating: 1-5 star rating
+            what_went_well: Optional text feedback
+            what_could_improve: Optional text feedback
+            additional_comments: Optional text feedback
+            would_recommend: Whether user would recommend
+            would_use_again: Whether user would use again
+
+        Returns:
+            True if email was sent successfully
+        """
+        admin_email = os.getenv("ADMIN_NOTIFICATION_EMAIL", "admin@nomadkaraoke.com")
+        subject = f"New Feedback from {user_email} — {overall_rating}/5 overall"
+
+        def stars(rating: int) -> str:
+            return "★" * rating + "☆" * (5 - rating)
+
+        def text_block(label: str, value: Optional[str]) -> str:
+            if not value:
+                return ""
+            escaped = html.escape(value).replace("\n", "<br>")
+            return f"""
+            <tr>
+                <td style="padding: 8px 12px; font-weight: bold; vertical-align: top; white-space: nowrap;">{label}</td>
+                <td style="padding: 8px 12px;">{escaped}</td>
+            </tr>"""
+
+        recommend_badge = "Yes ✓" if would_recommend else "No ✗"
+        use_again_badge = "Yes ✓" if would_use_again else "No ✗"
+
+        admin_url = f"{self.frontend_url}/admin/feedback"
+
+        extra_styles = """
+        .feedback-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+        }
+        .feedback-table td {
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .stars {
+            color: #eab308;
+            font-size: 18px;
+            letter-spacing: 2px;
+        }
+"""
+
+        content = f"""
+    <p>New product feedback submitted by <strong>{html.escape(user_email)}</strong>:</p>
+
+    <table class="feedback-table">
+        <tr>
+            <td style="padding: 8px 12px; font-weight: bold;">Overall</td>
+            <td style="padding: 8px 12px;"><span class="stars">{stars(overall_rating)}</span> ({overall_rating}/5)</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 12px; font-weight: bold;">Ease of Use</td>
+            <td style="padding: 8px 12px;"><span class="stars">{stars(ease_of_use_rating)}</span> ({ease_of_use_rating}/5)</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 12px; font-weight: bold;">Lyrics Accuracy</td>
+            <td style="padding: 8px 12px;"><span class="stars">{stars(lyrics_accuracy_rating)}</span> ({lyrics_accuracy_rating}/5)</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 12px; font-weight: bold;">Correction Experience</td>
+            <td style="padding: 8px 12px;"><span class="stars">{stars(correction_experience_rating)}</span> ({correction_experience_rating}/5)</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 12px; font-weight: bold;">Would Recommend</td>
+            <td style="padding: 8px 12px;">{recommend_badge}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 12px; font-weight: bold;">Would Use Again</td>
+            <td style="padding: 8px 12px;">{use_again_badge}</td>
+        </tr>
+        {text_block("What went well", what_went_well)}
+        {text_block("What could improve", what_could_improve)}
+        {text_block("Additional comments", additional_comments)}
+    </table>
+
+    <p style="text-align: center;">
+        <a href="{admin_url}" class="button">View All Feedback</a>
+    </p>
+"""
+
+        text_content = f"""New Feedback from {user_email}
+
+Overall: {overall_rating}/5
+Ease of Use: {ease_of_use_rating}/5
+Lyrics Accuracy: {lyrics_accuracy_rating}/5
+Correction Experience: {correction_experience_rating}/5
+Would Recommend: {recommend_badge}
+Would Use Again: {use_again_badge}
+
+What went well: {what_went_well or '(empty)'}
+What could improve: {what_could_improve or '(empty)'}
+Additional comments: {additional_comments or '(empty)'}
+
+View all feedback: {admin_url}
+"""
+
+        html_content = self._build_email_html(content, extra_styles)
+
+        return self._log_and_send(
+            to_email=admin_email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+
+    def send_credit_review_needed_email(
+        self,
+        user_email: str,
+        grant_type: str,
+        reason: str,
+        signals: dict | None = None,
+    ) -> bool:
+        """
+        Notify Andrew that a credit grant needs manual review.
+
+        Sent when AI evaluation fails, is uncertain, or encounters an error.
+        Includes abuse signals and a direct link to the user's admin page.
+        """
+        admin_user_url = f"{self.frontend_url}/admin/users/detail?email={user_email}"
+        subject = f"Credit review needed: {user_email} ({grant_type})"
+
+        # Build signals summary for the email
+        signals_html = ""
+        signals_text = ""
+        if signals:
+            user_data = signals.get("user_data", {})
+            ip_geo = signals.get("ip_geo")
+            fp_matches = signals.get("fingerprint_matches", [])
+            ip_matches = signals.get("ip_matches", [])
+
+            rows = []
+            text_rows = []
+
+            if user_data.get("signup_ip"):
+                rows.append(("IP Address", user_data["signup_ip"]))
+                text_rows.append(f"IP Address: {user_data['signup_ip']}")
+
+            if ip_geo:
+                geo_str = ", ".join(
+                    str(v) for v in [
+                        ip_geo.get("city"), ip_geo.get("region"), ip_geo.get("country"),
+                    ] if v
+                )
+                if ip_geo.get("org"):
+                    geo_str += f" ({ip_geo['org']})"
+                if geo_str:
+                    rows.append(("Location", geo_str))
+                    text_rows.append(f"Location: {geo_str}")
+
+            if signals.get("user_agent"):
+                rows.append(("User Agent", signals["user_agent"]))
+                text_rows.append(f"User Agent: {signals['user_agent']}")
+
+            if user_data.get("device_fingerprint"):
+                fp = user_data["device_fingerprint"]
+                rows.append(("Fingerprint", f"{fp[:12]}..."))
+                text_rows.append(f"Fingerprint: {fp[:12]}...")
+
+            rows.append(("Recent signups (IP)", str(signals.get("recent_signups_ip", 0))))
+            rows.append(("Recent signups (fingerprint)", str(signals.get("recent_signups_fp", 0))))
+            text_rows.append(f"Recent signups from IP: {signals.get('recent_signups_ip', 0)}")
+            text_rows.append(f"Recent signups from fingerprint: {signals.get('recent_signups_fp', 0)}")
+
+            if fp_matches:
+                match_emails = ", ".join(m.get("email", "?") for m in fp_matches)
+                rows.append(("Fingerprint matches", match_emails))
+                text_rows.append(f"Fingerprint matches: {match_emails}")
+
+            if ip_matches:
+                match_emails = ", ".join(m.get("email", "?") for m in ip_matches)
+                rows.append(("IP matches", match_emails))
+                text_rows.append(f"IP matches: {match_emails}")
+
+            table_rows = "".join(
+                f'<tr><td style="padding:4px 12px 4px 0;color:#999;white-space:nowrap;">{html.escape(label)}</td>'
+                f'<td style="padding:4px 0;">{html.escape(value or "")}</td></tr>'
+                for label, value in rows
+            )
+            signals_html = f"""
+    <table style="margin:12px 0;font-size:14px;border-collapse:collapse;">{table_rows}</table>"""
+            signals_text = "\n".join(text_rows)
+
+        content = f"""
+    <p>A {grant_type} credit grant for <strong>{user_email}</strong> needs your review.</p>
+
+    <p><strong>Reason:</strong> {reason}</p>
+    {signals_html}
+    <p>The user has been told that their signup is being reviewed and credits will be
+    assigned shortly if everything checks out.</p>
+
+    <p style="text-align: center;">
+        <a href="{admin_user_url}" class="button">Review User</a>
+    </p>
+
+    <p style="color: #999; font-size: 14px;">
+        If the user looks legitimate, grant them credits from their admin page.
+        If not, no action needed — they already have 0 credits.
+    </p>
+"""
+
+        signals_section = f"\n{signals_text}\n" if signals_text else ""
+        text_content = f"""Credit review needed: {user_email} ({grant_type})
+
+Reason: {reason}
+{signals_section}
+Review user: {admin_user_url}
+
+If the user looks legitimate, grant them credits from their admin page.
+"""
+
+        html_content = self._build_email_html(content)
+
+        return self._log_and_send(
+            to_email="andrew@beveridge.uk",
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+        )
+
+    def send_credit_denied_email(self, email: str, grant_type: str = "welcome", locale: str = "en") -> bool:
+        """
+        Send a friendly-but-firm email when free credits are denied due to abuse signals.
+
+        CC'd to andrew@beveridge.uk so he can intervene if it's a false positive.
+        The tone invites the user to reply if it's a mistake.
+        """
+        subject = t(locale, "emails.creditDenied.subject")
+
+        credit_type = t(locale, "emails.creditDenied.welcomeCredits") if grant_type == "welcome" else t(locale, "emails.creditDenied.feedbackCredits")
+
+        content = f"""
+    <p>{t(locale, "emails.creditDenied.greeting")}</p>
+
+    <p>{t(locale, "emails.creditDenied.thankYou")}</p>
+
+    <p>{t(locale, "emails.creditDenied.deniedMessage", credit_type=credit_type)}</p>
+
+    <p>{t(locale, "emails.creditDenied.mistakeNote")}</p>
+
+    <p>{t(locale, "emails.creditDenied.buyPrompt")}</p>
+
+    <p style="text-align: center;">
+        <a href="{self.buy_url}" class="button">{t(locale, "emails.creditDenied.buyButton")}</a>
+    </p>
+
+    <p style="color: #999; font-size: 14px;">{t(locale, "emails.creditDenied.costNote")}</p>
+"""
+
+        text_content = f"""{t(locale, "emails.creditDenied.greeting")}
+
+{t(locale, "emails.creditDenied.thankYou")}
+
+{t(locale, "emails.creditDenied.deniedMessage", credit_type=credit_type)}
+
+{t(locale, "emails.creditDenied.mistakeNote")}
+
+{t(locale, "emails.creditDenied.buyPrompt")}
+{self.buy_url}
+
+---
+© {self._get_year()} Nomad Karaoke
+"""
+
+        html_content = self._build_email_html(content, locale=locale)
+
+        return self._log_and_send(
+            to_email=email,
+            subject=subject,
+            html_content=html_content,
+            text_content=text_content,
+            cc_emails=["andrew@beveridge.uk"],
+        )
+
+
+# Global instance
+_email_service = None
+
+
+def get_email_service() -> EmailService:
+    """Get the global email service instance."""
+    global _email_service
+    if _email_service is None:
+        _email_service = EmailService()
+    return _email_service

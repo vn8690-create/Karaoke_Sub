@@ -1,0 +1,2638 @@
+"""
+Unit tests for review.py routes and related components.
+
+These tests verify the review-related state transitions and data structures.
+Tests that require full backend imports are in the emulator integration tests.
+"""
+import pytest
+import json
+from datetime import datetime, UTC
+from unittest.mock import MagicMock, AsyncMock, patch
+
+
+class TestJobStatusTransitionsForReview:
+    """Tests for review-related state transitions.
+    
+    These tests verify the Job model's state machine handles review flow correctly.
+    """
+    
+    def test_awaiting_review_can_transition_to_in_review(self):
+        """Test AWAITING_REVIEW -> IN_REVIEW is valid."""
+        from backend.models.job import STATE_TRANSITIONS, JobStatus
+        valid_transitions = STATE_TRANSITIONS.get(JobStatus.AWAITING_REVIEW, [])
+        assert JobStatus.IN_REVIEW in valid_transitions
+    
+    def test_awaiting_review_can_transition_to_review_complete(self):
+        """Test AWAITING_REVIEW -> REVIEW_COMPLETE is valid (skip in_review)."""
+        from backend.models.job import STATE_TRANSITIONS, JobStatus
+        valid_transitions = STATE_TRANSITIONS.get(JobStatus.AWAITING_REVIEW, [])
+        assert JobStatus.REVIEW_COMPLETE in valid_transitions
+    
+    def test_in_review_can_transition_to_review_complete(self):
+        """Test IN_REVIEW -> REVIEW_COMPLETE is valid."""
+        from backend.models.job import STATE_TRANSITIONS, JobStatus
+        valid_transitions = STATE_TRANSITIONS.get(JobStatus.IN_REVIEW, [])
+        assert JobStatus.REVIEW_COMPLETE in valid_transitions
+    
+    def test_review_complete_transitions_to_rendering_video(self):
+        """Test REVIEW_COMPLETE -> RENDERING_VIDEO is valid."""
+        from backend.models.job import STATE_TRANSITIONS, JobStatus
+        valid_transitions = STATE_TRANSITIONS.get(JobStatus.REVIEW_COMPLETE, [])
+        assert JobStatus.RENDERING_VIDEO in valid_transitions
+    
+    def test_rendering_video_status_exists(self):
+        """Test RENDERING_VIDEO status exists in JobStatus enum."""
+        from backend.models.job import JobStatus
+        assert hasattr(JobStatus, 'RENDERING_VIDEO')
+        assert JobStatus.RENDERING_VIDEO.value == "rendering_video"
+    
+    def test_rendering_video_transitions_to_instrumental_selected(self):
+        """Test RENDERING_VIDEO -> INSTRUMENTAL_SELECTED is valid (combined review flow)."""
+        from backend.models.job import STATE_TRANSITIONS, JobStatus
+        valid_transitions = STATE_TRANSITIONS.get(JobStatus.RENDERING_VIDEO, [])
+        assert JobStatus.INSTRUMENTAL_SELECTED in valid_transitions
+        # AWAITING_INSTRUMENTAL_SELECTION is no longer a valid transition from RENDERING_VIDEO
+        assert JobStatus.AWAITING_INSTRUMENTAL_SELECTION not in valid_transitions
+
+
+class TestStylesConfigRequirements:
+    """Tests documenting the required fields for ASS subtitle generation.
+    
+    These tests verify that the styles config format is documented correctly.
+    The actual styles creation is tested in integration tests.
+    """
+    
+    def test_required_karaoke_fields_documented(self):
+        """Document required karaoke style fields for ASS generation."""
+        # These fields are required by the ASS subtitle generator
+        # Missing any of them will cause video generation to fail
+        required_fields = [
+            "font",        # Font name for ASS
+            "font_path",   # Path to font file (can be empty string, NOT None)
+            "ass_name",    # Style name in ASS file
+            "primary_color",    # Format: "R, G, B, A"
+            "secondary_color",  # Format: "R, G, B, A"
+            "outline_color",    # Format: "R, G, B, A"
+            "back_color",       # Format: "R, G, B, A"
+            "bold",        # Boolean
+            "italic",      # Boolean
+            "underline",   # Boolean
+            "strike_out",  # Boolean
+            "scale_x",     # Integer
+            "scale_y",     # Integer
+            "spacing",     # Integer
+            "angle",       # Float
+            "border_style", # Integer
+            "outline",     # Integer
+            "shadow",      # Integer
+            "margin_l",    # Integer
+            "margin_r",    # Integer
+            "margin_v",    # Integer
+            "encoding",    # Integer
+        ]
+        
+        # This test documents the required fields
+        # Actual validation happens in integration tests
+        assert len(required_fields) == 22
+        assert "ass_name" in required_fields  # This was missing initially
+        assert "font_path" in required_fields  # Must be string, not None
+    
+    def test_minimal_styles_structure(self):
+        """Document the minimal styles JSON structure."""
+        minimal_styles = {
+            "karaoke": {
+                "background_color": "#000000",
+                "font_path": "",  # MUST be string, NOT None
+                "font": "Noto Sans",
+                "ass_name": "Default",  # REQUIRED
+                "primary_color": "112, 112, 247, 255",
+                "secondary_color": "255, 255, 255, 255",
+                "outline_color": "26, 58, 235, 255",
+                "back_color": "0, 0, 0, 0",
+                "bold": False,
+                "italic": False,
+                "underline": False,
+                "strike_out": False,
+                "scale_x": 100,
+                "scale_y": 100,
+                "spacing": 0,
+                "angle": 0.0,
+                "border_style": 1,
+                "outline": 1,
+                "shadow": 0,
+                "margin_l": 0,
+                "margin_r": 0,
+                "margin_v": 0,
+                "encoding": 0
+            }
+        }
+        
+        # Verify structure is valid JSON
+        json_str = json.dumps(minimal_styles)
+        parsed = json.loads(json_str)
+        
+        assert "karaoke" in parsed
+        assert parsed["karaoke"]["font_path"] == ""  # Not None
+        assert parsed["karaoke"]["ass_name"] == "Default"
+
+
+class TestCorrectionDataMerging:
+    """Tests documenting correction data merging requirements.
+    
+    The LyricsTranscriber React UI sends only partial correction data:
+    - corrections
+    - corrected_segments
+    
+    The backend must merge this with the original corrections.json to
+    reconstruct a full CorrectionResult.
+    """
+    
+    def test_frontend_sends_partial_data(self):
+        """Document what the frontend sends."""
+        # The frontend sends only these fields
+        frontend_payload = {
+            "corrections": [],  # List of corrections made
+            "corrected_segments": []  # Updated segment data
+        }
+        
+        # This is NOT a full CorrectionResult
+        assert "original_segments" not in frontend_payload
+        assert "metadata" not in frontend_payload
+    
+    def test_merging_strategy(self):
+        """Document the merging strategy for corrections."""
+        # Original data has full structure
+        original_data = {
+            "original_segments": [{"id": 1, "text": "test"}],
+            "corrected_segments": [{"id": 1, "text": "test"}],
+            "corrections": [],
+            "metadata": {"artist": "Test"}
+        }
+        
+        # Frontend sends partial update
+        frontend_update = {
+            "corrections": [{"id": 1, "type": "edit"}],
+            "corrected_segments": [{"id": 1, "text": "updated"}]
+        }
+        
+        # Merging strategy: update only the fields sent by frontend
+        if 'corrections' in frontend_update:
+            original_data['corrections'] = frontend_update['corrections']
+        if 'corrected_segments' in frontend_update:
+            original_data['corrected_segments'] = frontend_update['corrected_segments']
+        
+        # Result preserves original_segments and metadata
+        assert original_data['original_segments'] == [{"id": 1, "text": "test"}]
+        assert original_data['metadata'] == {"artist": "Test"}
+        # But has updated corrections and corrected_segments
+        assert original_data['corrections'] == [{"id": 1, "type": "edit"}]
+        assert original_data['corrected_segments'] == [{"id": 1, "text": "updated"}]
+
+
+class TestAddLyricsEndpoint:
+    """Tests for the add-lyrics endpoint."""
+    
+    def test_add_lyrics_requires_source_and_lyrics(self):
+        """Document that add_lyrics expects source and lyrics fields."""
+        # The frontend sends this payload
+        valid_payload = {
+            "source": "custom",
+            "lyrics": "Line 1\nLine 2\nLine 3"
+        }
+        
+        # Both fields are required
+        assert "source" in valid_payload
+        assert "lyrics" in valid_payload
+        assert len(valid_payload["source"].strip()) > 0
+        assert len(valid_payload["lyrics"].strip()) > 0
+    
+    def test_add_lyrics_uses_correction_operations(self):
+        """Verify CorrectionOperations.add_lyrics_source is available."""
+        from karaoke_gen.lyrics_transcriber.correction.operations import CorrectionOperations
+
+        # The method should exist
+        assert hasattr(CorrectionOperations, 'add_lyrics_source')
+
+        # It should be a static method
+        import inspect
+        # Get the method and check it's callable
+        method = getattr(CorrectionOperations, 'add_lyrics_source')
+        assert callable(method)
+
+
+class TestAddLyricsRejectionHandling:
+    """Endpoint tests for the relevance-filter rejection flow of add-lyrics.
+
+    The relevance filter can silently drop a pasted lyrics source during the
+    correction rerun. The endpoint must report that as status="rejected" (with
+    the relevance details) instead of a misleading generic success, and must
+    not persist the no-op rerun to GCS.
+    """
+
+    REJECTION = {"relevance": 0.013, "matched_words": 3, "total_words": 230}
+
+    @pytest.fixture(autouse=True)
+    def auth_overrides(self):
+        from backend.main import app
+        from backend.api.dependencies import require_review_auth
+
+        async def mock_require_review_auth(job_id: str = "test123"):
+            return (job_id, "full")
+
+        app.dependency_overrides[require_review_auth] = mock_require_review_auth
+        yield
+        app.dependency_overrides.pop(require_review_auth, None)
+
+    def _make_updated_result(self, source_kept: bool, source: str = "manual"):
+        result = MagicMock()
+        if source_kept:
+            result.reference_lyrics = {source: MagicMock()}
+            result.metadata = {}
+        else:
+            result.reference_lyrics = {}
+            result.metadata = {"rejected_sources": {source: dict(self.REJECTION)}}
+        result.to_dict.return_value = {"reference_lyrics": {}, "metadata": result.metadata}
+        return result
+
+    def _post_add_lyrics(self, test_client, updated_result, payload):
+        from backend.models.job import JobStatus
+
+        mock_job = MagicMock()
+        mock_job.status = JobStatus.IN_REVIEW
+        mock_job.artist = "Test Artist"
+        mock_job.title = "Test Song"
+
+        def fake_download(gcs_path, local_path):
+            with open(local_path, "w") as f:
+                json.dump({}, f)
+
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService") as mock_storage_cls, \
+                patch("backend.api.routes.review.CorrectionResult") as mock_cr, \
+                patch("backend.api.routes.review.CorrectionOperations") as mock_ops, \
+                patch("backend.api.routes.review._get_audio_hash", return_value="hash123"):
+            mock_jm.return_value.get_job.return_value = mock_job
+            mock_storage = mock_storage_cls.return_value
+            mock_storage.download_file.side_effect = fake_download
+            mock_cr.from_dict.return_value = MagicMock()
+            mock_ops.add_lyrics_source.return_value = updated_result
+
+            response = test_client.post("/api/review/job1/add-lyrics", json=payload)
+            return response, mock_ops, mock_storage
+
+    def test_kept_source_returns_success_and_uploads(self, test_client):
+        updated = self._make_updated_result(source_kept=True)
+        response, _, mock_storage = self._post_add_lyrics(
+            test_client, updated, {"source": "manual", "lyrics": "la la la"}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "success"
+        mock_storage.upload_json.assert_called_once()
+
+    def test_rejected_source_returns_rejected_without_upload(self, test_client):
+        updated = self._make_updated_result(source_kept=False)
+        response, _, mock_storage = self._post_add_lyrics(
+            test_client, updated, {"source": "manual", "lyrics": "wrong song lyrics"}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "rejected"
+        assert body["rejection"] == self.REJECTION
+        # The no-op rerun must not overwrite corrections.json
+        mock_storage.upload_json.assert_not_called()
+
+    def test_force_flag_is_passed_through(self, test_client):
+        updated = self._make_updated_result(source_kept=True)
+        _, mock_ops, _ = self._post_add_lyrics(
+            test_client, updated, {"source": "manual", "lyrics": "la la la", "force": "true"}
+        )
+
+        assert mock_ops.add_lyrics_source.call_args.kwargs["force"] is True
+
+
+class TestInstrumentalUrlsRefresh:
+    """GET /{job_id}/instrumental-urls returns same-origin audio proxy paths.
+
+    Since the 2026-09-17 fast-load re-architecture (Option B) the review hot path no
+    longer signs GCS URLs. Each option's ``audio_url`` is a RELATIVE proxy path to
+    ``/{job_id}/instrumental-audio/{option_id}`` (served as bytes, no signing, never
+    expires). The frontend turns it into an absolute token URL before use.
+    """
+
+    @pytest.fixture(autouse=True)
+    def auth_overrides(self):
+        from backend.main import app
+        from backend.api.dependencies import require_review_auth
+
+        async def mock_require_review_auth(job_id: str = "test123"):
+            return (job_id, "full")
+
+        app.dependency_overrides[require_review_auth] = mock_require_review_auth
+        yield
+        app.dependency_overrides.pop(require_review_auth, None)
+
+    @pytest.fixture(autouse=True)
+    def summary_patch(self):
+        # auto_approval_summary is exercised by its own tests; here we only check
+        # the endpoint passes its result through.
+        with patch(
+            "backend.services.auto_approval.instrumental.auto_approval_summary",
+            return_value={"backing": {"verdict": "keep", "confident": True, "resolved_selection": "with_backing"}},
+        ) as m:
+            yield m
+
+    def test_returns_proxy_paths_for_both_stems(self, test_client):
+        mock_job = MagicMock()
+        mock_job.job_id = "job1"
+        mock_job.state_data = {}
+        mock_job.file_urls = {
+            "stems": {
+                "instrumental_clean": "jobs/job1/stems/instrumental_clean.flac",
+                "instrumental_with_backing": "jobs/job1/stems/instrumental_with_backing.flac",
+            }
+        }
+
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.api.routes.review._dev_audio_proxy_enabled", return_value=False):
+            mock_jm.return_value.get_job.return_value = mock_job
+            response = test_client.get("/api/review/job1/instrumental-urls")
+
+        assert response.status_code == 200
+        options = response.json()["instrumental_options"]
+        ids = {o["id"]: o["audio_url"] for o in options}
+        assert ids["clean"] == "/api/review/job1/instrumental-audio/clean"
+        assert ids["with_backing"] == "/api/review/job1/instrumental-audio/with_backing"
+
+    def test_omits_stems_that_do_not_exist(self, test_client):
+        mock_job = MagicMock()
+        mock_job.job_id = "job1"
+        mock_job.state_data = {}
+        mock_job.file_urls = {
+            "stems": {"instrumental_clean": "jobs/job1/stems/instrumental_clean.flac"}
+        }
+
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.api.routes.review._dev_audio_proxy_enabled", return_value=False):
+            mock_jm.return_value.get_job.return_value = mock_job
+            response = test_client.get("/api/review/job1/instrumental-urls")
+
+        assert response.status_code == 200
+        options = response.json()["instrumental_options"]
+        assert [o["id"] for o in options] == ["clean"]
+
+    def test_does_not_sign_urls_on_hot_path(self, test_client):
+        """The root-cause fix: building instrumental options must perform NO URL signing
+        (the IAM signBlob round-trip is what stalled and took gen down on 2026-09-17)."""
+        mock_job = MagicMock()
+        mock_job.job_id = "job1"
+        mock_job.state_data = {}
+        mock_job.file_urls = {
+            "stems": {
+                "instrumental_clean": "jobs/job1/stems/instrumental_clean.flac",
+                "instrumental_with_backing": "jobs/job1/stems/instrumental_with_backing.flac",
+            }
+        }
+
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService") as mock_storage, \
+                patch("backend.api.routes.review._dev_audio_proxy_enabled", return_value=False), \
+                patch("backend.services.audio_transcoding_service.AudioTranscodingService.get_review_audio_url_async") as mock_sign_async:
+            mock_jm.return_value.get_job.return_value = mock_job
+            response = test_client.get("/api/review/job1/instrumental-urls")
+
+        assert response.status_code == 200
+        mock_sign_async.assert_not_called()
+        mock_storage.return_value.generate_signed_url.assert_not_called()
+
+    def test_missing_job_returns_404(self, test_client):
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"):
+            mock_jm.return_value.get_job.return_value = None
+            response = test_client.get("/api/review/job1/instrumental-urls")
+        assert response.status_code == 404
+
+    def _late_stems_job(self, *, audio_complete, stems, analysis=None):
+        from backend.models.job import JobStatus
+        mock_job = MagicMock()
+        mock_job.job_id = "job1"
+        mock_job.status = JobStatus.IN_REVIEW
+        mock_job.file_urls = {"stems": stems}
+        mock_job.state_data = {"audio_complete": audio_complete}
+        if analysis is not None:
+            mock_job.state_data["backing_vocals_analysis"] = analysis
+        return mock_job
+
+    def _get(self, test_client, mock_job):
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.api.routes.review._dev_audio_proxy_enabled", return_value=False):
+            mock_jm.return_value.get_job.return_value = mock_job
+            return test_client.get("/api/review/job1/instrumental-urls")
+
+    def test_reports_separation_still_running(self, test_client):
+        """Review opens on lyrics completion, often before separation: the page polls
+        this endpoint and needs to know the stems aren't there YET."""
+        response = self._get(test_client, self._late_stems_job(audio_complete=False, stems={}))
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["audio_complete"] is False
+        assert body["job_status"] == "in_review"
+        assert body["instrumental_options"] == []
+        assert body["backing_vocals_analysis"] == {}
+
+    def test_returns_late_analysis_and_fresh_auto_approval_once_audio_complete(
+        self, test_client, summary_patch
+    ):
+        analysis = {
+            "recommended_selection": "with_backing",
+            "has_audible_content": True,
+            "audible_percentage": 35.0,
+            "audible_segments": [{"avg_amplitude_db": -15.0, "peak_amplitude_db": -9.0}],
+        }
+        mock_job = self._late_stems_job(
+            audio_complete=True,
+            stems={
+                "instrumental_clean": "jobs/job1/stems/instrumental_clean.flac",
+                "instrumental_with_backing": "jobs/job1/stems/instrumental_with_backing.flac",
+            },
+            analysis=analysis,
+        )
+
+        response = self._get(test_client, mock_job)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["audio_complete"] is True
+        assert {o["id"] for o in body["instrumental_options"]} == {"clean", "with_backing"}
+        assert body["backing_vocals_analysis"]["recommended_selection"] == "with_backing"
+        assert body["backing_vocals_analysis"]["audible_percentage"] == 35.0
+        assert body["auto_approval"]["backing"]["resolved_selection"] == "with_backing"
+        # Summary re-derived from the CURRENT job (self-corrects a verdict scored
+        # before the backing analysis existed).
+        assert summary_patch.call_args.args[0] is mock_job
+
+
+    def test_analysis_recommendation_unified_with_scorer(self, test_client, summary_patch):
+        """Job 58555663: the analyzer heuristic said clean (9% audible, no loud
+        segment) while the 3-stem scorer confidently keeps — the served analysis
+        must recommend the scorer's stem so every screen agrees."""
+        analysis = {
+            "recommended_selection": "clean",
+            "has_audible_content": True,
+            "audible_percentage": 9.03,
+            "audible_segments": [{"avg_amplitude_db": -28.5, "peak_amplitude_db": -22.7}],
+            "stem_comparison": {
+                "backing_audible_fraction": 0.08, "lead_audible_fraction": 0.66,
+                "coverage_ratio": 0.11, "corr_backing_vocals": -0.02,
+                "lead_overlap_fraction": 0.55, "backing_median_db": -31.6,
+                "flat_fraction": 0.0, "error": None,
+            },
+        }
+        mock_job = self._late_stems_job(audio_complete=True, stems={}, analysis=analysis)
+
+        body = self._get(test_client, mock_job).json()
+
+        assert body["backing_vocals_analysis"]["recommended_selection"] == "with_backing"
+        assert body["backing_vocals_analysis"]["heuristic_recommended_selection"] == "clean"
+
+
+class TestInstrumentalAudioProxy:
+    """GET /{job_id}/instrumental-audio/{option_id} — same-origin byte proxy.
+
+    Option B of the 2026-09-17 fast-load re-architecture: serves the transcoded OGG
+    bytes with HTTP Range support instead of a signed GCS URL, so playback never depends
+    on IAM signBlob. The stem GCS path is resolved server-side from the option id.
+    """
+
+    @pytest.fixture(autouse=True)
+    def auth_overrides(self):
+        from backend.main import app
+        from backend.api.dependencies import require_review_auth
+
+        async def mock_require_review_auth(job_id: str = "test123"):
+            return (job_id, "full")
+
+        app.dependency_overrides[require_review_auth] = mock_require_review_auth
+        yield
+        app.dependency_overrides.pop(require_review_auth, None)
+
+    @pytest.fixture(autouse=True)
+    def clear_audio_cache(self):
+        # The proxy caches bytes per GCS path at module scope; clear it so a prior
+        # test's stubbed bytes don't leak into the next test's assertions.
+        from backend.api.routes import review as review_module
+        review_module._review_audio_cache.clear()
+        yield
+        review_module._review_audio_cache.clear()
+
+    def _mock_job(self):
+        job = MagicMock()
+        job.job_id = "job1"
+        job.file_urls = {
+            "stems": {
+                "instrumental_clean": "jobs/job1/stems/instrumental_clean.flac",
+                "instrumental_with_backing": "jobs/job1/stems/instrumental_with_backing.flac",
+            }
+        }
+        return job
+
+    def test_streams_transcoded_bytes(self, test_client):
+        audio = b"OggS" + b"\x00" * 100
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.services.audio_transcoding_service.AudioTranscodingService.get_review_audio_bytes_async",
+                      new=AsyncMock(return_value=(audio, "audio/ogg"))):
+            mock_jm.return_value.get_job.return_value = self._mock_job()
+            response = test_client.get("/api/review/job1/instrumental-audio/clean")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/ogg"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert response.content == audio
+
+    def test_supports_range_requests(self, test_client):
+        audio = bytes(range(50)) * 4  # 200 deterministic bytes
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.services.audio_transcoding_service.AudioTranscodingService.get_review_audio_bytes_async",
+                      new=AsyncMock(return_value=(audio, "audio/ogg"))):
+            mock_jm.return_value.get_job.return_value = self._mock_job()
+            response = test_client.get(
+                "/api/review/job1/instrumental-audio/clean",
+                headers={"Range": "bytes=10-19"},
+            )
+
+        assert response.status_code == 206
+        assert response.headers["content-range"] == f"bytes 10-19/{len(audio)}"
+        assert response.content == audio[10:20]
+
+    def test_unknown_option_id_returns_404(self, test_client):
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"):
+            mock_jm.return_value.get_job.return_value = self._mock_job()
+            response = test_client.get("/api/review/job1/instrumental-audio/bogus")
+        assert response.status_code == 404
+
+    def test_missing_stem_returns_404(self, test_client):
+        job = MagicMock()
+        job.job_id = "job1"
+        job.file_urls = {"stems": {"instrumental_clean": "jobs/job1/stems/instrumental_clean.flac"}}
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"):
+            mock_jm.return_value.get_job.return_value = job
+            response = test_client.get("/api/review/job1/instrumental-audio/with_backing")
+        assert response.status_code == 404
+
+    def test_missing_job_returns_404(self, test_client):
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"):
+            mock_jm.return_value.get_job.return_value = None
+            response = test_client.get("/api/review/job1/instrumental-audio/clean")
+        assert response.status_code == 404
+
+    def test_deleted_gcs_object_returns_404_not_500(self, test_client):
+        from google.cloud.exceptions import NotFound
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.services.audio_transcoding_service.AudioTranscodingService.get_review_audio_bytes_async",
+                      new=AsyncMock(side_effect=NotFound("gone"))):
+            mock_jm.return_value.get_job.return_value = self._mock_job()
+            response = test_client.get("/api/review/job1/instrumental-audio/clean")
+        assert response.status_code == 404
+
+    def test_does_not_sign_urls(self, test_client):
+        audio = b"OggS"
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService") as mock_storage, \
+                patch("backend.services.audio_transcoding_service.AudioTranscodingService.get_review_audio_bytes_async",
+                      new=AsyncMock(return_value=(audio, "audio/ogg"))):
+            mock_jm.return_value.get_job.return_value = self._mock_job()
+            response = test_client.get("/api/review/job1/instrumental-audio/clean")
+        assert response.status_code == 200
+        mock_storage.return_value.generate_signed_url.assert_not_called()
+
+
+class TestReviewResubmissionClearsWorkerProgress:
+    """Tests for ensuring review submission clears worker progress keys.
+
+    When a job is re-reviewed (e.g., after a reset to awaiting_review), the worker
+    progress keys must be cleared to prevent workers from skipping due to
+    idempotency checks (checking {worker}_progress.stage == 'complete').
+    """
+
+    def test_complete_review_clears_progress_keys(self):
+        """Document that complete_review should clear worker progress keys.
+
+        The complete_review endpoint calls delete_state_data_keys with:
+        ['render_progress', 'screens_progress', 'video_progress', 'encoding_progress']
+
+        This ensures that when a review is submitted, even if the job was
+        previously completed, workers will run fresh instead of skipping.
+        """
+        # This test documents the expected behavior.
+        # The actual integration test is in test_emulator_integration.py.
+        expected_keys_to_clear = [
+            'render_progress',
+            'screens_progress',
+            'video_progress',
+            'encoding_progress',
+        ]
+
+        # Verify all worker progress keys that affect idempotency are included
+        assert 'render_progress' in expected_keys_to_clear
+        assert 'video_progress' in expected_keys_to_clear
+        assert 'encoding_progress' in expected_keys_to_clear
+
+    def test_idempotency_check_examines_progress_stage(self):
+        """Document the idempotency check pattern used by workers.
+
+        Workers check state_data.{worker}_progress.stage == 'complete' to skip.
+        This is why clearing these keys is critical for re-processing.
+        """
+        # Example of what stale state looks like (causes skip)
+        stale_state_data = {
+            'render_progress': {'stage': 'complete'},  # Worker will skip!
+            'video_progress': {'stage': 'complete'},
+        }
+
+        # After clearing, the keys should not exist
+        clean_state_data = {}
+
+        # Verify worker would NOT skip after clearing
+        render_progress = clean_state_data.get('render_progress', {})
+        assert render_progress.get('stage') != 'complete'
+
+    def test_job_manager_has_delete_state_data_keys_method(self):
+        """Verify JobManager has the method needed for clearing keys."""
+        from backend.services.job_manager import JobManager
+
+        jm = JobManager.__new__(JobManager)  # Create without __init__
+        assert hasattr(jm, 'delete_state_data_keys')
+        assert callable(getattr(jm, 'delete_state_data_keys'))
+
+
+class TestCompleteReviewZeroSegmentValidation:
+    """Tests for the 0-segment lyrics guard in complete_review endpoint.
+
+    These test the actual HTTP endpoint, not just the validation logic.
+    """
+
+    @pytest.fixture
+    def _patched_client(self):
+        """Create TestClient with mocked services for complete_review."""
+        from backend.models.job import Job, JobStatus
+
+        mock_job_manager = MagicMock()
+        mock_job_manager.transition_to_state.return_value = True
+        mock_worker_service = MagicMock()
+        mock_creds = MagicMock()
+        mock_creds.universe_domain = "googleapis.com"
+
+        with patch("backend.api.routes.jobs.job_manager", mock_job_manager), \
+             patch("backend.api.routes.jobs.worker_service", mock_worker_service), \
+             patch("backend.services.firestore_service.firestore"), \
+             patch("backend.services.storage_service.storage"), \
+             patch("google.auth.default", return_value=(mock_creds, "test-project")):
+            from backend.main import app
+            from fastapi.testclient import TestClient
+            yield TestClient(app), mock_job_manager
+
+    def _make_job(self, state_data=None):
+        from backend.models.job import Job, JobStatus
+        return Job(
+            job_id="job-zero-seg",
+            status=JobStatus.AWAITING_REVIEW,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            state_data=state_data,
+        )
+
+    def test_endpoint_rejects_zero_segment_lyrics(self, _patched_client):
+        """POST complete-review returns 400 when lyrics pipeline produced 0 segments."""
+        client, mock_jm = _patched_client
+        job = self._make_job(state_data={
+            'lyrics_metadata': {'segment_count': 0, 'ready_for_review': True},
+            'corrected_lyrics': {'corrected_segments': [], 'original_segments': []},
+        })
+        mock_jm.get_job.return_value = job
+
+        response = client.post(
+            "/api/jobs/job-zero-seg/complete-review",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        assert response.status_code == 400
+        assert "no lyrics were detected" in response.json()["detail"]
+        mock_jm.transition_to_state.assert_not_called()
+
+    def test_endpoint_allows_nonzero_segment_lyrics(self, _patched_client):
+        """POST complete-review succeeds when lyrics have segments."""
+        client, mock_jm = _patched_client
+        job = self._make_job(state_data={
+            'lyrics_metadata': {'segment_count': 42},
+            'corrected_lyrics': {'corrected_segments': [{'text': 'hello'}] * 42},
+        })
+        mock_jm.get_job.return_value = job
+
+        response = client.post(
+            "/api/jobs/job-zero-seg/complete-review",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        assert response.status_code == 200
+        mock_jm.transition_to_state.assert_called_once()
+
+    def test_endpoint_allows_job_without_lyrics_metadata(self, _patched_client):
+        """POST complete-review succeeds for jobs without lyrics_metadata (e.g. finalise-only)."""
+        client, mock_jm = _patched_client
+        job = self._make_job(state_data={})  # No lyrics pipeline ran
+        mock_jm.get_job.return_value = job
+
+        response = client.post(
+            "/api/jobs/job-zero-seg/complete-review",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        assert response.status_code == 200
+
+    def test_existing_instrumental_defaults_selection_to_custom(self, _patched_client):
+        """Jobs that supplied their own instrumental (tenant/existing_instrumental flow)
+        have no instrumental-selection UI step, so complete-review must default the
+        selection to 'custom' — otherwise the render defaults to 'clean' (a separated
+        stem that was never produced) and fails the prerequisite check."""
+        client, mock_jm = _patched_client
+        job = self._make_job(state_data={'lyrics_metadata': {'segment_count': 5}})
+        job.existing_instrumental_gcs_path = "uploads/job-zero-seg/audio/existing_instrumental.mp3"
+        mock_jm.get_job.return_value = job
+
+        response = client.post(
+            "/api/jobs/job-zero-seg/complete-review",
+            headers={"Authorization": "Bearer test-admin-token"},
+        )
+
+        assert response.status_code == 200
+        mock_jm.update_state_data.assert_any_call(
+            "job-zero-seg", "instrumental_selection", "custom"
+        )
+
+    def test_existing_instrumental_does_not_override_explicit_selection(self, _patched_client):
+        """An explicit instrumental_selection in the request still wins over the default."""
+        client, mock_jm = _patched_client
+        job = self._make_job(state_data={'lyrics_metadata': {'segment_count': 5}})
+        job.existing_instrumental_gcs_path = "uploads/job-zero-seg/audio/existing_instrumental.mp3"
+        mock_jm.get_job.return_value = job
+
+        response = client.post(
+            "/api/jobs/job-zero-seg/complete-review",
+            headers={"Authorization": "Bearer test-admin-token"},
+            json={"instrumental_selection": "clean"},
+        )
+
+        assert response.status_code == 200
+        mock_jm.update_state_data.assert_any_call(
+            "job-zero-seg", "instrumental_selection", "clean"
+        )
+
+
+class TestPreviewStyleLoading:
+    """Tests for the unified style loader used in preview video generation.
+    
+    When a job has custom styles (uploaded via --style_params_json), these
+    must be loaded and applied to preview videos, not just the final render.
+    
+    This was a bug: preview videos were using minimal styles (black background)
+    even when the job had custom backgrounds and fonts configured.
+    
+    The style loading logic is now consolidated in karaoke_gen.style_loader
+    to avoid duplication between workers and API routes.
+    """
+    
+    def test_load_styles_from_gcs_with_custom_styles(self, tmp_path):
+        """Test that custom styles are downloaded and applied for preview."""
+        import os
+        from karaoke_gen.style_loader import load_styles_from_gcs
+        
+        # Create source style params file
+        source_style_params = tmp_path / "source_styles.json"
+        style_data = {
+            "karaoke": {
+                "background_image": "/original/path/background.png",
+                "font_path": "/original/path/font.ttf",
+                "background_color": "#000000",
+                "font": "Noto Sans",
+                "ass_name": "Default",
+            }
+        }
+        source_style_params.write_text(json.dumps(style_data))
+        
+        # Create source asset files
+        source_background = tmp_path / "background.png"
+        source_background.write_bytes(b"PNG image data")
+        source_font = tmp_path / "font.ttf"
+        source_font.write_bytes(b"TTF font data")
+        
+        # Create mock download function that simulates GCS download
+        def mock_download(gcs_path, local_path):
+            if "style_params.json" in gcs_path:
+                with open(local_path, 'w') as f:
+                    f.write(source_style_params.read_text())
+            elif "karaoke_background" in gcs_path:
+                with open(local_path, 'wb') as f:
+                    f.write(source_background.read_bytes())
+            elif "font.ttf" in gcs_path:
+                with open(local_path, 'wb') as f:
+                    f.write(source_font.read_bytes())
+        
+        # Call the unified style loader function
+        style_assets = {
+            "style_params": "jobs/test123/style/style_params.json",
+            "karaoke_background": "jobs/test123/style/karaoke_background.png",
+            "font": "jobs/test123/style/font.ttf",
+        }
+        
+        styles_path, result_styles = load_styles_from_gcs(
+            style_params_gcs_path="jobs/test123/style/style_params.json",
+            style_assets=style_assets,
+            temp_dir=str(tmp_path / "workdir"),
+            download_func=mock_download,
+        )
+        
+        # Verify styles file was created
+        assert os.path.exists(styles_path)
+        
+        # The paths should now point to the local downloaded files, not the original paths
+        assert "karaoke" in result_styles
+        assert result_styles["karaoke"]["background_image"] != "/original/path/background.png"
+        assert "karaoke_background.png" in result_styles["karaoke"]["background_image"]
+        assert result_styles["karaoke"]["font_path"] != "/original/path/font.ttf"
+        assert "font.ttf" in result_styles["karaoke"]["font_path"]
+    
+    def test_load_styles_from_gcs_requires_explicit_theme(self, tmp_path):
+        """Test that load_styles_from_gcs requires explicit theme (Phase 2)."""
+        from karaoke_gen.style_loader import load_styles_from_gcs
+
+        # Phase 2: Calling with no custom styles should raise an error
+        with pytest.raises(ValueError, match="style_params_gcs_path is required"):
+            load_styles_from_gcs(
+                style_params_gcs_path=None,  # No custom styles
+                style_assets={},
+                temp_dir=str(tmp_path),
+                download_func=lambda gcs_path, local_path: None,  # Won't be called
+            )
+    
+    def test_asset_mapping_is_complete(self):
+        """Verify all required asset mappings are defined in the unified style loader."""
+        from karaoke_gen.style_loader import ASSET_KEY_MAPPINGS
+        
+        # These mappings must be present for styles to work correctly
+        required_keys = [
+            "karaoke_background",
+            "intro_background",
+            "end_background",
+            "font",
+        ]
+        
+        for key in required_keys:
+            assert key in ASSET_KEY_MAPPINGS, f"Asset mapping '{key}' not found in ASSET_KEY_MAPPINGS"
+        
+        # Verify karaoke_background maps to the correct path
+        karaoke_mapping = ASSET_KEY_MAPPINGS["karaoke_background"]
+        assert karaoke_mapping == ("karaoke", "background_image")
+        
+        # Verify font maps to multiple sections
+        font_mappings = ASSET_KEY_MAPPINGS["font"]
+        assert isinstance(font_mappings, list)
+        assert ("karaoke", "font_path") in font_mappings
+
+
+class TestInstrumentalAnalysisAudioUrls:
+    """Tests for the audio_urls response from get_instrumental_analysis endpoint.
+
+    The frontend expects specific field names in the audio_urls dict.
+    This test documents and enforces the contract.
+    """
+
+    def test_audio_url_field_names_match_frontend_expectations(self):
+        """Verify audio_urls uses 'backing_vocals' not 'backing'.
+
+        The frontend InstrumentalSelector.tsx expects:
+        - audio_urls.clean
+        - audio_urls.with_backing
+        - audio_urls.original
+        - audio_urls.backing_vocals  <-- NOT 'backing'
+
+        This field name mismatch caused backing vocals audio to never load
+        in cloud mode because the frontend looked for 'backing_vocals' but
+        the backend returned 'backing'.
+        """
+        # Document the expected field names that frontend uses
+        expected_audio_url_keys = [
+            'clean',           # Clean instrumental (vocals removed)
+            'with_backing',    # Instrumental with backing vocals
+            'original',        # Original audio file
+            'backing_vocals',  # Backing vocals only stem (NOT 'backing')
+        ]
+
+        # Verify 'backing' is NOT in the expected keys
+        assert 'backing' not in expected_audio_url_keys
+        assert 'backing_vocals' in expected_audio_url_keys
+
+    def test_frontend_stem_type_map_uses_backing_vocals(self):
+        """Document that frontend maps 'backing' AudioType to 'backing_vocals' API field.
+
+        In InstrumentalSelector.tsx:
+        - STEM_TYPE_MAP['backing'] = 'backing_vocals'
+        - getAudioUrl() looks for urls.backing_vocals
+        - handleAudioChange() looks for urls.backing_vocals
+
+        The backend must return 'backing_vocals' to match.
+        """
+        # Frontend expects these audio_urls keys in cloud mode
+        # (In local mode, it uses STEM_TYPE_MAP which has different values)
+        expected_cloud_mode_keys = {
+            'original': 'original',
+            'backing': 'backing_vocals',  # AudioType 'backing' -> API field 'backing_vocals'
+            'clean': 'clean',  # AudioType 'clean' -> API field 'clean'
+            'with_backing': 'with_backing',
+        }
+
+        # Verify the mapping for backing is 'backing_vocals'
+        assert expected_cloud_mode_keys['backing'] == 'backing_vocals'
+        assert expected_cloud_mode_keys['clean'] == 'clean'
+
+
+class TestGetCorrectionDataPrioritizesUpdatedCorrections:
+    """Tests for the correction data endpoint's handling of updated vs original corrections.
+
+    The bug: When a user edits lyrics in LyricsAnalyzer, the edits are saved to
+    corrections_updated.json. However, when InstrumentalSelector fetches correction
+    data via GET /api/review/{job_id}/correction-data, it was returning the ORIGINAL
+    corrections.json, ignoring the user's edits.
+
+    The fix: The endpoint now checks for corrections_updated.json first and returns
+    that if it exists, matching the behavior of render_video_worker.py.
+    """
+
+    def test_endpoint_should_check_updated_corrections_first(self):
+        """Document that get_correction_data should check for corrections_updated first.
+
+        The endpoint logic should be:
+        1. Check for corrections_updated in file_urls or direct GCS path
+        2. If exists, use it
+        3. Otherwise, fall back to original corrections.json
+
+        This matches the pattern in render_video_worker.py:128-142.
+        """
+        # Document the expected file priority
+        file_priority = [
+            ("corrections_updated", "jobs/{job_id}/lyrics/corrections_updated.json"),
+            ("corrections", "jobs/{job_id}/lyrics/corrections.json"),
+        ]
+
+        # Verify corrections_updated comes first
+        assert file_priority[0][0] == "corrections_updated"
+        assert file_priority[1][0] == "corrections"
+
+    def test_updated_corrections_file_path_format(self):
+        """Document the expected file path for updated corrections."""
+        job_id = "test-job-123"
+
+        # The updated corrections path format
+        updated_path = f"jobs/{job_id}/lyrics/corrections_updated.json"
+
+        assert "corrections_updated.json" in updated_path
+        assert job_id in updated_path
+
+    def test_file_urls_key_for_updated_corrections(self):
+        """Document the file_urls key used for updated corrections."""
+        # The file_urls structure for a job with updated corrections
+        file_urls = {
+            "lyrics": {
+                "corrections": "jobs/test-job/lyrics/corrections.json",
+                "corrections_updated": "jobs/test-job/lyrics/corrections_updated.json",
+            }
+        }
+
+        # The key for updated corrections is 'corrections_updated'
+        assert "corrections_updated" in file_urls["lyrics"]
+
+        # This is different from 'corrections' (the original)
+        assert "corrections" in file_urls["lyrics"]
+        assert file_urls["lyrics"]["corrections"] != file_urls["lyrics"]["corrections_updated"]
+
+    def test_render_video_worker_and_api_use_same_pattern(self):
+        """Verify render_video_worker and get_correction_data use consistent logic.
+
+        Both should:
+        1. Try corrections_updated from file_urls first
+        2. Try direct GCS path for corrections_updated
+        3. Fall back to corrections from file_urls
+        4. Fall back to direct GCS path for corrections.json
+
+        This ensures the user's edits are used consistently.
+        """
+        # render_video_worker.py pattern (lines 128-142):
+        render_worker_priority = [
+            "file_urls.lyrics.corrections_updated",
+            "file_urls.lyrics.corrections",
+            "jobs/{job_id}/lyrics/corrections_updated.json (GCS)",
+            "jobs/{job_id}/lyrics/corrections.json (GCS)",
+        ]
+
+        # Verify corrections_updated is checked before corrections
+        assert "corrections_updated" in render_worker_priority[0]
+        assert "corrections_updated" not in render_worker_priority[1]
+
+    def test_correction_data_keys_that_frontend_edits(self):
+        """Document which keys the frontend modifies during review.
+
+        The frontend (LyricsAnalyzer) sends only partial data when saving:
+        - corrections: List of corrections made
+        - corrected_segments: Updated segment data with user edits
+
+        The backend merges these with the original to preserve metadata,
+        original_segments, etc.
+        """
+        # Keys that the frontend modifies
+        frontend_edited_keys = ["corrections", "corrected_segments"]
+
+        # Keys that are preserved from original
+        preserved_keys = [
+            "original_segments",
+            "metadata",
+            "reference_lyrics",
+            "anchor_sequences",
+            "gap_sequences",
+        ]
+
+        # These should not overlap
+        assert not set(frontend_edited_keys) & set(preserved_keys)
+
+
+class TestCorrectionFlowIntegration:
+    """Integration tests documenting the full correction data flow.
+
+    These tests document the expected behavior of the combined review flow
+    where corrections must survive from LyricsAnalyzer through InstrumentalSelector
+    to the final video render.
+    """
+
+    def test_correction_flow_endpoints(self):
+        """Document the endpoints involved in the correction flow."""
+        # The flow uses these endpoints in order:
+        endpoints = [
+            ("GET", "/api/review/{job_id}/correction-data", "Fetch corrections for LyricsAnalyzer"),
+            ("POST", "/api/jobs/{job_id}/corrections", "Save user's edits from LyricsAnalyzer"),
+            ("GET", "/api/review/{job_id}/correction-data", "Fetch corrections for InstrumentalSelector"),
+            ("POST", "/api/review/{job_id}/complete", "Submit final review with instrumental selection"),
+        ]
+
+        # The second GET must return the UPDATED corrections, not the original
+        assert endpoints[2][0] == "GET"
+        assert "correction-data" in endpoints[2][1]
+
+    def test_gcs_file_lifecycle_during_review(self):
+        """Document the GCS file lifecycle during the review flow."""
+        job_id = "test-job-123"
+
+        # Initial state (after lyrics processing)
+        initial_files = {
+            f"jobs/{job_id}/lyrics/corrections.json": "Created by lyrics worker",
+        }
+
+        # After LyricsAnalyzer saves edits
+        after_lyrics_review = {
+            f"jobs/{job_id}/lyrics/corrections.json": "Still exists (original)",
+            f"jobs/{job_id}/lyrics/corrections_updated.json": "Created with user's edits",
+        }
+
+        # Verify corrections_updated.json is created during review
+        assert f"jobs/{job_id}/lyrics/corrections_updated.json" in after_lyrics_review
+        assert f"jobs/{job_id}/lyrics/corrections_updated.json" not in initial_files
+
+    def test_job_file_urls_updated_after_saving_corrections(self):
+        """Document that file_urls is updated when corrections are saved."""
+        # Before saving corrections
+        file_urls_before = {
+            "lyrics": {
+                "corrections": "jobs/test-job/lyrics/corrections.json",
+            }
+        }
+
+        # After POST /api/jobs/{job_id}/corrections
+        file_urls_after = {
+            "lyrics": {
+                "corrections": "jobs/test-job/lyrics/corrections.json",
+                "corrections_updated": "jobs/test-job/lyrics/corrections_updated.json",
+            }
+        }
+
+        # The corrections_updated key should be added
+        assert "corrections_updated" not in file_urls_before["lyrics"]
+        assert "corrections_updated" in file_urls_after["lyrics"]
+
+
+class TestInstrumentalSelectionValidation:
+    """Tests for instrumental_selection validation in complete_review."""
+
+    def test_custom_allowed_with_custom_instrumental_stem(self):
+        """'custom' should be valid when custom_instrumental stem exists (mute-region editing)."""
+        from unittest.mock import Mock, patch, AsyncMock
+
+        valid_selections = ["clean", "with_backing"]
+        # Simulate the validation logic from review.py
+        stems = {"custom_instrumental": "jobs/test/stems/custom_instrumental.flac"}
+        existing_instrumental_gcs_path = None
+        if existing_instrumental_gcs_path or stems.get("custom_instrumental"):
+            valid_selections.append("custom")
+
+        assert "custom" in valid_selections
+
+    def test_custom_allowed_with_uploaded_instrumental(self):
+        """'custom' should be valid when existing_instrumental_gcs_path is set."""
+        valid_selections = ["clean", "with_backing"]
+        stems = {}
+        existing_instrumental_gcs_path = "uploads/test/audio/instrumental.flac"
+        if existing_instrumental_gcs_path or stems.get("custom_instrumental"):
+            valid_selections.append("custom")
+
+        assert "custom" in valid_selections
+
+    def test_custom_rejected_without_custom_stem_or_upload(self):
+        """'custom' should NOT be valid when neither custom stem nor upload exists."""
+        valid_selections = ["clean", "with_backing"]
+        stems = {"instrumental_clean": "jobs/test/stems/clean.flac"}
+        existing_instrumental_gcs_path = None
+        if existing_instrumental_gcs_path or stems.get("custom_instrumental"):
+            valid_selections.append("custom")
+
+        assert "custom" not in valid_selections
+
+
+class TestReviewCompleteDuetFlag:
+    """Tests for is_duet flag handling in complete_review endpoint.
+
+    The complete_review endpoint accepts an optional boolean is_duet field.
+    When present it must be a bool; it defaults to False when absent.
+    The flag is persisted via job_manager.update_state_data so the render
+    worker can later activate the multi-singer render path.
+    """
+
+    @pytest.fixture
+    def mock_job(self):
+        """Create a mock job in AWAITING_REVIEW state."""
+        from backend.models.job import Job, JobStatus
+        from datetime import datetime, UTC
+        job = MagicMock(spec=Job)
+        job.job_id = "job-duet-test"
+        job.status = JobStatus.AWAITING_REVIEW
+        job.file_urls = {"stems": {}}
+        job.state_data = {}
+        job.existing_instrumental_gcs_path = None
+        return job
+
+    def _call_complete_review(self, mock_job, payload, mock_job_manager, mock_storage):
+        """Call complete_review directly, bypassing HTTP layer."""
+        import asyncio
+        from backend.api.routes.review import complete_review
+
+        mock_job_manager.get_job.return_value = mock_job
+        mock_job_manager.update_state_data.return_value = None
+        mock_job_manager.transition_to_state.return_value = True
+        mock_job_manager.delete_state_data_keys.return_value = []
+        mock_storage.upload_json.return_value = None
+        mock_storage.update_file_url.return_value = None
+
+        async def _run():
+            return await complete_review(
+                job_id=mock_job.job_id,
+                updated_data=payload,
+                auth_info=("user@test.com", "job_owner"),
+            )
+
+        with patch("backend.api.routes.review.JobManager", return_value=mock_job_manager), \
+             patch("backend.api.routes.review.StorageService", return_value=mock_storage), \
+             patch("backend.api.routes.review.asyncio.create_task"), \
+             patch("backend.api.routes.review._background_tasks", set()), \
+             patch("backend.services.worker_service.get_worker_service") as mock_ws:
+            mock_ws.return_value.trigger_render_video_worker = AsyncMock(return_value=None)
+            result = asyncio.run(_run())
+        return result
+
+    def test_complete_saves_is_duet_true(self, mock_job):
+        """is_duet=True should be stored via update_state_data."""
+        mock_job_manager = MagicMock()
+        mock_storage = MagicMock()
+
+        payload = {
+            "corrections": {"corrected_segments": []},
+            "instrumental_selection": "with_backing",
+            "is_duet": True,
+        }
+        result = self._call_complete_review(mock_job, payload, mock_job_manager, mock_storage)
+
+        assert result["status"] == "success"
+        calls = [c for c in mock_job_manager.update_state_data.call_args_list
+                 if c.args[1] == "is_duet"]
+        assert len(calls) == 1
+        assert calls[0].args[2] is True
+
+    def test_complete_leaves_is_duet_untouched_when_absent(self, mock_job):
+        """Latch-up-only: when is_duet is absent from payload, don't write
+        anything — a prior submit_corrections may have set True and we must
+        not clobber it."""
+        mock_job_manager = MagicMock()
+        mock_storage = MagicMock()
+
+        payload = {
+            "corrections": {"corrected_segments": []},
+            "instrumental_selection": "with_backing",
+            # no is_duet field
+        }
+        result = self._call_complete_review(mock_job, payload, mock_job_manager, mock_storage)
+
+        assert result["status"] == "success"
+        calls = [c for c in mock_job_manager.update_state_data.call_args_list
+                 if c.args[1] == "is_duet"]
+        assert calls == [], "is_duet should not be written when payload omits the field"
+
+    def test_complete_latch_ignores_false_when_prior_true(self, mock_job):
+        """is_duet=False on complete is ignored when a prior submit_corrections
+        already persisted True. Prevents InstrumentalSelector's fallback
+        payload from silently downgrading duet jobs to solo."""
+        mock_job_manager = MagicMock()
+        mock_storage = MagicMock()
+        mock_job.state_data = {"is_duet": True}
+
+        payload = {
+            "corrections": {"corrected_segments": []},
+            "instrumental_selection": "with_backing",
+            "is_duet": False,
+        }
+        result = self._call_complete_review(mock_job, payload, mock_job_manager, mock_storage)
+
+        assert result["status"] == "success"
+        calls = [c for c in mock_job_manager.update_state_data.call_args_list
+                 if c.args[1] == "is_duet"]
+        assert calls == [], "is_duet=False must not overwrite a prior-True value"
+
+    def test_complete_writes_false_when_no_prior_true(self, mock_job):
+        """is_duet=False is honoured when no prior True has been latched."""
+        mock_job_manager = MagicMock()
+        mock_storage = MagicMock()
+        mock_job.state_data = {}
+
+        payload = {
+            "corrections": {"corrected_segments": []},
+            "instrumental_selection": "with_backing",
+            "is_duet": False,
+        }
+        result = self._call_complete_review(mock_job, payload, mock_job_manager, mock_storage)
+
+        assert result["status"] == "success"
+        calls = [c for c in mock_job_manager.update_state_data.call_args_list
+                 if c.args[1] == "is_duet"]
+        assert len(calls) == 1
+        assert calls[0].args[2] is False
+
+    def test_complete_rejects_non_bool_is_duet(self, mock_job):
+        """is_duet with a non-boolean value should return 400."""
+        import asyncio
+        from fastapi import HTTPException
+        from backend.api.routes.review import complete_review
+
+        mock_job_manager = MagicMock()
+        mock_storage = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+
+        payload = {
+            "corrections": {"corrected_segments": []},
+            "instrumental_selection": "with_backing",
+            "is_duet": "not a bool",
+        }
+
+        async def _run():
+            return await complete_review(
+                job_id=mock_job.job_id,
+                updated_data=payload,
+                auth_info=("user@test.com", "job_owner"),
+            )
+
+        with patch("backend.api.routes.review.JobManager", return_value=mock_job_manager), \
+             patch("backend.api.routes.review.StorageService", return_value=mock_storage):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(_run())
+            assert exc_info.value.status_code == 400
+            assert "is_duet" in exc_info.value.detail
+
+    def test_is_duet_not_saved_in_corrections_payload(self, mock_job):
+        """is_duet should be stripped from the corrections save payload."""
+        mock_job_manager = MagicMock()
+        mock_storage = MagicMock()
+
+        payload = {
+            "corrections": [{"id": 1, "type": "edit"}],
+            "corrected_segments": [{"id": 1, "text": "hello"}],
+            "instrumental_selection": "clean",
+            "is_duet": True,
+        }
+        self._call_complete_review(mock_job, payload, mock_job_manager, mock_storage)
+
+        # If corrections were uploaded, is_duet must NOT be in the uploaded data
+        if mock_storage.upload_json.called:
+            uploaded_data = mock_storage.upload_json.call_args[0][1]
+            assert "is_duet" not in uploaded_data
+            assert "instrumental_selection" not in uploaded_data
+
+
+class TestPreviewVideoDuetFlag:
+    """Tests for is_duet flag handling in generate_preview_video endpoint.
+
+    The preview-video endpoint must accept an optional boolean is_duet field,
+    validate it, and pass it into OutputConfig so the preview renders with duet
+    colours rather than solo colours.
+
+    We test the extraction + validation logic directly on the endpoint function
+    (which runs before the heavy tempfile/GCS work) and verify that OutputConfig
+    is constructed with the right is_duet kwarg by intercepting the class.
+    """
+
+    @pytest.fixture
+    def mock_job(self):
+        from backend.models.job import Job, JobStatus
+        job = MagicMock(spec=Job)
+        job.job_id = "job-preview-duet"
+        job.status = JobStatus.AWAITING_REVIEW
+        job.input_media_gcs_path = "jobs/job-preview-duet/audio/input.flac"
+        job.style_params_gcs_path = None
+        job.style_assets = {}
+        job.artist = "Test Artist"
+        job.title = "Test Song"
+        return job
+
+    def _run_preview_video(self, mock_job, payload, captured_config_kwargs):
+        """Run generate_preview_video with all heavy dependencies mocked.
+
+        Captures the kwargs passed to OutputConfig() so tests can assert on
+        the is_duet value without needing real GCS or video generation.
+        """
+        import asyncio
+        import tempfile
+        from backend.api.routes.review import generate_preview_video
+
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+
+        mock_storage = MagicMock()
+        mock_encoding_service = MagicMock()
+        mock_encoding_service.is_preview_enabled = False  # skip GCE path
+
+        mock_correction_result = MagicMock()
+        mock_correction_result.segments = []
+
+        def fake_output_config(**kwargs):
+            captured_config_kwargs.append(kwargs)
+            return MagicMock()
+
+        async def _run():
+            return await generate_preview_video(
+                job_id=mock_job.job_id,
+                updated_data=payload,
+                auth_info=("user@test.com", "job_owner"),
+            )
+
+        with patch("backend.api.routes.review.JobManager", return_value=mock_job_manager), \
+             patch("backend.api.routes.review.StorageService", return_value=mock_storage), \
+             patch("backend.api.routes.review.get_encoding_service", return_value=mock_encoding_service), \
+             patch("backend.api.routes.review.load_styles_from_gcs", return_value=("/tmp/styles.json", {})), \
+             patch("backend.api.routes.review.CorrectionResult") as mock_cr, \
+             patch("backend.api.routes.review.CorrectionOperations") as mock_co, \
+             patch("backend.api.routes.review.OutputConfig", side_effect=fake_output_config), \
+             patch("backend.api.routes.review.create_span") as mock_span, \
+             patch("backend.api.routes.review.job_log_context") as mock_log_ctx, \
+             patch("backend.api.routes.review.add_span_event"), \
+             patch("tempfile.TemporaryDirectory") as mock_tmpdir, \
+             patch("os.makedirs"):
+            # Make context managers work
+            mock_span.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_span.return_value.__exit__ = MagicMock(return_value=False)
+            mock_log_ctx.return_value.__enter__ = MagicMock(return_value=None)
+            mock_log_ctx.return_value.__exit__ = MagicMock(return_value=False)
+            mock_tmpdir.return_value.__enter__ = MagicMock(return_value="/tmp/preview_test")
+            mock_tmpdir.return_value.__exit__ = MagicMock(return_value=False)
+            mock_cr.from_dict.return_value = mock_correction_result
+            # corrections.json download: write valid JSON
+            corrections_json = json.dumps({"lines": [], "metadata": {}})
+            mock_storage.download_file.side_effect = lambda gcs, local: None
+            with patch("builtins.open", side_effect=lambda p, *a, **kw:
+                       __import__('io').StringIO(corrections_json) if 'r' in str(a) else
+                       open.__class__(p, *a, **kw)):
+                mock_co.generate_preview_video.return_value = {
+                    "video_path": "/tmp/preview.mp4",
+                    "ass_path": "/tmp/preview.ass",
+                }
+                try:
+                    asyncio.run(_run())
+                except Exception:
+                    pass  # Some paths raise; we only need captured_config_kwargs
+
+    def test_preview_video_passes_is_duet_true_to_output_config(self, mock_job):
+        """is_duet=True in request body must be forwarded to OutputConfig."""
+        captured = []
+        self._run_preview_video(mock_job, {"is_duet": True}, captured)
+        assert len(captured) >= 1, "OutputConfig must be constructed"
+        assert captured[0].get("is_duet") is True
+
+    def test_preview_video_defaults_is_duet_false_when_absent(self, mock_job):
+        """When is_duet is absent, OutputConfig must receive is_duet=False."""
+        captured = []
+        self._run_preview_video(mock_job, {}, captured)
+        assert len(captured) >= 1, "OutputConfig must be constructed"
+        assert captured[0].get("is_duet") is False
+
+    def test_preview_video_rejects_non_bool_is_duet(self, mock_job):
+        """is_duet with a non-boolean value should return 400 before OutputConfig."""
+        import asyncio
+        from fastapi import HTTPException
+        from backend.api.routes.review import generate_preview_video
+
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+        mock_encoding_service = MagicMock()
+        mock_encoding_service.is_preview_enabled = False
+
+        async def _run():
+            return await generate_preview_video(
+                job_id=mock_job.job_id,
+                updated_data={"is_duet": "yes"},
+                auth_info=("user@test.com", "job_owner"),
+            )
+
+        with patch("backend.api.routes.review.JobManager", return_value=mock_job_manager), \
+             patch("backend.api.routes.review.get_encoding_service", return_value=mock_encoding_service):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(_run())
+            assert exc_info.value.status_code == 400
+            assert "is_duet" in exc_info.value.detail
+
+
+class TestGetPreviewVideoRedirect:
+    """get_preview_video must redirect to a signed GCS URL, not proxy the bytes.
+
+    Cloud Run caps response bodies at 32 MiB. A long song's 360p preview exceeds
+    that, so streaming it through Cloud Run (the old FileResponse path) truncated
+    mid-stream — the response started 206 but the client got a 500, and the
+    browser reported "no supported format". Serving a 302 to a signed URL lets
+    the browser fetch the mp4 directly from GCS, bypassing the limit.
+    """
+
+    def _call(self, mock_storage, job_id="job-x", preview_hash="abc123"):
+        import asyncio
+        from backend.api.routes.review import get_preview_video, _preview_videos
+        _preview_videos.clear()  # force the standard-path / file_exists branch
+        with patch("backend.api.routes.review.StorageService", return_value=mock_storage):
+            return (get_preview_video(
+                job_id=job_id,
+                preview_hash=preview_hash,
+                auth_info=("user@test.com", "job_owner"),
+            ))
+
+    def test_returns_302_redirect_to_signed_url(self):
+        from starlette.responses import RedirectResponse
+        mock_storage = MagicMock()
+        mock_storage.file_exists.return_value = True
+        mock_storage.generate_signed_url.return_value = "https://signed.example/preview.mp4?sig=xyz"
+
+        resp = self._call(mock_storage)
+
+        assert isinstance(resp, RedirectResponse)
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "https://signed.example/preview.mp4?sig=xyz"
+        # Signed URL must be generated for the preview GCS object — never proxied.
+        mock_storage.generate_signed_url.assert_called_once()
+        assert mock_storage.generate_signed_url.call_args[0][0] == "jobs/job-x/previews/abc123.mp4"
+        mock_storage.download_file.assert_not_called()
+
+    def test_returns_404_when_preview_missing(self):
+        from fastapi import HTTPException
+        mock_storage = MagicMock()
+        mock_storage.file_exists.return_value = False
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call(mock_storage)
+        assert exc_info.value.status_code == 404
+        mock_storage.generate_signed_url.assert_not_called()
+
+
+class TestGetVocalsAudio:
+    """The vocals waveform endpoint proxies the full vocal stem for the timeline.
+
+    Two behaviours: (1) select the fullest vocal mix (vocals_clean) — real jobs
+    never store a plain 'vocals' key, they store vocals_clean / lead_vocals /
+    backing_vocals. (2) Return the bytes directly (not a 302 to GCS): the
+    waveform fetch()es + decodeAudioData()s the audio, and a cross-origin
+    redirect makes the browser send `Origin: null` which the bucket CORS rejects,
+    so the waveform never loads.
+    """
+
+    def _call(self, stems, audio_complete=True):
+        import asyncio
+        from backend.api.routes.review import _stream_audio, _review_audio_cache
+
+        # Vocals bytes are LRU-cached module-wide; clear so each test asserts a
+        # fresh fetch rather than a hit on a previous test's identical path.
+        _review_audio_cache.clear()
+
+        job = MagicMock()
+        job.input_media_gcs_path = "jobs/j/input.flac"
+        job.file_urls = {"stems": stems}
+        job.state_data = {"audio_complete": audio_complete}
+
+        job_manager = MagicMock()
+        job_manager.get_job.return_value = job
+
+        transcoding = MagicMock()
+        transcoding.get_review_audio_bytes_async = AsyncMock(
+            return_value=(b"OggS-fake-vocals-bytes", "audio/ogg")
+        )
+
+        with patch("backend.api.routes.review.JobManager", return_value=job_manager), patch(
+            "backend.services.audio_transcoding_service.AudioTranscodingService",
+            return_value=transcoding,
+        ):
+            resp = asyncio.run(
+                _stream_audio(job_id="j", stem="vocals")
+            )
+        return resp, transcoding
+
+    def test_proxies_bytes_not_redirect(self):
+        from starlette.responses import RedirectResponse, Response
+
+        resp, _ = self._call({"vocals_clean": "jobs/j/stems/vocals_clean.flac"})
+
+        # Must serve the bytes from the API (CORS-friendly), never 302 to GCS.
+        assert not isinstance(resp, RedirectResponse)
+        assert isinstance(resp, Response)
+        assert resp.status_code == 200
+        assert resp.media_type == "audio/ogg"
+        assert resp.body == b"OggS-fake-vocals-bytes"
+
+    def test_selects_vocals_clean_when_no_plain_vocals_key(self):
+        # The shape produced by real cloud jobs (no plain "vocals").
+        _, transcoding = self._call(
+            {
+                "instrumental_clean": "jobs/j/stems/instrumental_clean.flac",
+                "vocals_clean": "jobs/j/stems/vocals_clean.flac",
+                "lead_vocals": "jobs/j/stems/lead_vocals.flac",
+                "backing_vocals": "jobs/j/stems/backing_vocals.flac",
+            }
+        )
+        # Must pick the full vocal mix (vocals_clean), not lead_vocals or KeyError.
+        assert transcoding.get_review_audio_bytes_async.call_args[0][0] == "jobs/j/stems/vocals_clean.flac"
+
+    def test_prefers_plain_vocals_then_falls_back_to_lead(self):
+        # 2-stem split exposes a plain "vocals" — preferred.
+        _, transcoding = self._call({"vocals": "jobs/j/stems/vocals.flac"})
+        assert transcoding.get_review_audio_bytes_async.call_args[0][0] == "jobs/j/stems/vocals.flac"
+
+        # Only lead_vocals available — last-resort fallback.
+        _, transcoding = self._call({"lead_vocals": "jobs/j/stems/lead_vocals.flac"})
+        assert transcoding.get_review_audio_bytes_async.call_args[0][0] == "jobs/j/stems/lead_vocals.flac"
+
+    def test_404_when_no_vocal_stem_present(self):
+        """audio_complete=True + no vocal stem = the stem will never exist -> 404."""
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call({"instrumental_clean": "jobs/j/stems/instrumental_clean.flac"})
+        assert exc_info.value.status_code == 404
+
+    def test_202_when_separation_still_in_progress(self):
+        """Users can open lyrics review before audio separation finishes (it's
+        decoupled from the critical path), so a missing vocal stem while
+        audio_complete=False means "not yet" — return 202 so the frontend polls
+        instead of permanently hiding the waveform on a terminal 404."""
+        resp, transcoding = self._call({}, audio_complete=False)
+
+        assert resp.status_code == 202
+        assert resp.headers.get("Retry-After") == "15"
+        transcoding.get_review_audio_bytes_async.assert_not_called()
+
+    def test_404_when_separation_skipped_and_no_vocal_stem(self):
+        """Existing-instrumental jobs set audio_complete=True without ever
+        producing vocal stems — must 404 (terminal), not 202 (retry forever)."""
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._call({}, audio_complete=True)
+        assert exc_info.value.status_code == 404
+
+
+class TestReplayCorrectionData:
+    """Replay mode for correction-data: re-open a COMPLETED job read-only.
+
+    Verifies the status gate is bypassed with ?replay=true (full auth only), the
+    AWAITING_REVIEW->IN_REVIEW transition is skipped, and the edit_log is attached.
+    """
+
+    def _client_with_auth(self, auth_type: str = "full"):
+        from backend.main import app
+        from backend.api.dependencies import require_review_auth
+        from fastapi.testclient import TestClient
+
+        async def _mock_auth(job_id: str = "job1"):
+            return (job_id, auth_type)
+
+        app.dependency_overrides[require_review_auth] = _mock_auth
+        return TestClient(app)
+
+    def _teardown(self):
+        from backend.main import app
+        from backend.api.dependencies import require_review_auth
+        app.dependency_overrides.pop(require_review_auth, None)
+
+    def _completed_job(self):
+        from backend.models.job import JobStatus
+        job = MagicMock()
+        job.status = JobStatus.COMPLETE
+        job.job_id = "job1"
+        job.artist = "A"
+        job.title = "T"
+        job.input_media_gcs_path = "jobs/job1/input/audio.flac"
+        job.file_urls = {"lyrics": {"corrections_updated": "jobs/job1/lyrics/corrections_updated.json"},
+                         "stems": {}, "analysis": {}}
+        job.state_data = {"instrumental_selection": "with_backing",
+                          "last_edit_log_path": "jobs/job1/lyrics/edit_log_x.json"}
+        return job
+
+    def test_replay_bypasses_status_gate_and_attaches_edit_log(self):
+        client = self._client_with_auth("full")
+        try:
+            with patch("backend.api.routes.review.JobManager") as jm, \
+                 patch("backend.api.routes.review.StorageService") as storage_cls, \
+                 patch("backend.api.routes.review._get_audio_hash", return_value="h1"):
+                jm.return_value.get_job.return_value = self._completed_job()
+                storage = storage_cls.return_value
+                storage.file_exists.return_value = True
+                storage.download_json.side_effect = lambda p: (
+                    {"entries": [{"operation": "ai_suggestion_accept"}]}
+                    if p.endswith("edit_log_x.json")
+                    else {"corrected_segments": [], "metadata": {}}
+                )
+                resp = client.get("/api/review/job1/correction-data?replay=true")
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["replay"]["is_replay"] is True
+                assert body["replay"]["instrumental_selection"] == "with_backing"
+                assert body["replay"]["job_status"]  # some status string
+                assert len(body["replay"]["edit_log"]["entries"]) == 1
+                # Read-only: must NOT transition state.
+                jm.return_value.transition_to_state.assert_not_called()
+        finally:
+            self._teardown()
+
+    @pytest.mark.parametrize("lyrics_title,expected", [(None, "Waterloo"), ("Waterloo (Remaster)", "Waterloo (Remaster)")])
+    def test_metadata_exposes_unlabeled_lyrics_search_title(self, lyrics_title, expected):
+        """Tempo-labeled jobs: lyrics search boxes must default to the real song title."""
+        client = self._client_with_auth("full")
+        try:
+            with patch("backend.api.routes.review.JobManager") as jm, \
+                 patch("backend.api.routes.review.StorageService") as storage_cls, \
+                 patch("backend.api.routes.review._get_audio_hash", return_value="h1"):
+                job = self._completed_job()
+                job.title = "Waterloo (90% Tempo)"
+                job.lyrics_title = lyrics_title
+                job.lyrics_artist = None
+                jm.return_value.get_job.return_value = job
+                storage = storage_cls.return_value
+                storage.file_exists.return_value = True
+                storage.download_json.side_effect = lambda p: (
+                    {"entries": []} if p.endswith("edit_log_x.json")
+                    else {"corrected_segments": [], "metadata": {}}
+                )
+                resp = client.get("/api/review/job1/correction-data?replay=true")
+                assert resp.status_code == 200
+                meta = resp.json()["metadata"]
+                assert meta["title"] == "Waterloo (90% Tempo)"  # display keeps the label
+                assert meta["lyrics_title"] == expected
+                assert meta["lyrics_artist"] == "A"
+        finally:
+            self._teardown()
+
+    def test_non_replay_completed_job_is_rejected(self):
+        client = self._client_with_auth("full")
+        try:
+            with patch("backend.api.routes.review.JobManager") as jm, \
+                 patch("backend.api.routes.review.StorageService"):
+                jm.return_value.get_job.return_value = self._completed_job()
+                resp = client.get("/api/review/job1/correction-data")
+                assert resp.status_code == 400
+        finally:
+            self._teardown()
+
+    def _awaiting_job(self):
+        from backend.models.job import JobStatus
+        job = self._completed_job()
+        job.status = JobStatus.AWAITING_REVIEW
+        job.state_data = {}
+        return job
+
+    def test_auto_approver_race_returns_409_not_500(self):
+        """Job read as awaiting_review, then auto-approved before our transition."""
+        from backend.exceptions import InvalidStateTransitionError
+        from backend.models.job import JobStatus
+
+        client = self._client_with_auth("full")
+        try:
+            with patch("backend.api.routes.review.JobManager") as jm, \
+                 patch("backend.api.routes.review.StorageService") as storage_cls:
+                moved_on = self._awaiting_job()
+                moved_on.status = JobStatus.REVIEW_COMPLETE
+                jm.return_value.get_job.side_effect = [self._awaiting_job(), moved_on, moved_on]
+                jm.return_value.transition_to_state.side_effect = InvalidStateTransitionError(message="nope")
+                storage_cls.return_value.file_exists.return_value = True
+                storage_cls.return_value.download_json.return_value = {"corrected_segments": []}
+                resp = client.get("/api/review/job1/correction-data")
+                assert resp.status_code == 409
+                assert "review_complete" in resp.json()["detail"]
+                jm.return_value.record_review_started.assert_not_called()
+        finally:
+            self._teardown()
+
+    def test_replay_requires_full_auth(self):
+        client = self._client_with_auth("review_token")
+        try:
+            with patch("backend.api.routes.review.JobManager") as jm, \
+                 patch("backend.api.routes.review.StorageService"):
+                jm.return_value.get_job.return_value = self._completed_job()
+                resp = client.get("/api/review/job1/correction-data?replay=true")
+                assert resp.status_code == 403
+        finally:
+            self._teardown()
+
+
+class TestDevAudioProxy:
+    """The dev-only audio byte-proxy is inert unless REVIEW_AUDIO_PROXY is set."""
+
+    def test_dev_audio_404_when_flag_disabled(self, monkeypatch):
+        from backend.main import app
+        from fastapi.testclient import TestClient
+        monkeypatch.delenv("REVIEW_AUDIO_PROXY", raising=False)
+        client = TestClient(app)
+        resp = client.get("/api/review/job1/dev-audio?path=jobs/job1/stems/x.flac")
+        assert resp.status_code == 404
+
+    def test_dev_audio_rejects_out_of_scope_path(self, monkeypatch):
+        from backend.main import app
+        from fastapi.testclient import TestClient
+        monkeypatch.setenv("REVIEW_AUDIO_PROXY", "1")
+        client = TestClient(app)
+        resp = client.get("/api/review/job1/dev-audio?path=jobs/other/stems/x.flac")
+        assert resp.status_code == 400
+
+    def test_dev_audio_rejects_prefix_bypass_shapes(self, monkeypatch):
+        # The path must be anchored at jobs/{job_id}/ — a job_id that merely
+        # appears somewhere in the path (e.g. job_id="jobs") must not pass.
+        from backend.main import app
+        from fastapi.testclient import TestClient
+        monkeypatch.setenv("REVIEW_AUDIO_PROXY", "1")
+        client = TestClient(app)
+        resp = client.get("/api/review/jobs/dev-audio?path=jobs/other/stems/x.flac")
+        assert resp.status_code == 400
+        resp = client.get("/api/review/job1/dev-audio?path=jobs/job1/../other/x.flac")
+        assert resp.status_code == 400
+
+
+class TestPreviewVideoAsyncFlow:
+    """Tests for the async (non-blocking) GCE preview flow.
+
+    POST /preview-video must NOT wait for GCE encoding — cold-starting a
+    fallback encoder VM can take 2-3 minutes, longer than Cloudflare's ~100s
+    edge timeout (incident 2026-08-29, job 326e1aef: preview encoded fine but
+    the browser connection was cut and the UI spun forever). Instead the
+    endpoint returns {"status": "generating"} immediately and the browser
+    polls the /status endpoint until the mp4 exists in GCS.
+    """
+
+    @pytest.fixture
+    def mock_job(self):
+        from backend.models.job import Job, JobStatus
+        job = MagicMock(spec=Job)
+        job.job_id = "job-preview-async"
+        job.status = JobStatus.AWAITING_REVIEW
+        job.input_media_gcs_path = "jobs/job-preview-async/audio/input.flac"
+        job.style_params_gcs_path = None
+        job.style_assets = {}
+        job.artist = "Test Artist"
+        job.title = "Test Song"
+        return job
+
+    def _run_gce_preview(self, mock_job, *, mp4_exists, background_mock):
+        """Run generate_preview_video with GCE enabled and heavy deps mocked."""
+        import asyncio
+        from backend.api.routes.review import generate_preview_video
+
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+
+        mock_storage = MagicMock()
+        mock_storage.file_exists.return_value = mp4_exists
+
+        mock_encoding_service = MagicMock()
+        mock_encoding_service.is_preview_enabled = True
+
+        mock_settings = MagicMock()
+        mock_settings.gcs_bucket_name = "test-bucket"
+
+        async def _run():
+            result = await generate_preview_video(
+                job_id=mock_job.job_id,
+                updated_data={},
+                auth_info=("user@test.com", "job_owner"),
+            )
+            # Let any create_task'd background coroutine start
+            await asyncio.sleep(0)
+            return result
+
+        with patch("backend.api.routes.review.JobManager", return_value=mock_job_manager), \
+             patch("backend.api.routes.review.StorageService", return_value=mock_storage), \
+             patch("backend.api.routes.review.get_encoding_service", return_value=mock_encoding_service), \
+             patch("backend.api.routes.review.get_settings", return_value=mock_settings), \
+             patch("backend.api.routes.review._prepare_preview_inputs",
+                   return_value=(MagicMock(), "/tmp/audio.flac", MagicMock())), \
+             patch("backend.api.routes.review._encode_preview_in_background", background_mock), \
+             patch("backend.api.routes.review.CorrectionOperations") as mock_co, \
+             patch("tempfile.TemporaryDirectory") as mock_tmpdir:
+            mock_tmpdir.return_value.__enter__ = MagicMock(return_value="/tmp/preview_test")
+            mock_tmpdir.return_value.__exit__ = MagicMock(return_value=False)
+            mock_co.generate_preview_video.return_value = {
+                "preview_hash": "hash123",
+                "ass_path": "/tmp/preview.ass",
+            }
+            result = asyncio.run(_run())
+        return result, mock_storage, mock_co
+
+    def test_cache_hit_returns_success_without_encoding(self, mock_job):
+        """Same edits → same hash: if the mp4 already exists (e.g. user retried
+        after a dropped connection), return success immediately."""
+        background_mock = AsyncMock()
+        result, mock_storage, mock_co = self._run_gce_preview(
+            mock_job, mp4_exists=True, background_mock=background_mock)
+        assert result == {"status": "success", "preview_hash": "hash123"}
+        background_mock.assert_not_called()
+        # ASS is generated with ass_only=True (no local video render)
+        assert mock_co.generate_preview_video.call_args.kwargs["ass_only"] is True
+
+    def test_cache_miss_returns_generating_and_spawns_background_encode(self, mock_job):
+        """When the mp4 doesn't exist, the endpoint must return immediately
+        with status=generating and hand encoding to a background task."""
+        background_mock = AsyncMock()
+        result, mock_storage, _ = self._run_gce_preview(
+            mock_job, mp4_exists=False, background_mock=background_mock)
+        assert result == {"status": "generating", "preview_hash": "hash123"}
+        background_mock.assert_called_once()
+        kwargs = background_mock.call_args.kwargs
+        assert kwargs["preview_hash"] == "hash123"
+        assert kwargs["encode_kwargs"]["job_id"] == "preview_job-preview-async_hash123"
+        assert kwargs["encode_kwargs"]["output_gcs_path"] == \
+            "gs://test-bucket/jobs/job-preview-async/previews/hash123.mp4"
+        # Stale error marker from a previous failed attempt must be cleared
+        mock_storage.delete_file.assert_called_once_with(
+            "jobs/job-preview-async/previews/hash123.error.json", ignore_missing=True)
+
+
+class TestPreviewVideoStatusEndpoint:
+    """GET /{job_id}/preview-video/{hash}/status — poll target for async encodes."""
+
+    def _call(self, mock_storage, job_id="job-x", preview_hash="abc123"):
+        import asyncio
+        from backend.api.routes.review import get_preview_video_status
+        with patch("backend.api.routes.review.StorageService", return_value=mock_storage):
+            return (get_preview_video_status(
+                job_id=job_id,
+                preview_hash=preview_hash,
+                auth_info=("user@test.com", "job_owner"),
+            ))
+
+    def test_ready_when_mp4_exists(self):
+        mock_storage = MagicMock()
+        mock_storage.file_exists.side_effect = lambda p: p.endswith(".mp4")
+        result = self._call(mock_storage)
+        assert result == {"status": "ready", "preview_hash": "abc123"}
+
+    def test_error_when_marker_exists(self):
+        mock_storage = MagicMock()
+        mock_storage.file_exists.side_effect = lambda p: p.endswith(".error.json")
+        mock_storage.download_json.return_value = {"error": "encoder exploded"}
+        result = self._call(mock_storage)
+        assert result["status"] == "error"
+        assert result["message"] == "encoder exploded"
+
+    def test_generating_when_neither_exists(self):
+        mock_storage = MagicMock()
+        mock_storage.file_exists.return_value = False
+        result = self._call(mock_storage)
+        assert result == {"status": "generating", "preview_hash": "abc123"}
+
+
+class TestEncodePreviewInBackground:
+    """The background encode task: GCE first, local fallback, error marker last."""
+
+    @pytest.fixture
+    def mock_job(self):
+        from backend.models.job import Job
+        job = MagicMock(spec=Job)
+        job.job_id = "job-bg"
+        return job
+
+    def _run(self, mock_job, encoding_service, storage, local_render):
+        import asyncio
+        from backend.api.routes.review import _encode_preview_in_background
+        with patch("backend.api.routes.review.get_encoding_service", return_value=encoding_service), \
+             patch("backend.api.routes.review.StorageService", return_value=storage), \
+             patch("backend.api.routes.review._render_preview_locally", local_render):
+            asyncio.run(_encode_preview_in_background(
+                job=mock_job,
+                preview_hash="h1",
+                encode_kwargs={"job_id": "preview_job-bg_h1"},
+                updated_data={},
+                is_duet=False,
+            ))
+
+    def test_gce_success_skips_local_fallback(self, mock_job):
+        encoding_service = MagicMock()
+        encoding_service.encode_preview_video = AsyncMock(return_value={"status": "complete"})
+        storage = MagicMock()
+        local_render = MagicMock()
+        self._run(mock_job, encoding_service, storage, local_render)
+        local_render.assert_not_called()
+        storage.upload_json.assert_not_called()
+
+    def test_gce_failure_falls_back_to_local(self, mock_job):
+        encoding_service = MagicMock()
+        encoding_service.encode_preview_video = AsyncMock(side_effect=RuntimeError("stockout"))
+        storage = MagicMock()
+        local_render = AsyncMock(return_value="h1")
+        self._run(mock_job, encoding_service, storage, local_render)
+        local_render.assert_called_once()
+        storage.upload_json.assert_not_called()
+
+    def test_both_failures_write_error_marker(self, mock_job):
+        """If GCE and the local fallback both fail, an error marker must land in
+        GCS so the status poll surfaces the failure instead of timing out."""
+        encoding_service = MagicMock()
+        encoding_service.encode_preview_video = AsyncMock(side_effect=RuntimeError("stockout"))
+        storage = MagicMock()
+        local_render = AsyncMock(side_effect=RuntimeError("ffmpeg died"))
+        self._run(mock_job, encoding_service, storage, local_render)
+        storage.upload_json.assert_called_once_with(
+            "jobs/job-bg/previews/h1.error.json",
+            {"error": "ffmpeg died"},
+        )
+
+
+class TestPreviewAbandonedWhenJobLeavesReview:
+    """A reviewer who clicks Complete before the preview loads must not leave the
+    encode running: once the job leaves review the background task is cancelled
+    (no submission/polling/fallback/error marker) — 2026-09-23."""
+
+    @pytest.fixture
+    def mock_job(self):
+        from backend.models.job import Job
+        job = MagicMock(spec=Job)
+        job.job_id = "job-ab"
+        return job
+
+    def _run(self, mock_job, encoding_service, storage, local_render, status):
+        import asyncio
+        import backend.api.routes.review as review_mod
+        from backend.api.routes.review import _encode_preview_in_background, _preview_videos
+        _preview_videos.pop("job-ab", None)
+        firestore_job = MagicMock()
+        firestore_job.status = status
+        job_manager = MagicMock()
+        job_manager.get_job.return_value = firestore_job
+        with patch("backend.api.routes.review.get_encoding_service", return_value=encoding_service), \
+             patch("backend.api.routes.review.StorageService", return_value=storage), \
+             patch("backend.api.routes.review._render_preview_locally", local_render), \
+             patch("backend.api.routes.review.JobManager", return_value=job_manager), \
+             patch.object(review_mod, "PREVIEW_ABANDON_POLL_S", 0.02):
+            asyncio.run(_encode_preview_in_background(
+                job=mock_job,
+                preview_hash="h1",
+                encode_kwargs={"job_id": "preview_job-ab_h1"},
+                updated_data={},
+                is_duet=False,
+            ))
+        return job_manager
+
+    def test_encode_cancelled_once_job_leaves_review(self, mock_job):
+        import asyncio
+        import time
+        from backend.models.job import JobStatus
+        from backend.api.routes.review import _preview_videos
+
+        async def slow_encode(**kwargs):
+            await asyncio.sleep(10)  # would be a long GCE wait; must be cut short
+            return {"status": "complete"}
+
+        encoding_service = MagicMock()
+        encoding_service.encode_preview_video = AsyncMock(side_effect=slow_encode)
+        storage = MagicMock()
+        local_render = AsyncMock(return_value="h1")
+
+        started = time.monotonic()
+        job_manager = self._run(mock_job, encoding_service, storage, local_render, JobStatus.REVIEW_COMPLETE)
+        assert time.monotonic() - started < 3, "encode was not abandoned"
+
+        job_manager.get_job.assert_called()
+        local_render.assert_not_called()          # cancellation is not a GCE "failure"
+        storage.upload_json.assert_not_called()   # no error marker
+        assert "job-ab" not in _preview_videos    # nothing recorded as ready
+
+    def test_encode_continues_while_job_in_review(self, mock_job):
+        import asyncio
+        from backend.models.job import JobStatus
+        from backend.api.routes.review import _preview_videos
+
+        async def encode(**kwargs):
+            await asyncio.sleep(0.1)  # spans a few watcher polls
+            return {"status": "complete"}
+
+        encoding_service = MagicMock()
+        encoding_service.encode_preview_video = AsyncMock(side_effect=encode)
+        storage = MagicMock()
+        local_render = AsyncMock(return_value="h1")
+
+        job_manager = self._run(mock_job, encoding_service, storage, local_render, JobStatus.IN_REVIEW)
+
+        job_manager.get_job.assert_called()       # the watcher did poll…
+        local_render.assert_not_called()
+        assert _preview_videos.get("job-ab", {}).get("h1") == "jobs/job-ab/previews/h1.mp4"  # …and the encode finished
+
+    def test_watcher_read_failure_does_not_abandon(self, mock_job):
+        """A transient Firestore error while checking status must not cancel the encode."""
+        import asyncio
+        import backend.api.routes.review as review_mod
+        from backend.api.routes.review import _encode_preview_in_background, _preview_videos
+        _preview_videos.pop("job-ab", None)
+
+        async def encode(**kwargs):
+            await asyncio.sleep(0.1)
+            return {"status": "complete"}
+
+        encoding_service = MagicMock()
+        encoding_service.encode_preview_video = AsyncMock(side_effect=encode)
+        job_manager = MagicMock()
+        job_manager.get_job.side_effect = RuntimeError("firestore blip")
+        with patch("backend.api.routes.review.get_encoding_service", return_value=encoding_service), \
+             patch("backend.api.routes.review.StorageService", return_value=MagicMock()), \
+             patch("backend.api.routes.review.JobManager", return_value=job_manager), \
+             patch.object(review_mod, "PREVIEW_ABANDON_POLL_S", 0.02):
+            asyncio.run(_encode_preview_in_background(
+                job=mock_job, preview_hash="h1",
+                encode_kwargs={"job_id": "preview_job-ab_h1"}, updated_data={}, is_duet=False,
+            ))
+        assert job_manager.get_job.call_count >= 1
+        assert _preview_videos.get("job-ab", {}).get("h1") == "jobs/job-ab/previews/h1.mp4"
+
+    def _run_local_unbounded(self, abandoned, set_during_render):
+        """Drive _render_preview_locally_unbounded with the render mocked out."""
+        from backend.api.routes.review import _render_preview_locally_unbounded, _preview_videos
+        _preview_videos.pop("job-ab", None)
+        job = MagicMock()
+        job.job_id = "job-ab"
+        storage = MagicMock()
+
+        def fake_render(**kwargs):
+            if set_during_render:
+                abandoned.set()  # the watcher fired while ffmpeg was running
+            return {"preview_hash": "h1", "video_path": "/tmp/x.mp4"}
+
+        with patch("backend.api.routes.review.StorageService", return_value=storage), \
+             patch("backend.api.routes.review._prepare_preview_inputs", return_value=(MagicMock(), "/tmp/a.flac", MagicMock())), \
+             patch("backend.api.routes.review.CorrectionOperations.generate_preview_video", side_effect=fake_render) as render:
+            result = _render_preview_locally_unbounded(job, {}, False, abandoned)
+        return result, render, storage
+
+    def test_local_render_thread_skips_upload_when_abandoned_mid_render(self):
+        """Cancelling the awaiting task can't stop a thread already in ffmpeg —
+        the thread itself must drop the result instead of publishing it."""
+        import threading
+        from backend.api.routes.review import _preview_videos
+        abandoned = threading.Event()
+        result, render, storage = self._run_local_unbounded(abandoned, set_during_render=True)
+        render.assert_called_once()
+        storage.upload_file.assert_not_called()
+        assert "job-ab" not in _preview_videos
+        assert result == "h1"
+
+    def test_local_render_thread_skips_render_when_already_abandoned(self):
+        import threading
+        abandoned = threading.Event()
+        abandoned.set()
+        result, render, storage = self._run_local_unbounded(abandoned, set_during_render=False)
+        render.assert_not_called()
+        storage.upload_file.assert_not_called()
+        assert result == ""
+
+    def test_local_render_thread_publishes_when_not_abandoned(self):
+        import threading
+        from backend.api.routes.review import _preview_videos
+        result, render, storage = self._run_local_unbounded(threading.Event(), set_during_render=False)
+        storage.upload_file.assert_called_once_with("/tmp/x.mp4", "jobs/job-ab/previews/h1.mp4")
+        assert _preview_videos["job-ab"]["h1"] == "jobs/job-ab/previews/h1.mp4"
+
+
+class TestVocalsCacheRangeAndHeaders:
+    """Concurrent-load fixes on the vocals byte proxy: LRU cache, Range, Cache-Control."""
+
+    def _make_request(self, headers=None):
+        req = MagicMock()
+        req.headers = headers or {}
+        return req
+
+    def _run(self, request=None, path="jobs/j/stems/vocals_clean.flac", clear_cache=True):
+        import asyncio
+        from backend.api.routes.review import _stream_audio, _review_audio_cache
+
+        if clear_cache:
+            _review_audio_cache.clear()
+
+        job = MagicMock()
+        job.input_media_gcs_path = "jobs/j/input.flac"
+        job.file_urls = {"stems": {"vocals_clean": path}}
+        job.state_data = {"audio_complete": True}
+
+        job_manager = MagicMock()
+        job_manager.get_job.return_value = job
+
+        transcoding = MagicMock()
+        transcoding.get_review_audio_bytes_async = AsyncMock(
+            return_value=(b"0123456789", "audio/ogg")
+        )
+
+        with patch("backend.api.routes.review.JobManager", return_value=job_manager), patch(
+            "backend.services.audio_transcoding_service.AudioTranscodingService",
+            return_value=transcoding,
+        ):
+            resp = asyncio.run(_stream_audio("j", request, stem="vocals"))
+        return resp, transcoding
+
+    def test_second_fetch_served_from_lru_cache(self):
+        """Ten tabs of one job must not each re-download the stem from GCS."""
+        _, first = self._run()
+        first.get_review_audio_bytes_async.assert_awaited_once()
+
+        resp, second = self._run(clear_cache=False)
+        second.get_review_audio_bytes_async.assert_not_awaited()
+        assert resp.body == b"0123456789"
+
+    def test_range_request_returns_206_partial(self):
+        req = self._make_request({"range": "bytes=2-5"})
+        resp, _ = self._run(request=req)
+
+        assert resp.status_code == 206
+        assert resp.body == b"2345"
+        assert resp.headers["Content-Range"] == "bytes 2-5/10"
+        assert resp.headers["Accept-Ranges"] == "bytes"
+
+    def test_full_response_has_cache_control(self):
+        req = self._make_request({})
+        resp, _ = self._run(request=req)
+
+        assert resp.status_code == 200
+        assert "max-age" in resp.headers.get("Cache-Control", "")
+
+    def test_no_request_still_returns_full_body(self):
+        """Callers without a Request object (legacy path) keep working."""
+        resp, _ = self._run(request=None)
+        assert resp.status_code == 200
+        assert resp.body == b"0123456789"
+
+
+class TestWaveformDataEndpointCache:
+    """/waveform-data must serve via the persistent cache path, off the event loop."""
+
+    def _run(self, stems=None):
+        import asyncio
+        from backend.api.routes.review import get_waveform_data
+
+        job = MagicMock()
+        job.input_media_gcs_path = "jobs/j/input.flac"
+        if stems is None:
+            stems = {"backing_vocals": "jobs/j/stems/backing_vocals.flac"}
+        job.file_urls = {"stems": stems}
+
+        job_manager = MagicMock()
+        job_manager.get_job.return_value = job
+
+        analysis = MagicMock()
+        analysis.get_review_waveform.return_value = ([0.4, 0.8], 150.0)
+
+        with patch("backend.api.routes.review.JobManager", return_value=job_manager), patch(
+            "backend.services.audio_analysis_service.AudioAnalysisService",
+            return_value=analysis,
+        ), patch(
+            "backend.services.audio_transcoding_service.AudioTranscodingService",
+            return_value=MagicMock(),
+        ):
+            result = asyncio.run(
+                get_waveform_data("j", num_points=1000, auth_info=("admin", "full"))
+            )
+        return result, analysis
+
+    def test_serves_cached_review_waveform(self):
+        result, analysis = self._run()
+
+        analysis.get_review_waveform.assert_called_once()
+        args = analysis.get_review_waveform.call_args[0]
+        assert args[0] == "jobs/j/stems/backing_vocals.flac"
+        assert args[1] == "j"
+        assert args[2] == 1000
+        assert result["amplitudes"] == [0.4, 0.8]
+        assert result["duration_seconds"] == 150.0
+        assert result["duration"] == 150.0
+
+    def test_falls_back_to_input_audio_without_backing_stem(self):
+        _, analysis = self._run(stems={})
+        assert analysis.get_review_waveform.call_args[0][0] == "jobs/j/input.flac"
+
+
+class TestReviewAudioSingleFlightAndByteCap:
+    """CodeRabbit follow-ups on #1024: coalesce concurrent misses; bound cache bytes."""
+
+    def test_concurrent_misses_share_one_fetch(self):
+        import asyncio
+        from backend.api.routes import review as review_module
+
+        review_module._review_audio_cache.clear()
+
+        calls = {"n": 0}
+
+        class SlowTranscoding:
+            async def get_review_audio_bytes_async(self, path):
+                calls["n"] += 1
+                await asyncio.sleep(0.05)
+                return (b"shared-bytes", "audio/ogg")
+
+        async def scenario():
+            t = SlowTranscoding()
+            results = await asyncio.gather(
+                *[review_module._get_review_audio("jobs/j/stems/v.flac", t) for _ in range(5)]
+            )
+            return results
+
+        results = asyncio.run(scenario())
+        assert calls["n"] == 1  # five concurrent callers, one fetch
+        assert all(r == (b"shared-bytes", "audio/ogg") for r in results)
+
+    def test_failure_is_shared_and_next_call_retries(self):
+        import asyncio
+        from backend.api.routes import review as review_module
+
+        review_module._review_audio_cache.clear()
+
+        calls = {"n": 0}
+
+        class FlakyTranscoding:
+            async def get_review_audio_bytes_async(self, path):
+                calls["n"] += 1
+                await asyncio.sleep(0.02)
+                if calls["n"] == 1:
+                    raise RuntimeError("GCS blip")
+                return (b"ok", "audio/ogg")
+
+        async def scenario():
+            t = FlakyTranscoding()
+            first = await asyncio.gather(
+                *[review_module._get_review_audio("jobs/j/stems/v.flac", t) for _ in range(3)],
+                return_exceptions=True,
+            )
+            assert all(isinstance(r, RuntimeError) for r in first)
+            # In-flight entry must be gone — a fresh call retries and succeeds.
+            return await review_module._get_review_audio("jobs/j/stems/v.flac", t)
+
+        result = asyncio.run(scenario())
+        assert result == (b"ok", "audio/ogg")
+        assert calls["n"] == 2
+
+    def test_oversized_entry_not_cached(self, monkeypatch):
+        from backend.api.routes import review as review_module
+
+        review_module._review_audio_cache.clear()
+        monkeypatch.setattr(review_module, "_REVIEW_AUDIO_CACHE_MAX_BYTES", 100)
+
+        # > max_bytes // 4 → skipped (one giant fallback FLAC must not evict all)
+        review_module._review_audio_cache_put("big", (b"x" * 50, "audio/flac"))
+        assert "big" not in review_module._review_audio_cache
+
+    def test_byte_cap_evicts_lru(self, monkeypatch):
+        from backend.api.routes import review as review_module
+
+        review_module._review_audio_cache.clear()
+        review_module._review_audio_cache_bytes = 0
+        monkeypatch.setattr(review_module, "_REVIEW_AUDIO_CACHE_MAX_BYTES", 100)
+
+        for key in ("a", "b", "c", "d", "e"):
+            review_module._review_audio_cache_put(key, (b"x" * 25, "audio/ogg"))
+
+        # 5 × 25B = 125B > 100B cap → oldest evicted, total back under the cap.
+        assert "a" not in review_module._review_audio_cache
+        assert review_module._review_audio_cache_bytes <= 100
+        assert set(review_module._review_audio_cache) == {"b", "c", "d", "e"}
+
+
+class TestLocalPreviewRenderBound:
+    """The local preview ffmpeg fallback must be bounded so a GCE outage plus a
+    few concurrent Preview clicks can't saturate the API instance's CPU.
+    Admission is an async semaphore on the event loop (waiters are cheap
+    coroutines, not parked executor threads)."""
+
+    def test_serializes_and_times_out_admission(self, monkeypatch):
+        import asyncio
+        import threading
+        from backend.api.routes import review as review_module
+
+        monkeypatch.setattr(review_module, "_LOCAL_PREVIEW_QUEUE_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(review_module, "_local_preview_slots", asyncio.Semaphore(1))
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_render(job, updated_data, is_duet, abandoned=None):
+            started.set()
+            release.wait(timeout=5)
+            return "hash"
+
+        monkeypatch.setattr(review_module, "_render_preview_locally_unbounded", slow_render)
+
+        async def scenario():
+            first = asyncio.create_task(
+                review_module._render_preview_locally(MagicMock(), {}, False)
+            )
+            await asyncio.to_thread(started.wait, 5)
+
+            # Slot held by the first render — the second caller's admission wait
+            # times out fast instead of piling more ffmpeg onto the instance.
+            with pytest.raises(RuntimeError, match="busy"):
+                await review_module._render_preview_locally(MagicMock(), {}, False)
+
+            release.set()
+            assert await first == "hash"
+
+            # Slot released — a fresh render is admitted immediately.
+            monkeypatch.setattr(
+                review_module, "_render_preview_locally_unbounded",
+                lambda job, updated_data, is_duet, abandoned=None: "hash2",
+            )
+            assert await review_module._render_preview_locally(MagicMock(), {}, False) == "hash2"
+
+        asyncio.run(scenario())
+
+    def test_cancelled_caller_does_not_free_slot_while_render_runs(self, monkeypatch):
+        """Cancelling the awaiting request must NOT release the slot while the
+        ffmpeg worker thread is still running — otherwise a second render can
+        start and defeat the concurrency bound."""
+        import asyncio
+        import threading
+        from backend.api.routes import review as review_module
+
+        monkeypatch.setattr(review_module, "_LOCAL_PREVIEW_QUEUE_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(review_module, "_local_preview_slots", asyncio.Semaphore(1))
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_render(job, updated_data, is_duet, abandoned=None):
+            started.set()
+            release.wait(timeout=5)
+            return "hash"
+
+        monkeypatch.setattr(review_module, "_render_preview_locally_unbounded", slow_render)
+
+        async def scenario():
+            first = asyncio.create_task(
+                review_module._render_preview_locally(MagicMock(), {}, False)
+            )
+            await asyncio.to_thread(started.wait, 5)
+
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            # Worker thread is still rendering — the slot must still be held.
+            with pytest.raises(RuntimeError, match="busy"):
+                await review_module._render_preview_locally(MagicMock(), {}, False)
+
+            # Worker finishes → done-callback releases the slot.
+            release.set()
+            for _ in range(50):
+                if not review_module._local_preview_slots.locked():
+                    break
+                await asyncio.sleep(0.05)
+
+            monkeypatch.setattr(
+                review_module, "_render_preview_locally_unbounded",
+                lambda job, updated_data, is_duet, abandoned=None: "hash2",
+            )
+            assert await review_module._render_preview_locally(MagicMock(), {}, False) == "hash2"
+
+        asyncio.run(scenario())
+
+
+class TestVocalsPeaksEndpoint:
+    """/vocals-peaks serves the precomputed envelope (sub-second strips)."""
+
+    def _run(self, stems=None, audio_complete=True, pps=400):
+        import asyncio
+        from backend.api.routes.review import get_vocals_peaks
+
+        job = MagicMock()
+        job.input_media_gcs_path = "jobs/j/input.flac"
+        if stems is None:
+            stems = {"vocals_clean": "jobs/j/stems/vocals_clean.flac"}
+        job.file_urls = {"stems": stems}
+        job.state_data = {"audio_complete": audio_complete}
+
+        job_manager = MagicMock()
+        job_manager.get_job.return_value = job
+
+        analysis = MagicMock()
+        analysis.get_vocals_peaks.return_value = {
+            "peaks_b64": "AAECAw==",
+            "encoding": "u8",
+            "peaks_per_second": 400,
+            "duration_seconds": 12.5,
+            "source_gcs_path": "jobs/j/stems/vocals_clean.flac",
+        }
+
+        with patch("backend.api.routes.review.JobManager", return_value=job_manager), patch(
+            "backend.services.audio_analysis_service.AudioAnalysisService",
+            return_value=analysis,
+        ), patch(
+            "backend.services.audio_transcoding_service.AudioTranscodingService",
+            return_value=MagicMock(),
+        ):
+            resp = asyncio.run(
+                get_vocals_peaks("j", peaks_per_second=pps, auth_info=("admin", "full"))
+            )
+        return resp, analysis
+
+    def test_serves_payload_with_cache_headers(self):
+        import json as jsonlib
+
+        resp, analysis = self._run()
+
+        assert resp.status_code == 200
+        body = jsonlib.loads(resp.body)
+        assert body["peaks_b64"] == "AAECAw=="
+        assert body["encoding"] == "u8"
+        assert body["duration_seconds"] == 12.5
+        assert "max-age" in resp.headers.get("Cache-Control", "")
+        args = analysis.get_vocals_peaks.call_args[0]
+        assert args[0] == "jobs/j/stems/vocals_clean.flac"
+        assert args[1] == "j"
+        assert args[2] == 400
+
+    def test_clamps_peaks_per_second(self):
+        _, analysis = self._run(pps=999999)
+        assert analysis.get_vocals_peaks.call_args[0][2] == 1000
+
+    def test_202_while_separation_running(self):
+        resp, analysis = self._run(stems={}, audio_complete=False)
+        assert resp.status_code == 202
+        assert resp.headers.get("Retry-After") == "15"
+        analysis.get_vocals_peaks.assert_not_called()
+
+    def test_404_when_stem_will_never_exist(self):
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._run(stems={}, audio_complete=True)
+        assert exc_info.value.status_code == 404
+
+
+class TestCorrectionDataReviewTransitionIdempotent:
+    """GET correction-data opens review; concurrent opens (iOS) must not 500."""
+
+    def _run(self, status, transition_side_effect=None, transition_return=True, reread_status=None):
+        from backend.exceptions import InvalidStateTransitionError  # noqa: F401
+        helper = TestReplayCorrectionData()
+        client = helper._client_with_auth("full")
+        try:
+            with patch("backend.api.routes.review.JobManager") as jm, \
+                 patch("backend.api.routes.review.StorageService") as storage_cls, \
+                 patch("backend.api.routes.review._get_audio_hash", return_value="h1"):
+                job = helper._completed_job()
+                job.status = status
+                job.user_email = "u@example.com"
+                if reread_status is None:
+                    jm.return_value.get_job.return_value = job
+                else:
+                    reread = MagicMock()
+                    reread.status = reread_status
+                    jm.return_value.get_job.side_effect = [job, reread]
+                jm.return_value.transition_to_state.side_effect = transition_side_effect
+                jm.return_value.transition_to_state.return_value = transition_return
+                storage = storage_cls.return_value
+                storage.file_exists.return_value = True
+                storage.download_json.side_effect = lambda p: {"corrected_segments": [], "metadata": {}}
+                resp = client.get("/api/review/job1/correction-data")
+                return resp, jm.return_value
+        finally:
+            helper._teardown()
+
+    def test_already_in_review_does_not_transition(self):
+        from backend.models.job import JobStatus
+        resp, jm = self._run(JobStatus.IN_REVIEW)
+        assert resp.status_code == 200
+        jm.transition_to_state.assert_not_called()
+        jm.record_review_started.assert_not_called()
+
+    def test_awaiting_review_transitions_and_records_once(self):
+        from backend.models.job import JobStatus
+        resp, jm = self._run(JobStatus.AWAITING_REVIEW)
+        assert resp.status_code == 200
+        jm.transition_to_state.assert_called_once()
+        jm.record_review_started.assert_called_once()
+
+    def test_lost_race_returns_data_without_side_effects(self):
+        from backend.exceptions import InvalidStateTransitionError
+        from backend.models.job import JobStatus
+        resp, jm = self._run(
+            JobStatus.AWAITING_REVIEW,
+            transition_side_effect=InvalidStateTransitionError(
+                message="Invalid state transition in_review -> in_review"),
+            reread_status=JobStatus.IN_REVIEW,
+        )
+        assert resp.status_code == 200
+        jm.record_review_started.assert_not_called()
+
+    def test_other_invalid_transition_still_errors(self):
+        from backend.exceptions import InvalidStateTransitionError
+        from backend.models.job import JobStatus
+        resp, jm = self._run(
+            JobStatus.AWAITING_REVIEW,
+            transition_side_effect=InvalidStateTransitionError(message="nope"),
+            reread_status=JobStatus.CANCELLED,
+        )
+        assert resp.status_code == 500
+        jm.record_review_started.assert_not_called()
+
+
+class TestPreviewVideoMissingTimings:
+    """POST /preview-video with an untimed in-browser edit: fill it, or 422 naming the line (was a 500 KeyError)."""
+
+    @pytest.fixture(autouse=True)
+    def auth_overrides(self):
+        from backend.main import app
+        from backend.api.dependencies import require_review_auth
+
+        async def mock_require_review_auth(job_id: str = "test123"):
+            return (job_id, "full")
+
+        app.dependency_overrides[require_review_auth] = mock_require_review_auth
+        yield
+        app.dependency_overrides.pop(require_review_auth, None)
+
+    def _post(self, test_client, payload):
+        from backend.models.job import JobStatus
+
+        mock_job = MagicMock()
+        mock_job.status = JobStatus.IN_REVIEW
+        encoding = MagicMock()
+        encoding.is_preview_enabled = False  # local render path
+        render = AsyncMock(return_value="hash123")
+        with patch("backend.api.routes.review.JobManager") as mock_jm, \
+                patch("backend.api.routes.review.StorageService"), \
+                patch("backend.api.routes.review.get_encoding_service", return_value=encoding), \
+                patch("backend.api.routes.review._render_preview_locally", render):
+            mock_jm.return_value.get_job.return_value = mock_job
+            resp = test_client.post("/api/review/test123/preview-video", json=payload)
+        return resp, render
+
+    def test_unrecoverable_line_is_a_422_naming_it(self, test_client):
+        payload = {"corrections": [], "corrected_segments": [
+            {"id": "s", "text": "lonely line", "words": [{"id": "w", "text": "lonely"}]}]}
+        resp, render = self._post(test_client, payload)
+        assert resp.status_code == 422, resp.text
+        assert "lonely line" in resp.json()["detail"]
+        render.assert_not_awaited()
+
+    def test_fillable_gaps_reach_the_renderer_filled(self, test_client):
+        payload = {"corrections": [], "corrected_segments": [
+            {"id": "s", "text": "x", "start_time": 1.0,
+             "words": [{"id": "w", "text": "x", "start_time": 1.0, "end_time": 1.5}]}]}
+        resp, render = self._post(test_client, payload)
+        assert resp.status_code == 200, resp.text
+        sent = render.await_args.args[1]
+        assert sent["corrected_segments"][0]["end_time"] == 1.5

@@ -1,0 +1,1450 @@
+"""Tests for error_monitor.monitor module.
+
+All external dependencies (Cloud Logging, Firestore, Discord, LLM, Secret Manager)
+are mocked — no real GCP connections are made.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Import helpers
+# ---------------------------------------------------------------------------
+
+
+def _import_monitor_module():
+    from backend.services.error_monitor import monitor as m
+
+    return m
+
+
+def _import_error_monitor_class():
+    from backend.services.error_monitor.monitor import ErrorMonitor
+
+    return ErrorMonitor
+
+
+# ---------------------------------------------------------------------------
+# Helper to build a minimal mock log entry
+# ---------------------------------------------------------------------------
+
+
+def _make_entry(
+    payload=None,
+    resource_type="cloud_run_revision",
+    service_name="karaoke-backend",
+    job_name=None,
+    function_name=None,
+    instance_id=None,
+    resource_name=None,
+):
+    """Return a mock Cloud Logging entry."""
+    entry = MagicMock()
+    entry.payload = payload
+    entry.resource = MagicMock()
+    entry.resource.type = resource_type
+    entry.resource.labels = {
+        "service_name": service_name,
+        "job_name": job_name or "",
+        "function_name": function_name or "",
+        "instance_id": instance_id or "",
+    }
+    entry.labels = {}
+    if resource_name:
+        entry.labels["compute.googleapis.com/resource_name"] = resource_name
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_log_filter
+# ---------------------------------------------------------------------------
+
+
+class TestBuildLogFilter:
+    """_build_log_filter should produce correct Cloud Logging filter strings."""
+
+    def test_cloud_run_revision_filter(self):
+        m = _import_monitor_module()
+        result = m._build_log_filter("cloud_run_revision", ["svc-a", "svc-b"], 15)
+        assert 'resource.type="cloud_run_revision"' in result
+        assert "severity>=ERROR" in result
+        assert "svc-a" in result
+        assert "svc-b" in result
+        assert "resource.labels.service_name" in result
+
+    def test_cloud_run_job_filter(self):
+        m = _import_monitor_module()
+        result = m._build_log_filter("cloud_run_job", ["job-x"], 15)
+        assert 'resource.type="cloud_run_job"' in result
+        assert "severity>=ERROR" in result
+        assert "job-x" in result
+        assert "resource.labels.job_name" in result
+
+    def test_gce_instance_filter(self):
+        m = _import_monitor_module()
+        result = m._build_log_filter("gce_instance", ["enc-worker-a"], 15)
+        assert 'resource.type="gce_instance"' in result
+        assert "severity>=ERROR" in result
+        assert "enc-worker-a" in result
+        assert 'compute.googleapis.com/resource_name' in result
+
+    def test_cloud_function_filter(self):
+        m = _import_monitor_module()
+        result = m._build_log_filter("cloud_function", ["fn-one", "fn-two"], 10)
+        assert 'resource.type="cloud_function"' in result
+        assert "fn-one" in result
+        assert "fn-two" in result
+
+    def test_filter_contains_timestamp(self):
+        m = _import_monitor_module()
+        result = m._build_log_filter("cloud_run_revision", ["svc"], 30)
+        assert "timestamp>=" in result
+
+    def test_single_resource_no_or_clause_needed(self):
+        m = _import_monitor_module()
+        result = m._build_log_filter("cloud_run_revision", ["only-svc"], 15)
+        assert "only-svc" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: _extract_message
+# ---------------------------------------------------------------------------
+
+
+class TestExtractMessage:
+    """_extract_message should handle all payload shapes."""
+
+    def test_text_payload_string_returned_directly(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = "Something went wrong"
+        result = m._extract_message(entry)
+        assert result == "Something went wrong"
+
+    def test_dict_payload_message_key(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = {"message": "DB connection refused"}
+        result = m._extract_message(entry)
+        assert result == "DB connection refused"
+
+    def test_dict_payload_textPayload_key(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = {"textPayload": "File not found: /tmp/foo"}
+        result = m._extract_message(entry)
+        assert result == "File not found: /tmp/foo"
+
+    def test_dict_payload_error_key(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = {"error": "timeout after 30s"}
+        result = m._extract_message(entry)
+        assert result == "timeout after 30s"
+
+    def test_dict_payload_msg_key(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = {"msg": "panic: nil pointer dereference"}
+        result = m._extract_message(entry)
+        assert result == "panic: nil pointer dereference"
+
+    def test_none_payload_returns_none(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = None
+        result = m._extract_message(entry)
+        assert result is None
+
+    def test_dict_payload_no_known_key_returns_none(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = {"severity": "ERROR", "timestamp": "2026-04-10T10:00:00Z"}
+        result = m._extract_message(entry)
+        assert result is None
+
+    def test_empty_string_payload_treated_as_text(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = ""
+        result = m._extract_message(entry)
+        # Empty string is falsy — should return the string or None depending on impl
+        # As long as it doesn't crash; either return value is acceptable
+        assert result is None or result == ""
+
+
+# Invented paths/ids; the shapes are copied from real prod entries (2026-11-03).
+_PLAIN_TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "/app/backend/middleware/audit_logging.py", line 63, in dispatch\n'
+    "    response = await call_next(request)\n"
+    "               ^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    '  File "/app/backend/services/job_manager.py", line 657, in validate_state_transition\n'
+    "    raise InvalidStateTransitionError(\n"
+    "backend.exceptions.InvalidStateTransitionError: Invalid state transition for job 7f89f884: "
+    "complete -> in_review. Valid transitions: ['awaiting_review', 'lyrics_complete']\n"
+)
+_GROUP_TRACEBACK = (
+    "  + Exception Group Traceback (most recent call last):\n"
+    '  |   File "/usr/local/lib/python3.11/site-packages/starlette/_utils.py", line 104, in create_collapsing_task_group\n'
+    "  |     async with anyio.create_task_group() as tg:\n"
+    '  |   File "/usr/local/lib/python3.11/site-packages/anyio/_backends/_asyncio.py", line 847, in __aexit__\n'
+    "  |     raise BaseExceptionGroup(\n"
+    "  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)\n"
+    "  +-+---------------- 1 ----------------\n"
+    "    | Traceback (most recent call last):\n"
+    '    |   File "/app/backend/services/job_manager.py", line 657, in validate_state_transition\n'
+    "    |     raise InvalidStateTransitionError(\n"
+    "    | backend.exceptions.InvalidStateTransitionError: Invalid state transition for job 7f89f884: "
+    "complete -> in_review. Valid transitions: ['awaiting_review', 'lyrics_complete']\n"
+    "    +------------------------------------\n"
+)
+_EXPECTED_CAUSE = (
+    "Unhandled exception: backend.exceptions.InvalidStateTransitionError: Invalid state transition "
+    "for job 7f89f884: complete -> in_review. Valid transitions: ['awaiting_review', 'lyrics_complete']"
+)
+
+
+class TestUnhandledExceptionMessages:
+    """Every unhandled exception logs one of two fixed messages; the pattern must
+    come from the exception, or all crashes share one (already 'new') pattern and
+    a second, different crash never alerts."""
+
+    def _entry(self, message, exception, **extra):
+        entry = MagicMock()
+        entry.payload = {"message": message, "exception": exception, **extra}
+        return entry
+
+    def test_audit_error_plain_traceback(self):
+        m = _import_monitor_module()
+        entry = self._entry("request_audit_error", _PLAIN_TRACEBACK, path="/api/jobs/x/start-review", method="POST")
+        assert m._extract_message(entry) == _EXPECTED_CAUSE
+
+    def test_asgi_exception_group_traceback_with_pipe_prefixes(self):
+        m = _import_monitor_module()
+        entry = self._entry("Exception in ASGI application\n", _GROUP_TRACEBACK)
+        assert m._extract_message(entry) == _EXPECTED_CAUSE
+
+    def test_nested_exception_group(self):
+        m = _import_monitor_module()
+        nested = (
+            "  + Exception Group Traceback (most recent call last):\n"
+            "  | ExceptionGroup: outer (1 sub-exception)\n"
+            "  +-+---------------- 1 ----------------\n"
+            "    | Exception Group Traceback (most recent call last):\n"
+            "    | ExceptionGroup: inner (1 sub-exception)\n"
+            "    +-+---------------- 1 ----------------\n"
+            "      | Traceback (most recent call last):\n"
+            '      |   File "/app/a.py", line 1, in f\n'
+            "      |     boom()\n"
+            "      | ValueError: the real cause\n"
+            "      +------------------------------------\n"
+            "    +------------------------------------\n"
+        )
+        assert m._extract_message(self._entry("request_audit_error", nested)) == (
+            "Unhandled exception: ValueError: the real cause"
+        )
+
+    def test_multiline_exception_message_uses_its_first_line(self):
+        # pydantic's last traceback line is a docs link, the same for every failure.
+        m = _import_monitor_module()
+        exc = (
+            "Traceback (most recent call last):\n"
+            '  File "/app/a.py", line 1, in f\n'
+            "    boom()\n"
+            "pydantic_core._pydantic_core.ValidationError: 1 validation error for Job\n"
+            "status\n"
+            "  Input should be a valid string\n"
+            "    For further information visit https://errors.pydantic.dev/2/v/string_type\n"
+        )
+        assert m._extract_message(self._entry("request_audit_error", exc)) == (
+            "Unhandled exception: pydantic_core._pydantic_core.ValidationError: 1 validation error for Job"
+        )
+
+    def test_chained_exception_uses_the_final_one(self):
+        m = _import_monitor_module()
+        exc = (
+            "Traceback (most recent call last):\n"
+            '  File "/app/a.py", line 1, in f\n'
+            "    boom()\n"
+            "KeyError: 'first'\n\n"
+            "During handling of the above exception, another exception occurred:\n\n"
+            "Traceback (most recent call last):\n"
+            '  File "/app/b.py", line 2, in g\n'
+            "    bang()\n"
+            "RuntimeError: second\n"
+        )
+        assert m._extract_message(self._entry("request_audit_error", exc)) == (
+            "Unhandled exception: RuntimeError: second"
+        )
+
+    def test_no_exception_field_keeps_the_message(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.payload = {"message": "request_audit_error"}
+        assert m._extract_message(entry) == "request_audit_error"
+
+    def test_unparseable_exception_keeps_last_line(self):
+        m = _import_monitor_module()
+        assert m._extract_message(self._entry("request_audit_error", "something odd\nno frames here\n")) == (
+            "Unhandled exception: no frames here"
+        )
+
+    def test_other_messages_with_exception_field_are_untouched(self):
+        m = _import_monitor_module()
+        entry = self._entry("Job 1 could not save", _PLAIN_TRACEBACK)
+        assert m._extract_message(entry) == "Job 1 could not save"
+
+    def test_both_log_lines_of_one_crash_collapse_to_one_pattern(self):
+        from backend.services.error_monitor.normalizer import compute_pattern_hash, normalize_message
+
+        m = _import_monitor_module()
+        audit = m._extract_message(self._entry("request_audit_error", _PLAIN_TRACEBACK))
+        asgi = m._extract_message(self._entry("Exception in ASGI application\n", _GROUP_TRACEBACK))
+        assert compute_pattern_hash("s", normalize_message(audit)) == compute_pattern_hash("s", normalize_message(asgi))
+
+    def test_two_different_crashes_are_two_patterns(self):
+        from backend.services.error_monitor.normalizer import normalize_message
+
+        m = _import_monitor_module()
+        other = _PLAIN_TRACEBACK.replace(
+            "backend.exceptions.InvalidStateTransitionError: Invalid state transition for job 7f89f884: "
+            "complete -> in_review. Valid transitions: ['awaiting_review', 'lyrics_complete']",
+            "ZeroDivisionError: division by zero",
+        )
+        first = m._extract_message(self._entry("request_audit_error", _PLAIN_TRACEBACK))
+        second = m._extract_message(self._entry("request_audit_error", other))
+        assert normalize_message(first) != normalize_message(second)
+
+    def test_sample_keeps_the_path_but_the_pattern_does_not(self):
+        m = _import_monitor_module()
+        entry = self._entry(
+            "request_audit_error", _PLAIN_TRACEBACK, path="/api/jobs/7f89f884/start-review", method="POST"
+        )
+        message = m._extract_message(entry)
+        sample = m._extract_sample(entry, message)
+        assert sample.startswith("POST /api/jobs/7f89f884/start-review\n")
+        assert sample.endswith(_EXPECTED_CAUSE)
+        assert "start-review" not in message
+
+    def test_sample_is_the_message_without_a_path(self):
+        m = _import_monitor_module()
+        entry = self._entry("Exception in ASGI application\n", _GROUP_TRACEBACK)
+        message = m._extract_message(entry)
+        assert m._extract_sample(entry, message) == message
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_cycle_groups_a_crash_into_one_alert_with_the_path_in_its_sample(self, _digest, _llm):
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        m = _import_monitor_module()
+        audit = _make_entry(
+            payload={
+                "message": "request_audit_error",
+                "exception": _PLAIN_TRACEBACK,
+                "path": "/api/jobs/7f89f884/start-review",
+                "method": "POST",
+            }
+        )
+        asgi = _make_entry(payload={"message": "Exception in ASGI application\n", "exception": _GROUP_TRACEBACK})
+        audit.http_request = asgi.http_request = None
+        monitor = _make_monitor_with_mocks()
+        monitor.logging_client.list_entries.side_effect = [iter([audit, asgi])] + [iter([])] * (
+            len(m.RESOURCE_TYPE_FILTERS) - 1
+        )
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(pattern_id="p", is_new=True)
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.firestore_adapter.get_unalerted_new_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        assert monitor.firestore_adapter.upsert_pattern.call_count == 1
+        data = monitor.firestore_adapter.upsert_pattern.call_args[0][0]
+        assert data.count == 2
+        assert "/api/jobs/7f89f884/start-review" in data.sample_message
+        assert "start-review" not in data.normalized_message
+        assert "InvalidStateTransitionError" in data.normalized_message
+        assert monitor.discord.send_message.call_count == 1
+
+
+class TestExtractRequestUrl:
+    def test_reads_the_cloud_run_request_url(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.http_request = {"requestUrl": "https://x.a.run.app/api/search/health"}
+        assert m._extract_request_url(entry) == "https://x.a.run.app/api/search/health"
+
+    def test_none_without_http_request(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.http_request = None
+        assert m._extract_request_url(entry) is None
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_cycle_drops_health_aborts_but_alerts_real_search_paths(self, _digest, _llm):
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        m = _import_monitor_module()
+        msg = "The request was aborted after waiting too long for an available instance."
+        health = _make_entry(payload=msg, service_name="karaoke-decide-search")
+        health.http_request = {"requestUrl": "https://x.a.run.app/api/search/health"}
+        real = _make_entry(payload=msg, service_name="karaoke-decide-search")
+        real.http_request = {"requestUrl": "https://x.a.run.app/api/search?q=hello"}
+        monitor = _make_monitor_with_mocks()
+        monitor.logging_client.list_entries.side_effect = [iter([health, real])] + [iter([])] * (
+            len(m.RESOURCE_TYPE_FILTERS) - 1
+        )
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(pattern_id="p", is_new=True)
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.firestore_adapter.get_unalerted_new_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        assert monitor.firestore_adapter.upsert_pattern.call_count == 1
+        assert monitor.firestore_adapter.upsert_pattern.call_args[0][0].count == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: _extract_service_name
+# ---------------------------------------------------------------------------
+
+
+class TestExtractServiceName:
+    """_extract_service_name should return the correct label for each resource type."""
+
+    def test_cloud_run_revision_returns_service_name(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.resource = MagicMock()
+        entry.resource.labels = {"service_name": "karaoke-backend"}
+        result = m._extract_service_name(entry, "cloud_run_revision")
+        assert result == "karaoke-backend"
+
+    def test_cloud_run_job_returns_job_name(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.resource = MagicMock()
+        entry.resource.labels = {"job_name": "video-encoding-job"}
+        result = m._extract_service_name(entry, "cloud_run_job")
+        assert result == "video-encoding-job"
+
+    def test_cloud_function_returns_function_name(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.resource = MagicMock()
+        entry.resource.labels = {"function_name": "gdrive-validator"}
+        result = m._extract_service_name(entry, "cloud_function")
+        assert result == "gdrive-validator"
+
+    def test_gce_instance_returns_resource_name_from_labels(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.resource = MagicMock()
+        entry.resource.labels = {}
+        entry.labels = {"compute.googleapis.com/resource_name": "encoding-worker-a"}
+        result = m._extract_service_name(entry, "gce_instance")
+        assert result == "encoding-worker-a"
+
+    def test_gce_instance_falls_back_to_instance_id(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.resource = MagicMock()
+        entry.resource.labels = {"instance_id": "1234567890"}
+        entry.labels = {}
+        result = m._extract_service_name(entry, "gce_instance")
+        assert result == "1234567890"
+
+    def test_missing_labels_returns_unknown(self):
+        m = _import_monitor_module()
+        entry = MagicMock()
+        entry.resource = MagicMock()
+        entry.resource.labels = {}
+        entry.labels = {}
+        # Should not raise — returns some fallback string
+        result = m._extract_service_name(entry, "cloud_run_revision")
+        assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _classify_resource_type
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyResourceType:
+    """_classify_resource_type should map log resource types to canonical types."""
+
+    def test_cloud_run_revision_mapped(self):
+        m = _import_monitor_module()
+        assert m._classify_resource_type("cloud_run_revision") == "cloud_run_service"
+
+    def test_cloud_run_job_mapped(self):
+        m = _import_monitor_module()
+        assert m._classify_resource_type("cloud_run_job") == "cloud_run_job"
+
+    def test_cloud_function_mapped(self):
+        m = _import_monitor_module()
+        assert m._classify_resource_type("cloud_function") == "cloud_function"
+
+    def test_gce_instance_mapped(self):
+        m = _import_monitor_module()
+        assert m._classify_resource_type("gce_instance") == "gce_instance"
+
+    def test_unknown_type_returns_original_or_unknown(self):
+        m = _import_monitor_module()
+        result = m._classify_resource_type("unknown_type")
+        assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _group_by_pattern (via _run_monitor_cycle logic)
+# ---------------------------------------------------------------------------
+
+
+class TestGroupByPattern:
+    """_group_by_pattern should correctly group entries by hash and count duplicates."""
+
+    def _make_monitor(self):
+        """Create an ErrorMonitor instance without calling __init__ (no GCP calls)."""
+        ErrorMonitor = _import_error_monitor_class()
+        monitor = ErrorMonitor.__new__(ErrorMonitor)
+        monitor.logging_client = MagicMock()
+        monitor.firestore_adapter = MagicMock()
+        monitor.discord = MagicMock()
+        return monitor
+
+    def test_groups_entries_by_hash(self):
+        monitor = self._make_monitor()
+        m = _import_monitor_module()
+
+        entries = [
+            {"service": "svc-a", "normalized": "Connection refused", "message": "msg1"},
+            {"service": "svc-a", "normalized": "Connection refused", "message": "msg2"},
+            {"service": "svc-b", "normalized": "Timeout error", "message": "msg3"},
+        ]
+        result = m._group_by_pattern(entries)
+        # 2 unique patterns
+        assert len(result) == 2
+
+    def test_counts_duplicates_correctly(self):
+        monitor = self._make_monitor()
+        m = _import_monitor_module()
+
+        entries = [
+            {"service": "svc-a", "normalized": "Connection refused", "message": "msg1"},
+            {"service": "svc-a", "normalized": "Connection refused", "message": "msg2"},
+            {"service": "svc-a", "normalized": "Connection refused", "message": "msg3"},
+        ]
+        result = m._group_by_pattern(entries)
+        assert len(result) == 1
+        group = list(result.values())[0]
+        assert group["count"] == 3
+
+    def test_each_group_has_sample_message(self):
+        m = _import_monitor_module()
+
+        entries = [
+            {"service": "svc-a", "normalized": "DB error", "message": "DB error at line 42"},
+        ]
+        result = m._group_by_pattern(entries)
+        group = list(result.values())[0]
+        assert "sample_message" in group
+        assert group["sample_message"] == "DB error at line 42"
+
+
+# ---------------------------------------------------------------------------
+# Tests: _is_spike
+# ---------------------------------------------------------------------------
+
+
+class TestIsSpike:
+    """_is_spike should detect spikes based on multiplier and minimum count."""
+
+    def _make_monitor(self):
+        ErrorMonitor = _import_error_monitor_class()
+        monitor = ErrorMonitor.__new__(ErrorMonitor)
+        monitor.logging_client = MagicMock()
+        monitor.firestore_adapter = MagicMock()
+        monitor.discord = MagicMock()
+        return monitor
+
+    def test_detects_spike_when_count_exceeds_multiplier_and_min(self):
+        m = _import_monitor_module()
+        # rolling_counts of 1 each for the past 5 periods, current count = 10
+        # avg = 1.0, SPIKE_MULTIPLIER=5.0, so 10 > 5 and 10 >= SPIKE_MIN_COUNT=5
+        rolling_counts = [{"count": 1, "window_minutes": 60}, {"count": 1, "window_minutes": 60}, {"count": 1, "window_minutes": 60}, {"count": 1, "window_minutes": 60}, {"count": 1, "window_minutes": 60}]
+        assert m._is_spike(current_count=10, rolling_counts=rolling_counts) is True
+
+    def test_rejects_non_spike_count(self):
+        m = _import_monitor_module()
+        rolling_counts = [{"count": 4, "window_minutes": 60}, {"count": 4, "window_minutes": 60}, {"count": 4, "window_minutes": 60}, {"count": 4, "window_minutes": 60}]
+        # avg = 4.0, 5x = 20, current=5 → not a spike
+        assert m._is_spike(current_count=5, rolling_counts=rolling_counts) is False
+
+    def test_rejects_spike_below_min_count(self):
+        m = _import_monitor_module()
+        # avg = 0.5, 5x = 2.5, current = 3 → exceeds multiplier but below SPIKE_MIN_COUNT
+        rolling_counts = [{"count": 1, "window_minutes": 60}, {"count": 0, "window_minutes": 60}]
+        assert m._is_spike(current_count=3, rolling_counts=rolling_counts) is False
+
+    def test_empty_rolling_counts_not_a_spike(self):
+        m = _import_monitor_module()
+        assert m._is_spike(current_count=100, rolling_counts=[]) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: _rolling_average
+# ---------------------------------------------------------------------------
+
+
+class TestRollingAverage:
+    """_rolling_average should compute mean of rolling_counts."""
+
+    def test_computes_average_correctly(self):
+        m = _import_monitor_module()
+        rolling = [{"count": 2, "window_minutes": 60}, {"count": 4, "window_minutes": 60}, {"count": 6, "window_minutes": 60}]
+        result = m._rolling_average(rolling)
+        assert result == pytest.approx(4.0)
+
+    def test_single_entry_returns_that_value(self):
+        m = _import_monitor_module()
+        rolling = [{"count": 7, "window_minutes": 60}]
+        result = m._rolling_average(rolling)
+        assert result == pytest.approx(7.0)
+
+    def test_legacy_15_min_entries_scaled_to_current_window(self):
+        m = _import_monitor_module()
+        # Pre-2026-09-26 entries had no window_minutes and counted 15 min of
+        # errors; at the 60-min cadence they must count 4x.
+        rolling = [{"count": 2}, {"count": 8, "window_minutes": 60}]
+        assert m._rolling_average(rolling) == pytest.approx((8.0 + 8.0) / 2)
+
+    def test_legacy_history_does_not_fake_a_spike(self):
+        m = _import_monitor_module()
+        # Steady 2 errors / 15 min == 8 / hour: an 8/hour run is not a spike.
+        rolling = [{"count": 2}] * 10
+        assert m._is_spike(current_count=8, rolling_counts=rolling) is False
+
+    def test_empty_list_returns_zero(self):
+        m = _import_monitor_module()
+        result = m._rolling_average([])
+        assert result == 0.0
+
+    def test_counts_with_zeros(self):
+        m = _import_monitor_module()
+        rolling = [{"count": 0, "window_minutes": 60}, {"count": 0, "window_minutes": 60}, {"count": 10, "window_minutes": 60}]
+        result = m._rolling_average(rolling)
+        assert result == pytest.approx(10 / 3)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _run_monitor_cycle end-to-end
+# ---------------------------------------------------------------------------
+
+
+def _make_monitor_with_mocks():
+    """Return an ErrorMonitor with all external dependencies mocked."""
+    ErrorMonitor = _import_error_monitor_class()
+    monitor = ErrorMonitor.__new__(ErrorMonitor)
+    monitor.logging_client = MagicMock()
+    monitor.firestore_adapter = MagicMock()
+    monitor.discord = MagicMock()
+    return monitor
+
+
+class TestRunMonitorCycleNoErrors:
+    """When no error entries are found, auto-resolve check should still run."""
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_auto_resolve_called_even_when_no_errors(self, mock_digest, mock_llm):
+        monitor = _make_monitor_with_mocks()
+
+        # Cloud Logging returns empty results for all resource types
+        monitor.logging_client.list_entries.return_value = iter([])
+
+        # Firestore adapter returns no patterns eligible for auto-resolve
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+
+        monitor._run_monitor_cycle()
+
+        # Auto-resolve check must always run
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.assert_called_once()
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_no_discord_sent_when_no_errors(self, mock_digest, mock_llm):
+        monitor = _make_monitor_with_mocks()
+
+        monitor.logging_client.list_entries.return_value = iter([])
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+
+        monitor._run_monitor_cycle()
+
+        monitor.discord.send_message.assert_not_called()
+
+
+class TestRunMonitorCycleOneNewError:
+    """When one new error pattern is found, an individual alert should be sent."""
+
+    def _make_log_entry(self):
+        entry = MagicMock()
+        entry.payload = "RuntimeError: connection refused"
+        entry.resource = MagicMock()
+        entry.resource.type = "cloud_run_revision"
+        entry.resource.labels = {"service_name": "karaoke-backend"}
+        entry.labels = {}
+        return entry
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_individual_alert_sent_for_new_pattern(self, mock_digest, mock_llm, mock_ignore):
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        monitor = _make_monitor_with_mocks()
+
+        log_entry = self._make_log_entry()
+        monitor.logging_client.list_entries.return_value = iter([log_entry])
+
+        # Upsert returns is_new=True for first encounter
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(
+            pattern_id="abc123", is_new=True
+        )
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        # An alert should have been sent
+        assert monitor.discord.send_message.call_count >= 1
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_upsert_called_for_each_pattern_group(self, mock_digest, mock_llm, mock_ignore):
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        monitor = _make_monitor_with_mocks()
+
+        log_entry = self._make_log_entry()
+        monitor.logging_client.list_entries.return_value = iter([log_entry])
+
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(
+            pattern_id="abc123", is_new=True
+        )
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        assert monitor.firestore_adapter.upsert_pattern.call_count >= 1
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_known_issue_skipped(self, mock_digest, mock_llm, mock_ignore):
+        """Entries matched by should_ignore should not be upserted or alerted."""
+        from backend.services.error_monitor.known_issues import IgnoreReason
+
+        # Override: should_ignore returns a reason (i.e., ignore this entry)
+        mock_ignore.return_value = IgnoreReason(
+            pattern_name="startup_probe",
+            reason="Cloud Run cold start — startup probe failure is transient",
+        )
+
+        monitor = _make_monitor_with_mocks()
+        log_entry = self._make_log_entry()
+        monitor.logging_client.list_entries.return_value = iter([log_entry])
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+
+        monitor._run_monitor_cycle()
+
+        monitor.firestore_adapter.upsert_pattern.assert_not_called()
+        monitor.discord.send_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: _run_daily_digest (P0)
+# ---------------------------------------------------------------------------
+
+
+class TestRunDailyDigest:
+    """_run_daily_digest should fetch active patterns and send a digest to Discord."""
+
+    @pytest.fixture
+    def monitor(self):
+        ErrorMonitor = _import_error_monitor_class()
+        m = ErrorMonitor.__new__(ErrorMonitor)
+        m.logging_client = MagicMock()
+        m.firestore_adapter = MagicMock()
+        m.discord = MagicMock()
+        m.discord.messages_sent = 0
+        m.discord.noise_messages_sent = 0
+        m.logger = MagicMock()
+        return m
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    def test_digest_sends_message_with_chart_emoji(self, mock_llm, monitor):
+        """_run_daily_digest should send a message containing the 📊 emoji."""
+        monitor.firestore_adapter.get_active_patterns.return_value = [
+            {"service": "karaoke-backend", "total_count": 10, "status": "new"},
+            {"service": "video-worker", "total_count": 5, "status": "acknowledged"},
+        ]
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.discord.send_noise_message.return_value = True
+
+        monitor._run_daily_digest()
+
+        assert monitor.discord.send_noise_message.call_count == 1
+        sent_content = monitor.discord.send_noise_message.call_args[0][0]
+        assert "📊" in sent_content
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    def test_digest_includes_per_service_counts(self, mock_llm, monitor):
+        """_run_daily_digest should aggregate counts per service."""
+        monitor.firestore_adapter.get_active_patterns.return_value = [
+            {"service": "svc-alpha", "total_count": 7, "status": "new"},
+            {"service": "svc-alpha", "total_count": 3, "status": "acknowledged"},
+            {"service": "svc-beta", "total_count": 2, "status": "new"},
+        ]
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.discord.send_noise_message.return_value = True
+
+        monitor._run_daily_digest()
+
+        sent_content = monitor.discord.send_noise_message.call_args[0][0]
+        # Both services should be mentioned in the digest
+        assert "svc-alpha" in sent_content
+        assert "svc-beta" in sent_content
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    def test_digest_with_no_active_patterns(self, mock_llm, monitor):
+        """_run_daily_digest should still send a digest even when there are no patterns."""
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.discord.send_noise_message.return_value = True
+
+        monitor._run_daily_digest()
+
+        assert monitor.discord.send_noise_message.call_count == 1
+        sent_content = monitor.discord.send_noise_message.call_args[0][0]
+        assert "📊" in sent_content
+
+
+# ---------------------------------------------------------------------------
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    def test_digest_goes_to_noise_not_alerts(self, mock_llm, monitor):
+        """The digest is informational: it must never land in #alerts."""
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+
+        monitor._run_daily_digest()
+
+        monitor.discord.send_message.assert_not_called()
+        monitor.discord.send_noise_message.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests: PatternData construction (P0)
+# ---------------------------------------------------------------------------
+
+
+class TestPatternDataConstruction:
+    """upsert_pattern should be called with a PatternData object with correct field types."""
+
+    def _make_log_entry(self, message="RuntimeError: disk full", service="karaoke-backend"):
+        entry = MagicMock()
+        entry.payload = message
+        entry.resource = MagicMock()
+        entry.resource.type = "cloud_run_revision"
+        entry.resource.labels = {"service_name": service}
+        entry.labels = {}
+        return entry
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_pattern_data_fields_have_correct_types(self, mock_digest, mock_llm, mock_ignore):
+        """upsert_pattern receives a PatternData with correctly typed fields."""
+        from backend.services.error_monitor.firestore_adapter import PatternData, UpsertResult
+
+        monitor = _make_monitor_with_mocks()
+        log_entry = self._make_log_entry()
+        monitor.logging_client.list_entries.return_value = iter([log_entry])
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(
+            pattern_id="xyz789", is_new=True
+        )
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        assert monitor.firestore_adapter.upsert_pattern.call_count >= 1
+        call_arg = monitor.firestore_adapter.upsert_pattern.call_args[0][0]
+        assert isinstance(call_arg, PatternData)
+
+        # pattern_id should be a non-empty hex string
+        assert isinstance(call_arg.pattern_id, str)
+        assert len(call_arg.pattern_id) > 0
+        # All characters should be valid hex (the hash function produces hex)
+        assert all(c in "0123456789abcdef" for c in call_arg.pattern_id)
+
+        # service must match the log entry's service label
+        assert call_arg.service == "karaoke-backend"
+
+        # resource_type maps to canonical string
+        assert isinstance(call_arg.resource_type, str)
+        assert len(call_arg.resource_type) > 0
+
+        # normalized_message and sample_message must be non-empty strings
+        assert isinstance(call_arg.normalized_message, str)
+        assert len(call_arg.normalized_message) > 0
+        assert isinstance(call_arg.sample_message, str)
+        assert len(call_arg.sample_message) > 0
+
+        # count is a positive int
+        assert isinstance(call_arg.count, int)
+        assert call_arg.count >= 1
+
+        # timestamp is a datetime
+        assert isinstance(call_arg.timestamp, datetime)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Discord alert argument verification (P0)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordAlertContent:
+    """The Discord alert message should contain the service name and normalized message."""
+
+    def _make_log_entry(self, message, service):
+        entry = MagicMock()
+        entry.payload = message
+        entry.resource = MagicMock()
+        entry.resource.type = "cloud_run_revision"
+        entry.resource.labels = {"service_name": service}
+        entry.labels = {}
+        return entry
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_new_pattern_alert_contains_service_name(self, mock_digest, mock_llm, mock_ignore):
+        """The alert message sent to Discord should contain the originating service name."""
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        service_name = "my-special-service"
+        monitor = _make_monitor_with_mocks()
+        log_entry = self._make_log_entry("RuntimeError: boom", service=service_name)
+        monitor.logging_client.list_entries.return_value = iter([log_entry])
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(
+            pattern_id="aabbcc", is_new=True
+        )
+        monitor.firestore_adapter.get_pattern.return_value = {"first_seen": "2026-01-01T00:00:00Z"}
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        assert monitor.discord.send_message.call_count >= 1
+        sent_content = monitor.discord.send_message.call_args[0][0]
+        assert service_name in sent_content
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_new_pattern_alert_contains_normalized_message(
+        self, mock_digest, mock_llm, mock_ignore
+    ):
+        """The alert message should contain a recognizable part of the normalized error."""
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        monitor = _make_monitor_with_mocks()
+        # Use a distinctive error phrase that should survive normalization
+        log_entry = self._make_log_entry(
+            "ConnectionError: database connection refused", service="karaoke-backend"
+        )
+        monitor.logging_client.list_entries.return_value = iter([log_entry])
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(
+            pattern_id="def456", is_new=True
+        )
+        monitor.firestore_adapter.get_pattern.return_value = {"first_seen": "2026-01-01T00:00:00Z"}
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        assert monitor.discord.send_message.call_count >= 1
+        sent_content = monitor.discord.send_message.call_args[0][0]
+        # The normalized message should contain at least "connection" or "refused"
+        assert "connection" in sent_content.lower() or "refused" in sent_content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: analyze_patterns input format (P0)
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyzePatternsInputFormat:
+    """When LLM is enabled, analyze_patterns is called with correctly shaped dicts."""
+
+    def _make_log_entry(self, message, service):
+        entry = MagicMock()
+        entry.payload = message
+        entry.resource = MagicMock()
+        entry.resource.type = "cloud_run_revision"
+        entry.resource.labels = {"service_name": service}
+        entry.labels = {}
+        return entry
+
+    @patch("backend.services.error_monitor.monitor.analyze_patterns")
+    @patch("backend.services.error_monitor.monitor.find_duplicate_patterns")
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=True)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_analyze_patterns_receives_correct_keys(
+        self, mock_digest, mock_llm, mock_ignore, mock_find_dups, mock_analyze
+    ):
+        """analyze_patterns should receive a list of dicts with service, normalized_message, count."""
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        mock_analyze.return_value = MagicMock(incidents=[])
+        mock_find_dups.return_value = []
+
+        monitor = _make_monitor_with_mocks()
+
+        # Create 2 distinct log entries so LLM dedup + analysis paths are triggered
+        entry1 = self._make_log_entry("RuntimeError: disk full", service="svc-one")
+        entry2 = self._make_log_entry("ValueError: invalid input", service="svc-two")
+        monitor.logging_client.list_entries.side_effect = [
+            iter([entry1, entry2]),
+            iter([]),
+            iter([]),
+            iter([]),
+        ]
+
+        call_count = [0]
+
+        def upsert_side_effect(data):
+            call_count[0] += 1
+            return UpsertResult(pattern_id=data.pattern_id, is_new=True)
+
+        monitor.firestore_adapter.upsert_pattern.side_effect = upsert_side_effect
+        monitor.firestore_adapter.get_pattern.return_value = {"first_seen": "2026-01-01T00:00:00Z"}
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        # analyze_patterns should have been called once both new patterns exist
+        assert mock_analyze.call_count >= 1
+        call_args = mock_analyze.call_args[0][0]
+        assert isinstance(call_args, list)
+        assert len(call_args) >= 1
+
+        for item in call_args:
+            assert "service" in item, f"Missing 'service' key in {item}"
+            assert "normalized_message" in item, f"Missing 'normalized_message' key in {item}"
+            assert "count" in item, f"Missing 'count' key in {item}"
+            assert isinstance(item["service"], str)
+            assert isinstance(item["normalized_message"], str)
+            assert isinstance(item["count"], int)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Spike detection flow (P1)
+# ---------------------------------------------------------------------------
+
+
+class TestSpikeDetectionFlow:
+    """_run_monitor_cycle should send a spike alert when counts exceed the threshold."""
+
+    def _make_log_entry(self, message="RuntimeError: timeout", service="karaoke-backend"):
+        entry = MagicMock()
+        entry.payload = message
+        entry.resource = MagicMock()
+        entry.resource.type = "cloud_run_revision"
+        entry.resource.labels = {"service_name": service}
+        entry.labels = {}
+        return entry
+
+    @patch("backend.services.error_monitor.monitor.should_ignore", return_value=None)
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_spike_alert_sent_when_count_exceeds_threshold(
+        self, mock_digest, mock_llm, mock_ignore
+    ):
+        """A spike alert (⚠️) is sent when current count is >5x rolling average and >= min."""
+        from backend.services.error_monitor.firestore_adapter import UpsertResult
+
+        monitor = _make_monitor_with_mocks()
+
+        # Send 10 identical entries to make count = 10 (> SPIKE_MIN_COUNT=5)
+        entries = [self._make_log_entry() for _ in range(10)]
+        monitor.logging_client.list_entries.return_value = iter(entries)
+
+        # Upsert returns is_new=False (existing pattern) so spike check runs
+        monitor.firestore_adapter.upsert_pattern.return_value = UpsertResult(
+            pattern_id="spike-pattern-1", is_new=False
+        )
+
+        # get_pattern returns a pattern with rolling_counts that average to 1
+        # avg=1.0, 5x=5.0, current_count=10 → spike detected
+        monitor.firestore_adapter.get_pattern.return_value = {
+            "pattern_id": "spike-pattern-1",
+            "rolling_counts": [{"count": 1, "window_minutes": 60}] * 4,
+        }
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.firestore_adapter.get_active_patterns.return_value = []
+        monitor.discord.send_message.return_value = True
+
+        monitor._run_monitor_cycle()
+
+        # At least one Discord message should have been sent
+        assert monitor.discord.send_message.call_count >= 1
+
+        # At least one of the messages should be a spike alert (⚠️)
+        all_calls = monitor.discord.send_message.call_args_list
+        spike_messages = [c for c in all_calls if "⚠️" in c[0][0]]
+        assert len(spike_messages) >= 1, (
+            "Expected at least one spike alert (⚠️) but none found. "
+            f"Messages sent: {[c[0][0][:80] for c in all_calls]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Auto-resolve alert (P1)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoResolveAlert:
+    """_check_auto_resolve should resolve eligible patterns and send a ✅ alert."""
+
+    @pytest.fixture
+    def monitor(self):
+        ErrorMonitor = _import_error_monitor_class()
+        m = ErrorMonitor.__new__(ErrorMonitor)
+        m.logging_client = MagicMock()
+        m.firestore_adapter = MagicMock()
+        m.discord = MagicMock()
+        m.discord.messages_sent = 0
+        m.logger = MagicMock()
+        return m
+
+    def test_auto_resolve_calls_resolve_and_sends_alert(self, monitor):
+        """When a pattern qualifies for auto-resolve, the pattern is resolved and ✅ is sent."""
+        pattern = {
+            "pattern_id": "resolve-me-123",
+            "service": "karaoke-backend",
+            "normalized_message": "Connection refused",
+            "status": "new",
+        }
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = [pattern]
+        monitor.firestore_adapter.check_auto_resolve.return_value = 25.5  # hours silent
+        monitor.discord.send_noise_message.return_value = True
+
+        monitor._check_auto_resolve()
+
+        # auto_resolve_pattern must have been called with the correct pattern_id
+        monitor.firestore_adapter.auto_resolve_pattern.assert_called_once_with(
+            "resolve-me-123", 25.5
+        )
+
+        # A Discord message must have been sent
+        assert monitor.discord.send_noise_message.call_count == 1
+        sent_content = monitor.discord.send_noise_message.call_args[0][0]
+        assert "✅" in sent_content
+
+    def test_auto_resolve_no_alert_when_no_patterns_qualify(self, monitor):
+        """When no patterns qualify for auto-resolve, no Discord alert is sent."""
+        pattern = {
+            "pattern_id": "still-active",
+            "service": "svc-x",
+            "normalized_message": "Disk full",
+            "status": "acknowledged",
+        }
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = [pattern]
+        # check_auto_resolve returns None → pattern does not qualify yet
+        monitor.firestore_adapter.check_auto_resolve.return_value = None
+
+        monitor._check_auto_resolve()
+
+        monitor.firestore_adapter.auto_resolve_pattern.assert_not_called()
+        monitor.discord.send_message.assert_not_called()
+        monitor.discord.send_noise_message.assert_not_called()
+
+    def test_auto_resolve_via_monitor_cycle(self, monitor):
+        """_run_monitor_cycle with no errors should still trigger the auto-resolve check."""
+        with patch(
+            "backend.services.error_monitor.monitor.get_llm_enabled", return_value=False
+        ), patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False):
+            monitor.logging_client.list_entries.return_value = iter([])
+
+            pattern = {
+                "pattern_id": "cycle-resolve",
+                "service": "bg-worker",
+                "normalized_message": "queue timeout",
+                "status": "new",
+            }
+            monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = [pattern]
+            monitor.firestore_adapter.check_auto_resolve.return_value = 12.0
+            monitor.firestore_adapter.get_active_patterns.return_value = []
+            monitor.discord.send_noise_message.return_value = True
+
+            monitor._run_monitor_cycle()
+
+            monitor.firestore_adapter.auto_resolve_pattern.assert_called_once()
+            sent_content = monitor.discord.send_noise_message.call_args[0][0]
+            assert "✅" in sent_content
+
+
+# ---------------------------------------------------------------------------
+# Tests: #alerts vs #noise routing
+# ---------------------------------------------------------------------------
+
+
+class TestAutoResolveRoutesToNoise:
+    def test_auto_resolved_summary_goes_to_noise(self):
+        monitor = _make_monitor_with_mocks()
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = [
+            {"pattern_id": "p1", "service": "karaoke-backend", "normalized_message": "boom"}
+        ]
+        monitor.firestore_adapter.check_auto_resolve.return_value = 48.0
+
+        monitor._check_auto_resolve()
+
+        monitor.discord.send_message.assert_not_called()
+        monitor.discord.send_noise_message.assert_called_once()
+        assert "Auto-Resolved" in monitor.discord.send_noise_message.call_args[0][0]
+
+    def test_nothing_resolved_sends_nothing(self):
+        monitor = _make_monitor_with_mocks()
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+
+        monitor._check_auto_resolve()
+
+        monitor.discord.send_message.assert_not_called()
+        monitor.discord.send_noise_message.assert_not_called()
+
+
+class TestNoiseWebhookResolution:
+    ALERT = "https://discord.com/api/webhooks/1/alert"
+    NOISE = "https://discord.com/api/webhooks/2/noise"
+
+    def _monitor(self):
+        ErrorMonitor = _import_error_monitor_class()
+        return ErrorMonitor.__new__(ErrorMonitor)
+
+    def test_env_var_wins(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_NOISE_WEBHOOK_URL", self.NOISE)
+        with patch("backend.services.error_monitor.monitor.secretmanager") as sm:
+            assert self._monitor()._get_discord_noise_webhook(self.ALERT) == self.NOISE
+        sm.SecretManagerServiceClient.assert_not_called()
+
+    def test_reads_noise_secret_from_secret_manager(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_NOISE_WEBHOOK_URL", raising=False)
+        monkeypatch.delenv("DISCORD_NOISE_WEBHOOK_SECRET_NAME", raising=False)
+        with patch("backend.services.error_monitor.monitor.secretmanager") as sm:
+            client = sm.SecretManagerServiceClient.return_value
+            client.access_secret_version.return_value.payload.data = (self.NOISE + "\n").encode()
+            assert self._monitor()._get_discord_noise_webhook(self.ALERT) == self.NOISE
+        name = client.access_secret_version.call_args.kwargs["name"]
+        assert name.endswith("/secrets/discord-noise-webhook/versions/latest")
+
+    def test_falls_back_to_alert_webhook_when_secret_unavailable(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_NOISE_WEBHOOK_URL", raising=False)
+        with patch("backend.services.error_monitor.monitor.secretmanager") as sm:
+            sm.SecretManagerServiceClient.return_value.access_secret_version.side_effect = (
+                RuntimeError("403 permission denied")
+            )
+            assert self._monitor()._get_discord_noise_webhook(self.ALERT) == self.ALERT
+
+    def test_falls_back_to_alert_webhook_when_secret_empty(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_NOISE_WEBHOOK_URL", raising=False)
+        with patch("backend.services.error_monitor.monitor.secretmanager") as sm:
+            client = sm.SecretManagerServiceClient.return_value
+            client.access_secret_version.return_value.payload.data = b"  "
+            assert self._monitor()._get_discord_noise_webhook(self.ALERT) == self.ALERT
+
+    def test_init_wires_both_webhooks(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_WEBHOOK_URL", self.ALERT)
+        monkeypatch.setenv("DISCORD_NOISE_WEBHOOK_URL", self.NOISE)
+        m = _import_monitor_module()
+        with patch.object(m.cloud_logging, "Client"), patch.object(m, "ErrorPatternsAdapter"):
+            monitor = m.ErrorMonitor()
+        assert monitor.discord.webhook_url == self.ALERT
+        assert monitor.discord.noise_webhook_url == self.NOISE
+
+
+# ---------------------------------------------------------------------------
+# Tests: burst collapse + alert gating (2026-10-18 #alerts noise work)
+# ---------------------------------------------------------------------------
+
+
+class TestBurstCollapse:
+    """>3 new patterns from one service in a run -> ONE #alerts message.
+
+    2026-10-07/08: one bad mb-refresh run produced 73 distinct "New Error
+    Pattern" messages that dripped into #alerts 10 an hour (the per-run cap)."""
+
+    NOW = "2026-10-08T03:00:00+00:00"
+
+    def _pattern(self, pid, service, i=0):
+        return {
+            "pattern_id": pid,
+            "service": service,
+            "resource_type": "cloud_run_job",
+            "normalized_message": f"{service} failure {pid}",
+            "sample_message": f"sample {pid}",
+            "total_count": i + 1,
+            "status": "new",
+            "alerted_at": None,
+            "first_seen": "2026-10-07T02:00:00+00:00",
+            "last_seen": "2026-10-08T02:30:00+00:00",
+            "rolling_counts": [],
+        }
+
+    def _monitor(self, patterns, real_discord=False):
+        from backend.services.error_monitor.discord import ErrorMonitorDiscord
+
+        monitor = _make_monitor_with_mocks()
+        monitor.logging_client.list_entries.return_value = iter([])
+        by_id = {p["pattern_id"]: p for p in patterns}
+        monitor.firestore_adapter.get_unalerted_new_patterns.return_value = patterns
+        monitor.firestore_adapter.get_pattern.side_effect = lambda pid: by_id.get(pid)
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        if real_discord:
+            monitor.discord = ErrorMonitorDiscord(webhook_url="https://discord.com/api/webhooks/1/a")
+        else:
+            monitor.discord.send_message.return_value = True
+        return monitor
+
+    def _alerted_ids(self, monitor):
+        return [c.args[0] for c in monitor.firestore_adapter.update_pattern_alerted.call_args_list]
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_73_patterns_one_service_send_one_message(self, *_):
+        patterns = [self._pattern(f"mb{i}", "mb-refresh", i) for i in range(73)]
+        patterns += [self._pattern("be1", "karaoke-backend"), self._pattern("be2", "karaoke-backend")]
+        monitor = self._monitor(patterns)
+
+        monitor._run_monitor_cycle()
+
+        msgs = [c.args[0] for c in monitor.discord.send_message.call_args_list]
+        burst = [m for m in msgs if "mb-refresh" in m]
+        assert len(burst) == 1
+        assert "73 new error patterns" in burst[0]
+        assert "scripts/query-error-patterns.py --service mb-refresh" in burst[0]
+        # karaoke-backend had only 2 -> still individual alerts
+        assert sum("New Error Pattern" in m for m in msgs) == 2
+        assert len(msgs) == 3
+        assert sorted(self._alerted_ids(monitor)) == sorted(p["pattern_id"] for p in patterns)
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_exactly_three_patterns_stay_individual(self, *_):
+        patterns = [self._pattern(f"p{i}", "svc", i) for i in range(3)]
+        monitor = self._monitor(patterns)
+
+        monitor._run_monitor_cycle()
+
+        msgs = [c.args[0] for c in monitor.discord.send_message.call_args_list]
+        assert len(msgs) == 3
+        assert all("New Error Pattern" in m for m in msgs)
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_failed_burst_send_marks_nothing_alerted(self, *_):
+        patterns = [self._pattern(f"p{i}", "svc", i) for i in range(5)]
+        monitor = self._monitor(patterns)
+        monitor.discord.send_message.return_value = False
+
+        monitor._run_monitor_cycle()
+
+        monitor.firestore_adapter.update_pattern_alerted.assert_not_called()
+
+    @patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False)
+    @patch("backend.services.error_monitor.monitor.get_digest_mode", return_value=False)
+    def test_per_run_cap_still_holds(self, *_):
+        """15 services x 1 pattern + a burst: at most 10 posts; unsent stay unalerted."""
+        from backend.services.error_monitor.config import MAX_DISCORD_MESSAGES_PER_RUN
+
+        patterns = [self._pattern(f"s{i}", f"svc-{i}") for i in range(15)]
+        patterns += [self._pattern(f"b{i}", "burst-svc", i) for i in range(20)]
+        monitor = self._monitor(patterns, real_discord=True)
+
+        with patch("requests.post") as mock_post:
+            monitor._run_monitor_cycle()
+
+        assert mock_post.call_count == MAX_DISCORD_MESSAGES_PER_RUN
+        assert len(self._alerted_ids(monitor)) < len(patterns)
+
+
+class TestAlertGate:
+    """Patterns carrying alert_min_hourly_count (frontend chunk-load failures)
+    alert only once more than that many land within an hour."""
+
+    def _chunk_pattern(self, recent):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(tz=timezone.utc)
+        return {
+            "pattern_id": "chunk-build-x",
+            "service": "frontend",
+            "resource_type": "browser",
+            "normalized_message": "Failed to load JS chunk on build x",
+            "sample_message": "Error: Failed to load chunk …",
+            "total_count": recent,
+            "status": "new",
+            "alerted_at": None,
+            "first_seen": now.isoformat(),
+            "last_seen": now.isoformat(),
+            "alert_min_hourly_count": 10,
+            "rolling_counts": [
+                {"ts": (now - timedelta(minutes=i)).isoformat(), "count": 1} for i in range(recent)
+            ],
+        }
+
+    def _run(self, pattern):
+        monitor = _make_monitor_with_mocks()
+        monitor.logging_client.list_entries.return_value = iter([])
+        monitor.firestore_adapter.get_unalerted_new_patterns.return_value = [pattern]
+        monitor.firestore_adapter.get_pattern.return_value = pattern
+        monitor.firestore_adapter.get_patterns_for_auto_resolve.return_value = []
+        monitor.discord.send_message.return_value = True
+        with patch("backend.services.error_monitor.monitor.get_llm_enabled", return_value=False):
+            monitor._run_monitor_cycle()
+        return monitor
+
+    def test_single_chunk_error_does_not_alert(self):
+        monitor = self._run(self._chunk_pattern(1))
+        monitor.discord.send_message.assert_not_called()
+        monitor.firestore_adapter.update_pattern_alerted.assert_not_called()
+
+    def test_chunk_burst_over_threshold_alerts(self):
+        monitor = self._run(self._chunk_pattern(11))
+        assert monitor.discord.send_message.call_count == 1
+        monitor.firestore_adapter.update_pattern_alerted.assert_called_once_with("chunk-build-x")

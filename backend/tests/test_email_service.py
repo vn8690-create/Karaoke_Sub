@@ -1,0 +1,1134 @@
+"""
+Unit tests for email service.
+
+Tests the new job completion and action reminder email methods,
+as well as CC support.
+"""
+import pytest
+from unittest.mock import Mock, patch, MagicMock
+
+from backend.services.email_service import (
+    EmailService,
+    EmailProvider,
+    ConsoleEmailProvider,
+    PostmarkEmailProvider,
+    get_email_service,
+)
+
+
+class TestConsoleEmailProvider:
+    """Tests for console email provider."""
+
+    def test_send_email_basic(self):
+        """Test basic email logging."""
+        provider = ConsoleEmailProvider()
+
+        result = provider.send_email(
+            to_email="user@example.com",
+            subject="Test Subject",
+            html_content="<p>Test content</p>",
+        )
+
+        assert result is True
+
+    def test_send_email_with_text_content(self):
+        """Test email with text content."""
+        provider = ConsoleEmailProvider()
+
+        result = provider.send_email(
+            to_email="user@example.com",
+            subject="Test Subject",
+            html_content="<p>Test</p>",
+            text_content="Test plain text",
+        )
+
+        assert result is True
+
+    def test_send_email_with_cc(self):
+        """Test email with CC recipients."""
+        provider = ConsoleEmailProvider()
+
+        result = provider.send_email(
+            to_email="user@example.com",
+            subject="Test Subject",
+            html_content="<p>Test</p>",
+            cc_emails=["cc1@example.com", "cc2@example.com"],
+        )
+
+        assert result is True
+
+
+class TestPostmarkEmailProvider:
+    """Tests for Postmark email provider."""
+
+    def _mock_response(self, status_code=200, body=None):
+        resp = Mock()
+        resp.status_code = status_code
+        resp.json.return_value = body or {"To": "user@example.com", "MessageID": "abc"}
+        resp.text = ""
+        return resp
+
+    def test_send_email_success(self):
+        provider = PostmarkEmailProvider(
+            server_token="test-token",
+            from_email="from@example.com",
+            from_name="Test Sender",
+        )
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(200)
+
+            result = provider.send_email(
+                to_email="user@example.com",
+                subject="Test Subject",
+                html_content="<p>Test</p>",
+                text_content="Test",
+            )
+
+        assert result is True
+        mock_post.assert_called_once()
+        call = mock_post.call_args
+        assert call.kwargs["headers"]["X-Postmark-Server-Token"] == "test-token"
+        payload = call.kwargs["json"]
+        assert payload["From"] == '"Test Sender" <from@example.com>'
+        assert payload["To"] == "user@example.com"
+        assert payload["Subject"] == "Test Subject"
+        assert payload["HtmlBody"] == "<p>Test</p>"
+        assert payload["TextBody"] == "Test"
+        assert payload["MessageStream"] == "outbound"
+
+    def test_send_email_with_cc_and_bcc_dedupes(self):
+        provider = PostmarkEmailProvider(
+            server_token="test-token",
+            from_email="from@example.com",
+        )
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(200)
+
+            result = provider.send_email(
+                to_email="user@example.com",
+                subject="Test",
+                html_content="<p>x</p>",
+                cc_emails=["cc1@example.com", "CC1@example.com", "cc2@example.com"],
+                bcc_emails=["bcc@example.com"],
+            )
+
+        assert result is True
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["Cc"] == "cc1@example.com, cc2@example.com"
+        assert payload["Bcc"] == "bcc@example.com"
+
+    def test_send_email_with_sender_override(self):
+        provider = PostmarkEmailProvider(
+            server_token="test-token",
+            from_email="default@example.com",
+            from_name="Default",
+        )
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(200)
+
+            provider.send_email(
+                to_email="user@example.com",
+                subject="Test",
+                html_content="<p>x</p>",
+                from_email_override="tenant@partner.com",
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["From"] == '"Default" <tenant@partner.com>'
+
+    def test_send_email_failure_status(self):
+        provider = PostmarkEmailProvider(server_token="t", from_email="f@e.com")
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(
+                422, body={"ErrorCode": 406, "Message": "Inactive recipient"}
+            )
+
+            result = provider.send_email(
+                to_email="user@example.com",
+                subject="Test",
+                html_content="<p>x</p>",
+            )
+
+        assert result is False
+
+    def test_suppressed_recipient_flagged_and_not_error(self):
+        """422 ErrorCode 406 (InactiveRecipient) is benign: SendResult.suppressed
+        is True, provider.last_suppressed is True, and it's logged at INFO not ERROR."""
+        import logging
+        provider = PostmarkEmailProvider(server_token="t", from_email="f@e.com")
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(
+                422, body={"ErrorCode": 406, "Message": "Inactive recipient"}
+            )
+            with self._capture_logs(logging.ERROR) as errors:
+                result = provider.send_email_detailed(
+                    to_email="whatever@example.com",
+                    subject="Test",
+                    html_content="<p>x</p>",
+                )
+
+        assert result.success is False
+        assert result.suppressed is True
+        assert provider.last_suppressed is True
+        # No ERROR-level log for a suppressed recipient (it must not page).
+        assert not errors
+
+    def test_non_suppression_422_is_not_flagged_suppressed(self):
+        """A 422 with a different ErrorCode (e.g. bad signature) is a real error:
+        suppressed stays False and last_suppressed stays False."""
+        provider = PostmarkEmailProvider(server_token="t", from_email="f@e.com")
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(
+                422, body={"ErrorCode": 10, "Message": "Invalid API token"}
+            )
+            result = provider.send_email_detailed(
+                to_email="user@example.com",
+                subject="Test",
+                html_content="<p>x</p>",
+            )
+
+        assert result.success is False
+        assert result.suppressed is False
+        assert provider.last_suppressed is False
+
+    def test_last_suppressed_reset_on_success(self):
+        """last_suppressed is cleared on a subsequent successful send."""
+        provider = PostmarkEmailProvider(server_token="t", from_email="f@e.com")
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._mock_response(
+                422, body={"ErrorCode": 406, "Message": "Inactive recipient"}
+            )
+            provider.send_email_detailed(
+                to_email="whatever@example.com", subject="s", html_content="<p>x</p>"
+            )
+            assert provider.last_suppressed is True
+
+            mock_post.return_value = self._mock_response(200)
+            provider.send_email_detailed(
+                to_email="ok@example.com", subject="s", html_content="<p>x</p>"
+            )
+            assert provider.last_suppressed is False
+
+    @staticmethod
+    def _capture_logs(level):
+        """Context manager capturing records at >= level from the email_service logger."""
+        import contextlib
+        import logging
+
+        @contextlib.contextmanager
+        def _cm():
+            logger = logging.getLogger("backend.services.email_service")
+            records: list = []
+
+            class _H(logging.Handler):
+                def emit(self, record):
+                    if record.levelno >= level:
+                        records.append(record)
+
+            h = _H()
+            logger.addHandler(h)
+            try:
+                yield records
+            finally:
+                logger.removeHandler(h)
+
+        return _cm()
+
+    def test_send_email_request_exception(self):
+        import requests as _requests
+        provider = PostmarkEmailProvider(server_token="t", from_email="f@e.com")
+
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.side_effect = _requests.ConnectionError("network down")
+
+            result = provider.send_email(
+                to_email="user@example.com",
+                subject="Test",
+                html_content="<p>x</p>",
+            )
+
+        assert result is False
+
+
+class TestPostmarkRetry:
+    """Transient Postmark failures are retried; deterministic errors are not."""
+
+    def _response(self, status_code, body=None, json_body=True):
+        resp = Mock()
+        resp.status_code = status_code
+        if json_body:
+            resp.json.return_value = body or {"MessageID": "abc"}
+        else:
+            resp.json.side_effect = ValueError("not json")
+        resp.text = "" if json_body else "<html><center><h1>403 Forbidden</h1></center></html>"
+        return resp
+
+    def _send(self, provider):
+        return provider.send_email_detailed(
+            to_email="user@example.com", subject="Test", html_content="<p>x</p>"
+        )
+
+    @pytest.fixture(autouse=True)
+    def no_sleep(self):
+        with patch("backend.services.email_service.time.sleep") as mock_sleep:
+            self.mock_sleep = mock_sleep
+            yield
+
+    @pytest.fixture
+    def provider(self):
+        return PostmarkEmailProvider(server_token="t", from_email="f@e.com")
+
+    @pytest.fixture
+    def mock_smtp(self):
+        with patch("backend.services.email_service.smtplib.SMTP") as smtp_cls:
+            self.smtp = smtp_cls.return_value
+            yield smtp_cls
+
+    def test_html_403_falls_back_to_smtp_without_api_retries(self, provider, mock_smtp):
+        """The prod failure mode: nginx HTML 403 from Postmark's edge lasts hours."""
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            result = self._send(provider)
+
+        assert result.success is True
+        assert result.message_id is None
+        assert mock_post.call_count == 1
+        self.mock_sleep.assert_not_called()
+        mock_smtp.assert_called_once_with("smtp.postmarkapp.com", 587, timeout=15)
+        self.smtp.starttls.assert_called_once()
+        self.smtp.login.assert_called_once_with("t", "t")
+        msg = self.smtp.send_message.call_args.args[0]
+        assert msg["To"] == "user@example.com"
+        assert msg["From"] == "Nomad Karaoke <f@e.com>"
+        assert msg["X-PM-Message-Stream"] == "outbound"
+        assert self.smtp.send_message.call_args.kwargs["to_addrs"] == ["user@example.com"]
+
+    def test_smtp_fallback_builds_multipart_with_cc_bcc(self, provider, mock_smtp):
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            result = provider.send_email_detailed(
+                to_email="user@example.com",
+                subject="Ünïcode subject",
+                html_content="<p>hi</p>",
+                text_content="hi",
+                cc_emails=["cc@example.com", "CC@example.com"],
+                bcc_emails=["bcc@example.com"],
+                from_email_override="tenant@example.com",
+            )
+
+        assert result.success is True
+        msg = self.smtp.send_message.call_args.args[0]
+        assert msg["Cc"] == "cc@example.com"
+        assert msg["Bcc"] is None  # BCC never appears in headers
+        assert msg["Subject"] == "Ünïcode subject"
+        assert msg["From"] == "Nomad Karaoke <tenant@example.com>"
+        assert msg.get_body(("plain",)).get_content().strip() == "hi"
+        assert msg.get_body(("html",)).get_content().strip() == "<p>hi</p>"
+        assert self.smtp.send_message.call_args.kwargs["to_addrs"] == [
+            "user@example.com", "cc@example.com", "bcc@example.com"
+        ]
+
+    def test_smtp_fallback_failure_reports_failure(self, provider, mock_smtp):
+        import smtplib as _smtplib
+        self.smtp.login.side_effect = _smtplib.SMTPAuthenticationError(535, b"bad")
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            result = self._send(provider)
+
+        assert result.success is False
+
+    def test_smtp_fallback_connection_error_reports_failure(self, provider, mock_smtp):
+        mock_smtp.side_effect = OSError("unreachable")
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            result = self._send(provider)
+
+        assert result.success is False
+
+    def test_smtp_fallback_rejects_header_injection_without_raising(self, provider, mock_smtp):
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            result = provider.send_email_detailed(
+                to_email="user@example.com", subject="Song\nBcc: evil@example.com", html_content="<p>x</p>"
+            )
+
+        assert result.success is False
+        self.smtp.send_message.assert_not_called()
+
+    def test_quit_failure_after_send_still_reports_success(self, provider, mock_smtp):
+        """Postmark already accepted the message; a failed QUIT must not trigger a resend."""
+        import smtplib as _smtplib
+        self.smtp.quit.side_effect = _smtplib.SMTPServerDisconnected("gone")
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            result = self._send(provider)
+
+        assert result.success is True
+        self.smtp.close.assert_called_once()
+
+    def test_smtp_success_clears_stale_message_id(self, provider, mock_smtp):
+        provider.last_message_id = "old"
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(403, json_body=False)
+            self._send(provider)
+
+        assert provider.last_message_id is None
+
+    @pytest.mark.parametrize("status", [429, 500, 503])
+    def test_rate_limit_and_server_errors_are_retried(self, provider, status):
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.side_effect = [self._response(status, body={"ErrorCode": 0}), self._response(200)]
+            result = self._send(provider)
+
+        assert result.success is True
+        assert mock_post.call_count == 2
+
+    @pytest.mark.parametrize(
+        "status,body",
+        [
+            (403, {"ErrorCode": 10, "Message": "Bad or missing API token"}),  # JSON 403 = real auth error
+            (422, {"ErrorCode": 300, "Message": "Invalid email request"}),
+            (422, {"ErrorCode": 406, "Message": "Inactive recipient"}),
+        ],
+    )
+    def test_deterministic_postmark_errors_not_retried(self, provider, status, body):
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.return_value = self._response(status, body=body)
+            result = self._send(provider)
+
+        assert result.success is False
+        assert mock_post.call_count == 1
+        self.mock_sleep.assert_not_called()
+
+    def test_connect_timeout_is_retried(self, provider):
+        import requests as _requests
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.side_effect = [_requests.ConnectTimeout("slow"), self._response(200)]
+            result = self._send(provider)
+
+        assert result.success is True
+        assert mock_post.call_count == 2
+
+    def test_connect_timeout_on_every_attempt_falls_back_to_smtp(self, provider, mock_smtp):
+        import requests as _requests
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.side_effect = _requests.ConnectTimeout("slow")
+            result = self._send(provider)
+
+        assert result.success is True
+        assert mock_post.call_count == 3
+        self.smtp.send_message.assert_called_once()
+
+    def test_read_timeout_not_retried_to_avoid_duplicate_send(self, provider):
+        """Postmark may have accepted the message; it has no idempotency key."""
+        import requests as _requests
+        with patch("backend.services.email_service.requests.post") as mock_post:
+            mock_post.side_effect = _requests.ReadTimeout("no response")
+            result = self._send(provider)
+
+        assert result.success is False
+        assert mock_post.call_count == 1
+
+
+class TestEmailServiceProviderSelection:
+    """Tests for EmailService._get_provider() selection logic."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("POSTMARK_SERVER_TOKEN", raising=False)
+
+    def test_postmark_when_token_set(self, monkeypatch):
+        monkeypatch.setenv("POSTMARK_SERVER_TOKEN", "pm-token")
+        svc = EmailService()
+        assert isinstance(svc.provider, PostmarkEmailProvider)
+        assert svc.is_configured() is True
+
+    def test_console_when_no_token(self, monkeypatch):
+        svc = EmailService()
+        assert isinstance(svc.provider, ConsoleEmailProvider)
+        assert svc.is_configured() is False
+
+    def test_last_send_suppressed_wired_through_send_magic_link(self, monkeypatch):
+        """A suppressed recipient surfaces on EmailService.last_send_suppressed so
+        route handlers can log it at INFO instead of a scary ERROR."""
+        monkeypatch.setenv("POSTMARK_SERVER_TOKEN", "pm-token")
+        svc = EmailService()
+
+        def _suppressed_response(*args, **kwargs):
+            resp = Mock()
+            resp.status_code = 422
+            resp.json.return_value = {"ErrorCode": 406, "Message": "Inactive recipient"}
+            resp.text = ""
+            return resp
+
+        with patch("backend.services.email_service.requests.post", side_effect=_suppressed_response):
+            sent = svc.send_magic_link("whatever@example.com", "tok123")
+
+        assert sent is False
+        assert svc.last_send_suppressed is True
+
+
+class TestEmailServiceKjboxLoginCode:
+    """The kjbox karaoke-night sign-in code email."""
+
+    def _send(self, locale="en"):
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+        result = service.send_kjbox_login_code("singer@example.com", "042917", expiry_minutes=10, locale=locale)
+        return result, service.provider.send_email.call_args.kwargs
+
+    def test_subject_and_body_show_code_and_expiry(self):
+        result, kwargs = self._send()
+        assert result is True
+        assert kwargs["to_email"] == "singer@example.com"
+        assert kwargs["subject"] == "Your Nomad Karaoke code: 042917"
+        for body in (kwargs["html_content"], kwargs["text_content"]):
+            assert "042917" in body
+            assert "10 minutes" in body
+            assert "ignore" in body.lower()
+        # Code-only email: nothing to click
+        assert "/auth/verify" not in kwargs["html_content"]
+
+    def test_localised(self):
+        _, kwargs = self._send(locale="es")
+        from backend.i18n import t
+        assert kwargs["subject"] == t("es", "emails.kjboxLoginCode.subject", code="042917")
+        assert "042917" in kwargs["subject"]
+
+
+class TestEmailServiceJobCompletion:
+    """Tests for job completion email method."""
+
+    def test_send_job_completion_basic(self):
+        """Test basic job completion email."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        result = service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Your video is ready!",
+        )
+
+        assert result is True
+        service.provider.send_email.assert_called_once()
+
+    def test_send_job_completion_with_song_info(self):
+        """Test job completion email includes song in subject."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Your video is ready!",
+            artist="Test Artist",
+            title="Test Song",
+        )
+
+        call_args = service.provider.send_email.call_args
+        subject = call_args.kwargs.get('subject') or call_args[0][1]
+        assert "Test Artist" in subject
+        assert "Test Song" in subject
+
+    def test_send_job_completion_with_brand_code(self):
+        """Test job completion email includes brand code in subject."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Your video is ready!",
+            artist="Seether",
+            title="Tonight",
+            brand_code="NOMAD-1178",
+        )
+
+        call_args = service.provider.send_email.call_args
+        subject = call_args.kwargs.get('subject') or call_args[0][1]
+        # Subject format: "NOMAD-1178: Seether - Tonight (Your karaoke video is ready!)"
+        assert subject == "NOMAD-1178: Seether - Tonight (Your karaoke video is ready!)"
+
+    def test_send_job_completion_default_subject(self):
+        """Test job completion email default subject without song info."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Your video is ready!",
+        )
+
+        call_args = service.provider.send_email.call_args
+        subject = call_args.kwargs.get('subject') or call_args[0][1]
+        assert "karaoke video is ready" in subject.lower()
+
+    def test_send_job_completion_with_cc(self):
+        """Test job completion email with CC to admin."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Your video is ready!",
+            cc_admin=True,
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        assert "gen@nomadkaraoke.com" in call_kwargs.get('cc_emails', [])
+
+    def test_send_job_completion_without_cc(self):
+        """Test job completion email without CC."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Your video is ready!",
+            cc_admin=False,
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        assert call_kwargs.get('cc_emails') is None
+
+    def test_send_job_completion_escapes_html(self):
+        """Test that message content is HTML-escaped."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content="Test <script>alert('xss')</script>",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "<script>" not in html_content
+        assert "&lt;script&gt;" in html_content
+
+    def test_send_job_completion_includes_plain_text(self):
+        """Test that plain text content is included."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        message = "Your video is ready!"
+        service.send_job_completion(
+            to_email="user@example.com",
+            message_content=message,
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        assert call_kwargs.get('text_content') == message
+
+
+class TestEmailServiceActionReminder:
+    """Tests for action reminder email method."""
+
+    def test_send_action_reminder_lyrics(self):
+        """Test lyrics action reminder email."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        result = service.send_action_reminder(
+            to_email="user@example.com",
+            message_content="Please review your lyrics",
+            action_type="lyrics",
+        )
+
+        assert result is True
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        subject = call_kwargs.get('subject')
+        assert "lyrics" in subject.lower()
+
+    def test_send_action_reminder_instrumental(self):
+        """Test instrumental action reminder email."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        result = service.send_action_reminder(
+            to_email="user@example.com",
+            message_content="Please select instrumental",
+            action_type="instrumental",
+        )
+
+        assert result is True
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        subject = call_kwargs.get('subject')
+        assert "instrumental" in subject.lower()
+
+    def test_send_action_reminder_with_song_info(self):
+        """Test action reminder includes song in subject."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_action_reminder(
+            to_email="user@example.com",
+            message_content="Please review",
+            action_type="lyrics",
+            artist="Test Artist",
+            title="Test Song",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        subject = call_kwargs.get('subject')
+        assert "Test Artist" in subject
+        assert "Test Song" in subject
+
+    def test_send_action_reminder_unknown_type(self):
+        """Test action reminder with unknown type still sends."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        result = service.send_action_reminder(
+            to_email="user@example.com",
+            message_content="Please take action",
+            action_type="unknown",
+        )
+
+        assert result is True
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        subject = call_kwargs.get('subject')
+        assert "Action needed" in subject
+
+    def test_send_action_reminder_escapes_html(self):
+        """Test that message content is HTML-escaped."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_action_reminder(
+            to_email="user@example.com",
+            message_content="Test <script>alert('xss')</script>",
+            action_type="lyrics",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "<script>" not in html_content
+        assert "&lt;script&gt;" in html_content
+
+    def test_send_action_reminder_no_cc(self):
+        """Test that action reminders don't have CC."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_action_reminder(
+            to_email="user@example.com",
+            message_content="Please review",
+            action_type="lyrics",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        # Action reminders should not have CC
+        assert call_kwargs.get('cc_emails') is None
+
+
+class TestEmailServiceConfiguration:
+    """Tests for email service configuration."""
+
+    def test_uses_postmark_when_configured(self):
+        """Test that Postmark is used when server token is set."""
+        with patch.dict('os.environ', {'POSTMARK_SERVER_TOKEN': 'test-token'}):
+            service = EmailService()
+            assert isinstance(service.provider, PostmarkEmailProvider)
+
+    def test_uses_console_when_not_configured(self):
+        """Test that console is used when no token."""
+        import os
+        original = os.environ.pop('POSTMARK_SERVER_TOKEN', None)
+        try:
+            service = EmailService()
+            assert isinstance(service.provider, ConsoleEmailProvider)
+        finally:
+            if original:
+                os.environ['POSTMARK_SERVER_TOKEN'] = original
+
+    def test_is_configured_true_for_postmark(self):
+        """Test is_configured returns True for Postmark."""
+        service = EmailService()
+        service.provider = PostmarkEmailProvider("token", "from@example.com")
+        assert service.is_configured() is True
+
+    def test_is_configured_false_for_console(self):
+        """Test is_configured returns False for console."""
+        service = EmailService()
+        service.provider = ConsoleEmailProvider()
+        assert service.is_configured() is False
+
+
+class TestGlobalInstance:
+    """Tests for global instance management."""
+
+    def test_get_email_service_returns_same_instance(self):
+        """Test that get_email_service returns singleton."""
+        # Reset global
+        import backend.services.email_service as es
+        es._email_service = None
+
+        service1 = get_email_service()
+        service2 = get_email_service()
+
+        assert service1 is service2
+
+
+class TestCCFunctionality:
+    """Integration tests for CC functionality across providers."""
+
+    def test_console_provider_logs_cc(self, caplog):
+        """Test that console provider logs CC recipients."""
+        import logging
+        caplog.set_level(logging.INFO)
+
+        provider = ConsoleEmailProvider()
+        provider.send_email(
+            to_email="user@example.com",
+            subject="Test",
+            html_content="<p>Test</p>",
+            cc_emails=["cc1@example.com", "cc2@example.com"],
+        )
+
+        # Check that CC was logged
+        assert "cc1@example.com" in caplog.text or "CC:" in caplog.text
+
+class TestMadeForYouOrderConfirmation:
+    """Tests for send_made_for_you_order_confirmation method."""
+
+    def test_send_order_confirmation_success(self):
+        """Test successful order confirmation email."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        result = service.send_made_for_you_order_confirmation(
+            to_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="test-job-123",
+        )
+
+        assert result is True
+        service.provider.send_email.assert_called_once()
+        # Verify BCC is set
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        assert call_kwargs.get('bcc_emails') == ["done@nomadkaraoke.com"]
+
+    def test_send_order_confirmation_subject_format(self):
+        """Test order confirmation has correct subject format."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_order_confirmation(
+            to_email="customer@example.com",
+            artist="Seether",
+            title="Tonight",
+            job_id="test-job-456",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        subject = call_kwargs.get('subject')
+        assert "Order Confirmed" in subject
+        assert "Seether" in subject
+        assert "Tonight" in subject
+
+    def test_send_order_confirmation_with_notes(self):
+        """Test order confirmation includes notes."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_order_confirmation(
+            to_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="test-job-789",
+            notes="Wedding anniversary!",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "Wedding anniversary!" in html_content
+
+    def test_send_order_confirmation_includes_delivery_promise(self):
+        """Test order confirmation mentions delivery timeframe."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_order_confirmation(
+            to_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="test-job-abc",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content', '')
+        text_content = call_kwargs.get('text_content', '')
+        # Should mention delivery timeline
+        assert "24" in html_content or "24" in text_content
+
+    def test_send_order_confirmation_failure(self):
+        """Test handling of email send failure."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = False
+
+        result = service.send_made_for_you_order_confirmation(
+            to_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="test-job-def",
+        )
+
+        assert result is False
+
+
+class TestMadeForYouAdminNotification:
+    """Tests for send_made_for_you_admin_notification method."""
+
+    def test_send_admin_notification_success(self):
+        """Test successful admin notification email."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        result = service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="job-123",
+            admin_login_token="test-token-abc",
+        )
+
+        assert result is True
+        service.provider.send_email.assert_called_once()
+
+    def test_send_admin_notification_subject_format(self):
+        """Test admin notification has correct subject format."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Seether",
+            title="Tonight",
+            job_id="job-123",
+            admin_login_token="test-token-abc",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        subject = call_kwargs.get('subject')
+        # Subject format: "Karaoke Order: {artist} - {title} [ID: {job_id}]"
+        assert "Karaoke Order" in subject
+        assert "Seether" in subject
+        assert "Tonight" in subject
+
+    def test_send_admin_notification_includes_customer_email(self):
+        """Test admin notification includes customer email."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="vip@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="job-123",
+            admin_login_token="test-token-abc",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "vip@example.com" in html_content
+
+    def test_send_admin_notification_includes_job_link(self):
+        """Test admin notification includes job link."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="abc-def-123",
+            admin_login_token="test-token-abc",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "abc-def-123" in html_content
+
+    def test_send_admin_notification_link_deep_links_to_audio_queue(self):
+        """Admin 'Open Job' link must one-click login AND deep-link to the
+        awaiting-audio-selection queue so the made-for-you order is visible
+        (a bare /app link lands on a dashboard that filters it out)."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="job-123",
+            admin_login_token="tok-xyz",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        text_content = call_kwargs.get('text_content')
+        for body in (html_content, text_content):
+            assert "admin_token=tok-xyz" in body
+            assert "status=awaiting_audio_selection" in body
+
+    def test_send_admin_notification_includes_audio_count(self):
+        """Test admin notification includes audio source count."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="job-123",
+            admin_login_token="test-token-abc",
+            audio_source_count=5,
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "5" in html_content
+
+    def test_send_admin_notification_includes_notes(self):
+        """Test admin notification includes customer notes."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = True
+
+        service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="job-123",
+            admin_login_token="test-token-abc",
+            notes="Rush order please!",
+        )
+
+        call_kwargs = service.provider.send_email.call_args.kwargs
+        html_content = call_kwargs.get('html_content')
+        assert "Rush order please!" in html_content
+
+    def test_send_admin_notification_failure(self):
+        """Test handling of email send failure."""
+        service = EmailService()
+        service.provider = Mock()
+        service.provider.send_email.return_value = False
+
+        result = service.send_made_for_you_admin_notification(
+            to_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            artist="Test Artist",
+            title="Test Song",
+            job_id="job-123",
+            admin_login_token="test-token-abc",
+        )
+
+        assert result is False
+
+
+class TestEverySendHasOneSignature:
+    """Every customer email gets the signature exactly once, via the shared footer.
+
+    Regression: the credit-denied ("About your Nomad Karaoke free credits") email
+    appended the signature itself AND got it from _build_email_html, so it showed twice.
+    """
+
+    @staticmethod
+    def _sample(name, param):
+        import inspect
+
+        n = name.lower()
+        if param.annotation is int or any(k in n for k in ("credits", "count", "hours", "percent")):
+            return 3
+        if param.annotation is bool:
+            return False
+        if "email" in n:
+            return "user@example.com"
+        if "locale" in n:
+            return "en"
+        if "url" in n or "link" in n:
+            return "https://example.com/x"
+        if param.annotation is dict or "details" in n:
+            return {}
+        if param.annotation is list:
+            return []
+        assert param.default is inspect.Parameter.empty
+        return "Sample"
+
+    def _send_methods(self):
+        import inspect
+
+        return [
+            (name, fn)
+            for name, fn in inspect.getmembers(EmailService, inspect.isfunction)
+            if name.startswith("send_") and name != "send_email"
+        ]
+
+    def test_send_methods_discovered(self):
+        names = {n for n, _ in self._send_methods()}
+        assert {"send_credit_denied_email", "send_welcome_email", "send_job_completion"} <= names
+
+    def test_signature_appears_exactly_once(self):
+        import inspect
+
+        signature_marker = "+1 (803) 636-3267"
+        service = EmailService()
+        assert service._get_email_signature().count(signature_marker) == 1
+        failures = []
+        for name, fn in self._send_methods():
+            service.provider = Mock()
+            service.provider.send_email.return_value = True
+            kwargs = {
+                pn: self._sample(pn, p)
+                for pn, p in list(inspect.signature(fn).parameters.items())[1:]
+                if p.default is inspect.Parameter.empty
+            }
+            with patch.object(EmailService, "_record_sent_email"):
+                fn(service, **kwargs)
+            if not service.provider.send_email.called:
+                continue
+            html_content = service.provider.send_email.call_args.kwargs["html_content"]
+            count = html_content.count(signature_marker)
+            if count != 1:
+                failures.append(f"{name}: {count}")
+        assert not failures, f"signature count != 1 in: {failures}"

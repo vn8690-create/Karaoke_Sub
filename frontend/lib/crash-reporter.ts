@@ -1,0 +1,222 @@
+/**
+ * Frontend crash reporter.
+ *
+ * - Call `reportClientError(...)` from React error boundaries and global listeners.
+ * - Dedupes identical errors within a short window to avoid spamming the API.
+ * - Never throws; any failure to report is swallowed and logged to the console.
+ */
+
+import { API_BASE_URL } from '@/lib/api'
+import { collectDiagnostics, getBreadcrumbs } from '@/lib/diagnostics'
+
+export interface ClientErrorContext {
+  href: string
+  userAgent: string
+  innerWidth?: number
+  innerHeight?: number
+  locale?: string
+  release?: string
+  userEmail?: string | null
+}
+
+export interface CollectedContext {
+  url: string
+  userAgent: string
+  locale: string
+  release: string
+  viewport: { w: number; h: number } | undefined
+  userEmail: string | null
+}
+
+export interface ReportArgs {
+  error: unknown
+  /** Where the error was caught. e.g. 'window.onerror', 'error.tsx', 'CrashReportBoundary' */
+  source: string
+  context: ClientErrorContext
+  extra?: Record<string, unknown>
+  /**
+   * The browser gave us no Error object (e.g. Firefox "out of memory"), so the
+   * caller synthesized one. Its stack is the reporter's own and is dropped so it
+   * doesn't masquerade as the crash site; filename/lineno/colno in `extra` say
+   * where it actually happened.
+   */
+  synthetic?: boolean
+}
+
+const DEDUP_WINDOW_MS = 5_000
+const recentSignatures = new Map<string, number>()
+// A wedged tab (e.g. out of memory) can throw on every render; cap what one page
+// load may send so it can't flood the endpoint or the alert channel.
+const MAX_REPORTS_PER_PAGE = 20
+let reportsThisPage = 0
+
+export function __resetForTest() {
+  recentSignatures.clear()
+  reportsThisPage = 0
+}
+
+function sanitizeUrl(href: string): string {
+  if (!href) return ''
+  try {
+    const u = new URL(href)
+    u.search = ''
+    u.hash = ''
+    return u.toString()
+  } catch {
+    return href.slice(0, 512)
+  }
+}
+
+export function collectContext(ctx: ClientErrorContext): CollectedContext {
+  const viewport =
+    typeof ctx.innerWidth === 'number' && typeof ctx.innerHeight === 'number'
+      ? { w: ctx.innerWidth, h: ctx.innerHeight }
+      : undefined
+  return {
+    url: sanitizeUrl(ctx.href),
+    userAgent: ctx.userAgent || '',
+    locale: ctx.locale || 'en',
+    release: ctx.release || process.env.NEXT_PUBLIC_COMMIT_SHA || '',
+    viewport,
+    userEmail: ctx.userEmail ?? null,
+  }
+}
+
+function normalizeError(e: unknown): { message: string; stack: string | null } {
+  if (e instanceof Error) {
+    return {
+      message: `${e.name}: ${e.message}`,
+      stack: e.stack ?? null,
+    }
+  }
+  if (typeof e === 'string') {
+    return { message: e, stack: null }
+  }
+  try {
+    return { message: JSON.stringify(e).slice(0, 4000), stack: null }
+  } catch {
+    return { message: String(e).slice(0, 4000), stack: null }
+  }
+}
+
+function signatureFor(message: string, stack: string | null, source: string): string {
+  return `${source}|${stack?.slice(0, 500) ?? message.slice(0, 500)}`
+}
+
+/**
+ * Benign errors that are routinely produced by the browser during normal use
+ * and carry no diagnostic value. These must never reach the error monitor:
+ *
+ * - A rejected `HTMLMediaElement.play()` promise (DOMException "AbortError")
+ *   that fires when playback is interrupted by a pause / src change / unmount —
+ *   e.g. clicking play on the lyrics-review audio while it is still loading.
+ * - The "ResizeObserver loop …" notice: a spec-defined signal that an observer
+ *   callback nudged layout and the browser deferred the next batch a frame. It
+ *   is not a crash — Chrome hides it from its own console — and every page using
+ *   ResizeObserver (TimelineCanvas, FlyerPreview, the VNC toolbar, …) emits it.
+ */
+const BENIGN_MESSAGE_PATTERNS = [
+  // Both the current ("completed with undelivered notifications") and legacy
+  // ("loop limit exceeded") Chromium phrasings.
+  /resizeobserver loop/i,
+]
+
+/**
+ * Browser page translation (Chrome/Edge "Translate this page") rewrites the text
+ * nodes React owns, so React's next commit throws NotFoundError from removeChild /
+ * insertBefore. The crash is caused by the translator, not our code, and only
+ * counts as benign while the page is actually translated (Chrome marks <html>
+ * with a `translated-ltr` / `translated-rtl` class).
+ */
+const TRANSLATE_DOM_CONFLICT = /Failed to execute '(removeChild|insertBefore)' on 'Node'/
+
+function isPageMachineTranslated(): boolean {
+  if (typeof document === 'undefined') return false
+  if (/\btranslated-(ltr|rtl)\b/.test(document.documentElement.className)) return true
+  // Translators that don't mark <html> (e.g. Edge) still wrap the text they rewrite in
+  // <font style="vertical-align: inherit">, which our app never renders.
+  return document.querySelector('font[style*="vertical-align: inherit"]') !== null
+}
+
+export function isBenignError(e: unknown): boolean {
+  if (e instanceof DOMException && e.name === 'AbortError') return true
+  // Some browsers surface the same media abort as a plain Error.
+  if (e instanceof Error && e.name === 'AbortError') return true
+  const message =
+    e instanceof Error ? e.message : typeof e === 'string' ? e : ''
+  if (TRANSLATE_DOM_CONFLICT.test(message) && isPageMachineTranslated()) return true
+  return BENIGN_MESSAGE_PATTERNS.some((re) => re.test(message))
+}
+
+/**
+ * Local development must never reach the production error monitor. On localhost
+ * the API base URL is relative, so reports would be proxied straight to the prod
+ * backend and trip prod alerts for transient dev errors (hot-reload, half-saved
+ * edits, etc.). Decided from the page URL the error occurred on.
+ */
+function isLocalhostUrl(url: string | undefined): boolean {
+  if (!url) return false
+  try {
+    const h = new URL(url).hostname
+    return h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '::1'
+  } catch {
+    return false
+  }
+}
+
+export async function reportClientError(args: ReportArgs): Promise<void> {
+  try {
+    if (isBenignError(args.error)) return
+
+    const normalized = normalizeError(args.error)
+    const message = normalized.message
+    const stack = args.synthetic ? null : normalized.stack
+    const sig = signatureFor(message, stack, args.source)
+    const now = Date.now()
+    const last = recentSignatures.get(sig)
+    if (last && now - last < DEDUP_WINDOW_MS) return
+    recentSignatures.set(sig, now)
+    // simple cleanup
+    if (recentSignatures.size > 200) {
+      for (const [k, t] of recentSignatures) {
+        if (now - t > DEDUP_WINDOW_MS * 4) recentSignatures.delete(k)
+      }
+    }
+
+    const ctx = collectContext(args.context)
+    // Never report from local dev — would hit the prod error monitor.
+    if (isLocalhostUrl(ctx.url)) return
+    if (reportsThisPage >= MAX_REPORTS_PER_PAGE) return
+    reportsThisPage++
+    const body = {
+      message,
+      stack,
+      url: ctx.url,
+      user_agent: ctx.userAgent,
+      release: ctx.release,
+      user_email: ctx.userEmail,
+      viewport: ctx.viewport ?? null,
+      locale: ctx.locale,
+      source: args.source,
+      extra: {
+        ...(args.extra ?? {}),
+        ...(args.synthetic ? { synthetic_error: true } : {}),
+        diagnostics: { ...collectDiagnostics(), reports_this_page: reportsThisPage },
+        breadcrumbs: getBreadcrumbs(),
+      },
+    }
+
+    await fetch(`${API_BASE_URL}/api/client-errors`, {
+      method: 'POST',
+      keepalive: true,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {
+      /* swallow — never surface reporter errors to callers */
+    })
+  } catch (err) {
+    if (typeof console !== 'undefined') {
+      console.warn('[crash-reporter] failed:', err)
+    }
+  }
+}

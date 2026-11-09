@@ -1,0 +1,3541 @@
+"""
+Review API routes - Combined lyrics + instrumental review.
+
+These endpoints support the combined review flow where users review lyrics
+AND select their instrumental in a single session.
+
+The correction-data endpoint now includes instrumental options and backing
+vocals analysis, and the complete endpoint requires instrumental selection.
+
+Usage:
+  Frontend URL: http://localhost:5173/?baseApiUrl=http://localhost:8000/api/review/{job_id}
+
+The baseApiUrl includes the job_id, and all endpoints are relative to that.
+"""
+import asyncio
+import concurrent.futures
+import logging
+import hashlib
+import json
+import os
+import tempfile
+import threading
+from collections import OrderedDict
+from pathlib import Path
+from typing import Dict, Any, List, Literal, Optional, Set, Tuple
+
+from fastapi import APIRouter, HTTPException, Request, Depends, Form, File, UploadFile
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from google.cloud.exceptions import NotFound
+from google.cloud.firestore_v1.field_path import FieldPath
+
+from backend.models.job import JobStatus
+from backend.models.review_session import ReviewSession, ReviewSessionSummary
+from backend.services.job_manager import JobManager
+from backend.exceptions import InvalidStateTransitionError
+from backend.services.review_state import ensure_in_review
+from backend.services.firestore_service import FirestoreService
+from backend.services.storage_service import StorageService
+from backend.services.tempo_label import (
+    apply_tempo_to_title,
+    cumulative_tempo_factor,
+    is_tempo_adjusted,
+    strip_tempo_suffix,
+)
+from backend.services.job_logging import job_log_context, JobLogger
+from backend.services.tracing import create_span, add_span_attribute, add_span_event
+from backend.services.auto_approval.instrumental import with_unified_recommendation
+from backend.services.encoding_service import get_encoding_service
+from backend.api.dependencies import require_admin, require_auth, require_review_auth
+from backend.utils.stems import vocals_stem_path as _vocals_stem_path
+from backend.services.auth_service import UserType
+from backend.config import get_settings
+from backend.i18n import t, get_locale_from_request
+from backend.services.duration_reconciliation import reconcile_and_maybe_pause
+from backend.utils.audio_filenames import local_audio_filename
+
+from pydantic import BaseModel as _PydBaseModel
+from backend.services.custom_lyrics_service import (
+    CustomLyricsService,
+    CustomLyricsServiceError,
+    get_custom_lyrics_service,
+)
+from backend.services.auto_correct import (
+    AutoCorrectService,
+    AutoCorrectServiceError,
+    get_auto_correct_service,
+)
+
+
+class LineMetadataResponse(_PydBaseModel):
+    line_index: int
+    target_text: str
+    candidate_text: str
+    target_syllables: list[int]
+    candidate_syllables: list[int]
+    min_delta: int
+    passes: bool
+    severity: str  # "ok" | "minor" | "major"
+    time_budget_seconds: float
+
+
+class CustomLyricsResponse(_PydBaseModel):
+    lines: list[str]
+    line_metadata: list[LineMetadataResponse]
+    iterations_used: int
+    stop_reason: str  # "success" | "plateau" | "max_iters_reached" | "line_count_mismatch" | "verbatim_skip"
+    settings_applied: dict
+    new_segment_timing: Optional[list[tuple[float, float]]] = None
+    line_count_mismatch: bool
+    warnings: list[str]
+    model: str
+
+
+class AutoCorrectRequest(_PydBaseModel):
+    segments: list[dict]  # client's current working corrected_segments
+    reference_lyrics: dict  # client's reference sources (incl. user-added)
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    settings: Optional[dict] = None  # AutoCorrectSettings knobs
+
+
+class AutoCorrectSuggestionResponse(_PydBaseModel):
+    id: str
+    op: str  # "replace" | "delete" | "insert_after"
+    word_ids: list[str]
+    segment_ids: list[str]
+    original_text: str
+    new_text: str
+    reason: str
+    category: str
+    confidence: float
+    models: list[str]
+    consensus: int
+    total_models: int
+    conflict_group: Optional[str] = None
+
+
+class AutoCorrectResponse(_PydBaseModel):
+    suggestions: list[AutoCorrectSuggestionResponse]
+    model: str
+    elapsed_seconds: float
+    settings_applied: dict
+    warnings: list[str]
+    cached: bool = False
+
+
+def _get_custom_lyrics_service_dep() -> CustomLyricsService:
+    """FastAPI dependency wrapper around the singleton accessor."""
+    return get_custom_lyrics_service()
+
+
+def _get_auto_correct_service_dep() -> AutoCorrectService:
+    """FastAPI dependency wrapper around the singleton accessor."""
+    return get_auto_correct_service()
+
+
+async def _load_target_segments_for_custom_lyrics(
+    job_id: str,
+    target_lines: list[str],
+) -> list[dict]:
+    """Load segments with timing for the custom-lyrics endpoint.
+
+    Tries to fetch corrections.json from GCS for accurate per-segment timing
+    (start_time, end_time). Falls back to synthesized timing (2s per line)
+    if corrections.json is unavailable or has a mismatched line count.
+
+    Returns a list of dicts with at least start_time, end_time, text, words keys.
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        return _synthesized_segments(target_lines)
+
+    # Try corrections_updated first (latest review session edits), then corrections (original)
+    corrections_path = (
+        job.file_urls.get("lyrics", {}).get("corrections_updated")
+        or f"jobs/{job_id}/lyrics/corrections_updated.json"
+    )
+    if not (corrections_path and storage.file_exists(corrections_path)):
+        corrections_path = (
+            job.file_urls.get("lyrics", {}).get("corrections")
+            or f"jobs/{job_id}/lyrics/corrections.json"
+        )
+
+    try:
+        if corrections_path and storage.file_exists(corrections_path):
+            data = storage.download_json(corrections_path)
+            segments = data.get("corrected_segments") or data.get("segments") or []
+            if len(segments) == len(target_lines):
+                return segments
+            logger.warning(
+                f"Job {job_id}: corrections.json has {len(segments)} segments but "
+                f"{len(target_lines)} target_lines provided; using synthesized timing"
+            )
+    except Exception as e:  # noqa: BLE001 - degrade gracefully
+        logger.warning(
+            f"Job {job_id}: could not load segments from {corrections_path}: {e}; "
+            f"using synthesized timing"
+        )
+
+    return _synthesized_segments(target_lines)
+
+
+def _synthesized_segments(target_lines: list[str]) -> list[dict]:
+    """Fallback when real timing is unavailable: 2s per line."""
+    return [
+        {
+            "id": f"synth-{i}",
+            "start_time": float(i * 2.0),
+            "end_time": float((i + 1) * 2.0),
+            "text": line,
+            "words": [],
+        }
+        for i, line in enumerate(target_lines)
+    ]
+
+
+# LyricsTranscriber imports for preview generation
+from karaoke_gen.lyrics_transcriber.types import CorrectionResult
+from karaoke_gen.lyrics_transcriber.core.config import OutputConfig
+from karaoke_gen.lyrics_transcriber.correction.operations import CorrectionOperations
+from karaoke_gen.lyrics_transcriber.output.timing_validation import LyricsTimingError
+
+# Import from the unified style loader
+from karaoke_gen.style_loader import load_styles_from_gcs
+
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/review", tags=["review"])
+
+# Store job context for the session
+# In production, this would be handled differently (e.g., session tokens)
+_job_contexts: Dict[str, Dict[str, Any]] = {}
+
+# Store preview video paths for serving
+_preview_videos: Dict[str, Dict[str, str]] = {}
+
+# Keep references to background tasks to prevent garbage collection
+_background_tasks: Set[asyncio.Task] = set()
+
+
+def _get_audio_hash(job_id: str) -> str:
+    """Generate a consistent audio hash for a job."""
+    return hashlib.md5(job_id.encode()).hexdigest()
+
+
+def _preview_error_marker_path(job_id: str, preview_hash: str) -> str:
+    """GCS marker written when a background preview encode fails permanently.
+
+    The status-poll endpoint reports it so the review UI can stop polling and
+    show a real error. GCS (not memory) because polls may hit a different
+    Cloud Run instance than the one running the encode task.
+    """
+    return f"jobs/{job_id}/previews/{preview_hash}.error.json"
+
+
+def _record_preview_video(job_id: str, preview_hash: str, gcs_path: str) -> None:
+    if job_id not in _preview_videos:
+        _preview_videos[job_id] = {}
+    _preview_videos[job_id][preview_hash] = gcs_path
+
+
+def _prepare_preview_inputs(job, temp_dir: str, storage, is_duet: bool):
+    """Download corrections/audio/styles for a preview render into temp_dir.
+
+    Returns (correction_result, audio_path, output_config). Blocking (GCS
+    downloads) — shared by the preview endpoint and the local-encode fallback.
+    """
+    job_id = job.job_id
+    with create_span("download-corrections-and-audio") as download_span:
+        corrections_gcs = f"jobs/{job_id}/lyrics/corrections.json"
+        corrections_path = os.path.join(temp_dir, "corrections.json")
+        storage.download_file(corrections_gcs, corrections_path)
+
+        with open(corrections_path, 'r', encoding='utf-8') as f:
+            original_data = json.load(f)
+
+        audio_path = os.path.join(temp_dir, local_audio_filename(job.input_media_gcs_path, "audio"))
+        storage.download_file(job.input_media_gcs_path, audio_path)
+        download_span.set_attribute("audio_gcs_path", job.input_media_gcs_path)
+
+    correction_result = CorrectionResult.from_dict(original_data)
+    add_span_event("corrections_loaded")
+
+    with create_span("load-styles") as styles_span:
+        styles_path, _ = load_styles_from_gcs(
+            style_params_gcs_path=job.style_params_gcs_path,
+            style_assets=job.style_assets,
+            temp_dir=temp_dir,
+            download_func=storage.download_file,
+            logger=logger,
+        )
+        styles_span.set_attribute("styles_path", styles_path)
+
+    output_dir = os.path.join(temp_dir, "output")
+    cache_dir = os.path.join(temp_dir, "cache")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    output_config = OutputConfig(
+        output_styles_json=styles_path,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+        video_resolution="360p",
+        is_duet=is_duet,
+    )
+    return correction_result, audio_path, output_config
+
+
+# At most this many local preview renders at once. The local path runs ffmpeg
+# ON the 2-vCPU API instance (it's the fallback when GCE preview encoding is
+# down); unbounded, a GCE outage plus a few users clicking Preview saturates
+# the instance's CPU, stalls the health probe, and shows everyone the orange
+# "trouble reaching our servers" banner. Serializing renders keeps the API
+# responsive — previews just queue a little longer during an encoder outage.
+_LOCAL_PREVIEW_MAX_CONCURRENCY = max(1, int(os.getenv("LOCAL_PREVIEW_MAX_CONCURRENCY", "1")))
+_LOCAL_PREVIEW_QUEUE_TIMEOUT_S = int(os.getenv("LOCAL_PREVIEW_QUEUE_TIMEOUT_S", "900"))
+_local_preview_slots = asyncio.Semaphore(_LOCAL_PREVIEW_MAX_CONCURRENCY)
+# Dedicated executor: admitted renders never compete with the shared to_thread
+# pool, and its concurrent.futures-level done callbacks fire when the WORKER
+# THREAD finishes — the asyncio wrapper future can be "cancelled" while the
+# thread is still running, so it must not drive the slot release.
+_local_preview_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_LOCAL_PREVIEW_MAX_CONCURRENCY, thread_name_prefix="local-preview"
+)
+
+
+async def _render_preview_locally(
+    job,
+    updated_data: Dict[str, Any],
+    is_duet: bool,
+    abandoned: Optional[threading.Event] = None,
+) -> str:
+    """Render the full 360p preview locally (bounded) and upload it to GCS.
+
+    Used when GCE preview encoding is disabled and as the fallback when it
+    fails. Admission happens HERE on the event loop (async semaphore +
+    wait_for) so queued renders wait as cheap coroutines — only an ADMITTED
+    render occupies a thread-pool worker for its blocking downloads + ffmpeg.
+
+    ``abandoned`` (set by the preview watcher when the job leaves review) is
+    checked by the render thread: cancelling the awaiting task cannot stop a
+    thread already running ffmpeg, so the thread itself skips the render if
+    the flag is already set, and skips the upload/record if it was set
+    mid-render — a discarded preview never lands in GCS.
+    """
+    try:
+        await asyncio.wait_for(
+            _local_preview_slots.acquire(), timeout=_LOCAL_PREVIEW_QUEUE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            "Local preview encoder is busy (waited "
+            f"{_LOCAL_PREVIEW_QUEUE_TIMEOUT_S}s for a slot) — try again shortly"
+        )
+    def _run_render():
+        return _render_preview_locally_unbounded(job, updated_data, is_duet, abandoned)
+
+    loop = asyncio.get_running_loop()
+    worker_future = _local_preview_executor.submit(_run_render)
+
+    def _release_slot(fut: "concurrent.futures.Future") -> None:
+        # Runs when the WORKER THREAD actually finishes. Releasing from an
+        # async finally (or the asyncio wrapper's callback) would free the slot
+        # the moment the awaiting request is cancelled — while the ffmpeg
+        # render thread is still consuming CPU — letting a second render start
+        # and defeating the concurrency bound.
+        if not fut.cancelled():
+            fut.exception()  # mark retrieved when the caller was cancelled/abandoned
+        try:
+            loop.call_soon_threadsafe(_local_preview_slots.release)
+        except RuntimeError:
+            pass  # loop already closed (shutdown) — nothing left to bound
+
+    worker_future.add_done_callback(_release_slot)
+    return await asyncio.wrap_future(worker_future)
+
+
+def _render_preview_locally_unbounded(
+    job,
+    updated_data: Dict[str, Any],
+    is_duet: bool,
+    abandoned: Optional[threading.Event] = None,
+) -> str:
+    job_id = job.job_id
+    storage = StorageService()
+
+    def _is_abandoned() -> bool:
+        return abandoned is not None and abandoned.is_set()
+
+    if _is_abandoned():
+        logger.info(f"Job {job_id}: Skipping local preview render — job left review")
+        return ""
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        correction_result, audio_path, output_config = _prepare_preview_inputs(
+            job=job, temp_dir=temp_dir, storage=storage, is_duet=is_duet
+        )
+
+        with create_span("render-preview-video-local") as render_span:
+            render_span.set_attribute("resolution", "360p")
+            result = CorrectionOperations.generate_preview_video(
+                correction_result=correction_result,
+                updated_data=updated_data,
+                output_config=output_config,
+                audio_filepath=audio_path,
+                artist=job.artist,
+                title=job.title,
+                logger=logger,
+                ass_only=False,
+            )
+            preview_hash = result["preview_hash"]
+            video_path = result["video_path"]
+            add_span_event("render_complete")
+
+        if _is_abandoned():
+            # The watcher cancelled the awaiting task mid-render; this thread
+            # couldn't be stopped, but don't publish the unwatchable result.
+            logger.info(f"Job {job_id}: Discarding local preview {preview_hash} — job left review")
+            return preview_hash
+
+        with create_span("upload-preview-video") as upload_span:
+            preview_gcs_path = f"jobs/{job_id}/previews/{preview_hash}.mp4"
+            storage.upload_file(video_path, preview_gcs_path)
+            upload_span.set_attribute("gcs_path", preview_gcs_path)
+
+    _record_preview_video(job_id, preview_hash, preview_gcs_path)
+    return preview_hash
+
+
+# How often an in-flight background preview encode re-checks that its job is
+# still in review. A reviewer who is confident can click Complete without
+# waiting for the preview; once the job leaves awaiting_review/in_review the
+# preview is unwatchable, so the encode is abandoned — no encoder VM cold
+# start, no submission, no status polling, no local fallback — instead of
+# burning encoder time on a video nobody can see.
+PREVIEW_ABANDON_POLL_S = float(os.getenv("PREVIEW_ABANDON_POLL_S", "3"))
+_REVIEW_STATUSES = (JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW)
+
+
+async def _job_left_review(job_id: str) -> bool:
+    """True once the job is no longer in a review state (or no longer exists)."""
+    # Construct the manager inside the worker thread too — client setup can
+    # block (credentials/transport), and this polls from the API event loop.
+    job = await asyncio.to_thread(lambda: JobManager().get_job(job_id))
+    return job is None or job.status not in _REVIEW_STATUSES
+
+
+async def _cancel_preview_when_job_leaves_review(
+    job_id: str,
+    preview_hash: str,
+    encode_task: "asyncio.Task[None]",
+    abandoned: threading.Event,
+) -> bool:
+    """Watch the job's status while ``encode_task`` runs; cancel it once the
+    job leaves review. Returns True iff this watcher cancelled the encode.
+
+    Status is read from Firestore (not an in-memory flag) because the
+    /complete request that ends the review may land on a different Cloud Run
+    instance than the one running the encode.
+
+    Cancellation is best-effort for work already inside a thread: a local
+    ffmpeg render checks ``abandoned`` and skips its upload; an in-flight VM
+    start (``_warmup_encoding_worker_fallback`` → to_thread) cannot be
+    stopped and runs to completion — the idle-shutdown reclaims the VM.
+    """
+    while not encode_task.done():
+        await asyncio.sleep(PREVIEW_ABANDON_POLL_S)
+        if encode_task.done():
+            return False
+        try:
+            left = await _job_left_review(job_id)
+        except Exception as e:  # transient Firestore blip — keep watching
+            logger.debug(f"Job {job_id}: preview abandon check failed (will retry): {e}")
+            continue
+        if left:
+            logger.info(
+                f"Job {job_id}: Abandoning preview {preview_hash} — job left review "
+                f"(reviewer completed without waiting for the preview)"
+            )
+            abandoned.set()
+            encode_task.cancel()
+            return True
+    return False
+
+
+async def _encode_preview_in_background(
+    job,
+    preview_hash: str,
+    encode_kwargs: Dict[str, Any],
+    updated_data: Dict[str, Any],
+    is_duet: bool,
+) -> None:
+    """Run the GCE preview encode without holding the HTTP request open.
+
+    Cold-starting a fallback encoder VM can take 2-3 minutes — longer than
+    Cloudflare's ~100s edge timeout — so POST /preview-video returns as soon
+    as the ASS is uploaded and the browser polls the /status endpoint, which
+    reports ready once the mp4 exists in GCS. On GCE failure this falls back
+    to a local render; if that also fails an error marker is written so the
+    poll can surface the failure instead of spinning until its timeout.
+
+    The encode is abandoned (cancelled, nothing written) as soon as the job
+    leaves review — see ``_cancel_preview_when_job_leaves_review``.
+    """
+    job_id = job.job_id
+    abandoned = threading.Event()
+    with job_log_context(job_id, worker="preview"):
+        encode_task = asyncio.create_task(
+            _run_preview_encode(job, preview_hash, encode_kwargs, updated_data, is_duet, abandoned)
+        )
+        watcher = asyncio.create_task(
+            _cancel_preview_when_job_leaves_review(job_id, preview_hash, encode_task, abandoned)
+        )
+        try:
+            await encode_task
+        except asyncio.CancelledError:
+            if watcher.done() and not watcher.cancelled() and watcher.result():
+                return  # abandoned on purpose — already logged by the watcher
+            raise  # genuine outer cancellation (e.g. shutdown)
+        finally:
+            watcher.cancel()
+
+
+async def _run_preview_encode(
+    job,
+    preview_hash: str,
+    encode_kwargs: Dict[str, Any],
+    updated_data: Dict[str, Any],
+    is_duet: bool,
+    abandoned: Optional[threading.Event] = None,
+) -> None:
+    """GCE encode → local fallback → error marker (the cancellable inner body)."""
+    job_id = job.job_id
+    storage = StorageService()
+    encoding_service = await asyncio.to_thread(get_encoding_service)
+    preview_gcs_path = f"jobs/{job_id}/previews/{preview_hash}.mp4"
+
+    with job_log_context(job_id, worker="preview"):
+        try:
+            with create_span("gce-preview-encoding", {"job_id": job_id, "preview_hash": preview_hash}) as gce_span:
+                gce_result = await encoding_service.encode_preview_video(**encode_kwargs)
+                gce_span.set_attribute("gce_status", gce_result.get("status"))
+            _record_preview_video(job_id, preview_hash, preview_gcs_path)
+            logger.info(f"Job {job_id}: Preview generated via GCE: {preview_hash}")
+            return
+        except Exception as gce_error:
+            logger.warning(f"Job {job_id}: GCE preview encoding failed, falling back to local: {gce_error}")
+
+        try:
+            await _render_preview_locally(job, updated_data, is_duet, abandoned=abandoned)
+            logger.info(f"Job {job_id}: Preview generated locally after GCE failure: {preview_hash}")
+        except Exception as local_error:
+            logger.error(
+                f"Job {job_id}: Preview generation failed (GCE and local fallback): {local_error}",
+                exc_info=True,
+            )
+            try:
+                storage.upload_json(
+                    _preview_error_marker_path(job_id, preview_hash),
+                    {"error": str(local_error)},
+                )
+            except Exception:
+                logger.exception(f"Job {job_id}: Failed to write preview error marker")
+
+
+# Cross-job search endpoint MUST be registered before {job_id} routes
+# to avoid FastAPI matching "sessions" as a job_id path parameter.
+@router.get("/sessions/search")
+def search_review_sessions(
+    q: str = "",
+    limit: int = 20,
+    auth_info: Tuple[str, str] = Depends(require_auth)
+):
+    """
+    Search review sessions across all jobs (admin only).
+
+    Query params:
+    - q: Search text (matches artist, title, or job_id)
+    - limit: Max results (default 20)
+    """
+    firestore_svc = FirestoreService()
+    results = firestore_svc.search_review_sessions(query_text=q, limit=limit)
+
+    return {"sessions": results}
+
+
+@router.get("/{job_id}/ping")
+async def ping(job_id: str):
+    """Health check endpoint expected by frontend."""
+    return {"status": "ok"}
+
+
+def _dev_audio_proxy_enabled() -> bool:
+    """True when the backend should proxy review audio bytes instead of returning
+    GCS signed URLs. Enabled via ``REVIEW_AUDIO_PROXY=1`` on a LOCAL dev backend
+    that lacks URL-signing credentials (plain user ADC can't sign). Never set in
+    prod — prod keeps the lighter signed-URL/redirect path.
+    """
+    return os.environ.get("REVIEW_AUDIO_PROXY", "").lower() in ("1", "true", "yes")
+
+
+def _review_vocals_path(job) -> Optional[str]:
+    """Vocals stem for the review waveform. Storage retention purges separated stems
+    30 days after completion; for those jobs fall back to the backfilled word-timing
+    training copy of the lead stem (``training/lead_vocals/{job_id}.flac``), so
+    replaying an old job still shows the vocal waveform. Blocking (GCS exists check)."""
+    from datetime import datetime as _dt
+
+    path = _vocals_stem_path(job)
+    purged = getattr(job, "stems_purged_at", None)
+    if path or not isinstance(purged, (_dt, str)) or not purged:
+        return path
+    training = f"training/lead_vocals/{job.job_id}.flac"
+    try:
+        return training if StorageService().file_exists(training) else None
+    except Exception:  # noqa: BLE001 - best-effort fallback
+        return None
+
+
+def _dev_audio_url(job_id: str, gcs_path: Optional[str], base_url: str = "") -> Optional[str]:
+    """Build an ABSOLUTE dev-proxy URL for a review audio/image artifact.
+
+    The URL is used directly as an ``<audio>``/``<img>`` src by the frontend, which
+    resolves relative URLs against the page origin (localhost:3000), not the API host.
+    So we must return the full backend URL (``request.base_url``, e.g. http://127.0.0.1:8000/).
+    """
+    if not gcs_path:
+        return None
+    from urllib.parse import quote
+    return f"{base_url.rstrip('/')}/api/review/{job_id}/dev-audio?path={quote(gcs_path, safe='')}"
+
+
+# Maps the public instrumental option id to the stem key in job.file_urls["stems"].
+# Used both when building instrumental_options and when the byte-proxy endpoint
+# resolves an option id back to its GCS stem path (server-side, never client-supplied).
+_INSTRUMENTAL_OPTION_STEMS = {
+    "clean": "instrumental_clean",
+    "with_backing": "instrumental_with_backing",
+}
+
+
+def _instrumental_proxy_path(job_id: str, option_id: str) -> str:
+    """Relative same-origin proxy path for an instrumental option's audio bytes.
+
+    Returned as ``instrumental_options[*].audio_url``. The frontend turns this into an
+    absolute, token-authenticated URL (``API_BASE_URL`` + ``?token=``) before using it
+    as an ``<audio>`` src — see ``resolveInstrumentalAudioUrls()`` in ``frontend/lib/api.ts``.
+    Kept RELATIVE because the backend has no trustworthy public base URL behind Cloudflare
+    (``request.base_url`` reports the wrong scheme/host), and a raw absolute-to-the-wrong-host
+    src would break.
+    """
+    return f"/api/review/{job_id}/instrumental-audio/{option_id}"
+
+
+async def _build_instrumental_options(job, request) -> List[Dict[str, Any]]:
+    """Build the ``instrumental_options`` list (id/label + same-origin audio proxy URL).
+
+    Root-cause fix (2026-09-17, Option B — see docs/archive/2026-09-17-review-fast-full-load-plan.md):
+    the review hot path no longer signs GCS URLs here. Signing went through the IAM
+    signBlob API over the network (~120 s worst-case), which made review loads slow and,
+    when it stalled, took the whole service down. Instead each option's ``audio_url`` is a
+    relative path to the ``GET /{job_id}/instrumental-audio/{option_id}`` byte proxy — no
+    signing, cannot stall, never expires. Shared by the corrections endpoint (initial
+    load) and ``GET /{job_id}/instrumental-urls`` (kept for backwards compatibility).
+    """
+    stems = job.file_urls.get("stems", {})
+    clean_url = stems.get("instrumental_clean")
+    backing_url = stems.get("instrumental_with_backing")
+
+    def _audio_url(option_id: str, source_gcs_path: str) -> Optional[str]:
+        # Local dev (no URL-signing creds) keeps its existing byte proxy, which takes the
+        # GCS path directly; prod/default returns the option-scoped proxy path.
+        if _dev_audio_proxy_enabled():
+            return _dev_audio_url(job.job_id, source_gcs_path, str(request.base_url))
+        return _instrumental_proxy_path(job.job_id, option_id)
+
+    instrumental_options: List[Dict[str, Any]] = []
+    if clean_url:
+        instrumental_options.append({
+            "id": "clean",
+            "label": "Clean Instrumental",
+            "description": "No backing vocals - just the music",
+            "audio_url": _audio_url("clean", clean_url),
+        })
+    if backing_url:
+        instrumental_options.append({
+            "id": "with_backing",
+            "label": "Instrumental with Backing Vocals",
+            "description": "Includes harmonies and background vocals",
+            "audio_url": _audio_url("with_backing", backing_url),
+        })
+    return instrumental_options
+
+
+def _reconstruct_post_ai_segments(
+    raw_segments: List[Dict[str, Any]],
+    edit_log: Optional[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Reconstruct the "post-AI, pre-human" lyrics state for replay.
+
+    Forward-replays the reviewer's edit log onto the RAW transcription
+    (``corrections.json`` corrected_segments), applying only the accepted AI
+    suggestion ops and STOPPING at the first manual op. The result is what the
+    reviewer saw right after the AI auto-corrections were applied but before they
+    made any manual edits — so a "Post-AI" toggle vs the final state makes the
+    human's manual edits obvious (e.g. cleaning up an AI self-conflict that inserted
+    a duplicate word).
+
+    Best-effort: ops that can't be applied are skipped rather than raising. Returns
+    None if there's no edit log (nothing to reconstruct) or no manual edits at all
+    (post-AI == final, so a toggle would be pointless).
+    """
+    import copy
+
+    if not edit_log:
+        return None
+    entries = edit_log.get("entries") or []
+    if not any(e.get("operation") and not str(e["operation"]).startswith("ai_suggestion") for e in entries):
+        return None  # no manual edits → nothing to distinguish
+
+    segments = copy.deepcopy(raw_segments)
+
+    def _find(word_id):
+        for seg in segments:
+            words = seg.get("words") or []
+            for i, w in enumerate(words):
+                if w.get("id") == word_id:
+                    return seg, words, i
+        return None, None, None
+
+    _new_id = [0]
+
+    def _gen_id():
+        _new_id[0] += 1
+        return f"postai_{_new_id[0]}"
+
+    for e in entries:
+        op = e.get("operation") or ""
+        if not op.startswith("ai_suggestion"):
+            break  # reached the human's manual edits — stop
+        if op != "ai_suggestion_accept":
+            continue  # run/reject/undo: not an applied change
+        details = e.get("details") or {}
+        sub_op = details.get("op") or "replace"
+        before_ids = e.get("word_ids_before") or []
+        text_after = (e.get("text_after") or "").strip()
+        anchor_id = before_ids[0] if before_ids else None
+        seg, words, idx = (_find(anchor_id) if anchor_id else (None, None, None))
+
+        def _make_words(text, start, end):
+            # Split the replacement/insertion text into individual words, distributing
+            # the [start, end] span evenly so multi-word replacements get distinct
+            # timestamps (not all crammed into one slot with identical timing).
+            toks = text.split()
+            n = len(toks) or 1
+            if end is None or start is None or end < start:
+                end = start
+            step = (end - start) / n
+            out = []
+            for i, tok in enumerate(toks):
+                ws = start + i * step
+                we = start + (i + 1) * step
+                out.append({"id": _gen_id(), "text": tok, "start_time": ws, "end_time": we,
+                            "ai_corrected": True, "original_text": ""})
+            return out
+
+        try:
+            if sub_op == "replace":
+                if words is not None:
+                    # word_ids_before may span MULTIPLE words (e.g.
+                    # 'quite a picket fence' -> 'white picket fences'). Replace the
+                    # whole contiguous span with the space-split replacement text,
+                    # spreading the original span's [start,end] across the new words.
+                    id_set = set(before_ids)
+                    span = [k for k, w in enumerate(words) if w.get("id") in id_set]
+                    if span:
+                        lo, hi = min(span), max(span)
+                        s0 = words[lo].get("start_time", 0.0)
+                        e0 = words[hi].get("end_time", s0)
+                        words[lo:hi + 1] = _make_words(text_after, s0, e0) if text_after else []
+            elif sub_op in ("insert_after", "insert_before", "insert"):
+                if words is not None:
+                    at = idx if sub_op == "insert_before" else idx + 1
+                    anchor = words[idx]
+                    a_s = anchor.get("start_time", 0.0)
+                    a_e = anchor.get("end_time", a_s)
+                    words[at:at] = _make_words(text_after, a_s, a_e)
+            elif sub_op in ("delete", "remove", "adlib_removal"):
+                if words is not None:
+                    id_set = set(before_ids)
+                    seg["words"] = [w for w in words if w.get("id") not in id_set]
+        except Exception:
+            continue  # best-effort
+
+    # Refresh each segment's joined text for display.
+    for seg in segments:
+        seg["text"] = " ".join((w.get("text") or "") for w in (seg.get("words") or [])).strip()
+    return segments
+
+
+def _lyrics_search_title(job) -> Optional[str]:
+    """Title to search lyrics providers with (never the tempo-labeled display title)."""
+    return getattr(job, 'lyrics_title', None) or strip_tempo_suffix(job.title)
+
+
+def _load_edit_log(job, storage) -> Optional[Dict[str, Any]]:
+    """Load the reviewer's persisted edit log for replay, or None if absent.
+
+    Prefers the ``state_data.last_edit_log_path`` pointer written by the
+    submit-edit-log endpoint; the file lives at
+    ``jobs/{job_id}/lyrics/edit_log_{session_id}.json`` and holds ordered,
+    typed ops (``ai_suggestion_accept/reject`` vs manual ``word_*``/``timing_change``).
+    """
+    try:
+        path = (job.state_data or {}).get('last_edit_log_path')
+        if not path:
+            return None
+        if not storage.file_exists(path):
+            return None
+        return storage.download_json(path)
+    except Exception as e:  # never let replay fail on a missing/corrupt log
+        logger.warning(f"Job {job.job_id}: could not load edit_log for replay: {e}")
+        return None
+
+
+@router.get("/{job_id}/correction-data")
+async def get_correction_data(
+    job_id: str,
+    request: Request,
+    replay: bool = False,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Get correction data for the combined review interface.
+
+    Returns the CorrectionResult data plus instrumental options and analysis
+    for the combined lyrics + instrumental review UI.
+
+    Response includes:
+    - All lyrics correction data (segments, reference lyrics, anchors, etc.)
+    - instrumental_options: List of available instrumental tracks with audio URLs
+    - backing_vocals_analysis: Analysis data to help users choose instrumental
+    - vocal_gaps: sung stretches with no transcribed words (possible missing
+      lyrics) — see services/auto_approval/vocal_gaps.py
+
+    Replay mode (``?replay=true``, requires full auth — admin/owner, not a
+    review-token link): serves the SAME payload for a job in ANY status so the
+    review UI can be re-opened read-only for a completed job. It skips the
+    AWAITING_REVIEW/IN_REVIEW status gate and the AWAITING_REVIEW→IN_REVIEW
+    transition side-effect, and additionally attaches the reviewer's ordered
+    ``edit_log`` (AI-accept/reject/manual ops) under ``replay``. Purely read-only;
+    used for the fully-automated-review recording program. See
+    docs/archive/2026-08-25-full-auto-review-design.md.
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+
+    # All Firestore/GCS round-trips in this handler run via to_thread: they're
+    # blocking client-library calls, and on the single-process/single-loop
+    # server anything left on the event loop serializes EVERY in-flight request
+    # behind it under concurrent load (see 2026-09-18 investigation doc).
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if replay and auth_info[1] != "full":
+        # Replay reopens completed jobs; restrict to authenticated admin/owner,
+        # never anonymous review-token links.
+        raise HTTPException(status_code=403, detail="Replay mode requires admin/owner authentication")
+
+    if not replay and job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.reviewNotReady", status=job.status)
+        )
+
+    # Server-side pre-apply ON LOAD (C2 completeness): jobs processed before the
+    # screens_worker pre-apply shipped (or whose cache landed after that gate) reach
+    # this endpoint without a pre_applied marker, so the review UI would still run its
+    # on-load client-side apply (the visible ~4s "uncorrected -> corrected" flicker).
+    # Apply here from an EXISTING cache only (generate_on_miss=False so the page never
+    # blocks on a multi-model LLM call). Best-effort + idempotent: a no-op when the
+    # job was already pre-applied, already human-edited, or has no cache. The direct
+    # corrections_updated path below then serves the freshly-written corrected state.
+    if not replay:
+        from backend.services.auto_approval.pre_apply import ensure_and_pre_apply
+        await ensure_and_pre_apply(job_id, generate_on_miss=False)
+
+    # Check for updated corrections first (from previous review sessions where user edited lyrics)
+    # This mirrors the logic in render_video_worker.py to ensure consistency
+    corrections_updated_gcs = job.file_urls.get('lyrics', {}).get('corrections_updated')
+    if not corrections_updated_gcs:
+        # Try direct path for updated corrections
+        corrections_updated_gcs = f"jobs/{job_id}/lyrics/corrections_updated.json"
+
+    if corrections_updated_gcs and await asyncio.to_thread(storage.file_exists, corrections_updated_gcs):
+        corrections_gcs = corrections_updated_gcs
+        logger.info(f"Job {job_id}: Using updated corrections from previous review")
+    else:
+        # Fall back to original corrections
+        corrections_gcs = job.file_urls.get('lyrics', {}).get('corrections')
+        if not corrections_gcs:
+            corrections_gcs = f"jobs/{job_id}/lyrics/corrections.json"
+            if not await asyncio.to_thread(storage.file_exists, corrections_gcs):
+                raise HTTPException(
+                    status_code=404,
+                    detail=t("en", "review.correctionsNotFound")
+                )
+
+    # Download and return corrections data
+    try:
+        corrections_data = await asyncio.to_thread(storage.download_json, corrections_gcs)
+
+        # Add audio hash for the frontend
+        audio_hash = _get_audio_hash(job_id)
+        if 'metadata' not in corrections_data:
+            corrections_data['metadata'] = {}
+        corrections_data['metadata']['audio_hash'] = audio_hash
+        corrections_data['metadata']['artist'] = job.artist
+        corrections_data['metadata']['title'] = job.title
+        # What the lyrics search should use: the display title may carry a
+        # "(90% Tempo)" label that lyrics providers won't match.
+        corrections_data['metadata']['lyrics_artist'] = getattr(job, 'lyrics_artist', None) or job.artist
+        corrections_data['metadata']['lyrics_title'] = _lyrics_search_title(job)
+
+        # Store context for audio serving
+        _job_contexts[job_id] = {
+            'audio_hash': audio_hash,
+            'audio_gcs_path': job.input_media_gcs_path
+        }
+
+        # === Add instrumental data for combined review ===
+        # Same-origin audio proxy paths (no signing; see _build_instrumental_options).
+        corrections_data['instrumental_options'] = await _build_instrumental_options(
+            job, request
+        )
+
+        # Get backing vocals analysis from state_data (populated by screens_worker)
+        backing_vocals_analysis = with_unified_recommendation(
+            job.state_data.get('backing_vocals_analysis', {})
+        )
+        corrections_data['backing_vocals_analysis'] = backing_vocals_analysis
+
+        # Possible missing lyrics (auto-approval analysis): the review UI marks
+        # "evidenced" gaps and offers the reference lines for insertion.
+        corrections_data['vocal_gaps'] = job.state_data.get('vocal_gaps') or None
+
+        # Admin "perfectly synced" mark (word-timing reference set), so a re-review
+        # shows the existing mark and can revoke it.
+        corrections_data['sync_reference'] = job.state_data.get('sync_reference') or None
+
+        # Per-screen skip (C1): tell the frontend whether each review half is
+        # confidently auto-resolved, so it can skip the instrumental screen (or the
+        # lyrics screen). Derived from the stored auto-approval verdict + the job's
+        # backing_preference — the same decision the executor / complete endpoint use.
+        from backend.config import get_settings as _get_settings
+        from backend.services.auto_approval.instrumental import auto_approval_summary
+        corrections_data['auto_approval'] = auto_approval_summary(job, _get_settings())
+
+        # NOTE: we intentionally do NOT sign/emit a ``backing_vocals_waveform_url`` here.
+        # The frontend renders the backing-vocals waveform from the Bearer-authenticated
+        # JSON endpoint ``GET /{job_id}/waveform-data`` (amplitudes drawn on a canvas), and
+        # never consumed this field. Signing it was a pure IAM-signBlob round-trip on the
+        # review hot path with no consumer — removed as part of the 2026-09-17 fast-load
+        # re-architecture so ``correction-data`` performs zero signing.
+
+        # Transition to IN_REVIEW if not already (never in replay — read-only)
+        if not replay and job.status == JobStatus.AWAITING_REVIEW:
+            # Idempotent: iOS/in-app browsers fire two concurrent loads; the loser
+            # must not 500 on "in_review -> in_review" nor repeat one-time side effects.
+            try:
+                started = "started" == await asyncio.to_thread(
+                    ensure_in_review,
+                    job_manager,
+                    job_id,
+                    job.status,
+                    "User opened combined review interface",
+                )
+            except InvalidStateTransitionError:
+                # Lost the race: the auto-approver moved the job on after the status
+                # gate above. Not a load failure, so 409 rather than the 500 below.
+                current = await asyncio.to_thread(job_manager.get_job, job_id)
+                status = current.status if current else job.status
+                raise HTTPException(
+                    status_code=409,
+                    detail=t("en", "review.reviewNotReady", status=getattr(status, "value", status)),
+                )
+            if started:
+                # Set by require_review_auth (absent for review-token links).
+                auth_state = getattr(request, "state", None)
+                await asyncio.to_thread(
+                    job_manager.record_review_started,
+                    job_id,
+                    getattr(job, "user_email", None),
+                    getattr(auth_state, "review_auth_email", None),
+                    getattr(auth_state, "review_auth_is_admin", False),
+                )
+
+        # Replay: attach the reviewer's ordered edit_log so the UI can show the
+        # sequence of actions (AI-accept/reject/manual/timing) beside the final state.
+        if replay:
+            edit_log = await asyncio.to_thread(_load_edit_log, job, storage)
+            post_ai_segments = None
+            try:
+                raw_data = await asyncio.to_thread(
+                    storage.download_json, f"jobs/{job_id}/lyrics/corrections.json"
+                )
+                post_ai_segments = _reconstruct_post_ai_segments(
+                    raw_data.get('corrected_segments', []), edit_log
+                )
+            except Exception as e:
+                logger.warning(f"Job {job_id}: could not reconstruct post-AI segments: {e}")
+            corrections_data['replay'] = {
+                'is_replay': True,
+                'job_status': str(job.status),
+                'instrumental_selection': job.state_data.get('instrumental_selection'),
+                'edit_log': edit_log,
+                # Present only when the reviewer made manual edits — lets the UI offer a
+                # "Post-AI (pre-human)" toggle vs the final state.
+                'post_ai_segments': post_ai_segments,
+                'has_manual_edits': post_ai_segments is not None,
+            }
+
+        logger.info(f"Job {job_id}: Serving correction data (replay={replay}) for combined review")
+        return corrections_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error loading corrections: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.correctionsLoadFailed", error=str(e)))
+
+
+@router.get("/{job_id}/audio/vocals")
+async def get_vocals_audio(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Stream the vocals audio file for playback."""
+    return await _stream_audio(job_id, request, stem="vocals")
+
+
+@router.get("/{job_id}/audio/{audio_hash}")
+async def get_audio_with_hash(
+    job_id: str,
+    audio_hash: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Stream the audio file for playback (with hash parameter)."""
+    return await _stream_audio(job_id, request)
+
+
+@router.get("/{job_id}/audio/")
+@router.get("/{job_id}/audio")
+async def get_audio_no_hash(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Stream the audio file for playback (without hash parameter)."""
+    return await _stream_audio(job_id, request)
+
+
+async def _stream_audio(job_id: str, request: Optional[Request] = None, stem: Literal["input"] | Literal["vocals"] = "input"):
+    """
+    Redirect to a signed GCS URL for audio playback in the review interface.
+
+    Serves transcoded OGG Opus (~3 MB) instead of raw FLAC (~35 MB).
+    Falls back to FLAC if transcoded version is not available.
+    """
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    job_manager = JobManager()
+
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    audio_gcs_path = None
+    if stem == "input":
+        audio_gcs_path = job.input_media_gcs_path
+    elif stem == "vocals":
+        audio_gcs_path = await asyncio.to_thread(_review_vocals_path, job)
+    if not audio_gcs_path:
+        # Audio separation is decoupled from the lyrics-review critical path, so a
+        # user can open review before the vocal stems have been uploaded (the stem
+        # arrives a minute or two later). Signal "not ready yet, retry" with a 202
+        # so the frontend polls instead of treating it as a terminal 404.
+        # state_data.audio_complete is set both when separation finishes and when
+        # it's skipped entirely (existing-instrumental jobs), so a missing stem
+        # with audio_complete=True really is a permanent 404.
+        if stem == "vocals" and not job.state_data.get("audio_complete", False):
+            logger.info(f"Job {job_id}: Vocal stem not yet available (separation in progress), returning 202")
+            return Response(status_code=202, headers={"Retry-After": "15"})
+        raise HTTPException(status_code=404, detail=t("en", "review.audioNotFound"))
+
+    try:
+        transcoding = AudioTranscodingService()
+
+        if stem == "vocals":
+            # Proxy the vocals bytes through the API rather than 302-redirecting to
+            # a signed GCS URL. The waveform visualizer fetch()es + decodeAudioData()s
+            # this (a cross-origin READ), and a cross-origin redirect makes the
+            # browser send `Origin: null`, which the bucket CORS rejects. Serving
+            # the (~3 MB) bytes from the API keeps it same-origin to api.* whose
+            # CORS already allows the frontend. <audio> playback (stem="input")
+            # doesn't need CORS, so it keeps the lighter redirect below.
+            # Cached in the bounded LRU (same as /instrumental-audio) with
+            # single-flight misses, so ten tabs of the same job — or a play after
+            # the waveform decode — share one GCS fetch instead of N.
+            audio_bytes, content_type = await _get_review_audio(audio_gcs_path, transcoding)
+            logger.info(f"Job {job_id}: Proxying {len(audio_bytes)}B vocals audio for waveform")
+            if request is not None:
+                return _ranged_response(request, audio_bytes, content_type)
+            return Response(content=audio_bytes, media_type=content_type)
+
+        if _dev_audio_proxy_enabled():
+            # Local dev (no GCS URL-signing creds): proxy the bytes instead of
+            # 302-redirecting to a signed URL. Prod (flag unset) is unchanged.
+            audio_bytes, content_type = await transcoding.get_review_audio_bytes_async(audio_gcs_path)
+            logger.info(f"Job {job_id}: [dev-proxy] streaming {len(audio_bytes)}B input audio")
+            if request is not None:
+                # Range support so native players (iOS AVPlayer) can seek the song source.
+                return _ranged_response(request, audio_bytes, content_type)
+            return Response(content=audio_bytes, media_type=content_type)
+
+        signed_url = await transcoding.get_review_audio_url_async(audio_gcs_path, expiration_minutes=120)
+        logger.info(f"Job {job_id}: Redirecting to signed URL for audio review")
+        return RedirectResponse(url=signed_url, status_code=302)
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error generating audio signed URL: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.audioServeError", error=str(e)))
+
+
+# In-memory cache of already-fetched/transcoded dev-audio bytes so HTTP Range
+# requests (seeking) don't re-transcode the whole file each time. Dev-only.
+_DEV_AUDIO_CACHE: Dict[str, Tuple[bytes, str]] = {}
+
+
+# BOUNDED cache of transcoded review-audio bytes for the PROD byte proxy (Option B).
+# Serving the ~3 MB OGG through the API means each play/seek would otherwise re-download
+# the object from GCS; cache a small number of recently-served objects so Range seeks and
+# repeat plays are cheap. Unlike _DEV_AUDIO_CACHE this is capped by BOTH entry count and
+# total retained bytes (the transcode-failure fallback can serve a 35+ MB raw FLAC — a
+# count-only LRU of those would OOM a 2 GiB instance). Keyed by GCS path, guarded by a
+# lock for thread safety.
+_REVIEW_AUDIO_CACHE_MAX = int(os.getenv("REVIEW_AUDIO_CACHE_MAX", "16"))
+_REVIEW_AUDIO_CACHE_MAX_BYTES = int(os.getenv("REVIEW_AUDIO_CACHE_MAX_BYTES", str(192 * 1024 * 1024)))
+_review_audio_cache: "OrderedDict[str, Tuple[bytes, str]]" = OrderedDict()
+_review_audio_cache_bytes = 0
+_review_audio_cache_lock = threading.Lock()
+
+# Single-flight coordination for cache misses: N tabs of the same job must share ONE
+# transcode/GCS-download instead of duplicating it N times. Keyed by GCS path; only
+# ever touched from the event loop (async handlers), so no extra lock is needed.
+_review_audio_inflight: Dict[str, "asyncio.Future[Tuple[bytes, str]]"] = {}
+
+
+def _review_audio_cache_get(path: str) -> Optional[Tuple[bytes, str]]:
+    with _review_audio_cache_lock:
+        item = _review_audio_cache.get(path)
+        if item is not None:
+            _review_audio_cache.move_to_end(path)  # mark most-recently-used
+        return item
+
+
+def _review_audio_cache_put(path: str, value: Tuple[bytes, str]) -> None:
+    global _review_audio_cache_bytes
+    size = len(value[0])
+    if size > _REVIEW_AUDIO_CACHE_MAX_BYTES // 4:
+        # One oversized fallback (raw FLAC) must not evict the whole working set.
+        return
+    with _review_audio_cache_lock:
+        old = _review_audio_cache.pop(path, None)
+        if old is not None:
+            _review_audio_cache_bytes -= len(old[0])
+        _review_audio_cache[path] = value
+        _review_audio_cache_bytes += size
+        while _review_audio_cache and (
+            len(_review_audio_cache) > _REVIEW_AUDIO_CACHE_MAX
+            or _review_audio_cache_bytes > _REVIEW_AUDIO_CACHE_MAX_BYTES
+        ):
+            _, evicted = _review_audio_cache.popitem(last=False)  # least-recently-used
+            _review_audio_cache_bytes -= len(evicted[0])
+
+
+async def _get_review_audio(source_gcs_path: str, transcoding) -> Tuple[bytes, str]:
+    """Cached, single-flight fetch of transcoded review-audio bytes.
+
+    Cache hit → served from memory. Miss → exactly one caller runs the
+    transcode/download; concurrent callers for the same path await its result
+    (success and failure are both shared). Used by /audio/vocals and
+    /instrumental-audio.
+    """
+    cached = _review_audio_cache_get(source_gcs_path)
+    if cached is not None:
+        return cached
+
+    inflight = _review_audio_inflight.get(source_gcs_path)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
+
+    future: "asyncio.Future[Tuple[bytes, str]]" = asyncio.get_running_loop().create_future()
+    _review_audio_inflight[source_gcs_path] = future
+    try:
+        value = await transcoding.get_review_audio_bytes_async(source_gcs_path)
+        _review_audio_cache_put(source_gcs_path, value)
+        future.set_result(value)
+        return value
+    except Exception as e:
+        future.set_exception(e)
+        # The originator re-raises; mark the future's exception as observed so
+        # an awaiter-less failure doesn't log "exception was never retrieved".
+        future.exception()
+        raise
+    finally:
+        _review_audio_inflight.pop(source_gcs_path, None)
+
+
+def _ranged_response(request: Request, data: bytes, content_type: str) -> Response:
+    """Serve ``data`` honoring an HTTP Range header (206) so <audio> can seek."""
+    total = len(data)
+    range_header = request.headers.get("range")
+    # Let the browser reuse review audio across reloads/tabs for a few minutes
+    # instead of re-pulling multi-MB bodies through the API. Short-lived because
+    # audio-edit can replace a stem's bytes at the same URL.
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=600"}
+    if range_header and range_header.startswith("bytes="):
+        try:
+            spec = range_header.split("=", 1)[1].split(",")[0].strip()
+            start_s, _, end_s = spec.partition("-")
+            start = int(start_s) if start_s else 0
+            end = int(end_s) if end_s else total - 1
+            end = min(end, total - 1)
+            if start > end or start >= total:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+            chunk = data[start:end + 1]
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            headers["Content-Length"] = str(len(chunk))
+            return Response(content=chunk, status_code=206, media_type=content_type, headers=headers)
+        except Exception:
+            pass  # fall through to full 200
+    headers["Content-Length"] = str(total)
+    return Response(content=data, media_type=content_type, headers=headers)
+
+
+@router.get("/{job_id}/dev-audio")
+async def get_dev_audio(job_id: str, path: str, request: Request):
+    """LOCAL-DEV ONLY audio/image byte proxy for replay when signing creds are absent.
+
+    Returns 404 unless ``REVIEW_AUDIO_PROXY`` is enabled, so it is inert in prod.
+    No auth dependency (dev backend binds to localhost); it only ever serves bytes
+    under ``jobs/{job_id}/`` so it can't be used to read arbitrary blobs. Supports
+    HTTP Range so audio elements can seek.
+    """
+    if not _dev_audio_proxy_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    # Scope guard: only this job's own artifacts (path anchored under the job's
+    # prefix), and no traversal. Localhost-dev-only, so this is belt-and-braces.
+    if not path.startswith(f"jobs/{job_id}/") or ".." in path:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    try:
+        cached = _DEV_AUDIO_CACHE.get(path)
+        if cached is None:
+            storage = StorageService()
+            if path.lower().endswith(".png"):
+                cached = (storage.download_bytes(path), "image/png")
+            else:
+                from backend.services.audio_transcoding_service import AudioTranscodingService
+                cached = await AudioTranscodingService().get_review_audio_bytes_async(path)
+            _DEV_AUDIO_CACHE[path] = cached
+        data, content_type = cached
+        return _ranged_response(request, data, content_type)
+    except Exception as e:
+        logger.error(f"Job {job_id}: [dev-proxy] error serving {path}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="dev-audio proxy error")
+
+
+@router.get("/{job_id}/instrumental-audio/{option_id}")
+async def get_instrumental_audio(
+    job_id: str,
+    option_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """Stream a review instrumental stem's transcoded OGG bytes (same-origin proxy).
+
+    Option B of the fast-review-load re-architecture (2026-09-17): replaces the per-load
+    IAM signBlob round-trip with a same-origin byte proxy, so the review page never depends
+    on URL signing to play audio (signing could stall ~120 s and take the service down).
+
+    Serves the ~3 MB transcoded OGG with HTTP Range support so ``<audio>`` can seek,
+    authenticated by ``require_review_auth`` (the token rides in the query string for
+    raw-media-src use — the same mechanism as ``/audio/vocals``). The stem GCS path is
+    resolved SERVER-SIDE from ``option_id``, so a client can only ever fetch this job's own
+    instrumental stems, never an arbitrary blob.
+    """
+    stem_key = _INSTRUMENTAL_OPTION_STEMS.get(option_id)
+    if not stem_key:
+        raise HTTPException(status_code=404, detail=t("en", "review.audioNotFound"))
+
+    job = await asyncio.to_thread(JobManager().get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    stems = job.file_urls.get("stems", {}) if job.file_urls else {}
+    source_gcs_path = stems.get(stem_key)
+    if not source_gcs_path:
+        raise HTTPException(status_code=404, detail=t("en", "review.audioNotFound"))
+
+    try:
+        from backend.services.audio_transcoding_service import AudioTranscodingService
+        transcoding = AudioTranscodingService(storage_service=StorageService())
+        data, content_type = await _get_review_audio(source_gcs_path, transcoding)
+        logger.info(f"Job {job_id}: Proxying {len(data)}B instrumental audio ({option_id})")
+        return _ranged_response(request, data, content_type)
+    except NotFound:
+        # The stem is referenced in file_urls but its GCS object (and any transcoded
+        # cache) is gone — a genuine 404, not a server error.
+        logger.warning(f"Job {job_id}: instrumental audio object missing for {option_id}")
+        raise HTTPException(status_code=404, detail=t("en", "review.audioNotFound"))
+    except Exception as e:
+        logger.error(f"Job {job_id}: error proxying instrumental audio {option_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.audioServeError", error=str(e)))
+
+
+@router.post("/{job_id}/complete")
+async def complete_review(
+    job_id: str,
+    updated_data: Dict[str, Any],
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Complete the combined review - save corrected lyrics AND instrumental selection.
+
+    This endpoint receives:
+    - Updated correction data (lyrics corrections)
+    - instrumental_selection: "clean" or "with_backing" (REQUIRED)
+
+    After saving, triggers the render video worker which will use the
+    pre-selected instrumental (no separate instrumental selection step).
+    """
+    # Local stack only (FAKE_WORKERS=1): a one-shot 503 for the finish-failure flows.
+    from backend.services.fake_workers import fake_workers_enabled
+    if fake_workers_enabled():
+        await asyncio.to_thread(_fake_complete_failure_hook, job_id)
+
+    # Validation + GCS/Firestore writes are all sync (the corrections upload alone
+    # took 21s on 2026-10-08, freezing every request on the instance) — run them
+    # in a worker thread; only the render dispatch below runs on the loop.
+    instrumental_selection = await asyncio.to_thread(_save_review_completion, job_id, updated_data)
+
+    # Trigger the render video worker. AWAIT the dispatch (don't fire-and-forget)
+    # so the Cloud Task / Cloud Run Job dispatch is guaranteed enqueued before we
+    # return — a background asyncio task can be dropped if the Cloud Run instance
+    # is recycled right after the response, stranding the job at REVIEW_COMPLETE.
+    # If the dispatch itself fails we DON'T fail the user's approval: the job is
+    # safely at REVIEW_COMPLETE and the recover-stuck-jobs watchdog re-triggers
+    # render for REVIEW_COMPLETE jobs with no render underway within ~5 min.
+    from backend.services.worker_service import get_worker_service
+    worker_service = get_worker_service()
+    try:
+        await worker_service.trigger_render_video_worker(job_id)
+        logger.info(f"Job {job_id}: Combined review complete, render video worker triggered")
+    except Exception as e:
+        logger.error(
+            f"Job {job_id}: render trigger failed after review completion "
+            f"(watchdog will recover): {e}",
+            exc_info=True,
+        )
+
+    return {
+        "status": "success",
+        "instrumental_selection": instrumental_selection,
+    }
+
+
+class SyncReferenceRequest(_PydBaseModel):
+    verified: bool
+    notes: Optional[str] = None
+    reasons: Optional[List[str]] = None   # why not perfectly synced (preset chips)
+
+
+@router.post("/{job_id}/sync-reference")
+async def set_sync_reference(job_id: str, body: SyncReferenceRequest, auth_result=Depends(require_admin)):
+    """Admin-only: mark this job's reviewed word timing as "perfectly synced".
+
+    Verified jobs form the reference set for word-timing training and evaluation
+    (full-auto v2). A tick means the admin is confident the sync is right, from a
+    listen or a confident spot-check; jobs never marked are treated as unverified.
+    """
+    from datetime import datetime, timezone
+
+    job_manager = JobManager()
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+    # A "verified" mark vouches for reviewed timing, so it needs saved review output.
+    lyrics_urls = ((job.file_urls or {}).get("lyrics") or {}) if isinstance(job.file_urls, dict) else {}
+    if body.verified and not lyrics_urls.get("corrections_updated"):
+        # Older jobs may have the file without the file_urls pointer (same fallback
+        # get_correction_data uses).
+        direct = f"jobs/{job_id}/lyrics/corrections_updated.json"
+        if not await asyncio.to_thread(StorageService().file_exists, direct):
+            raise HTTPException(status_code=409, detail="No reviewed lyrics saved yet; save the review first")
+    record = {
+        "verified": body.verified,
+        "by": auth_result.user_email or str(auth_result.user_type),
+        "at": datetime.now(timezone.utc).isoformat(),
+        "notes": (body.notes or "").strip()[:2000] or None,
+        "reasons": [r.strip()[:80] for r in (body.reasons or []) if r and r.strip()][:10] or None,
+    }
+    await asyncio.to_thread(job_manager.update_state_data, job_id, "sync_reference", record)
+    logger.info(f"Job {job_id}: sync_reference verified={body.verified} by {record['by']}")
+    return {"status": "success", "sync_reference": record}
+
+
+def _fake_complete_failure_hook(job_id: str) -> None:
+    """Raise a 503 once when the job's user set ``review_complete_fail_once`` (fake workers only)."""
+    from backend.services.fake_workers.config import consume_review_complete_failure
+
+    job = JobManager().get_job(job_id)
+    if job and consume_review_complete_failure(getattr(job, "user_email", None)):
+        raise HTTPException(status_code=503, detail="Fake review-complete failure (review_complete_fail_once)")
+
+
+def _save_review_completion(job_id: str, updated_data: Dict[str, Any]) -> str:
+    """Validate a review submission, persist it and move the job to REVIEW_COMPLETE.
+
+    Sync (blocking GCS + Firestore I/O) — call via ``asyncio.to_thread``.
+    Returns the resolved instrumental selection.
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.reviewNotReady", status=job.status)
+        )
+
+    # === Require instrumental selection ===
+    instrumental_selection = updated_data.get("instrumental_selection")
+    if not instrumental_selection:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.instrumentalSelectionRequired")
+        )
+
+    # Per-screen skip (C1): a client that skipped the instrumental screen because
+    # the backing decision was confidently auto-resolved sends "auto"; resolve it
+    # from the stored verdict here so CLI/tenant clients get the skip for free.
+    if instrumental_selection == "auto":
+        from backend.config import get_settings as _get_settings
+        from backend.services.auto_approval.instrumental import resolve_auto_instrumental
+        resolved = resolve_auto_instrumental(job, _get_settings())
+        if not resolved:
+            raise HTTPException(
+                status_code=400,
+                detail=t("en", "review.instrumentalSelectionRequired"),
+            )
+        logger.info(f"Job {job_id}: Resolved instrumental_selection='auto' -> '{resolved}'")
+        instrumental_selection = resolved
+
+    valid_selections = ["clean", "with_backing"]
+    # Allow "custom" for mute-region instrumentals or user-uploaded instrumentals
+    stems = job.file_urls.get("stems", {}) if job.file_urls else {}
+    if job.existing_instrumental_gcs_path or stems.get("custom_instrumental"):
+        valid_selections.append("custom")
+
+    if instrumental_selection not in valid_selections:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.invalidInstrumentalSelection", valid_selections=valid_selections)
+        )
+
+    # === is_duet flag (optional) — latch-up-only ===
+    # InstrumentalSelector may send is_duet=False on the complete call when
+    # correctionData.is_duet is undefined (the flag doesn't round-trip through
+    # the /corrections response on the cloud path). Never downgrade True→False:
+    # if a prior submit_corrections already persisted True, honor that.
+    is_duet_raw = updated_data.get("is_duet", None)
+    if is_duet_raw is not None and not isinstance(is_duet_raw, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.invalidIsDuetFlag"),
+        )
+
+    try:
+        # Remove instrumental_selection and is_duet from updated_data before saving corrections
+        # (they're stored separately in state_data)
+        excluded_fields = {"instrumental_selection", "is_duet"}
+        corrections_to_save = {k: v for k, v in updated_data.items() if k not in excluded_fields}
+
+        # Only write corrections_updated.json if there's actual correction data.
+        # Writing an empty dict causes KeyError downstream when render workers
+        # try to access updated_data["corrections"].
+        if corrections_to_save and "corrections" in corrections_to_save:
+            corrections_gcs_path = f"jobs/{job_id}/lyrics/corrections_updated.json"
+            storage.upload_json(corrections_gcs_path, corrections_to_save)
+            job_manager.update_file_url(job_id, 'lyrics', 'corrections_updated', corrections_gcs_path)
+            logger.info(f"Job {job_id}: Saved updated corrections")
+        else:
+            logger.info(f"Job {job_id}: No corrections data in request, skipping corrections_updated.json")
+
+        # === Store instrumental selection in state_data ===
+        # This will be used by render_video_worker to skip AWAITING_INSTRUMENTAL_SELECTION
+        job_manager.update_state_data(job_id, 'instrumental_selection', instrumental_selection)
+        logger.info(f"Job {job_id}: Stored instrumental selection: {instrumental_selection}")
+
+        # Store duet flag so render worker knows to use multi-singer styles.
+        # Latch-up-only: True overwrites; False is ignored if a prior submit
+        # already persisted True.
+        if is_duet_raw is True:
+            job_manager.update_state_data(job_id, 'is_duet', True)
+            logger.info(f"Job {job_id}: Stored is_duet flag: True (from complete)")
+        elif is_duet_raw is False:
+            job = job_manager.get_job(job_id)
+            prior = bool(job.state_data.get('is_duet', False)) if job else False
+            if prior:
+                logger.info(
+                    f"Job {job_id}: Ignoring is_duet=False on complete — already True from prior submit"
+                )
+            else:
+                job_manager.update_state_data(job_id, 'is_duet', False)
+                logger.info(f"Job {job_id}: Stored is_duet flag: False")
+        # else is_duet_raw is None: leave existing state_data value untouched
+
+        # Clear worker progress keys to ensure workers will run fresh (not skip due to idempotency)
+        # This handles cases where a job is re-reviewed after completion or where state was inconsistent.
+        # The idempotency check in workers looks at {worker}_progress.stage == 'complete' to skip,
+        # so we must clear these before triggering the render-video worker.
+        progress_keys = ['render_progress', 'screens_progress', 'video_progress', 'encoding_progress']
+        cleared = job_manager.delete_state_data_keys(job_id, progress_keys)
+        if cleared:
+            logger.info(f"Job {job_id}: Cleared worker progress keys for re-processing: {cleared}")
+
+        # Transition to REVIEW_COMPLETE
+        job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.REVIEW_COMPLETE,
+            progress=70,
+            message=f"Review complete (instrumental: {instrumental_selection}), rendering video"
+        )
+        return instrumental_selection
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error completing review: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.reviewCompletedError", error=str(e)))
+
+
+@router.post("/{job_id}/custom-lyrics/generate", response_model=CustomLyricsResponse)
+async def generate_custom_lyrics(
+    job_id: str,
+    existing_lines: str = Form(..., description="JSON-encoded array of segment lines"),
+    custom_text: Optional[str] = Form(None),
+    notes: Optional[str] = Form(None),
+    artist: Optional[str] = Form(None),
+    title: Optional[str] = Form(None),
+    settings_json: Optional[str] = Form(None, description="JSON-encoded GenerationSettings"),
+    file: Optional[UploadFile] = File(None),
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+    service: CustomLyricsService = Depends(_get_custom_lyrics_service_dep),
+) -> CustomLyricsResponse:
+    """Generate syllable-aware custom lyrics for a job using Gemini 3.1 Pro.
+
+    Stateless: returns generated lines + per-line metadata for the frontend
+    to render in an annotated preview. Persistence happens via the existing
+    /complete path after the user reviews and saves.
+    """
+    from backend.services.custom_lyrics.settings import (
+        GenerationSettings,
+        settings_from_dict,
+    )
+
+    # Parse existing_lines JSON
+    try:
+        parsed_lines = json.loads(existing_lines)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"existing_lines is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed_lines, list) or not all(
+        isinstance(x, str) for x in parsed_lines
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="existing_lines must be a JSON array of strings",
+        )
+    if not parsed_lines:
+        raise HTTPException(status_code=400, detail="existing_lines is empty")
+
+    # Parse settings (default to GenerationSettings() if missing)
+    if settings_json:
+        try:
+            settings_dict = json.loads(settings_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"settings_json is not valid JSON: {exc}"
+            ) from exc
+        try:
+            settings = settings_from_dict(settings_dict)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid settings: {exc}") from exc
+    else:
+        settings = GenerationSettings()
+
+    # Read file body
+    file_bytes: Optional[bytes] = None
+    file_mime: Optional[str] = None
+    file_name: Optional[str] = None
+    if file is not None:
+        file_bytes = await file.read()
+        file_mime = file.content_type
+        file_name = file.filename
+
+    if not custom_text and not file_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="must provide either custom_text or a file upload",
+        )
+
+    # Load segments for timing context
+    target_segments = await _load_target_segments_for_custom_lyrics(job_id, parsed_lines)
+
+    try:
+        # Off the event loop: generate() makes a synchronous Gemini call that can take
+        # minutes; on the loop it froze the whole instance for 151s (2026-10-17).
+        result = await asyncio.to_thread(
+            service.generate,
+            job_id=job_id,
+            target_lines=parsed_lines,
+            target_segments=target_segments,
+            artist=artist,
+            title=title,
+            custom_text=custom_text,
+            file_bytes=file_bytes,
+            file_mime=file_mime,
+            file_name=file_name,
+            notes=notes,
+            settings=settings,
+        )
+    except CustomLyricsServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    return CustomLyricsResponse(
+        lines=result.lines,
+        line_metadata=[
+            LineMetadataResponse(
+                line_index=v.line_index,
+                target_text=v.target_text,
+                candidate_text=v.candidate_text,
+                target_syllables=v.target_syllables,
+                candidate_syllables=v.candidate_syllables,
+                min_delta=v.min_delta,
+                passes=v.passes,
+                severity=v.severity.value,
+                time_budget_seconds=v.time_budget_seconds,
+            )
+            for v in result.line_metadata
+        ],
+        iterations_used=result.iterations_used,
+        stop_reason=result.stop_reason.value,
+        settings_applied=result.settings_applied.to_dict(),
+        new_segment_timing=result.new_segment_timing,
+        line_count_mismatch=result.line_count_mismatch,
+        warnings=result.warnings,
+        model=result.model,
+    )
+
+
+@router.post("/{job_id}/auto-correct", response_model=AutoCorrectResponse)
+async def auto_correct_suggestions(
+    job_id: str,
+    body: AutoCorrectRequest,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+    service: AutoCorrectService = Depends(_get_auto_correct_service_dep),
+) -> AutoCorrectResponse:
+    """Generate AI auto-correction suggestions for the lyrics review UI.
+
+    Stateless and strictly opt-in: one whole-song LLM call comparing the
+    client's current working transcription against the reference lyrics.
+    Returns word-id-keyed suggestions; nothing is applied server-side —
+    the reviewer accepts or rejects each suggestion individually and
+    persistence happens via the existing corrections/complete paths.
+    """
+    from backend.services.auto_correct.settings import settings_from_dict
+
+    try:
+        settings = settings_from_dict(body.settings or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid settings: {exc}") from exc
+
+    with job_log_context(job_id), create_span("auto_correct_suggestions"):
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("segment_count", len(body.segments))
+        logger.info(
+            "auto-correct requested job=%s segments=%d sources=%d",
+            job_id, len(body.segments), len(body.reference_lyrics),
+        )
+        try:
+            result = await asyncio.to_thread(
+                service.suggest,
+                job_id=job_id,
+                segments=body.segments,
+                reference_lyrics=body.reference_lyrics,
+                artist=body.artist,
+                title=body.title,
+                settings=settings,
+            )
+        except AutoCorrectServiceError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        logger.info(
+            "auto-correct completed job=%s suggestions=%d model=%s elapsed=%.1fs",
+            job_id, len(result.suggestions), result.model, result.elapsed_seconds,
+        )
+
+    return AutoCorrectResponse(
+        suggestions=[
+            AutoCorrectSuggestionResponse(
+                id=s.id,
+                op=s.op,
+                word_ids=s.word_ids,
+                segment_ids=s.segment_ids,
+                original_text=s.original_text,
+                new_text=s.new_text,
+                reason=s.reason,
+                category=s.category,
+                confidence=s.confidence,
+                models=s.models,
+                consensus=s.consensus,
+                total_models=s.total_models,
+                conflict_group=s.conflict_group,
+            )
+            for s in result.suggestions
+        ],
+        model=result.model,
+        elapsed_seconds=result.elapsed_seconds,
+        settings_applied=result.settings_applied.to_dict(),
+        warnings=result.warnings,
+        cached=result.cached,
+    )
+
+
+@router.post("/{job_id}/handlers")
+def update_handlers(
+    job_id: str,
+    enabled_handlers: list,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Update enabled correction handlers (optional feature).
+    
+    For now, just acknowledge the request - full handler support
+    would require re-running correction.
+    """
+    logger.info(f"Job {job_id}: Handler update requested (not implemented)")
+    return {"status": "success", "message": t("en", "review.handlersUpdateNotImplemented")}
+
+
+@router.post("/{job_id}/add-lyrics")
+def add_lyrics(
+    job_id: str,
+    data: Dict[str, str],
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Add custom lyrics source and rerun correction.
+    
+    Uses the LyricsTranscriber's CorrectionOperations to add a new lyrics source
+    and regenerate corrections with the new source included.
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+    
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    # Job must be in review state to add lyrics
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.reviewNotReady", status=job.status)
+        )
+    
+    source = data.get("source", "").strip()
+    lyrics_text = data.get("lyrics", "").strip()
+    raw_force = data.get("force", False)
+    force = raw_force if isinstance(raw_force, bool) else str(raw_force).lower() == "true"
+
+    logger.info(f"Job {job_id}: Adding lyrics source '{source}' with {len(lyrics_text)} characters (force={force})")
+    
+    # Use tracing and job_log_context for full observability
+    with create_span("add-lyrics", {"job_id": job_id, "source": source, "lyrics_length": len(lyrics_text)}) as span:
+        with job_log_context(job_id, worker="add-lyrics"):
+            try:
+                # Create temp directory for this operation
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Download current corrections.json
+                    with create_span("download-corrections") as download_span:
+                        corrections_gcs = f"jobs/{job_id}/lyrics/corrections.json"
+                        corrections_path = os.path.join(temp_dir, "corrections.json")
+                        storage.download_file(corrections_gcs, corrections_path)
+                        download_span.set_attribute("gcs_path", corrections_gcs)
+                    
+                    with open(corrections_path, 'r', encoding='utf-8') as f:
+                        original_data = json.load(f)
+                    
+                    # Load as CorrectionResult
+                    correction_result = CorrectionResult.from_dict(original_data)
+                    add_span_event("corrections_loaded", {
+                        "segments": len(correction_result.corrected_segments) if correction_result.corrected_segments else 0,
+                        "reference_sources": len(correction_result.reference_lyrics) if correction_result.reference_lyrics else 0,
+                    })
+                    
+                    # Set up cache directory
+                    cache_dir = os.path.join(temp_dir, "cache")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    
+                    # Add lyrics source using CorrectionOperations (this is the heavy operation)
+                    with create_span("correction-operations-add-lyrics") as correction_span:
+                        correction_span.set_attribute("source_name", source)
+                        updated_result = CorrectionOperations.add_lyrics_source(
+                            correction_result=correction_result,
+                            source=source,
+                            lyrics_text=lyrics_text,
+                            cache_dir=cache_dir,
+                            logger=logger,
+                            force=force,
+                        )
+                        add_span_event("correction_complete", {
+                            "new_segments": len(updated_result.corrected_segments) if updated_result.corrected_segments else 0,
+                        })
+                    
+                    # Add audio hash for the frontend
+                    audio_hash = _get_audio_hash(job_id)
+                    if not updated_result.metadata:
+                        updated_result.metadata = {}
+                    updated_result.metadata['audio_hash'] = audio_hash
+                    updated_result.metadata['artist'] = job.artist
+                    updated_result.metadata['title'] = job.title
+
+                    # The relevance filter may silently drop the new source during the
+                    # correction rerun. Surface that as a "rejected" outcome (without
+                    # persisting the no-op rerun) so the frontend can offer force-add.
+                    source_kept = source in (updated_result.reference_lyrics or {})
+                    if not source_kept:
+                        rejection = (updated_result.metadata.get("rejected_sources") or {}).get(source) or {}
+                        logger.info(
+                            f"Job {job_id}: Lyrics source '{source}' rejected by relevance filter "
+                            f"({rejection.get('matched_words')}/{rejection.get('total_words')} words matched)"
+                        )
+                        span.set_attribute("rejected", True)
+                        return {"status": "rejected", "rejection": rejection, "data": updated_result.to_dict()}
+
+                    # Upload updated corrections back to GCS
+                    with create_span("upload-corrections") as upload_span:
+                        updated_data = updated_result.to_dict()
+                        storage.upload_json(corrections_gcs, updated_data)
+                        upload_span.set_attribute("gcs_path", corrections_gcs)
+
+                    logger.info(f"Job {job_id}: Successfully added lyrics source '{source}'")
+                    span.set_attribute("success", True)
+
+                    return {"status": "success", "data": updated_data}
+                    
+            except ValueError as e:
+                # ValueError from CorrectionOperations (e.g., duplicate source name)
+                logger.warning(f"Job {job_id}: Invalid add lyrics request: {e}")
+                span.set_attribute("error", str(e))
+                raise HTTPException(status_code=400, detail=t("en", "review.lyricsAddInvalidRequest", error=str(e)))
+            except Exception as e:
+                logger.error(f"Job {job_id}: Failed to add lyrics: {e}", exc_info=True)
+                span.set_attribute("error", str(e))
+                raise HTTPException(status_code=500, detail=t("en", "review.lyricsAddError", error=str(e)))
+
+
+@router.post("/{job_id}/search-lyrics")
+def search_lyrics(
+    job_id: str,
+    data: Dict[str, Any],
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Search for lyrics using an alternate artist/title and rerun correction.
+
+    Queries all configured lyrics providers (Genius, Spotify, Musixmatch, LRCLIB)
+    with the supplied artist and title, then runs the correction pipeline (which
+    includes the relevance filter). Sources that pass the filter are added to the
+    job's corrections.json and returned to the frontend.
+
+    Request body:
+        artist (str): Artist name to search.
+        title (str): Song title to search.
+        force_sources (list[str], optional): Provider names whose results should
+            bypass the relevance filter.
+
+    Response:
+        200 {"status": "success", "data": {...CorrectionData...}, "sources_added": [...],
+             "sources_rejected": {...}, "sources_not_found": [...]}
+        200 {"status": "no_results", "message": "...", "sources_rejected": {...},
+             "sources_not_found": [...]}
+        400 on invalid request / wrong job state
+        500 on internal error
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.reviewNotReady", status=job.status)
+        )
+
+    artist = (data.get("artist") or "").strip()
+    title = (data.get("title") or "").strip()
+    force_sources: List[str] = data.get("force_sources") or []
+
+    if not artist or not title:
+        raise HTTPException(status_code=400, detail="artist and title are required")
+
+    logger.info(f"Job {job_id}: Searching lyrics for '{artist}' - '{title}' (force={force_sources})")
+
+    with create_span("search-lyrics", {"job_id": job_id, "artist": artist, "title": title}) as span:
+        with job_log_context(job_id, worker="search-lyrics"):
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Download current corrections.json
+                    with create_span("download-corrections") as download_span:
+                        corrections_gcs = f"jobs/{job_id}/lyrics/corrections.json"
+                        corrections_path = os.path.join(temp_dir, "corrections.json")
+                        storage.download_file(corrections_gcs, corrections_path)
+                        download_span.set_attribute("gcs_path", corrections_gcs)
+
+                    with open(corrections_path, "r", encoding="utf-8") as f:
+                        original_data = json.load(f)
+
+                    correction_result = CorrectionResult.from_dict(original_data)
+                    add_span_event("corrections_loaded", {
+                        "segments": len(correction_result.corrected_segments) if correction_result.corrected_segments else 0,
+                        "reference_sources": len(correction_result.reference_lyrics) if correction_result.reference_lyrics else 0,
+                    })
+
+                    cache_dir = os.path.join(temp_dir, "cache")
+                    os.makedirs(cache_dir, exist_ok=True)
+
+                    with create_span("correction-operations-search-lyrics") as correction_span:
+                        correction_span.set_attribute("artist", artist)
+                        correction_span.set_attribute("title", title)
+                        search_result = CorrectionOperations.search_lyrics_sources(
+                            correction_result=correction_result,
+                            artist=artist,
+                            title=title,
+                            cache_dir=cache_dir,
+                            force_sources=force_sources,
+                            logger=logger,
+                        )
+
+                    sources_added = search_result["sources_added"]
+                    sources_rejected = search_result["sources_rejected"]
+                    sources_not_found = search_result["sources_not_found"]
+                    updated_result = search_result["updated_result"]
+
+                    if not sources_added or updated_result is None:
+                        logger.info(
+                            f"Job {job_id}: No valid lyrics found via search "
+                            f"(rejected={list(sources_rejected.keys())}, not_found={sources_not_found})"
+                        )
+                        span.set_attribute("success", False)
+                        return {
+                            "status": "no_results",
+                            "message": t("en", "review.lyricsSearchNoResults"),
+                            "sources_added": [],
+                            "sources_rejected": sources_rejected,
+                            "sources_not_found": sources_not_found,
+                        }
+
+                    # Add audio hash / job metadata for the frontend
+                    audio_hash = _get_audio_hash(job_id)
+                    if not updated_result.metadata:
+                        updated_result.metadata = {}
+                    updated_result.metadata["audio_hash"] = audio_hash
+                    updated_result.metadata["artist"] = job.artist
+                    updated_result.metadata["title"] = job.title
+                    updated_result.metadata["lyrics_artist"] = getattr(job, 'lyrics_artist', None) or job.artist
+                    updated_result.metadata["lyrics_title"] = _lyrics_search_title(job)
+
+                    # Upload updated corrections back to GCS
+                    with create_span("upload-corrections") as upload_span:
+                        updated_data = updated_result.to_dict()
+                        storage.upload_json(corrections_gcs, updated_data)
+                        upload_span.set_attribute("gcs_path", corrections_gcs)
+
+                    logger.info(
+                        f"Job {job_id}: Search complete — added={sources_added}, "
+                        f"rejected={list(sources_rejected.keys())}, not_found={sources_not_found}"
+                    )
+                    span.set_attribute("success", True)
+                    span.set_attribute("sources_added", len(sources_added))
+
+                    return {
+                        "status": "success",
+                        "data": updated_data,
+                        "sources_added": sources_added,
+                        "sources_rejected": sources_rejected,
+                        "sources_not_found": sources_not_found,
+                    }
+
+            except HTTPException:
+                raise
+            except ValueError as e:
+                logger.warning(f"Job {job_id}: Invalid search lyrics request: {e}")
+                span.set_attribute("error", str(e))
+                raise HTTPException(status_code=400, detail=t("en", "review.lyricsSearchInvalidRequest", error=str(e)))
+            except Exception as e:
+                logger.error(f"Job {job_id}: Failed to search lyrics: {e}", exc_info=True)
+                span.set_attribute("error", str(e))
+                raise HTTPException(status_code=500, detail=t("en", "review.lyricsSearchError", error=str(e)))
+
+
+@router.post("/{job_id}/preview-video")
+async def generate_preview_video(
+    job_id: str,
+    updated_data: Dict[str, Any],
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Generate a preview video with the current corrections.
+
+    Uses the LyricsTranscriber's CorrectionOperations to generate a 360p preview
+    video with the user's current corrections applied.
+
+    When USE_GCE_PREVIEW_ENCODING is enabled, video encoding is offloaded to
+    the high-performance GCE worker for faster generation (15-20s vs 60+s).
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+    settings = get_settings()
+    encoding_service = await asyncio.to_thread(get_encoding_service)
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    # Job must be in review state to generate preview
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.reviewNotReady", status=job.status)
+        )
+
+    # An in-browser edit can send words/lines without timings (JSON drops undefined),
+    # which crashed the preview with KeyError 'end_time'. Fill what we can, as review
+    # submit does, and name the line we can't instead of returning a 500.
+    from backend.services.timing_sanitizer import find_missing_timings, sanitize_corrections
+    _, timing_fixes = sanitize_corrections(updated_data)
+    if timing_fixes:
+        logger.info(f"Job {job_id}: preview payload had {timing_fixes} missing/out-of-range timings; filled")
+    untimed_line = find_missing_timings(updated_data)
+    if untimed_line is not None:
+        raise HTTPException(status_code=422, detail=t("en", "review.previewMissingTimings", line=untimed_line[:80]))
+
+    # Check if GCE preview encoding is enabled
+    use_gce_preview = encoding_service.is_preview_enabled
+
+    # Check if user wants theme background image (slower) or black background (faster, default)
+    use_background_image = updated_data.get("use_background_image", False)
+
+    # === is_duet flag (optional, defaults to False) ===
+    is_duet_raw = updated_data.get("is_duet", False)
+    if not isinstance(is_duet_raw, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=t("en", "review.invalidIsDuetFlag"),
+        )
+    is_duet = is_duet_raw
+
+    logger.info(f"Job {job_id}: Generating preview video (GCE: {use_gce_preview}, background image: {use_background_image}, is_duet: {is_duet})")
+
+    # Use tracing and job_log_context for full observability
+    with create_span("generate-preview-video", {"job_id": job_id, "use_gce": use_gce_preview}) as span:
+        with job_log_context(job_id, worker="preview"):
+            try:
+                if use_gce_preview:
+                    # GCE path: prepare inputs and generate ASS subtitles inline
+                    # (fast), then hand the video encode to a background task and
+                    # return immediately. Encoding can take minutes when a worker
+                    # VM cold-starts — longer than Cloudflare's ~100s edge timeout
+                    # — so the request must not wait for it; the frontend polls
+                    # the /status endpoint until the mp4 lands in GCS.
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        # Blocking work (GCS downloads, ASS generation) runs in a
+                        # worker thread so other requests on this instance don't
+                        # stall behind it.
+                        correction_result, audio_path, output_config = await asyncio.to_thread(
+                            _prepare_preview_inputs,
+                            job=job, temp_dir=temp_dir, storage=storage, is_duet=is_duet,
+                        )
+
+                        try:
+                            with create_span("generate-ass-subtitles") as ass_span:
+                                result = await asyncio.to_thread(
+                                    CorrectionOperations.generate_preview_video,
+                                    correction_result=correction_result,
+                                    updated_data=updated_data,
+                                    output_config=output_config,
+                                    audio_filepath=audio_path,
+                                    artist=job.artist,
+                                    title=job.title,
+                                    logger=logger,
+                                    ass_only=True,  # Only generate ASS, skip video encoding
+                                )
+                                preview_hash = result["preview_hash"]
+                                ass_path = result["ass_path"]
+                                ass_span.set_attribute("ass_path", ass_path)
+                                add_span_event("ass_generated")
+
+                            span.set_attribute("preview_hash", preview_hash)
+                            preview_gcs_path = f"jobs/{job_id}/previews/{preview_hash}.mp4"
+
+                            # The hash is deterministic over the correction data, so
+                            # if this exact preview already exists (e.g. the user
+                            # retried after a dropped connection) skip encoding.
+                            if storage.file_exists(preview_gcs_path):
+                                _record_preview_video(job_id, preview_hash, preview_gcs_path)
+                                span.set_attribute("preview_cache_hit", True)
+                                logger.info(f"Job {job_id}: Preview cache hit: {preview_hash}")
+                                return {"status": "success", "preview_hash": preview_hash}
+
+                            # Upload ASS to GCS
+                            with create_span("upload-ass-to-gcs") as upload_ass_span:
+                                ass_gcs_path = f"jobs/{job_id}/previews/{preview_hash}.ass"
+                                await asyncio.to_thread(storage.upload_file, ass_path, ass_gcs_path)
+                                upload_ass_span.set_attribute("ass_gcs_path", ass_gcs_path)
+
+                            # A stale error marker from an earlier failed attempt at
+                            # this same hash would make the status poll fail instantly.
+                            storage.delete_file(
+                                _preview_error_marker_path(job_id, preview_hash),
+                                ignore_missing=True,
+                            )
+
+                            bucket_name = settings.gcs_bucket_name
+                            style_assets = job.style_assets or {}
+
+                            # Only use background image if user explicitly requested it.
+                            # Default is black background for faster preview generation.
+                            background_image_gcs_path = None
+                            if use_background_image:
+                                for key in ["karaoke_background", "style_karaoke_background"]:
+                                    if key in style_assets:
+                                        background_image_gcs_path = f"gs://{bucket_name}/{style_assets[key]}"
+                                        break
+                            span.set_attribute("use_background_image", use_background_image)
+
+                            font_gcs_path = None
+                            for key in ["font", "style_font"]:
+                                if key in style_assets:
+                                    font_gcs_path = f"gs://{bucket_name}/{style_assets[key]}"
+                                    break
+
+                            encode_kwargs = {
+                                "job_id": f"preview_{job_id}_{preview_hash}",
+                                "ass_gcs_path": f"gs://{bucket_name}/{ass_gcs_path}",
+                                "audio_gcs_path": f"gs://{bucket_name}/{job.input_media_gcs_path}",
+                                "output_gcs_path": f"gs://{bucket_name}/{preview_gcs_path}",
+                                "background_color": "black",
+                                "background_image_gcs_path": background_image_gcs_path,
+                                "font_gcs_path": font_gcs_path,
+                            }
+                            task = asyncio.create_task(
+                                _encode_preview_in_background(
+                                    job=job,
+                                    preview_hash=preview_hash,
+                                    encode_kwargs=encode_kwargs,
+                                    updated_data=updated_data,
+                                    is_duet=is_duet,
+                                )
+                            )
+                            _background_tasks.add(task)
+                            task.add_done_callback(_background_tasks.discard)
+
+                            logger.info(f"Job {job_id}: Preview encode running in background: {preview_hash}")
+                            return {"status": "generating", "preview_hash": preview_hash}
+
+                        except LyricsTimingError:
+                            raise
+                        except Exception as gce_error:
+                            # Fall back to synchronous local encoding if GCE setup fails
+                            logger.warning(
+                                f"Job {job_id}: GCE preview setup failed, falling back to local: {gce_error}"
+                            )
+                            span.set_attribute("gce_fallback", True)
+                            use_gce_preview = False  # Fall through to local encoding below
+
+                # Local path (GCE preview disabled, or GCE setup failed): render
+                # the full preview synchronously — no cold-start problem, but slow.
+                preview_hash = await _render_preview_locally(job, updated_data, is_duet)
+
+                logger.info(f"Job {job_id}: Preview video generated: {preview_hash}")
+                span.set_attribute("preview_hash", preview_hash)
+                span.set_attribute("success", True)
+
+                return {"status": "success", "preview_hash": preview_hash}
+
+            except LyricsTimingError as timing_err:
+                # Untimed lyrics (e.g. custom lyrics not yet tap-synced) — this is a
+                # user-fixable input problem, not a server fault. Return 422 with an
+                # actionable message instead of a cryptic 500.
+                logger.warning(f"Job {job_id}: Preview blocked — lyrics not synchronized: {timing_err}")
+                span.set_attribute("error", "lyrics_not_synchronized")
+                raise HTTPException(status_code=422, detail=str(timing_err)) from timing_err
+            except Exception as e:
+                logger.error(f"Job {job_id}: Failed to generate preview video: {e}", exc_info=True)
+                span.set_attribute("error", str(e))
+                raise HTTPException(
+                    status_code=500,
+                    detail=t("en", "review.previewVideoGenerationError", error=str(e))
+                ) from e
+
+
+@router.get("/{job_id}/preview-video/{preview_hash}")
+def get_preview_video(
+    job_id: str,
+    preview_hash: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Serve the generated preview video via a signed GCS URL redirect.
+
+    We redirect to a signed URL rather than proxying the bytes through Cloud
+    Run because Cloud Run caps response bodies at 32 MiB. Long songs (e.g. a
+    30+ minute mashup) produce a 360p preview larger than that, which the proxy
+    path truncated mid-stream — the response started as 206 but the client
+    received a 500, so the browser reported "no supported format". The signed
+    URL lets the browser fetch the mp4 directly from GCS (with byte-range
+    support intact), bypassing the limit entirely. Mirrors the audio-review
+    endpoint above.
+    """
+    storage = StorageService()
+
+    # Check in-memory cache first
+    preview_gcs_path = None
+    if job_id in _preview_videos and preview_hash in _preview_videos[job_id]:
+        preview_gcs_path = _preview_videos[job_id][preview_hash]
+    else:
+        # Try standard path
+        preview_gcs_path = f"jobs/{job_id}/previews/{preview_hash}.mp4"
+        if not storage.file_exists(preview_gcs_path):
+            raise HTTPException(status_code=404, detail=t("en", "review.previewVideoNotFound"))
+
+    try:
+        signed_url = storage.generate_signed_url(preview_gcs_path, expiration_minutes=120)
+        logger.info(f"Job {job_id}: Redirecting to signed URL for preview video {preview_hash}")
+        return RedirectResponse(url=signed_url, status_code=302)
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error serving preview video: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.previewVideoStreamError", error=str(e)))
+
+
+@router.get("/{job_id}/preview-video/{preview_hash}/status")
+def get_preview_video_status(
+    job_id: str,
+    preview_hash: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Poll the state of a background preview encode.
+
+    POST /preview-video returns {"status": "generating"} immediately and the
+    encode runs in a background task (_encode_preview_in_background). The
+    browser polls this endpoint until the mp4 appears in GCS. GCS is the
+    source of truth so polls work regardless of which Cloud Run instance
+    they hit.
+    """
+    storage = StorageService()
+
+    if storage.file_exists(f"jobs/{job_id}/previews/{preview_hash}.mp4"):
+        return {"status": "ready", "preview_hash": preview_hash}
+
+    marker_path = _preview_error_marker_path(job_id, preview_hash)
+    if storage.file_exists(marker_path):
+        message = None
+        try:
+            message = storage.download_json(marker_path).get("error")
+        except Exception:
+            logger.warning(f"Job {job_id}: Unreadable preview error marker {marker_path}")
+        return {
+            "status": "error",
+            "preview_hash": preview_hash,
+            "message": message or t("en", "review.previewVideoGenerationError", error="encoding failed"),
+        }
+
+    return {"status": "generating", "preview_hash": preview_hash}
+
+
+@router.post("/{job_id}/v1/annotations")
+def submit_annotation(
+    job_id: str,
+    payload: Dict[str, Any],
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Submit correction annotations for ML training data.
+
+    Accepts either a single annotation dict or {"annotations": [...]} batch.
+    Stores to GCS at jobs/{job_id}/lyrics/annotations.json.
+    """
+    annotations = payload.get("annotations", [payload]) if isinstance(payload, dict) else [payload]
+
+    try:
+        storage = StorageService()
+        gcs_path = f"jobs/{job_id}/lyrics/annotations.json"
+
+        # Merge with any existing annotations
+        existing: list = []
+        try:
+            existing_data = storage.download_json(gcs_path)
+            if isinstance(existing_data, list):
+                existing = existing_data
+            elif isinstance(existing_data, dict) and "annotations" in existing_data:
+                existing = existing_data["annotations"]
+        except Exception:
+            pass  # No existing file, start fresh
+
+        merged = existing + annotations
+        storage.upload_json(gcs_path, {"annotations": merged})
+
+        logger.info(f"Job {job_id}: {len(annotations)} annotation(s) saved ({len(merged)} total)")
+        return {"status": "success", "saved_count": len(annotations), "total_count": len(merged)}
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error saving annotations: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.annotationSaveError", error=str(e)))
+
+
+@router.get("/{job_id}/v1/annotations/stats")
+def get_annotation_stats(
+    job_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Get annotation statistics."""
+    try:
+        storage = StorageService()
+        gcs_path = f"jobs/{job_id}/lyrics/annotations.json"
+        data = storage.download_json(gcs_path)
+        annotations = data.get("annotations", []) if isinstance(data, dict) else data
+        by_type: Dict[str, int] = {}
+        for a in annotations:
+            atype = a.get("annotation_type", "unknown")
+            by_type[atype] = by_type.get(atype, 0) + 1
+        return {"total_annotations": len(annotations), "by_type": by_type}
+    except Exception:
+        return {"total_annotations": 0, "by_type": {}}
+
+
+@router.get("/{job_id}/instrumental-urls")
+async def get_instrumental_urls(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Return instrumental stem options (same-origin audio proxy paths) for the review.
+
+    Since the 2026-09-17 fast-load re-architecture these are non-expiring proxy paths, so
+    a refresh is no longer strictly needed — but the preview modal still calls this on an
+    audio load error (e.g. a transient network blip) to swap in a fresh URL, and it's a
+    cheap, backwards-compatible way to do so. Returns the same shape as correction-data's
+    ``instrumental_options``.
+
+    Also the review page's "are the stems ready yet?" poll: review opens as soon as
+    LYRICS finish, while audio separation typically lands 2-3 minutes later, so the
+    correction-data fetched at page load often has no stems / backing analysis. The
+    page polls this until ``audio_complete`` and then swaps in the fresh
+    ``backing_vocals_analysis`` + ``auto_approval`` (re-derived now that the analysis
+    exists), so the finish modal's instrumental chooser appears without a reload.
+    ``audio_complete`` is set only after stems, review OGGs and the backing analysis
+    are all written (audio_worker), so it's the right "everything is ready" signal.
+    """
+    from backend.config import get_settings as _get_settings
+    from backend.services.auto_approval.instrumental import auto_approval_summary
+
+    job = await asyncio.to_thread(JobManager().get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    instrumental_options = await _build_instrumental_options(job, request)
+    return {
+        "instrumental_options": instrumental_options,
+        "audio_complete": bool(job.state_data.get("audio_complete", False)),
+        "job_status": str(getattr(job.status, "value", job.status)),
+        "backing_vocals_analysis": with_unified_recommendation(
+            job.state_data.get("backing_vocals_analysis", {})
+        ),
+        "auto_approval": auto_approval_summary(job, _get_settings()),
+    }
+
+
+@router.get("/{job_id}/instrumental-analysis")
+async def get_instrumental_analysis(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Get instrumental analysis data for the review interface.
+
+    Returns analysis data in the format expected by InstrumentalSelector component:
+    - analysis: backing vocals analysis with audible segments
+    - audio_urls: signed URLs for instrumental stems
+    - has_original: whether original audio is available
+    """
+    job_manager = JobManager()
+    storage = StorageService()
+
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    # Get backing vocals analysis from state_data
+    backing_analysis = with_unified_recommendation(job.state_data.get('backing_vocals_analysis', {}))
+
+    # Get stem URLs
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+    transcoding = AudioTranscodingService(storage_service=storage)
+
+    stems = job.file_urls.get('stems', {})
+    clean_url = stems.get('instrumental_clean')
+    backing_url = stems.get('instrumental_with_backing')
+    backing_vocals_path = stems.get('backing_vocals')
+
+    # Build audio URLs with transcoded signed access (OGG Opus, parallel).
+    # In local dev without signing creds, use same-origin byte-proxy URLs.
+    audio_url_sources = {
+        'clean': clean_url,
+        'with_backing': backing_url,
+        'original': job.input_media_gcs_path,
+        'backing_vocals': backing_vocals_path,
+    }
+    audio_urls = {}
+    if _dev_audio_proxy_enabled():
+        _base = str(request.base_url)
+        for key, src in audio_url_sources.items():
+            if src:
+                audio_urls[key] = _dev_audio_url(job_id, src, _base)
+    else:
+        url_tasks = {
+            key: transcoding.get_review_audio_url_async(src, expiration_minutes=120)
+            for key, src in audio_url_sources.items() if src
+        }
+        if url_tasks:
+            # Best-effort per URL (signing is a bounded IAM round-trip): a stall on one
+            # stem yields a null URL the client can retry, not a failed refresh call.
+            results = await asyncio.gather(*url_tasks.values(), return_exceptions=True)
+            for key, res in zip(url_tasks.keys(), results):
+                if isinstance(res, Exception):
+                    logger.warning(f"Signing review audio URL failed ({key}): {res}")
+                    audio_urls[key] = None
+                else:
+                    audio_urls[key] = res
+
+    # Format response to match InstrumentalAnalysis type
+    return {
+        "job_id": job_id,
+        "artist": job.artist,
+        "title": job.title,
+        "duration_seconds": backing_analysis.get('total_duration_seconds'),
+        "analysis": {
+            "has_audible_content": backing_analysis.get('has_audible_content', False),
+            "total_duration_seconds": backing_analysis.get('total_duration_seconds', 0),
+            "audible_segments": backing_analysis.get('audible_segments', []),
+            "recommended_selection": backing_analysis.get('recommended_selection', 'clean'),
+            "total_audible_duration_seconds": backing_analysis.get('total_audible_duration_seconds', 0),
+            "audible_percentage": backing_analysis.get('audible_percentage', 0),
+            "silence_threshold_db": backing_analysis.get('silence_threshold_db', -40),
+        },
+        "audio_urls": audio_urls,
+        "has_original": bool(job.input_media_gcs_path),
+        "has_uploaded_instrumental": bool(job.existing_instrumental_gcs_path),
+    }
+
+
+# Bound how many waveform computations/loads can run at once on an instance.
+# A cache miss decodes a whole audio file (seconds of CPU); before this bound —
+# and before the compute moved off the event loop — ~10 concurrent review-page
+# loads could wedge the single uvicorn event loop and take the whole service
+# down ("no available instance" aborts; see 2026-09-18 investigation doc).
+# max(1, …): a zero/negative override would otherwise deadlock every request.
+_WAVEFORM_MAX_CONCURRENCY = max(1, int(os.getenv("REVIEW_WAVEFORM_MAX_CONCURRENCY", "4")))
+_waveform_semaphore = asyncio.Semaphore(_WAVEFORM_MAX_CONCURRENCY)
+
+
+@router.get("/{job_id}/vocals-peaks")
+async def get_vocals_peaks(
+    job_id: str,
+    peaks_per_second: int = 400,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Pre-computed peak envelope of the vocal stem (Waveforms review mode).
+
+    Replaces the frontend's download-and-decode of the whole vocals OGG
+    (~7 MB + WebAudio decode) with a ~150 KB JSON, so the per-segment
+    waveform strips paint sub-second on page load. Served from a persistent
+    GCS cache, pre-computed by screens_worker; a miss computes off the event
+    loop, bounded by the shared waveform semaphore. Returns 202 while audio
+    separation is still producing the stem (frontend polls, mirroring
+    /audio/vocals).
+
+    Response: {peaks_b64 (base64 uint8 per bucket), encoding: "u8",
+    peaks_per_second, duration_seconds}.
+    """
+    from backend.services.audio_analysis_service import AudioAnalysisService
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    peaks_per_second = max(50, min(peaks_per_second, 1000))
+
+    job = await asyncio.to_thread(JobManager().get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    vocals_path = await asyncio.to_thread(_review_vocals_path, job)
+    if not vocals_path:
+        if not job.state_data.get("audio_complete", False):
+            return Response(status_code=202, headers={"Retry-After": "15"})
+        raise HTTPException(status_code=404, detail=t("en", "review.audioNotFound"))
+
+    try:
+        analysis_service = AudioAnalysisService()
+        async with _waveform_semaphore:
+            payload = await asyncio.to_thread(
+                analysis_service.get_vocals_peaks,
+                vocals_path,
+                job_id,
+                peaks_per_second,
+                AudioTranscodingService(),
+            )
+        return JSONResponse(
+            content={
+                "peaks_b64": payload["peaks_b64"],
+                "encoding": payload.get("encoding", "u8"),
+                "peaks_per_second": payload["peaks_per_second"],
+                "duration_seconds": payload["duration_seconds"],
+            },
+            # Immutable per stem path; short-lived like the audio responses.
+            headers={"Cache-Control": "private, max-age=600"},
+        )
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error generating vocals peaks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.waveformGenerationError", error=str(e)))
+
+
+@router.get("/{job_id}/waveform-data")
+async def get_waveform_data(
+    job_id: str,
+    num_points: int = 1000,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Get waveform amplitude data for client-side rendering.
+
+    Returns amplitude values for drawing the waveform in the frontend.
+    Served from a persistent GCS cache (precomputed by screens_worker before
+    the job reaches review); a miss decodes off the event loop, bounded by
+    ``_waveform_semaphore``.
+    """
+    from backend.services.audio_analysis_service import AudioAnalysisService
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    job_manager = JobManager()
+
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    # Get backing vocals path
+    stems = job.file_urls.get('stems', {})
+    backing_vocals_path = stems.get('backing_vocals')
+
+    if not backing_vocals_path:
+        # Fallback to input audio if no backing vocals
+        backing_vocals_path = job.input_media_gcs_path
+
+    if not backing_vocals_path:
+        raise HTTPException(status_code=404, detail=t("en", "review.waveformNoAudio"))
+
+    try:
+        analysis_service = AudioAnalysisService()
+        async with _waveform_semaphore:
+            amplitudes, duration = await asyncio.to_thread(
+                analysis_service.get_review_waveform,
+                backing_vocals_path,
+                job_id,
+                num_points,
+                AudioTranscodingService(),
+            )
+
+        return {
+            "amplitudes": amplitudes,
+            "duration_seconds": duration,
+            "duration": duration,  # Legacy field name
+            "sample_rate": num_points,
+        }
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error generating waveform data: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t("en", "review.waveformGenerationError", error=str(e)))
+
+
+# ============================================
+# Review Session Endpoints (backup/restore)
+# ============================================
+
+
+@router.post("/{job_id}/sessions")
+def save_review_session(
+    job_id: str,
+    data: Dict[str, Any],
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Save a review session snapshot for backup/restore.
+
+    Stores correction data in GCS and metadata in Firestore subcollection.
+    Skips save if the data is identical to the most recent session (deduplication).
+
+    Request body:
+    - correction_data: Full CorrectionData object
+    - edit_count: Number of edits in this session
+    - trigger: "auto" | "preview" | "manual"
+    - summary: { total_segments, total_words, corrections_made, changed_words[] }
+    """
+    job_manager = JobManager()
+    firestore_svc = FirestoreService()
+    storage = StorageService()
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    correction_data = data.get("correction_data")
+    if not correction_data:
+        raise HTTPException(status_code=400, detail=t("en", "review.sessionSaveError"))
+
+    # Compute hash for deduplication
+    data_json = json.dumps(correction_data, sort_keys=True, default=str)
+    data_hash = hashlib.sha256(data_json.encode()).hexdigest()
+
+    # Check if identical to most recent session
+    latest_hash = firestore_svc.get_latest_review_session_hash(job_id)
+    if latest_hash == data_hash:
+        logger.info(f"Job {job_id}: Skipping duplicate review session save")
+        return {"status": "skipped", "reason": "identical_data"}
+
+    # Get audio duration from backing_vocals_analysis if available
+    audio_duration = None
+    backing_analysis = job.state_data.get("backing_vocals_analysis", {})
+    if backing_analysis:
+        audio_duration = backing_analysis.get("total_duration_seconds")
+
+    # Build session
+    user_email = auth_info[0] if auth_info else ""
+    summary_data = data.get("summary", {})
+
+    session = ReviewSession(
+        job_id=job_id,
+        user_email=user_email,
+        edit_count=data.get("edit_count", 0),
+        trigger=data.get("trigger", "auto"),
+        audio_duration_seconds=audio_duration,
+        artist=job.artist,
+        title=job.title,
+        summary=ReviewSessionSummary.from_dict(summary_data),
+        data_hash=data_hash,
+    )
+
+    # Upload correction data to GCS
+    gcs_path = f"jobs/{job_id}/review_sessions/{session.session_id}.json"
+    storage.upload_json(gcs_path, correction_data)
+    session.correction_data_gcs_path = gcs_path
+
+    # Save metadata to Firestore
+    firestore_svc.save_review_session(job_id, session)
+
+    logger.info(f"Job {job_id}: Saved review session {session.session_id} (trigger={session.trigger}, edits={session.edit_count})")
+    return {
+        "status": "saved",
+        "session_id": session.session_id,
+        "created_at": session.created_at.isoformat(),
+    }
+
+
+@router.get("/{job_id}/sessions")
+def list_review_sessions(
+    job_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    List all review sessions for a job (metadata only, no correction_data).
+    Ordered by updated_at descending (most recent first).
+    """
+    firestore_svc = FirestoreService()
+    sessions = firestore_svc.list_review_sessions(job_id)
+
+    return {
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "job_id": s.job_id,
+                "user_email": s.user_email,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+                "edit_count": s.edit_count,
+                "trigger": s.trigger,
+                "audio_duration_seconds": s.audio_duration_seconds,
+                "artist": s.artist,
+                "title": s.title,
+                "summary": s.summary.to_dict(),
+            }
+            for s in sessions
+        ]
+    }
+
+
+@router.get("/{job_id}/sessions/{session_id}")
+def get_review_session(
+    job_id: str,
+    session_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """
+    Get a single review session with full correction_data loaded from GCS.
+    """
+    firestore_svc = FirestoreService()
+    storage = StorageService()
+
+    session = firestore_svc.get_review_session(job_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Review session not found")
+
+    # Load correction data from GCS
+    correction_data = None
+    if session.correction_data_gcs_path:
+        try:
+            correction_data = storage.download_json(session.correction_data_gcs_path)
+        except Exception as e:
+            logger.error(f"Job {job_id}: Error loading correction data for session {session_id}: {e}")
+            raise HTTPException(status_code=500, detail="Error loading session correction data")
+
+    return {
+        "session_id": session.session_id,
+        "job_id": session.job_id,
+        "user_email": session.user_email,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+        "edit_count": session.edit_count,
+        "trigger": session.trigger,
+        "audio_duration_seconds": session.audio_duration_seconds,
+        "artist": session.artist,
+        "title": session.title,
+        "summary": session.summary.to_dict(),
+        "correction_data": correction_data,
+    }
+
+
+@router.delete("/{job_id}/sessions/{session_id}")
+def delete_review_session(
+    job_id: str,
+    session_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth)
+):
+    """Delete a review session (metadata + GCS data)."""
+    firestore_svc = FirestoreService()
+    storage = StorageService()
+
+    session = firestore_svc.get_review_session(job_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Review session not found")
+
+    # Delete GCS data
+    if session.correction_data_gcs_path:
+        try:
+            storage.delete_file(session.correction_data_gcs_path)
+        except Exception:
+            logger.warning(f"Job {job_id}: Could not delete GCS file for session {session_id}")
+
+    # Delete Firestore doc
+    firestore_svc.delete_review_session(job_id, session_id)
+
+    return {"status": "deleted", "session_id": session_id}
+
+
+# ============================================
+# Audio Edit Session Endpoints (backup/restore)
+# ============================================
+
+
+@router.post("/{job_id}/audio-edit-sessions")
+def save_audio_edit_session(
+    job_id: str,
+    data: Dict[str, Any],
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """Save an audio edit session snapshot."""
+    import hashlib
+    import json as json_mod
+    from backend.models.audio_edit_session import AudioEditSession, AudioEditSessionSummary
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    user_email = auth_info[0] if isinstance(auth_info, tuple) else ""
+    edit_data = data.get("edit_data", {})
+
+    # Compute hash for deduplication
+    data_json = json_mod.dumps(edit_data, sort_keys=True, default=str)
+    data_hash = hashlib.sha256(data_json.encode()).hexdigest()
+
+    # Skip if identical to most recent
+    firestore_svc = FirestoreService()
+    latest_hash = firestore_svc.get_latest_audio_edit_session_hash(job_id)
+    if latest_hash == data_hash:
+        return {"status": "skipped", "reason": "identical_data"}
+
+    # Build session
+    summary_data = data.get("summary", {})
+    session = AudioEditSession(
+        job_id=job_id,
+        user_email=user_email,
+        edit_count=data.get("edit_count", 0),
+        trigger=data.get("trigger", "auto"),
+        audio_duration_seconds=summary_data.get("net_duration_seconds"),
+        original_duration_seconds=data.get("original_duration_seconds"),
+        artist=job.artist,
+        title=job.title,
+        summary=AudioEditSessionSummary.from_dict(summary_data),
+        data_hash=data_hash,
+    )
+
+    # Upload edit_data to GCS
+    storage = StorageService()
+    gcs_path = f"jobs/{job_id}/audio_edit_sessions/{session.session_id}.json"
+    storage.upload_json(gcs_path, edit_data)
+    session.edit_data_gcs_path = gcs_path
+
+    # Save metadata to Firestore
+    firestore_svc.save_audio_edit_session(job_id, session)
+
+    return {
+        "status": "saved",
+        "session_id": session.session_id,
+        "created_at": session.created_at.isoformat(),
+    }
+
+
+@router.get("/{job_id}/audio-edit-sessions")
+def list_audio_edit_sessions(
+    job_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """List all audio edit sessions for a job (metadata only)."""
+    firestore_svc = FirestoreService()
+    sessions = firestore_svc.list_audio_edit_sessions(job_id)
+    return {
+        "sessions": [s.to_dict() for s in sessions]
+    }
+
+
+@router.get("/{job_id}/audio-edit-sessions/{session_id}")
+def get_audio_edit_session(
+    job_id: str,
+    session_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """Get a single audio edit session with full edit_data loaded from GCS."""
+    firestore_svc = FirestoreService()
+    session = firestore_svc.get_audio_edit_session(job_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result = session.to_dict()
+
+    # Load edit data from GCS
+    if session.edit_data_gcs_path:
+        try:
+            storage = StorageService()
+            result["edit_data"] = storage.download_json(session.edit_data_gcs_path)
+        except Exception as e:
+            logger.warning(f"Could not load audio edit data from GCS for session {session_id}: {e}")
+            result["edit_data"] = None
+    else:
+        result["edit_data"] = None
+
+    return result
+
+
+@router.delete("/{job_id}/audio-edit-sessions/{session_id}")
+def delete_audio_edit_session(
+    job_id: str,
+    session_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """Delete an audio edit session (metadata + GCS data)."""
+    firestore_svc = FirestoreService()
+    session = firestore_svc.get_audio_edit_session(job_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Delete GCS data
+    if session.edit_data_gcs_path:
+        try:
+            storage = StorageService()
+            storage.delete_file(session.edit_data_gcs_path)
+        except Exception:
+            logger.warning(f"Could not delete GCS file for audio edit session {session_id}")
+
+    # Delete Firestore doc
+    firestore_svc.delete_audio_edit_session(job_id, session_id)
+
+    return {"status": "deleted", "session_id": session_id}
+
+
+# ============================================
+# Audio Edit Endpoints
+# ============================================
+
+
+def _get_current_audio_gcs_path(job) -> str:
+    """Get the GCS path of the current audio (latest edit or original)."""
+    state_data = job.state_data or {}
+    edit_stack = state_data.get('audio_edit_stack', [])
+    if edit_stack:
+        return edit_stack[-1]['gcs_path']
+    return job.input_media_gcs_path
+
+
+def _build_audio_edit_response(
+    job_id: str,
+    gcs_path: str,
+    edit_stack: list,
+    redo_stack: list,
+    edit_id: str | None = None,
+) -> dict:
+    """Build a standard response for audio edit operations matching AudioEditResponse interface."""
+    from backend.services.audio_analysis_service import AudioAnalysisService
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    analysis_service = AudioAnalysisService()
+    transcoding_service = AudioTranscodingService()
+
+    # Get waveform data for current audio
+    amplitudes, duration = analysis_service.get_waveform_data(
+        gcs_audio_path=gcs_path,
+        job_id=job_id,
+        num_points=1000,
+    )
+
+    # Get playback URL (OGG Opus)
+    playback_url = transcoding_service.get_review_audio_url(gcs_path)
+
+    # Build flat response matching frontend AudioEditResponse interface
+    response = {
+        "status": "success",
+        "duration_after": duration,
+        "current_audio_url": playback_url,
+        "waveform_data": {"amplitudes": list(amplitudes)},
+        "edit_stack": [
+            {
+                "edit_id": entry.get("edit_id", ""),
+                "operation": entry.get("operation", ""),
+                "params": entry.get("params", {}),
+                "duration_before": entry.get("duration_before", 0),
+                "duration_after": entry.get("duration_after", entry.get("duration_seconds", 0)),
+                "timestamp": entry.get("timestamp", ""),
+            }
+            for entry in edit_stack
+        ],
+        "can_undo": len(edit_stack) > 0,
+        "can_redo": len(redo_stack) > 0,
+    }
+    if edit_id is not None:
+        response["edit_id"] = edit_id
+    return response
+
+
+@router.get("/{job_id}/input-audio-info")
+def get_input_audio_info(
+    job_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """
+    Get metadata about the input audio for the audio editor UI.
+
+    Returns duration, waveform data, playback URL, and edit state.
+    """
+    from backend.services.audio_analysis_service import AudioAnalysisService
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+    from backend.services.audio_edit_service import AudioEditService
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if not job.input_media_gcs_path:
+        raise HTTPException(status_code=404, detail="No input audio available")
+
+    try:
+        edit_service = AudioEditService()
+        analysis_service = AudioAnalysisService()
+        transcoding_service = AudioTranscodingService()
+
+        state_data = job.state_data or {}
+        edit_stack = state_data.get('audio_edit_stack', [])
+
+        # Try cached waveform first (pre-generated by download worker), fall back to on-demand
+        waveform_cache_path = state_data.get('audio_edit_waveform_cache_path')
+        cached = None
+        if waveform_cache_path:
+            cached = analysis_service.load_cached_waveform(waveform_cache_path)
+
+        if cached:
+            orig_amplitudes, orig_duration = cached
+            logger.info(f"Job {job_id}: Using cached waveform data")
+        else:
+            orig_amplitudes, orig_duration = analysis_service.get_waveform_data(
+                gcs_audio_path=job.input_media_gcs_path,
+                job_id=job_id,
+                num_points=1000,
+            )
+
+        original_playback_url = transcoding_service.get_review_audio_url(job.input_media_gcs_path)
+
+        # Determine current audio state
+        current_duration = orig_duration
+        current_audio_url = original_playback_url
+        current_waveform = orig_amplitudes
+        if edit_stack:
+            current_gcs_path = edit_stack[-1]['gcs_path']
+            current_waveform, current_duration = analysis_service.get_waveform_data(
+                gcs_audio_path=current_gcs_path,
+                job_id=job_id,
+                num_points=1000,
+            )
+            current_audio_url = transcoding_service.get_review_audio_url(current_gcs_path)
+
+        # Return flat structure matching AudioEditInfo frontend interface
+        result = {
+            "job_id": job_id,
+            "artist": job.artist,
+            "title": job.title,
+            "original_duration_seconds": orig_duration,
+            "current_duration_seconds": current_duration,
+            "original_audio_url": original_playback_url,
+            "current_audio_url": current_audio_url,
+            "waveform_data": {"amplitudes": list(current_waveform)},
+            "original_waveform_data": {"amplitudes": list(orig_amplitudes)},
+            "edit_stack": [
+                {
+                    "edit_id": entry.get("edit_id", ""),
+                    "operation": entry.get("operation", ""),
+                    "params": entry.get("params", {}),
+                    "duration_before": entry.get("duration_before", 0),
+                    "duration_after": entry.get("duration_after", 0),
+                    "timestamp": entry.get("timestamp", ""),
+                }
+                for entry in edit_stack
+            ],
+            "can_undo": len(edit_stack) > 0,
+            "can_redo": len(state_data.get('audio_edit_redo_stack', [])) > 0,
+        }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error getting input audio info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting audio info: {str(e)}")
+
+
+@router.post("/{job_id}/audio-edit/apply")
+async def apply_audio_edit(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """
+    Apply an edit operation to the input audio.
+
+    Supported operations: trim_start, trim_end, cut, mute, fade_in, fade_out, tempo,
+    join_start, join_end.
+    Returns updated waveform data and playback URL.
+    """
+    import uuid
+    from backend.services.audio_edit_service import AudioEditService
+
+    body = await request.json()
+    operation = body.get("operation")
+    params = body.get("params", {})
+    edit_id = body.get("edit_id") or str(uuid.uuid4())
+
+    if not operation:
+        raise HTTPException(status_code=400, detail="Missing 'operation' field")
+
+    valid_operations = {"trim_start", "trim_end", "cut", "mute", "fade_in", "fade_out", "tempo", "join_start", "join_end"}
+    if operation not in valid_operations:
+        raise HTTPException(status_code=400, detail=f"Invalid operation: {operation}. Valid: {valid_operations}")
+
+    if operation == "tempo":
+        factor = params.get("factor")
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            raise HTTPException(status_code=400, detail="Missing or non-numeric 'factor' for tempo operation")
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in (JobStatus.AWAITING_AUDIO_EDIT, JobStatus.IN_AUDIO_EDIT):
+        raise HTTPException(status_code=400, detail=f"Job is not in audio edit state (current: {job.status})")
+
+    # Transition to IN_AUDIO_EDIT if not already
+    if job.status == JobStatus.AWAITING_AUDIO_EDIT:
+        job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.IN_AUDIO_EDIT,
+            progress=15,
+            message="Audio editing in progress"
+        )
+
+    # Resolve upload_id to GCS path for join operations
+    if operation in ("join_start", "join_end"):
+        upload_id = params.get("upload_id")
+        if not upload_id:
+            raise HTTPException(status_code=400, detail="Missing 'upload_id' for join operation")
+        state_data = job.state_data or {}
+        uploads = state_data.get('audio_edit_uploads', {})
+        upload_info = uploads.get(upload_id)
+        if not upload_info:
+            raise HTTPException(status_code=404, detail=f"Upload {upload_id} not found")
+        params["upload_gcs_path"] = upload_info["gcs_path"]
+
+    try:
+        edit_service = AudioEditService()
+
+        # Get current audio path and duration before edit
+        state_data = job.state_data or {}
+        existing_stack = state_data.get('audio_edit_stack', [])
+        current_gcs_path = _get_current_audio_gcs_path(job)
+
+        # Determine duration before this edit
+        if existing_stack:
+            duration_before = existing_stack[-1].get('duration_seconds', 0)
+        else:
+            before_metadata = await asyncio.to_thread(edit_service.get_metadata_from_gcs, current_gcs_path)
+            duration_before = before_metadata.duration_seconds
+
+        output_gcs_path = f"jobs/{job_id}/audio_edit/edit_{edit_id}.flac"
+
+        # Apply the edit (ffmpeg + GCS download/upload: off the event loop)
+        metadata, result_path = await asyncio.to_thread(
+            edit_service.apply_edit,
+            input_gcs_path=current_gcs_path,
+            operation=operation,
+            params=params,
+            output_gcs_path=output_gcs_path,
+            job_id=job_id,
+        )
+
+        # Update edit stack in state_data
+        edit_stack = list(existing_stack)
+        edit_stack.append({
+            "edit_id": edit_id,
+            "operation": operation,
+            "params": {k: v for k, v in params.items() if k != "upload_gcs_path"},
+            "gcs_path": result_path,
+            "duration_before": duration_before,
+            "duration_after": metadata.duration_seconds,
+            "duration_seconds": metadata.duration_seconds,
+            "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+        })
+
+        # Clear redo stack on new edit. Atomic per-field writes so a rapid
+        # follow-up edit/undo — or the idle-reminder scheduler that runs during
+        # the audio-edit phase — can't clobber unrelated state_data keys by
+        # re-persisting a stale copy of the whole map. NOTE: these two list
+        # fields are still last-write-wins across concurrent edits to the SAME
+        # job (a list can't be dot-path-merged); that's acceptable for the
+        # single-reviewer, sequential audio-editor UI. True multi-writer safety
+        # would need a transaction / optimistic-concurrency CAS.
+        job_manager.update_job(job_id, {
+            'state_data.audio_edit_stack': edit_stack,
+            'state_data.audio_edit_redo_stack': [],
+        })
+
+        return _build_audio_edit_response(
+            job_id=job_id,
+            gcs_path=result_path,
+            edit_stack=edit_stack,
+            redo_stack=[],
+            edit_id=edit_id,
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error applying audio edit: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error applying edit: {str(e)}")
+
+
+@router.post("/{job_id}/audio-edit/undo")
+def undo_audio_edit(
+    job_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """Undo the last audio edit operation."""
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in (JobStatus.AWAITING_AUDIO_EDIT, JobStatus.IN_AUDIO_EDIT):
+        raise HTTPException(status_code=400, detail=f"Job is not in audio edit state (current: {job.status})")
+
+    state_data = job.state_data or {}
+    edit_stack = list(state_data.get('audio_edit_stack', []))
+    redo_stack = list(state_data.get('audio_edit_redo_stack', []))
+
+    if not edit_stack:
+        raise HTTPException(status_code=400, detail="Nothing to undo")
+
+    # Pop from edit stack, push to redo stack
+    undone_edit = edit_stack.pop()
+    redo_stack.append(undone_edit)
+
+    # Atomic per-field writes so a rapid undo/redo (or the idle-reminder
+    # scheduler active during audio-edit) can't clobber unrelated state_data
+    # keys by re-persisting a stale copy of the whole map. NOTE: the two list
+    # fields remain last-write-wins across concurrent edits to the SAME job —
+    # acceptable for the single-reviewer sequential UI; true multi-writer safety
+    # would need a transaction / optimistic-concurrency CAS.
+    job_manager.update_job(job_id, {
+        'state_data.audio_edit_stack': edit_stack,
+        'state_data.audio_edit_redo_stack': redo_stack,
+    })
+
+    # Get the now-current audio (previous edit or original)
+    current_gcs_path = edit_stack[-1]['gcs_path'] if edit_stack else job.input_media_gcs_path
+
+    try:
+        return _build_audio_edit_response(
+            job_id=job_id,
+            gcs_path=current_gcs_path,
+            edit_stack=edit_stack,
+            redo_stack=redo_stack,
+        )
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error building undo response: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error during undo: {str(e)}")
+
+
+@router.post("/{job_id}/audio-edit/redo")
+def redo_audio_edit(
+    job_id: str,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """Redo a previously undone audio edit."""
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in (JobStatus.AWAITING_AUDIO_EDIT, JobStatus.IN_AUDIO_EDIT):
+        raise HTTPException(status_code=400, detail=f"Job is not in audio edit state (current: {job.status})")
+
+    state_data = job.state_data or {}
+    edit_stack = list(state_data.get('audio_edit_stack', []))
+    redo_stack = list(state_data.get('audio_edit_redo_stack', []))
+
+    if not redo_stack:
+        raise HTTPException(status_code=400, detail="Nothing to redo")
+
+    # Pop from redo stack, push to edit stack
+    redone_edit = redo_stack.pop()
+    edit_stack.append(redone_edit)
+
+    # Atomic per-field writes so a rapid undo/redo (or the idle-reminder
+    # scheduler active during audio-edit) can't clobber unrelated state_data
+    # keys by re-persisting a stale copy of the whole map. NOTE: the two list
+    # fields remain last-write-wins across concurrent edits to the SAME job —
+    # acceptable for the single-reviewer sequential UI; true multi-writer safety
+    # would need a transaction / optimistic-concurrency CAS.
+    job_manager.update_job(job_id, {
+        'state_data.audio_edit_stack': edit_stack,
+        'state_data.audio_edit_redo_stack': redo_stack,
+    })
+
+    current_gcs_path = edit_stack[-1]['gcs_path']
+
+    try:
+        return _build_audio_edit_response(
+            job_id=job_id,
+            gcs_path=current_gcs_path,
+            edit_stack=edit_stack,
+            redo_stack=redo_stack,
+        )
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error building redo response: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error during redo: {str(e)}")
+
+
+@router.post("/{job_id}/audio-edit/upload")
+async def upload_audio_for_join(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """
+    Upload additional audio for join operations.
+
+    Accepts multipart form upload. Returns upload_id and metadata.
+    """
+    import uuid
+    from fastapi import UploadFile
+    from backend.services.audio_edit_service import AudioEditService
+    from backend.services.audio_analysis_service import AudioAnalysisService
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in (JobStatus.AWAITING_AUDIO_EDIT, JobStatus.IN_AUDIO_EDIT):
+        raise HTTPException(status_code=400, detail=f"Job is not in audio edit state (current: {job.status})")
+
+    # Parse multipart form
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing 'file' in form data")
+
+    # Validate file extension
+    filename = getattr(file, 'filename', 'unknown')
+    valid_extensions = {'.flac', '.wav', '.mp3', '.m4a', '.ogg'}
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in valid_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type '{ext}'. Accepted: {', '.join(valid_extensions)}"
+        )
+
+    upload_id = str(uuid.uuid4())
+    gcs_path = f"jobs/{job_id}/audio_edit/upload_{upload_id}{ext}"
+
+    try:
+        storage = StorageService()
+        edit_service = AudioEditService()
+        analysis_service = AudioAnalysisService()
+
+        # Save uploaded file to GCS
+        content = await file.read()
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        try:
+            await asyncio.to_thread(storage.upload_file, tmp_path, gcs_path)
+
+            # Get metadata
+            metadata = edit_service.get_metadata(tmp_path)
+
+            # Get waveform data
+            from karaoke_gen.instrumental_review import WaveformGenerator
+            waveform_gen = WaveformGenerator()
+            amplitudes, duration = waveform_gen.generate_data_only(
+                audio_path=tmp_path,
+                num_points=1000,
+            )
+        finally:
+            os.unlink(tmp_path)
+
+        # Store upload info in state_data. Write ONLY this upload's entry, keyed
+        # by its uuid. FieldPath.to_api_repr() backtick-escapes the uuid segment
+        # (it contains hyphens, so a raw dotted path would be misparsed) and keeps
+        # the key a string so it doesn't clash with the string 'updated_at' key
+        # update_job appends. Merging at the entry level means two concurrent
+        # uploads no longer drop each other — the old whole-map replace would
+        # orphan a GCS file and 404 later on join_start/join_end.
+        uploads_field = FieldPath("state_data", "audio_edit_uploads", upload_id).to_api_repr()
+        job_manager.update_job(job_id, {
+            uploads_field: {
+                "gcs_path": gcs_path,
+                "duration_seconds": metadata.duration_seconds,
+                "filename": filename,
+            },
+        })
+
+        return {
+            "upload_id": upload_id,
+            "duration_seconds": metadata.duration_seconds,
+            "waveform_data": {
+                "amplitudes": amplitudes,
+                "duration": duration,
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error uploading audio for join: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error uploading audio: {str(e)}")
+
+
+def _tempo_label_updates(job, factor: float) -> dict:
+    """Job field updates that (re)label job.title for a tempo change, or {} if none needed.
+
+    The suffix goes into job.title because every published output (screens,
+    filenames, Dropbox/GDrive/kjbox, YouTube, emails) reads it. The original
+    title is pinned into lyrics_title so lyrics search still finds the song.
+    """
+    if is_tempo_adjusted(factor):
+        updates = {
+            "title": apply_tempo_to_title(job.title, factor),
+            "tempo_factor": round(factor, 4),
+        }
+        if not getattr(job, "lyrics_title", None):
+            updates["lyrics_title"] = strip_tempo_suffix(job.title)
+        return updates
+    if getattr(job, "tempo_factor", None) is not None:
+        # A previous submit labeled this job but the tempo is now back to normal.
+        return {"title": strip_tempo_suffix(job.title), "tempo_factor": None}
+    return {}
+
+
+@router.post("/{job_id}/audio-edit/submit")
+async def submit_audio_edit(
+    job_id: str,
+    request: Request,
+    auth_info: Tuple[str, str] = Depends(require_review_auth),
+):
+    """
+    Finalize the audio edit and continue processing.
+
+    Copies the current edited audio to the job's input path,
+    then triggers audio separation and lyrics transcription workers.
+    """
+    from backend.services.worker_service import get_worker_service
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t("en", "review.jobNotFound"))
+
+    if job.status not in (JobStatus.AWAITING_AUDIO_EDIT, JobStatus.IN_AUDIO_EDIT):
+        raise HTTPException(status_code=400, detail=f"Job is not in audio edit state (current: {job.status})")
+
+    state_data = job.state_data or {}
+    edit_stack = state_data.get('audio_edit_stack', [])
+
+    storage = StorageService()
+
+    # Save edit log if provided
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    edit_log = body.get("edit_log")
+    if edit_log:
+        edit_log_path = f"jobs/{job_id}/audio_edit/edit_log.json"
+        await asyncio.to_thread(storage.upload_json, edit_log_path, edit_log)
+        logger.info(f"Job {job_id}: Saved audio edit log to {edit_log_path}")
+
+    if edit_stack:
+        # Copy the latest edited audio to the canonical input path
+        current_edited_path = edit_stack[-1]['gcs_path']
+        edited_input_path = f"jobs/{job_id}/input/edited.flac"
+
+        # Download and re-upload to canonical path
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_path = os.path.join(temp_dir, "edited.flac")
+            await asyncio.to_thread(storage.download_file, current_edited_path, local_path)
+            await asyncio.to_thread(storage.upload_file, local_path, edited_input_path)
+
+        # Update job to use edited audio as input
+        job_manager.update_job(job_id, {
+            'input_media_gcs_path': edited_input_path,
+        })
+        logger.info(f"Job {job_id}: Audio edit submitted, using edited audio: {edited_input_path}")
+    else:
+        logger.info(f"Job {job_id}: Audio edit submitted with no edits, using original audio")
+
+    # Label tempo-changed tracks. Must happen before the workers are triggered:
+    # lyrics/screens/render/distribution all read job.title from here on.
+    tempo_updates = _tempo_label_updates(job, cumulative_tempo_factor(edit_stack))
+    if tempo_updates:
+        job_manager.update_job(job_id, tempo_updates)
+        logger.info(f"Job {job_id}: Tempo label updates applied: {tempo_updates}")
+
+    # Transition state
+    job_manager.transition_to_state(
+        job_id=job_id,
+        new_status=JobStatus.AUDIO_EDIT_COMPLETE,
+        progress=18,
+        message="Audio edit complete, starting processing"
+    )
+
+    # Reconcile credit charge against the (possibly-edited) audio before triggering workers.
+    # reconcile_and_maybe_pause probes job.input_media_gcs_path — which was just updated above
+    # to point to the edited audio (jobs/{job_id}/input/edited.flac) if edits were applied.
+    if await reconcile_and_maybe_pause(job_id):
+        # Job paused (AWAITING_DURATION_CONFIRM) or cancelled — do not start processing.
+        # Reload to distinguish the two outcomes so the caller can surface the right message.
+        reloaded = job_manager.get_job(job_id)
+        if reloaded and reloaded.status in (JobStatus.CANCELLED, JobStatus.FAILED):
+            return {
+                "status": "cancelled",
+                "message": "Audio edit saved. Job was cancelled — audio exceeds the supported limit.",
+                "job_id": job_id,
+                "edits_applied": len(edit_stack),
+            }
+        return {
+            "status": "paused",
+            "message": "Audio edit saved. Additional credits are required to continue processing.",
+            "job_id": job_id,
+            "edits_applied": len(edit_stack),
+        }
+
+    # Trigger parallel workers in background so the HTTP response returns immediately.
+    # The worker triggers involve Cloud Run Job calls that can take 30+ seconds;
+    # waiting synchronously causes the browser request to time out.
+    worker_service = get_worker_service()
+
+    async def _trigger_workers():
+        try:
+            await asyncio.gather(
+                worker_service.trigger_audio_worker(job_id),
+                worker_service.trigger_lyrics_worker(job_id),
+            )
+        except Exception as e:
+            logger.error(f"Job {job_id}: Failed to trigger workers after audio edit: {e}")
+
+    asyncio.create_task(_trigger_workers())
+
+    return {
+        "status": "success",
+        "message": "Audio edit saved. Processing will continue with edited audio.",
+        "job_id": job_id,
+        "edits_applied": len(edit_stack),
+    }

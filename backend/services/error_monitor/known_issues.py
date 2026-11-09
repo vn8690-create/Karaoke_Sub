@@ -1,0 +1,219 @@
+"""Known infrastructure noise patterns for the production error monitoring service.
+
+Filters out transient, expected log messages so the error monitor is not flooded
+with Cloud Run cold-start probes, deploy events, spot VM preemptions, and similar
+operational noise.
+
+Usage:
+    from backend.services.error_monitor.known_issues import should_ignore
+
+    reason = should_ignore(service, message)
+    if reason:
+        # skip this log entry — it's known infrastructure noise
+        ...
+"""
+
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from urllib.parse import SplitResult, urlsplit
+
+
+@dataclass
+class IgnoreReason:
+    """Describes why a log entry should be suppressed.
+
+    Attributes:
+        pattern_name: Machine-readable name of the matching ignore pattern.
+        reason: Human-readable explanation of why this is infrastructure noise.
+    """
+
+    pattern_name: str
+    reason: str
+
+
+# ---------------------------------------------------------------------------
+# Compiled ignore patterns (applied in order)
+# All patterns use re.IGNORECASE for case-insensitive matching.
+# ---------------------------------------------------------------------------
+
+_IGNORE_PATTERNS: list[tuple[str, re.Pattern, str]] = [
+    (
+        "startup_probe",
+        re.compile(r"startup (?:tcp |http |grpc )?probe failed", re.IGNORECASE),
+        "Cloud Run cold start — startup probe failure is transient and expected",
+    ),
+    (
+        "ready_condition",
+        re.compile(r"ready condition status changed", re.IGNORECASE),
+        "Cloud Run deploy event — readiness condition change is expected on deploy",
+    ),
+    (
+        "spot_preemption",
+        re.compile(r"instance was preempted", re.IGNORECASE),
+        "Spot/preemptible VM preemption — expected behaviour for spot instances",
+    ),
+    (
+        "idle_shutdown",
+        re.compile(r"stopping idle encoding worker", re.IGNORECASE),
+        "Encoding worker idle shutdown — expected behaviour when no jobs are queued",
+    ),
+    (
+        "encoding_worker_capacity_retry",
+        # Only the TRANSIENT start failures: GCE 503/SERVICE UNAVAILABLE or a
+        # capacity code (ZONE_RESOURCE_POOL_EXHAUSTED / STOCKOUT / QUOTA_EXCEEDED
+        # — see encoding_errors.CAPACITY_ERROR_CODES). The render worker parks
+        # these for auto-retry. A non-transient EncodingWorkerStartError (other /
+        # unknown code) shares the "aborting retries" prefix but must still page,
+        # so we require the transient signal, not just the prefix.
+        # Bind the transient signal to the GCE error CODE field — which appears
+        # immediately after "start failed in <zone>: " / "could not be started in
+        # <zone>: " (see encoding_errors.classify_gce_error). Matching the code in
+        # position (not anywhere in the line) prevents a non-transient failure
+        # whose message text merely contains "503" from being suppressed.
+        re.compile(
+            r"encoding worker start failed, aborting retries:.*?"
+            r"(?:start failed|could not be started) in [\w.-]+:\s*"
+            r"(?:503\b|service unavailable|zone_resource_pool_exhausted"
+            r"|stockout|quota_exceeded)",
+            re.IGNORECASE,
+        ),
+        (
+            "GCE encoding worker VM start hit a transient GCP condition (zone "
+            "capacity exhaustion or 503 SERVICE UNAVAILABLE) — the render worker "
+            "parks the job for auto-retry rather than failing it. Non-transient "
+            "start failures still alert."
+        ),
+    ),
+    (
+        "health_check_404",
+        re.compile(
+            r"(?:GET|HEAD)\b[^\n]*?/health[^\n]*?\b(?:404|not found)\b",
+            re.IGNORECASE,
+        ),
+        "Load balancer health check returning 404 — transient during cold start",
+    ),
+    (
+        "scheduler_retry",
+        re.compile(r"cloud scheduler.*retry", re.IGNORECASE),
+        "Cloud Scheduler transient retry — expected on intermittent job failures",
+    ),
+    (
+        "runner_startup",
+        re.compile(r"github\.runner\..*(?:starting|stopping|idle)", re.IGNORECASE),
+        "GitHub Actions runner lifecycle event — expected during runner start/stop",
+    ),
+    (
+        "container_shutdown",
+        re.compile(r"container called exit\(0\)", re.IGNORECASE),
+        "Container clean exit — exit code 0 indicates a graceful, expected shutdown",
+    ),
+    (
+        "cloud_trace_export",
+        re.compile(r"error while writing to cloud trace", re.IGNORECASE),
+        "OpenTelemetry Cloud Trace exporter got a transient gRPC error from Google "
+        "(e.g. StatusCode.INTERNAL) — best-effort telemetry, spans are just dropped",
+    ),
+]
+
+
+# Patterns that are noise only for specific services: the same message from a
+# customer-facing service is a real problem. (pattern_name, services, regex, reason)
+_SERVICE_IGNORE_PATTERNS: list[tuple[str, frozenset[str], re.Pattern, str]] = [
+    (
+        "audio_separation_experiment_traceback",
+        frozenset({"audio-separation-job"}),
+        # Two consecutive <string> frames: `python -c` running exec'd code, i.e. an
+        # experiment on a prod job image. A multiprocessing-spawn traceback also
+        # starts with a <string> frame, but its second frame is a real file.
+        re.compile(r'File "<string>", line 1, in <module>\s+File "<string>", line \d+'),
+        "Ad-hoc experiment run on a prod audio-separation-job image, not a job failure "
+        "(seen 2026-10-31, 11-01)",
+    ),
+    (
+        "url_download_failed_duplicate",
+        frozenset({"karaoke-backend"}),
+        # file_upload.py logs this, then fail_job: ops_alerts' job-failed alert is the
+        # one alert for the failure.
+        re.compile(r"^URL download failed: "),
+        "Same failure as the job-failed alert that fail_job sends right after this line",
+    ),
+]
+
+
+def _is_runner_manager_webhook(url: SplitResult) -> bool:
+    """GitHub webhooks hit the bare function URL; Cloud Scheduler ticks add ``?action=``."""
+    return url.path == "/github-runner-manager" and not url.query
+
+
+# Noise only for one service AND request URL (Cloud Run request logs carry the URL
+# outside the message). The URL matcher is an exact path, or a predicate on the split
+# URL when the path alone can't tell requests apart.
+# (pattern_name, services, message regex, URL path or predicate, reason)
+_SERVICE_URL_IGNORE_PATTERNS: list[
+    tuple[str, frozenset[str], re.Pattern, str | Callable[[SplitResult], bool], str]
+] = [
+    (
+        "runner_manager_no_available_instance",
+        frozenset({"github-runner-manager"}),
+        re.compile(
+            r"request was aborted (because there was no available instance"
+            r"|after waiting too long for an available instance)",
+            re.IGNORECASE,
+        ),
+        _is_runner_manager_webhook,
+        "github-runner-manager scale-up burst: Cloud Run aborts webhook requests "
+        "while instances start. GitHub does not redeliver them; the 5-minute "
+        "redispatch_stalled_jobs tick launches a runner for any job left queued "
+        "(seen 2026-09-20, 09-23, 09-27, 10-08, 11-04). Scheduler ticks are not "
+        "ignored: a failed tick means that safety net didn't run.",
+    ),
+    (
+        "decide_search_health_abort",
+        frozenset({"karaoke-decide-search"}),
+        re.compile(
+            r"request was aborted after waiting too long for an available instance",
+            re.IGNORECASE,
+        ),
+        "/api/search/health",
+        "The keep-warm ping waiting on a min-0 cold start (seen 2026-10-30). The same "
+        "abort on a real search path drops a user's request and still alerts.",
+    ),
+]
+
+
+def should_ignore(service: str, message: str, request_url: str | None = None) -> IgnoreReason | None:
+    """Check whether a log entry matches a known infrastructure noise pattern.
+
+    ``_IGNORE_PATTERNS`` match on the message alone; ``_SERVICE_IGNORE_PATTERNS``
+    also require ``service`` to be one of the listed services, and
+    ``_SERVICE_URL_IGNORE_PATTERNS`` also require ``request_url``'s path.
+
+    Args:
+        service: The originating service name (e.g. ``"karaoke-backend"``).
+        message: The raw log message string to evaluate.
+        request_url: The entry's request URL, if it is a request log.
+
+    Returns:
+        An :class:`IgnoreReason` if the message matches a known noise pattern,
+        or ``None`` if the message should be processed normally.
+    """
+    if not message:
+        return None
+
+    for pattern_name, pattern, reason in _IGNORE_PATTERNS:
+        if pattern.search(message):
+            return IgnoreReason(pattern_name=pattern_name, reason=reason)
+
+    for pattern_name, services, pattern, reason in _SERVICE_IGNORE_PATTERNS:
+        if service in services and pattern.search(message):
+            return IgnoreReason(pattern_name=pattern_name, reason=reason)
+
+    if request_url:
+        url = urlsplit(request_url)
+        for pattern_name, services, pattern, url_match, reason in _SERVICE_URL_IGNORE_PATTERNS:
+            url_ok = url_match(url) if callable(url_match) else url.path == url_match
+            if service in services and url_ok and pattern.search(message):
+                return IgnoreReason(pattern_name=pattern_name, reason=reason)
+
+    return None

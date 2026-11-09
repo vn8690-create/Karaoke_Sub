@@ -1,0 +1,1045 @@
+"""
+Unit tests for service layer.
+
+Tests AuthService, StorageService, WorkerService, and FirestoreService
+without requiring actual cloud resources.
+"""
+import asyncio
+import pytest
+from unittest.mock import Mock, MagicMock, AsyncMock, patch, call
+from datetime import datetime, UTC
+
+# Mock Google Cloud before imports
+import sys
+sys.modules['google.cloud.firestore'] = MagicMock()
+sys.modules['google.cloud.storage'] = MagicMock()
+sys.modules['google.cloud.tasks_v2'] = MagicMock()
+
+from backend.services.auth_service import AuthService, UserType
+from backend.services.storage_service import StorageService  
+from backend.services.worker_service import WorkerService, get_worker_service
+from backend.services.firestore_service import FirestoreService
+from backend.models.job import Job, JobStatus
+
+
+class TestAuthService:
+    """Test AuthService token validation and management."""
+    
+    def test_validate_admin_token(self):
+        """Test validating hardcoded admin tokens."""
+        with patch('backend.services.auth_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "admin123,secret456"
+            
+            auth_service = AuthService()
+            
+            # Valid admin token - returns (is_valid, user_type, usage_count, token)
+            is_valid, user_type, usage_count, token = auth_service.validate_token('admin123')
+            assert is_valid is True
+            assert user_type == UserType.ADMIN
+            
+            # Another valid admin token
+            is_valid, user_type, _, _ = auth_service.validate_token('secret456')
+            assert is_valid is True
+            assert user_type == UserType.ADMIN
+    
+    def test_validate_invalid_token(self):
+        """Test rejecting invalid tokens."""
+        with patch('backend.services.auth_service.FirestoreService') as mock_fs:
+            mock_fs_instance = Mock()
+            mock_fs.return_value = mock_fs_instance
+            mock_fs_instance.get_token.return_value = None  # Token not in DB
+            
+            with patch('backend.services.auth_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = "admin123"
+                
+                auth_service = AuthService()
+                is_valid, _, _, _ = auth_service.validate_token('invalid_token')
+                
+                assert is_valid is False
+    
+    def test_validate_token_from_firestore(self):
+        """Test validating tokens stored in Firestore."""
+        with patch('backend.services.auth_service.FirestoreService') as mock_fs:
+            mock_fs_instance = Mock()
+            mock_fs.return_value = mock_fs_instance
+            
+            # Mock Firestore returning a token
+            mock_fs_instance.get_token.return_value = {
+                'token': 'db_token123',
+                'type': 'unlimited',
+                'valid': True,
+                'usage_count': 5,
+                'created_at': datetime.now(UTC).isoformat()
+            }
+            
+            with patch('backend.services.auth_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = ""
+                
+                auth_service = AuthService()
+                is_valid, user_type, usage_count, token = auth_service.validate_token('db_token123')
+                
+                assert is_valid is True
+                assert user_type == UserType.UNLIMITED
+                # usage_count can be -1 for unlimited tokens
+                assert isinstance(usage_count, int)
+
+
+class TestStorageService:
+    """Test StorageService GCS operations."""
+    
+    def test_upload_file(self):
+        """Test uploading a file to GCS."""
+        with patch('backend.services.storage_service.storage') as mock_storage:
+            mock_client = MagicMock()
+            mock_storage.Client.return_value = mock_client
+            
+            mock_bucket = MagicMock()
+            mock_client.bucket.return_value = mock_bucket
+            
+            mock_blob = MagicMock()
+            mock_bucket.blob.return_value = mock_blob
+            
+            storage_service = StorageService()
+            
+            # Upload file - correct parameter names
+            result = storage_service.upload_file(
+                local_path="/tmp/test.flac",
+                destination_path="uploads/test123/test.flac"
+            )
+            
+            # Verify blob was created and uploaded
+            mock_bucket.blob.assert_called_once_with("uploads/test123/test.flac")
+            mock_blob.upload_from_filename.assert_called_once_with("/tmp/test.flac")
+            # Result should be the destination path
+            assert result == "uploads/test123/test.flac"
+    
+    def test_download_file(self):
+        """Test downloading a file from GCS."""
+        with patch('backend.services.storage_service.storage') as mock_storage:
+            mock_client = MagicMock()
+            mock_storage.Client.return_value = mock_client
+            
+            mock_bucket = MagicMock()
+            mock_client.bucket.return_value = mock_bucket
+            
+            mock_blob = MagicMock()
+            mock_bucket.blob.return_value = mock_blob
+            
+            storage_service = StorageService()
+            
+            # Download file - correct parameter names
+            storage_service.download_file(
+                source_path="uploads/test123/test.flac",
+                destination_path="/tmp/downloaded.flac"
+            )
+            
+            # Verify download was called
+            mock_blob.download_to_filename.assert_called_once_with("/tmp/downloaded.flac")
+    
+    def test_delete_file(self):
+        """Test deleting a file from GCS."""
+        with patch('backend.services.storage_service.storage') as mock_storage:
+            mock_client = MagicMock()
+            mock_storage.Client.return_value = mock_client
+            
+            mock_bucket = MagicMock()
+            mock_client.bucket.return_value = mock_bucket
+            
+            mock_blob = MagicMock()
+            mock_bucket.blob.return_value = mock_blob
+            
+            storage_service = StorageService()
+            
+            # Delete file
+            storage_service.delete_file("uploads/test123/test.flac")
+            
+            # Verify delete was called
+            mock_blob.delete.assert_called_once()
+
+
+class TestWorkerService:
+    """Test WorkerService worker triggering."""
+
+    @pytest.mark.asyncio
+    async def test_trigger_audio_worker(self):
+        """Test triggering audio worker via Cloud Run Jobs."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            # Mock Cloud Run v2 Jobs client
+            mock_jobs_client = MagicMock()
+            mock_operation = MagicMock()
+            mock_operation.metadata = "test-metadata"
+            mock_jobs_client.run_job.return_value = mock_operation
+
+            mock_run_v2 = MagicMock()
+            mock_run_v2.JobsClient.return_value = mock_jobs_client
+            mock_run_v2.RunJobRequest = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock()
+
+            # Patch both sys.modules and the parent package attribute to ensure
+            # 'from google.cloud import run_v2' resolves to our mock regardless
+            # of whether the real package is installed (namespace package resolution)
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_audio_worker("test123")
+
+                # Verify Cloud Run Job was triggered
+                assert result is True
+                mock_jobs_client.run_job.assert_called_once()
+
+                # Verify correct job name was used
+                call_args = mock_run_v2.RunJobRequest.call_args
+                assert call_args is not None
+                assert "audio-separation-job" in str(call_args)
+
+    @pytest.mark.asyncio
+    async def test_trigger_lyrics_worker(self):
+        """Test triggering lyrics worker via Cloud Run Jobs."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            # Mock Cloud Run v2 Jobs client
+            mock_jobs_client = MagicMock()
+            mock_operation = MagicMock()
+            mock_operation.metadata = "test-metadata"
+            mock_jobs_client.run_job.return_value = mock_operation
+
+            mock_run_v2 = MagicMock()
+            mock_run_v2.JobsClient.return_value = mock_jobs_client
+            mock_run_v2.RunJobRequest = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock()
+
+            # Patch both sys.modules and the parent package attribute to ensure
+            # 'from google.cloud import run_v2' resolves to our mock regardless
+            # of whether the real package is installed (namespace package resolution)
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_lyrics_worker("test123")
+
+                # Verify Cloud Run Job was triggered
+                assert result is True
+                mock_jobs_client.run_job.assert_called_once()
+
+                # Verify correct job name was used
+                call_args = mock_run_v2.RunJobRequest.call_args
+                assert call_args is not None
+                assert "lyrics-transcription-job" in str(call_args)
+
+    @pytest.mark.asyncio
+    async def test_trigger_audio_worker_local_subprocess_in_dev_mode(self):
+        """With ENABLE_CLOUD_TASKS=false, CRJ-based workers run as local subprocesses."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = False
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            with patch('subprocess.Popen') as mock_popen:
+                service = WorkerService()
+                result = await service.trigger_audio_worker("test123")
+
+            assert result is True
+            mock_popen.assert_called_once()
+            cmd = mock_popen.call_args[0][0]
+            assert cmd[1:] == ["-m", "backend.workers.audio_worker", "--job-id", "test123"]
+
+    @pytest.mark.asyncio
+    async def test_no_local_subprocess_in_production_even_without_cloud_tasks(self):
+        """A prod deploy that omits ENABLE_CLOUD_TASKS must still use Cloud Run Jobs."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings, \
+             patch('backend.services.worker_service.is_production', return_value=True):
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = False
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            mock_operation = MagicMock()
+            mock_operation.metadata = "test-metadata"
+            mock_run_v2, mock_jobs_client = self._mock_run_v2([mock_operation])
+
+            import google.cloud
+            with patch('subprocess.Popen') as mock_popen, \
+                 patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_audio_worker("test123")
+
+            assert result is True
+            mock_popen.assert_not_called()
+            mock_jobs_client.run_job.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_trigger_bulk_search_worker_local_subprocess_in_dev_mode(self):
+        """Bulk search worker also falls back to a local subprocess in dev mode."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = False
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            with patch('subprocess.Popen') as mock_popen:
+                service = WorkerService()
+                result = await service.trigger_bulk_search_worker("batch-1")
+
+            assert result is True
+            cmd = mock_popen.call_args[0][0]
+            assert cmd[1:] == ["-m", "backend.workers.bulk_search_worker", "--batch-id", "batch-1"]
+
+    def _mock_run_v2(self, run_job_side_effect):
+        """Build a mocked run_v2 module whose JobsClient.run_job uses side_effect."""
+        mock_jobs_client = MagicMock()
+        mock_jobs_client.run_job.side_effect = run_job_side_effect
+        mock_run_v2 = MagicMock()
+        mock_run_v2.JobsClient.return_value = mock_jobs_client
+        mock_run_v2.RunJobRequest = MagicMock()
+        mock_run_v2.RunJobRequest.Overrides = MagicMock()
+        mock_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock()
+        return mock_run_v2, mock_jobs_client
+
+    @pytest.mark.asyncio
+    async def test_trigger_worker_retries_transient_503_then_succeeds(self):
+        """A one-off transient 503 from the Jobs Admin API is retried, not fatal."""
+        from google.api_core import exceptions as gcp_exceptions
+        from backend.services.worker_service import (
+            WorkerService, reset_worker_service, _RUN_JOB_MAX_ATTEMPTS,
+        )
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings, \
+             patch('backend.services.worker_service.asyncio.sleep', new=AsyncMock()) as mock_sleep:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            mock_operation = MagicMock()
+            mock_operation.metadata = "test-metadata"
+            # Fail once with a transient 503, then succeed on retry.
+            mock_run_v2, mock_jobs_client = self._mock_run_v2(
+                [gcp_exceptions.ServiceUnavailable("503 unavailable"), mock_operation]
+            )
+
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_lyrics_worker("test123")
+
+            assert result is True
+            assert mock_jobs_client.run_job.call_count == 2  # first fails, retry succeeds
+            assert mock_sleep.await_count == 1  # backed off once between attempts
+            assert _RUN_JOB_MAX_ATTEMPTS >= 2
+
+    @pytest.mark.asyncio
+    async def test_trigger_worker_gives_up_after_max_attempts(self):
+        """Persistent transient errors exhaust retries and return False (not a raise)."""
+        from google.api_core import exceptions as gcp_exceptions
+        from backend.services.worker_service import (
+            WorkerService, reset_worker_service, _RUN_JOB_MAX_ATTEMPTS,
+        )
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings, \
+             patch('backend.services.worker_service.asyncio.sleep', new=AsyncMock()):
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            mock_run_v2, mock_jobs_client = self._mock_run_v2(
+                gcp_exceptions.ServiceUnavailable("503 unavailable")
+            )
+
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_lyrics_worker("test123")
+
+            assert result is False
+            assert mock_jobs_client.run_job.call_count == _RUN_JOB_MAX_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_trigger_worker_does_not_retry_permanent_error(self):
+        """Non-transient errors (e.g. PermissionDenied) fail fast without retry."""
+        from google.api_core import exceptions as gcp_exceptions
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings, \
+             patch('backend.services.worker_service.asyncio.sleep', new=AsyncMock()) as mock_sleep:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+
+            mock_run_v2, mock_jobs_client = self._mock_run_v2(
+                gcp_exceptions.PermissionDenied("permission denied")
+            )
+
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_lyrics_worker("test123")
+
+            assert result is False
+            assert mock_jobs_client.run_job.call_count == 1  # no retry on permanent error
+            assert mock_sleep.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_trigger_screens_worker(self):
+        """Test triggering screens worker via internal HTTP."""
+        with patch('backend.services.worker_service.httpx.AsyncClient') as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+            
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_client.post.return_value = mock_response
+            
+            worker_service = get_worker_service()
+            
+            await worker_service.trigger_screens_worker("test123")
+            
+            # Verify HTTP POST was made
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+            assert "/api/internal/workers/screens" in str(call_args)
+    
+    @pytest.mark.asyncio
+    async def test_trigger_video_worker(self):
+        """Test triggering video worker via internal HTTP."""
+        with patch('backend.services.worker_service.httpx.AsyncClient') as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_client.post.return_value = mock_response
+
+            worker_service = get_worker_service()
+
+            await worker_service.trigger_video_worker("test123")
+
+            # Verify HTTP POST was made
+            mock_client.post.assert_called_once()
+            call_args = mock_client.post.call_args
+            assert "/api/internal/workers/video" in str(call_args)
+
+    @pytest.mark.asyncio
+    async def test_trigger_video_worker_routes_to_cloud_run_job(self):
+        """Test that video worker routes to Cloud Run Jobs when enabled.
+
+        When USE_CLOUD_RUN_JOBS_FOR_VIDEO=true and ENABLE_CLOUD_TASKS=true,
+        trigger_video_worker should dispatch a Cloud Run Job instead of
+        posting to the internal HTTP endpoint. This ensures the encoding
+        orchestrator runs to completion, immune to Cloud Run Service
+        deployment rollouts (see incident 2026-03-08, job 43c0d519).
+        """
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = True
+
+            mock_jobs_client = MagicMock()
+            mock_operation = MagicMock()
+            mock_operation.metadata = "test-metadata"
+            mock_jobs_client.run_job.return_value = mock_operation
+
+            mock_run_v2 = MagicMock()
+            mock_run_v2.JobsClient.return_value = mock_jobs_client
+            mock_run_v2.RunJobRequest = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock()
+
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_video_worker("test123")
+
+                assert result is True
+                mock_jobs_client.run_job.assert_called_once()
+
+                # Verify correct Cloud Run Job name
+                call_args = mock_run_v2.RunJobRequest.call_args
+                assert call_args is not None
+                assert "video-encoding-job" in str(call_args)
+
+                # Verify job_id is passed via container args override
+                override_args = mock_run_v2.RunJobRequest.Overrides.ContainerOverride.call_args
+                assert "--job-id" in str(override_args)
+                assert "test123" in str(override_args)
+
+    @pytest.mark.asyncio
+    async def test_trigger_render_video_worker_routes_to_cloud_run_job(self):
+        """Test that render worker routes to Cloud Run Jobs when enabled.
+
+        When USE_CLOUD_RUN_JOBS_FOR_RENDER=true and ENABLE_CLOUD_TASKS=true,
+        trigger_render_video_worker should dispatch a Cloud Run Job (reusing
+        video-encoding-job with a render_video_worker args override) instead
+        of posting to the internal HTTP endpoint. As a BackgroundTask on the
+        service, the render poll was killed ~10s after SIGTERM whenever a
+        deploy rollout landed mid-render, freezing the job at rendering_video
+        (see incident 2026-09-13, job 41e06b90).
+        """
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_render = True
+
+            mock_jobs_client = MagicMock()
+            mock_operation = MagicMock()
+            mock_operation.metadata = "test-metadata"
+            mock_jobs_client.run_job.return_value = mock_operation
+
+            mock_run_v2 = MagicMock()
+            mock_run_v2.JobsClient.return_value = mock_jobs_client
+            mock_run_v2.RunJobRequest = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides = MagicMock()
+            mock_run_v2.RunJobRequest.Overrides.ContainerOverride = MagicMock()
+
+            import google.cloud
+            with patch.dict('sys.modules', {'google.cloud.run_v2': mock_run_v2}), \
+                 patch.object(google.cloud, 'run_v2', mock_run_v2, create=True):
+                service = WorkerService()
+                result = await service.trigger_render_video_worker("test456")
+
+                assert result is True
+                mock_jobs_client.run_job.assert_called_once()
+
+                # Reuses the video-encoding-job Cloud Run Job resource
+                call_args = mock_run_v2.RunJobRequest.call_args
+                assert call_args is not None
+                assert "video-encoding-job" in str(call_args)
+
+                # But overrides the module to the render worker with the job id
+                override_args = mock_run_v2.RunJobRequest.Overrides.ContainerOverride.call_args
+                assert "backend.workers.render_video_worker" in str(override_args)
+                assert "--job-id" in str(override_args)
+                assert "test456" in str(override_args)
+
+    @pytest.mark.asyncio
+    async def test_trigger_render_video_worker_flag_off_uses_legacy_path(self):
+        """With USE_CLOUD_RUN_JOBS_FOR_RENDER off, the legacy Cloud Tasks /
+        HTTP path is used and no Cloud Run Job is dispatched (rollback path)."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = "test-token"
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = True
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_render = False
+
+            service = WorkerService()
+            with patch.object(service, '_trigger_worker_cloud_run_job', new=AsyncMock()) as mock_crj, \
+                 patch.object(service, 'trigger_worker', new=AsyncMock(return_value=True)) as mock_legacy:
+                result = await service.trigger_render_video_worker("test789")
+
+                assert result is True
+                mock_crj.assert_not_called()
+                mock_legacy.assert_called_once_with("render-video", "test789")
+
+
+class TestWorkerServiceWarmup:
+    """Test encoding worker warmup in trigger methods."""
+
+    @pytest.mark.asyncio
+    async def test_trigger_video_worker_calls_warmup(self):
+        """trigger_video_worker calls _warmup_encoding_worker before dispatching."""
+        with patch('backend.services.worker_service.httpx.AsyncClient') as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_client.post.return_value = mock_response
+
+            worker_service = get_worker_service()
+
+            with patch.object(worker_service, '_warmup_encoding_worker') as mock_warmup:
+                await worker_service.trigger_video_worker("test-job")
+                await asyncio.gather(*worker_service._warmup_tasks)
+                mock_warmup.assert_called_once_with("test-job")
+
+    @pytest.mark.asyncio
+    async def test_trigger_render_video_worker_calls_warmup(self):
+        """trigger_render_video_worker calls _warmup_encoding_worker before dispatching."""
+        with patch('backend.services.worker_service.httpx.AsyncClient') as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_client.post.return_value = mock_response
+
+            worker_service = get_worker_service()
+
+            with patch.object(worker_service, '_warmup_encoding_worker') as mock_warmup:
+                await worker_service.trigger_render_video_worker("test-job")
+                await asyncio.gather(*worker_service._warmup_tasks)
+                mock_warmup.assert_called_once_with("test-job")
+
+    @pytest.mark.asyncio
+    async def test_trigger_does_not_wait_for_slow_warmup(self):
+        """A slow (cold-start) warmup must not delay dispatch nor block the loop.
+
+        Regression for 2026-09-23: the warmup ran inline and synchronously, so
+        the /complete request — and every other request on the instance — hung
+        for the 10-20 s VM start.
+        """
+        import time
+
+        with patch('backend.services.worker_service.httpx.AsyncClient') as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_client.post.return_value = mock_response
+
+            worker_service = get_worker_service()
+
+            def slow_warmup(job_id):
+                time.sleep(0.5)
+
+            with patch.object(worker_service, '_warmup_encoding_worker', side_effect=slow_warmup) as mock_warmup:
+                started = time.monotonic()
+                await worker_service.trigger_render_video_worker("test-job")
+                elapsed = time.monotonic() - started
+                assert elapsed < 0.4, f"trigger waited on warmup ({elapsed:.2f}s)"
+
+                # The loop stays responsive while the warmup runs in a thread…
+                ticks = 0
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                    ticks += 1
+                assert ticks > 5
+
+                # …and the warmup still completes.
+                await asyncio.gather(*worker_service._warmup_tasks)
+                mock_warmup.assert_called_once_with("test-job")
+                assert not worker_service._warmup_tasks
+
+    def test_start_warmup_without_event_loop_runs_inline(self):
+        """Sync callers (no running loop) get the original inline behaviour."""
+        worker_service = get_worker_service()
+        with patch.object(worker_service, '_warmup_encoding_worker') as mock_warmup:
+            worker_service._start_encoding_worker_warmup("test-job")
+            mock_warmup.assert_called_once_with("test-job")
+
+    def test_warmup_swallows_exceptions(self):
+        """Warmup failures are logged but never block worker dispatch."""
+        worker_service = get_worker_service()
+
+        with patch('backend.services.encoding_worker_manager.EncodingWorkerManager.ensure_primary_running',
+                    side_effect=Exception("Compute API down")):
+            # Should not raise
+            worker_service._warmup_encoding_worker("test-job")
+
+
+class TestWorkerServiceCloudTasks:
+    """Test WorkerService Cloud Tasks integration."""
+
+    def test_should_use_cloud_tasks_default_false(self):
+        """Test that Cloud Tasks is disabled by default."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+        
+        with patch('backend.services.worker_service.os.getenv') as mock_getenv:
+            mock_getenv.side_effect = lambda k, d=None: {
+                'PORT': '8000',
+            }.get(k, d)
+            
+            with patch('backend.services.worker_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = None
+                mock_settings.return_value.google_cloud_project = "test-project"
+                mock_settings.return_value.enable_cloud_tasks = False
+                mock_settings.return_value.gcp_region = "us-central1"
+                mock_settings.return_value.use_cloud_run_jobs_for_video = False
+                
+                service = WorkerService()
+                assert service._use_cloud_tasks is False
+    
+    def test_should_use_cloud_tasks_enabled(self):
+        """Test that Cloud Tasks can be enabled via settings."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+        
+        with patch('backend.services.worker_service.os.getenv') as mock_getenv:
+            mock_getenv.side_effect = lambda k, d=None: {
+                'PORT': '8000',
+            }.get(k, d)
+            
+            with patch('backend.services.worker_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = None
+                mock_settings.return_value.google_cloud_project = "test-project"
+                mock_settings.return_value.enable_cloud_tasks = True
+                mock_settings.return_value.gcp_region = "us-central1"
+                mock_settings.return_value.use_cloud_run_jobs_for_video = False
+                
+                service = WorkerService()
+                assert service._use_cloud_tasks is True
+    
+    def test_worker_queues_mapping(self):
+        """Test that all worker types have queue mappings."""
+        from backend.services.worker_service import WORKER_QUEUES
+        
+        # Verify all expected workers have queues
+        assert "audio" in WORKER_QUEUES
+        assert "lyrics" in WORKER_QUEUES
+        assert "screens" in WORKER_QUEUES
+        assert "render-video" in WORKER_QUEUES
+        assert "video" in WORKER_QUEUES
+        
+        # Verify queue names are correct
+        assert WORKER_QUEUES["audio"] == "audio-worker-queue"
+        assert WORKER_QUEUES["lyrics"] == "lyrics-worker-queue"
+        assert WORKER_QUEUES["screens"] == "screens-worker-queue"
+        assert WORKER_QUEUES["render-video"] == "render-worker-queue"
+        assert WORKER_QUEUES["video"] == "video-worker-queue"
+    
+    @pytest.mark.asyncio
+    async def test_trigger_worker_uses_http_when_cloud_tasks_disabled(self):
+        """Test that trigger_worker uses HTTP when Cloud Tasks is disabled."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+        
+        with patch('backend.services.worker_service.os.getenv') as mock_getenv:
+            mock_getenv.side_effect = lambda k, d=None: {
+                'PORT': '8000',
+            }.get(k, d)
+            
+            with patch('backend.services.worker_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = "test-token"
+                mock_settings.return_value.google_cloud_project = "test-project"
+                mock_settings.return_value.enable_cloud_tasks = False
+                mock_settings.return_value.gcp_region = "us-central1"
+                mock_settings.return_value.use_cloud_run_jobs_for_video = False
+                
+                with patch('backend.services.worker_service.httpx.AsyncClient') as mock_client_cls:
+                    mock_client = AsyncMock()
+                    mock_client_cls.return_value.__aenter__.return_value = mock_client
+                    
+                    mock_response = Mock()
+                    mock_response.status_code = 200
+                    mock_client.post.return_value = mock_response
+                    
+                    service = WorkerService()
+                    assert service._use_cloud_tasks is False
+                    
+                    result = await service.trigger_worker("audio", "test-job-123")
+                    
+                    # Verify HTTP was used
+                    assert result is True
+                    mock_client.post.assert_called_once()
+    
+    @pytest.mark.asyncio
+    async def test_trigger_worker_uses_cloud_tasks_when_enabled(self):
+        """Test that trigger_worker uses Cloud Tasks when enabled."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+        
+        with patch('backend.services.worker_service.os.getenv') as mock_getenv:
+            mock_getenv.side_effect = lambda k, d=None: {
+                'CLOUD_RUN_SERVICE_URL': 'https://api.example.com',
+            }.get(k, d)
+            
+            with patch('backend.services.worker_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = "test-token"
+                mock_settings.return_value.google_cloud_project = "test-project"
+                mock_settings.return_value.enable_cloud_tasks = True
+                mock_settings.return_value.gcp_region = "us-central1"
+                mock_settings.return_value.use_cloud_run_jobs_for_video = False
+                
+                # Mock Cloud Tasks client
+                mock_tasks_client = MagicMock()
+                mock_tasks_client.queue_path.return_value = "projects/test-project/locations/us-central1/queues/audio-worker-queue"
+                mock_task_response = MagicMock()
+                mock_task_response.name = "projects/test-project/locations/us-central1/queues/audio-worker-queue/tasks/abc123"
+                mock_tasks_client.create_task.return_value = mock_task_response
+                
+                # Mock the google.cloud.tasks_v2 module which is imported inside the method
+                mock_tasks_module = MagicMock()
+                mock_tasks_module.CloudTasksClient.return_value = mock_tasks_client
+                mock_tasks_module.HttpMethod.POST = "POST"
+                
+                with patch.dict('sys.modules', {'google.cloud.tasks_v2': mock_tasks_module}):
+                    with patch.dict(sys.modules, {'google.cloud': MagicMock()}):
+                        service = WorkerService()
+                        service._tasks_client = mock_tasks_client  # Inject mocked client
+                        
+                        result = await service.trigger_worker("audio", "test-job-123")
+                        
+                        # Verify Cloud Tasks was used
+                        assert result is True
+                        mock_tasks_client.create_task.assert_called_once()
+                        
+                        # Verify task payload
+                        call_args = mock_tasks_client.create_task.call_args
+                        assert call_args is not None
+    
+    @pytest.mark.asyncio
+    async def test_trigger_worker_returns_false_for_unknown_worker_type(self):
+        """Test that trigger_worker returns False for unknown worker types."""
+        from backend.services.worker_service import WorkerService, reset_worker_service
+        reset_worker_service()
+        
+        with patch('backend.services.worker_service.os.getenv') as mock_getenv:
+            mock_getenv.side_effect = lambda k, d=None: {
+                'CLOUD_RUN_SERVICE_URL': 'https://api.example.com',
+            }.get(k, d)
+            
+            with patch('backend.services.worker_service.get_settings') as mock_settings:
+                mock_settings.return_value.admin_tokens = "test-token"
+                mock_settings.return_value.google_cloud_project = "test-project"
+                mock_settings.return_value.enable_cloud_tasks = True
+                mock_settings.return_value.gcp_region = "us-central1"
+                mock_settings.return_value.use_cloud_run_jobs_for_video = False
+                
+                service = WorkerService()
+                
+                result = await service.trigger_worker("unknown-worker", "test-job-123")
+                
+                assert result is False
+    
+    def test_reset_worker_service(self):
+        """Test that reset_worker_service resets the singleton."""
+        from backend.services.worker_service import get_worker_service, reset_worker_service
+        
+        with patch('backend.services.worker_service.get_settings') as mock_settings:
+            mock_settings.return_value.admin_tokens = None
+            mock_settings.return_value.google_cloud_project = "test-project"
+            mock_settings.return_value.enable_cloud_tasks = False
+            mock_settings.return_value.gcp_region = "us-central1"
+            mock_settings.return_value.use_cloud_run_jobs_for_video = False
+            
+            service1 = get_worker_service()
+            reset_worker_service()
+            service2 = get_worker_service()
+            
+            # After reset, should be different instances
+            assert service1 is not service2
+
+
+class TestFirestoreService:
+    """Test FirestoreService database operations."""
+    
+    def test_create_job(self):
+        """Test creating a job document in Firestore."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            
+            mock_collection = MagicMock()
+            mock_client.collection.return_value = mock_collection
+            
+            mock_doc_ref = MagicMock()
+            mock_collection.document.return_value = mock_doc_ref
+            
+            firestore_service = FirestoreService()
+            
+            job = Job(
+                job_id="test123",
+                status=JobStatus.PENDING,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC)
+            )
+            
+            firestore_service.create_job(job)  # Returns None
+            
+            # Verify document was set
+            mock_doc_ref.set.assert_called_once()
+    
+    def test_get_job(self):
+        """Test fetching a job from Firestore."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            
+            mock_collection = MagicMock()
+            mock_client.collection.return_value = mock_collection
+            
+            mock_doc_ref = MagicMock()
+            mock_collection.document.return_value = mock_doc_ref
+            
+            mock_doc = MagicMock()
+            mock_doc.exists = True
+            mock_doc.to_dict.return_value = {
+                'job_id': 'test123',
+                'status': 'pending',
+                'progress': 0,
+                'created_at': datetime.now(UTC).isoformat(),
+                'updated_at': datetime.now(UTC).isoformat()
+            }
+            mock_doc_ref.get.return_value = mock_doc
+            
+            firestore_service = FirestoreService()
+            
+            job = firestore_service.get_job("test123")
+            
+            # Verify document was fetched
+            mock_doc_ref.get.assert_called_once()
+            assert job is not None
+            assert job.job_id == "test123"
+    
+    def test_get_nonexistent_job(self):
+        """Test fetching a job that doesn't exist."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            
+            mock_collection = MagicMock()
+            mock_client.collection.return_value = mock_collection
+            
+            mock_doc_ref = MagicMock()
+            mock_collection.document.return_value = mock_doc_ref
+            
+            mock_doc = MagicMock()
+            mock_doc.exists = False
+            mock_doc_ref.get.return_value = mock_doc
+            
+            firestore_service = FirestoreService()
+            
+            job = firestore_service.get_job("nonexistent")
+            
+            assert job is None
+    
+    def test_failed_status_triggers_failure_alert(self):
+        """Incident-hardening D1: a transition to FAILED fires the failure alert."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            mock_collection = MagicMock()
+            mock_client.collection.return_value = mock_collection
+            mock_collection.document.return_value = MagicMock()
+
+            firestore_service = FirestoreService()
+            with patch('backend.services.ops_alerts.notify_job_failed') as mock_notify:
+                firestore_service.update_job_status("job1", JobStatus.FAILED, message="boom")
+                mock_notify.assert_called_once()
+                # Reuses the caller's client + collection (no second Firestore client).
+                _, kwargs = mock_notify.call_args
+                assert kwargs["job_id"] == "job1"
+                assert kwargs["db"] is mock_client
+
+    def test_non_failed_status_does_not_alert(self):
+        """A normal status transition must NOT fire the failure alert."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            mock_client.collection.return_value.document.return_value = MagicMock()
+
+            firestore_service = FirestoreService()
+            with patch('backend.services.ops_alerts.notify_job_failed') as mock_notify:
+                firestore_service.update_job_status("job1", JobStatus.COMPLETE, message="done")
+                mock_notify.assert_not_called()
+
+    def test_failure_alert_error_does_not_break_status_write(self):
+        """If the alerter raises, the status write must still succeed (best-effort)."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            mock_doc_ref = MagicMock()
+            mock_client.collection.return_value.document.return_value = mock_doc_ref
+
+            firestore_service = FirestoreService()
+            with patch('backend.services.ops_alerts.notify_job_failed', side_effect=RuntimeError("x")):
+                # Should not raise.
+                firestore_service.update_job_status("job1", JobStatus.FAILED, message="boom")
+            mock_doc_ref.update.assert_called_once()
+
+    def test_update_job(self):
+        """Test updating a job in Firestore."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+
+            mock_collection = MagicMock()
+            mock_client.collection.return_value = mock_collection
+            
+            mock_doc_ref = MagicMock()
+            mock_collection.document.return_value = mock_doc_ref
+            
+            firestore_service = FirestoreService()
+            
+            updates = {
+                'status': JobStatus.SEPARATING_STAGE1,
+                'progress': 25
+            }
+            
+            firestore_service.update_job("test123", updates)
+            
+            # Verify update was called
+            mock_doc_ref.update.assert_called_once()
+    
+    def test_delete_job(self):
+        """Test deleting a job from Firestore."""
+        with patch('backend.services.firestore_service.firestore') as mock_firestore:
+            mock_client = MagicMock()
+            mock_firestore.Client.return_value = mock_client
+            
+            mock_collection = MagicMock()
+            mock_client.collection.return_value = mock_collection
+            
+            mock_doc_ref = MagicMock()
+            mock_collection.document.return_value = mock_doc_ref
+            
+            firestore_service = FirestoreService()
+            
+            firestore_service.delete_job("test123")
+            
+            # Verify delete was called
+            mock_doc_ref.delete.assert_called_once()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+

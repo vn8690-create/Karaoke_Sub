@@ -1,0 +1,736 @@
+"""
+Audio download worker.
+
+Downloads audio from the selected source (Spotify, YouTube, RED, OPS) and
+triggers audio separation + lyrics transcription workers.
+
+This runs as a Cloud Run Job to avoid the instance termination issue where
+Cloud Run would shut down instances mid-download when using BackgroundTasks.
+The download can take 30s-5min depending on the source.
+
+Flow:
+1. Read job from Firestore to get download params
+2. Download audio via flacfetch (Spotify/RED/OPS) or YouTube service
+3. Upload to GCS at uploads/{job_id}/audio/
+4. Update Firestore with input_media_gcs_path
+5. Transition job from DOWNLOADING_AUDIO to DOWNLOADING
+6. Trigger audio separation + lyrics transcription workers
+"""
+import asyncio
+import logging
+import mimetypes
+import os
+import shutil
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+
+from backend.models.job import JobStatus
+from backend.services.job_manager import JobManager, with_notification_drain
+from backend.services.storage_service import StorageService
+from backend.config import get_settings
+from backend.services.fake_workers import fake_workers_enabled
+from backend.services.worker_service import get_worker_service
+from backend.services.flacfetch_client import (
+    get_flacfetch_client,
+    FlacfetchDownloadStalledError,
+    FlacfetchServiceError,
+)
+from backend.services import audio_download_limits
+from backend.services.audio_search_service import DownloadError
+from backend.services.duration_reconciliation import reconcile_and_maybe_pause
+
+
+logger = logging.getLogger(__name__)
+
+
+# Must match max_retries on the audio-download-job in infrastructure/modules/cloud_run.py.
+# When CLOUD_RUN_TASK_ATTEMPT < MAX_RETRIES, Cloud Run will retry on failure.
+CLOUD_RUN_MAX_RETRIES = 2
+
+# How long the "retry pending" marker is valid for after we record it.
+# Generous enough to cover Cloud Run's retry delay (~75s) + provisioning (~75s)
+# plus a buffer for slow starts. After this window the UI falls back to the
+# normal Retry button so users aren't stuck waiting forever.
+RETRY_PENDING_WINDOW = timedelta(minutes=3)
+
+
+# Statuses indicating the download has already completed for this job.
+# When the worker is invoked with one of these statuses, it has been re-run
+# (e.g. Cloud Run Job auto-retry of a successful task) and must return
+# successfully without re-downloading — re-downloading races with downstream
+# workers and breaks the state machine (see job 8a9c74ff post-mortem).
+DOWNLOAD_ALREADY_DONE_STATUSES = frozenset({
+    JobStatus.DOWNLOADING,
+    JobStatus.AWAITING_AUDIO_EDIT,
+    JobStatus.IN_AUDIO_EDIT,
+    JobStatus.AUDIO_EDIT_COMPLETE,
+    JobStatus.AUDIO_COMPLETE,
+    JobStatus.TRANSCRIBING,
+    JobStatus.CORRECTING,
+    JobStatus.LYRICS_COMPLETE,
+    JobStatus.GENERATING_SCREENS,
+    JobStatus.APPLYING_PADDING,
+    JobStatus.AWAITING_REVIEW,
+    JobStatus.IN_REVIEW,
+    JobStatus.REVIEW_COMPLETE,
+    JobStatus.RENDERING_VIDEO,
+    JobStatus.RENDER_PENDING_CAPACITY,
+    JobStatus.AWAITING_INSTRUMENTAL_SELECTION,
+    JobStatus.INSTRUMENTAL_SELECTED,
+    JobStatus.GENERATING_VIDEO,
+    JobStatus.ENCODING,
+    JobStatus.PACKAGING,
+    JobStatus.UPLOADING,
+    JobStatus.NOTIFYING,
+    JobStatus.COMPLETE,
+    JobStatus.PREP_COMPLETE,
+    JobStatus.CANCELLED,
+})
+
+# How long to wait for a (non-torrent) flacfetch download before giving up. This
+# MUST stay strictly below the Cloud Run task timeout for audio-download-job. If
+# they are equal, Cloud Run SIGKILLs the task before this timeout can fire, so the
+# worker never records retry-pending or fails gracefully — leaving an in-flight
+# auto-retry that races manual retries (job 1cd29294). The execution timeout is
+# overridden per run (audio_download_limits.task_timeout_seconds, >= 2700s);
+# torrents use the longer audio_download_limits.torrent_wait_timeout_seconds.
+DOWNLOAD_WAIT_TIMEOUT_SECONDS = 1080
+
+
+def _current_task_attempt() -> int:
+    """Read CLOUD_RUN_TASK_ATTEMPT env var injected by Cloud Run Jobs.
+
+    Returns 0 outside of Cloud Run Jobs (e.g. unit tests, local invocations).
+    """
+    try:
+        return int(os.environ.get("CLOUD_RUN_TASK_ATTEMPT", "0"))
+    except ValueError:
+        return 0
+
+
+def _mark_retry_pending_if_attempts_remain(job_manager: JobManager, job_id: str) -> None:
+    """If Cloud Run will auto-retry this failed task, record that on the job.
+
+    The UI and /retry endpoint use this to avoid showing a Retry button (and
+    refusing manual retries) while an automatic retry is still in flight.
+
+    On the FINAL attempt (no retry coming), explicitly clear any marker left
+    by an earlier attempt. Otherwise the marker from attempt N persists for
+    its full TTL after attempt N+1 also fails — blocking the user from
+    clicking Retry for up to RETRY_PENDING_WINDOW after the job actually
+    failed permanently.
+    """
+    attempt = _current_task_attempt()
+    if attempt >= CLOUD_RUN_MAX_RETRIES:
+        job_manager.update_state_data(job_id, 'cloud_run_retry_pending', None)
+        return
+    expires_at = datetime.now(timezone.utc) + RETRY_PENDING_WINDOW
+    job_manager.update_state_data(job_id, 'cloud_run_retry_pending', {
+        'expires_at': expires_at.isoformat(),
+        'expected_attempt': attempt + 1,
+    })
+
+
+def _clear_retry_pending_and_error(job_manager: JobManager, job_id: str) -> None:
+    """Clear retry-pending marker and stale error fields after a successful run.
+
+    Called once the download has succeeded so the dashboard stops displaying
+    a transient failure message and the retry button (where shown elsewhere)
+    no longer wrongly suggests action is required.
+    """
+    job_manager.update_state_data(job_id, 'cloud_run_retry_pending', None)
+    job_manager.update_state_data(job_id, audio_download_limits.KEEP_TRYING_STATE_KEY, None)
+    job_manager.update_job(job_id, {
+        'error_message': None,
+        'error_details': {},
+    })
+
+
+def _fail_stalled_download(job_manager: JobManager, job_id: str, keep_trying: bool, error: Exception) -> None:
+    """Fail a job whose torrent never started transferring, for the user to decide.
+
+    No Cloud Run auto-retry: re-adding the same torrent seconds later rarely helps
+    when its only seeder is offline. The job card shows a "Keep trying (up to 1
+    hour)" / "Choose different audio" prompt keyed on error_details.code, and
+    main() exits 0 so Cloud Run doesn't retry the task.
+    """
+    minutes = audio_download_limits.stall_seconds(keep_trying) // 60
+    job_manager.update_state_data(job_id, 'cloud_run_retry_pending', None)
+    job_manager.fail_job(
+        job_id,
+        f"Audio download didn't start within {minutes} minutes (source offline, "
+        f"no peers reachable): {error}",
+        error_details={
+            'stage': 'audio_download',
+            'code': audio_download_limits.STALLED_ERROR_CODE,
+            'stall_minutes': minutes,
+            'keep_trying': keep_trying,
+        },
+    )
+
+
+def _log_job_deleted(job_id: str, when: str) -> bool:
+    """The job doc is gone (user deleted it): expected, not an error.
+
+    Returns True so the caller reports success and main() exits 0: a Cloud Run
+    retry can't help, and nothing more should be written for a deleted job.
+    """
+    logger.info(f"[job:{job_id}] Job not found {when} (deleted?); stopping without retry")
+    return True
+
+
+def _job_is_gone(job_manager: JobManager, job_id: str) -> bool:
+    """True only if a fresh read confirms the job doc no longer exists."""
+    try:
+        return job_manager.get_job(job_id) is None
+    except Exception:
+        return False
+
+
+def _extract_gcs_path(filepath: str) -> str:
+    """Extract relative GCS path from a full gs:// URL or path."""
+    bucket_prefix = "gs://karaoke-gen-storage-nomadkaraoke/"
+    if filepath.startswith(bucket_prefix):
+        return filepath[len(bucket_prefix):]
+    # Also handle the older bucket name
+    bucket_prefix_alt = "gs://karaoke-gen-storage/"
+    if filepath.startswith(bucket_prefix_alt):
+        return filepath[len(bucket_prefix_alt):]
+    # Check for any gs:// prefix
+    if filepath.startswith("gs://"):
+        parts = filepath.split("/", 3)
+        if len(parts) == 2:
+            return parts[1]
+    return filepath
+
+
+async def process_audio_download(job_id: str) -> bool:
+    """
+    Download audio for a job and trigger processing workers.
+
+    This is the main entry point, called by the Cloud Run Job CLI.
+
+    Args:
+        job_id: Job ID to process
+
+    Returns:
+        True if download and worker triggers succeeded, False otherwise
+    """
+    job_manager = JobManager()
+    storage_service = StorageService()
+
+    try:
+        job = job_manager.get_job(job_id)
+        if not job:
+            return _log_job_deleted(job_id, "at start")
+
+        # Idempotency guard: if the download is already done (status is past
+        # DOWNLOADING_AUDIO), return success without re-running. This handles
+        # Cloud Run Job auto-retries of a successful task — re-downloading
+        # would double-trigger downstream workers and break state transitions.
+        if job.status in DOWNLOAD_ALREADY_DONE_STATUSES:
+            # Exception: an audio-edit job still at DOWNLOADING means the previous
+            # run died between the download and entering AWAITING_AUDIO_EDIT
+            # (e.g. OOM-killed while pre-generating editor assets — job 2c1b922e).
+            # Nothing downstream is triggered on that path, so finishing it here
+            # is safe — skipping would orphan the job at `downloading` forever.
+            if (
+                job.status == JobStatus.DOWNLOADING
+                and job.state_data.get('requires_audio_edit')
+                and job.input_media_gcs_path
+            ):
+                logger.info(
+                    f"[job:{job_id}] Download complete but audio-edit prep unfinished; "
+                    f"resuming"
+                )
+                enter_audio_edit(job_manager, job_id, job.input_media_gcs_path)
+                return True
+            logger.info(
+                f"[job:{job_id}] Download already complete (status={job.status}), "
+                f"skipping re-run"
+            )
+            return True
+
+        # Validate job is in correct state
+        if job.status not in (JobStatus.DOWNLOADING_AUDIO, JobStatus.FAILED):
+            logger.warning(
+                f"[job:{job_id}] Unexpected status {job.status}, expected DOWNLOADING_AUDIO"
+            )
+            # Still proceed if there's download params - this handles retry cases
+            if not (job.source_name and (job.source_id or job.download_url)):
+                logger.error(f"[job:{job_id}] No download params available, aborting")
+                return False
+
+        keep_trying = bool(job.state_data.get(audio_download_limits.KEEP_TRYING_STATE_KEY))
+
+        # Get download params from job
+        search_results = job.state_data.get('audio_search_results', [])
+        selection_index = job.state_data.get('selected_audio_index')
+        remote_search_id = job.state_data.get('remote_search_id')
+
+        if selection_index is not None and search_results:
+            selected = search_results[selection_index]
+            source_name = selected.get('provider')
+            source_id = selected.get('source_id')
+            target_file = selected.get('target_file')
+            download_url = selected.get('url')
+        elif job.source_name and (job.source_id or job.download_url):
+            # Fallback to job-level params (set by _validate_and_prepare_selection,
+            # or by provide-url which only knows the pasted URL, not a source_id)
+            source_name = job.source_name
+            source_id = job.source_id
+            target_file = job.target_file
+            download_url = job.download_url
+            selected = {'artist': job.artist, 'title': job.title}
+        else:
+            raise DownloadError("No audio source selection found in job data")
+
+        logger.info(
+            f"[job:{job_id}] Starting audio download: "
+            f"source={source_name}, id={source_id}"
+        )
+
+        # Route to appropriate download handler
+        audio_gcs_path, filename = await _download_audio(
+            job_id=job_id,
+            source_name=source_name,
+            source_id=source_id,
+            target_file=target_file,
+            download_url=download_url,
+            remote_search_id=remote_search_id,
+            selection_index=selection_index,
+            selected=selected,
+            storage_service=storage_service,
+            keep_trying=keep_trying,
+        )
+
+        # Concurrency guard: a second download run may have completed while we
+        # were downloading — e.g. a manual /retry racing this task's Cloud Run
+        # auto-retry. Re-read status now (it was read once at entry, before a
+        # potentially minutes-long download). If another run already advanced
+        # the job, treat this as an idempotent success: don't re-write the input
+        # path, don't re-transition (that would be an invalid
+        # downloading -> downloading), and don't re-trigger downstream workers.
+        # The winning run owns all of that.
+        latest = job_manager.get_job(job_id)
+        if latest is None:
+            return _log_job_deleted(job_id, "after download")
+        if latest.status in DOWNLOAD_ALREADY_DONE_STATUSES:
+            logger.info(
+                f"[job:{job_id}] Another run already advanced the job "
+                f"(status={latest.status}); skipping duplicate transition/triggers"
+            )
+            return True
+
+        # Update job with GCS path
+        job_manager.update_job(job_id, {
+            'input_media_gcs_path': audio_gcs_path,
+            'filename': filename,
+        })
+        # Record the original input audio in file_urls too (the upload path does this
+        # in audio_worker), so it appears in the admin files manifest consistently
+        # across all source types and can be staged into the output folder.
+        job_manager.update_file_url(job_id, 'input', 'audio', audio_gcs_path)
+
+        # Download succeeded — clear any stale retry-pending marker and
+        # previous error so the UI stops showing a resolved failure.
+        _clear_retry_pending_and_error(job_manager, job_id)
+
+        # Transition from DOWNLOADING_AUDIO (or FAILED, on recovery) to
+        # DOWNLOADING. Use raise_on_invalid=False so a tight race that slipped
+        # past the guard above (another run advancing the job between our
+        # re-read and here) does NOT raise into the generic except and fail_job
+        # a job another run already succeeded on.
+        transitioned = job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.DOWNLOADING,
+            progress=15,
+            message="Audio downloaded, starting processing",
+            raise_on_invalid=False,
+        )
+        if not transitioned:
+            latest = job_manager.get_job(job_id)
+            if latest and latest.status in DOWNLOAD_ALREADY_DONE_STATUSES:
+                logger.info(
+                    f"[job:{job_id}] Concurrent run advanced job during transition "
+                    f"(status={latest.status}); treating as idempotent success"
+                )
+                return True
+            # Genuinely unexpected state (not a concurrency case) — surface it
+            # through the normal failure path so retry-pending is recorded.
+            raise DownloadError(
+                f"Could not transition to DOWNLOADING "
+                f"(status={latest.status if latest else 'missing'})"
+            )
+
+        # Check if audio editing was requested — enter blocking state instead of processing
+        job = job_manager.get_job(job_id)
+        if job and job.state_data.get('requires_audio_edit'):
+            enter_audio_edit(job_manager, job_id, audio_gcs_path)
+            return True
+
+        # Reconcile credit charge against actual audio duration before processing.
+        # If the audio turns out longer than estimated, the job is paused for
+        # re-confirmation (AWAITING_DURATION_CONFIRM) or cancelled; in either case
+        # we must NOT trigger downstream workers.
+        if await reconcile_and_maybe_pause(job_id):
+            return True  # paused for confirmation or cancelled; workers not started
+
+        # Trigger audio separation and lyrics workers
+        worker_service = get_worker_service()
+        await asyncio.gather(
+            worker_service.trigger_audio_worker(job_id),
+            worker_service.trigger_lyrics_worker(job_id)
+        )
+
+        logger.info(f"[job:{job_id}] Audio download complete, workers triggered")
+        return True
+
+    except FlacfetchDownloadStalledError as e:
+        logger.warning(f"[job:{job_id}] Torrent stalled; asking the user to keep trying or re-pick: {e}")
+        _fail_stalled_download(job_manager, job_id, keep_trying, e)
+        return False
+    except Exception as e:
+        # e.g. a Firestore NotFound because the user deleted the job mid-run.
+        # Confirm with a fresh read: a GCS NotFound on a live job is a real error.
+        if _job_is_gone(job_manager, job_id):
+            return _log_job_deleted(job_id, f"during download ({type(e).__name__})")
+        if not isinstance(e, (DownloadError, FlacfetchServiceError)):
+            logger.error(f"[job:{job_id}] Download failed: {e}", exc_info=True)
+        else:
+            # Expected failure type; fail_job below sends the one job-failed alert.
+            logger.warning(f"[job:{job_id}] Download failed: {e}")
+        _mark_retry_pending_if_attempts_remain(job_manager, job_id)
+        job_manager.fail_job(job_id, f"Audio download failed: {e}",
+                             error_details={'stage': 'audio_download'})
+        return False
+
+
+def enter_audio_edit(job_manager: JobManager, job_id: str, audio_gcs_path: str) -> None:
+    """Prepare editor assets and park the job at AWAITING_AUDIO_EDIT.
+
+    Shared by the download flow (here) and uploads (JobManager.start_job_processing).
+    """
+    # Preserve the original input path before any edits
+    job_manager.update_state_data(job_id, 'original_input_media_gcs_path', audio_gcs_path)
+
+    # Pre-generate audio editor assets (OGG transcode + waveform data)
+    # so the editor UI loads instantly. Non-fatal if this fails.
+    waveform_cache_path = f"jobs/{job_id}/audio_edit/waveform_original.json"
+    try:
+        from backend.services.audio_transcoding_service import AudioTranscodingService
+        from backend.services.audio_analysis_service import AudioAnalysisService
+
+        transcoding = AudioTranscodingService()
+        transcoding.transcode_if_needed(audio_gcs_path)
+        logger.info(f"[job:{job_id}] Pre-transcoded input audio to OGG for editor")
+
+        analysis = AudioAnalysisService()
+        analysis.cache_waveform_data(audio_gcs_path, job_id, waveform_cache_path)
+        logger.info(f"[job:{job_id}] Pre-generated waveform data for editor")
+
+        job_manager.update_state_data(job_id, 'audio_edit_waveform_cache_path', waveform_cache_path)
+    except Exception as e:
+        logger.warning(f"[job:{job_id}] Failed to pre-generate editor assets (non-fatal): {e}")
+
+    # raise_on_invalid=False: a concurrent run (e.g. manual retry racing a Cloud
+    # Run auto-retry) may already have moved the job on — that's success, and
+    # raising would reach the caller's fail_job and clobber the advanced job.
+    transitioned = job_manager.transition_to_state(
+        job_id=job_id,
+        new_status=JobStatus.AWAITING_AUDIO_EDIT,
+        progress=15,
+        message="Audio downloaded. Please review and edit the audio before processing.",
+        raise_on_invalid=False,
+    )
+    if not transitioned:
+        latest = job_manager.get_job(job_id)
+        if latest and latest.status in DOWNLOAD_ALREADY_DONE_STATUSES and latest.status != JobStatus.DOWNLOADING:
+            logger.info(
+                f"[job:{job_id}] Concurrent run already advanced the job "
+                f"(status={latest.status}); treating as idempotent success"
+            )
+            return
+        raise DownloadError(
+            f"Could not transition to AWAITING_AUDIO_EDIT "
+            f"(status={latest.status if latest else 'missing'})"
+        )
+    logger.info(f"[job:{job_id}] Audio download complete, awaiting audio edit")
+
+
+async def _download_audio(
+    job_id: str,
+    source_name: str,
+    source_id: str,
+    target_file: str | None,
+    download_url: str | None,
+    remote_search_id: str | None,
+    selection_index: int | None,
+    selected: dict,
+    storage_service: StorageService,
+    keep_trying: bool = False,
+) -> tuple[str, str]:
+    """
+    Download audio from the selected source and return (gcs_path, filename).
+
+    Routes to the appropriate download handler based on source type.
+    """
+    if fake_workers_enabled(get_settings()):
+        # Local stack: every provider "downloads" the canned fake song.
+        from backend.services.fake_workers.pipeline import fake_download_audio
+
+        return await fake_download_audio(job_id, selected, storage_service)
+
+    if source_name == 'YouTube':
+        return await _download_youtube(job_id, source_id, download_url, selected)
+
+    elif source_name in ('RED', 'OPS'):
+        return await _download_torrent(
+            job_id, source_name, source_id, target_file,
+            download_url, remote_search_id, selection_index,
+            keep_trying=keep_trying,
+        )
+
+    elif source_name == 'Spotify':
+        return await _download_spotify(
+            job_id, source_id, download_url
+        )
+
+    else:
+        raise DownloadError(f"Unsupported audio source: {source_name}")
+
+
+async def _download_youtube(
+    job_id: str,
+    source_id: str,
+    download_url: str | None,
+    selected: dict,
+) -> tuple[str, str]:
+    """Download from YouTube via YouTubeDownloadService."""
+    from backend.services.youtube_download_service import (
+        get_youtube_download_service,
+        YouTubeDownloadError,
+    )
+
+    youtube_service = get_youtube_download_service()
+
+    if not source_id and download_url:
+        source_id = youtube_service._extract_video_id(download_url)
+
+    if not source_id:
+        raise DownloadError("No video ID available for YouTube download")
+
+    logger.info(f"[job:{job_id}] YouTube download: video_id={source_id}")
+
+    try:
+        audio_gcs_path = await youtube_service.download_by_id(
+            video_id=source_id,
+            job_id=job_id,
+            artist=selected.get('artist'),
+            title=selected.get('title'),
+        )
+        filename = os.path.basename(audio_gcs_path)
+        return audio_gcs_path, filename
+    except YouTubeDownloadError as e:
+        raise DownloadError(f"YouTube download failed: {e}")
+
+
+def _download_heartbeat(job_id: str, job_manager: JobManager | None = None):
+    """Progress callback that periodically records download progress on the job.
+
+    Besides giving admins visibility (progress / peers), each write bumps the
+    job's updated_at so the recover-stuck-jobs cron — which treats a job sitting
+    in downloading_audio for >10 min *without an update* as a dead worker — does
+    not park a torrent we're still legitimately waiting on (stall budgets are
+    20-60 min). Best-effort: a failed write never interrupts the download.
+    """
+    last_write = [0.0]
+    manager = [job_manager]  # created lazily once, reused for every write
+
+    def _callback(status: dict) -> None:
+        now = time.monotonic()
+        if last_write[0] and now - last_write[0] < audio_download_limits.HEARTBEAT_INTERVAL_SECONDS:
+            return
+        last_write[0] = now
+        try:
+            if manager[0] is None:
+                manager[0] = JobManager()
+            manager[0].update_state_data(job_id, 'audio_download_progress', {
+                'progress': status.get('progress', 0),
+                'peers': status.get('peers', 0),
+                'download_speed_kbps': status.get('download_speed_kbps', 0),
+                'at': datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[job:{job_id}] Download heartbeat write failed: {e}")
+
+    return _callback
+
+
+async def _download_torrent(
+    job_id: str,
+    source_name: str,
+    source_id: str | None,
+    target_file: str | None,
+    download_url: str | None,
+    remote_search_id: str | None,
+    selection_index: int | None,
+    keep_trying: bool = False,
+) -> tuple[str, str]:
+    """Download from torrent source (RED/OPS) via flacfetch.
+
+    flacfetch aborts after `stall_seconds(keep_trying)` with no progress, which
+    surfaces here as FlacfetchDownloadStalledError.
+    """
+    flacfetch_client = get_flacfetch_client()
+    if not flacfetch_client:
+        raise DownloadError(
+            f"Cannot download from {source_name} without remote flacfetch service. "
+            "Configure FLACFETCH_API_URL."
+        )
+
+    gcs_destination = f"uploads/{job_id}/audio/"
+    max_stall_seconds = audio_download_limits.stall_seconds(keep_trying)
+
+    if source_id:
+        logger.info(
+            f"[job:{job_id}] Torrent download: {source_name} ID={source_id} "
+            f"(max stall {max_stall_seconds}s)"
+        )
+        download_id = await flacfetch_client.download_by_id(
+            source_name=source_name,
+            source_id=source_id,
+            target_file=target_file,
+            download_url=download_url,
+            gcs_path=gcs_destination,
+            max_stall_seconds=max_stall_seconds,
+        )
+    else:
+        if not remote_search_id:
+            raise DownloadError(
+                f"No source_id or remote_search_id available for {source_name} download"
+            )
+        logger.info(f"[job:{job_id}] Torrent download via search-based download")
+        download_id = await flacfetch_client.download(
+            search_id=remote_search_id,
+            result_index=selection_index,
+            gcs_path=gcs_destination,
+            max_stall_seconds=max_stall_seconds,
+        )
+
+    final_status = await flacfetch_client.wait_for_download(
+        download_id,
+        timeout=audio_download_limits.torrent_wait_timeout_seconds(keep_trying),
+        progress_callback=_download_heartbeat(job_id),
+    )
+
+    filepath = final_status.get("gcs_path") or final_status.get("output_path")
+    if not filepath:
+        raise DownloadError("Remote download completed but no file path returned")
+
+    audio_gcs_path = _extract_gcs_path(filepath)
+    filename = os.path.basename(filepath)
+    logger.info(f"[job:{job_id}] Torrent download complete: {audio_gcs_path}")
+    return audio_gcs_path, filename
+
+
+async def _download_spotify(
+    job_id: str,
+    source_id: str,
+    download_url: str | None,
+) -> tuple[str, str]:
+    """Download from Spotify via flacfetch."""
+    flacfetch_client = get_flacfetch_client()
+    if not flacfetch_client:
+        raise DownloadError(
+            "Cannot download from Spotify without remote flacfetch service. "
+            "Configure FLACFETCH_API_URL."
+        )
+
+    gcs_destination = f"uploads/{job_id}/audio/"
+    logger.info(f"[job:{job_id}] Spotify download: source_id={source_id}")
+
+    download_id = await flacfetch_client.download_by_id(
+        source_name="Spotify",
+        source_id=source_id,
+        download_url=download_url,
+        gcs_path=gcs_destination,
+    )
+
+    final_status = await flacfetch_client.wait_for_download(
+        download_id,
+        timeout=DOWNLOAD_WAIT_TIMEOUT_SECONDS,
+    )
+
+    filepath = final_status.get("gcs_path") or final_status.get("output_path")
+    if not filepath:
+        raise DownloadError("Remote download completed but no file path returned")
+
+    audio_gcs_path = _extract_gcs_path(filepath)
+    filename = os.path.basename(filepath)
+    logger.info(f"[job:{job_id}] Spotify download complete: {audio_gcs_path}")
+    return audio_gcs_path, filename
+
+
+def _failed_awaiting_user(job_id: str) -> bool:
+    """True if the job failed with a user-recoverable stall (see _fail_stalled_download)."""
+    try:
+        job = JobManager().get_job(job_id)
+    except Exception:
+        return False
+    details = (job.error_details or {}) if job else {}
+    return details.get('code') == audio_download_limits.STALLED_ERROR_CODE
+
+
+def main():
+    """
+    CLI entry point for running audio download worker as a Cloud Run Job.
+
+    Usage:
+        python -m backend.workers.audio_download_worker --job-id abc123
+    """
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Audio download worker for karaoke generation"
+    )
+    parser.add_argument(
+        "--job-id",
+        required=True,
+        help="Job ID to process"
+    )
+
+    args = parser.parse_args()
+    job_id = args.job_id
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    logger.info(f"Starting audio download worker for job {job_id}")
+
+    try:
+        # Drain: push/email sends scheduled by the job's last state change must
+        # finish before asyncio.run cancels pending tasks on exit.
+        success = asyncio.run(with_notification_drain(process_audio_download(job_id)))
+        if success:
+            logger.info(f"Audio download completed successfully for job {job_id}")
+            sys.exit(0)
+        elif _failed_awaiting_user(job_id):
+            # Stalled torrent: the job is failed with a "Keep trying?" prompt for
+            # the user. Exit 0 so Cloud Run doesn't auto-retry the same torrent.
+            logger.warning(f"Audio download stalled for job {job_id}; awaiting user decision")
+            sys.exit(0)
+        else:
+            logger.error(f"Audio download failed for job {job_id}")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Audio download worker crashed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

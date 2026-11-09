@@ -1,0 +1,929 @@
+"""
+Audio search service for finding and downloading audio files.
+
+This service integrates with karaoke_gen.audio_fetcher (which wraps flacfetch)
+to search for audio from various sources (YouTube, music trackers, etc.)
+and download the selected audio file.
+
+This is a thin wrapper that adds backend-specific functionality:
+- Caching raw results for API-based selection flow
+- Firestore-compatible serialization
+- Singleton pattern for service lifecycle
+- Remote flacfetch service integration for torrent downloads
+
+When FLACFETCH_API_URL is configured, this service uses the remote flacfetch
+HTTP API for search and download operations. This is required for torrent
+downloads since Cloud Run doesn't support BitTorrent peer connections.
+"""
+import asyncio
+import logging
+import os
+import re
+import unicodedata
+from typing import Any, Dict, List, Optional
+
+import nest_asyncio
+
+# Import shared classes from karaoke_gen.audio_fetcher - single source of truth
+# Note: Import directly from audio_fetcher module, not karaoke_gen.__init__
+# to avoid pulling in heavier dependencies like lyrics_transcriber
+from karaoke_gen.audio_fetcher import (
+    FlacFetcher,
+    AudioSearchResult,
+    AudioFetchResult,
+    AudioFetcherError,
+    NoResultsError,
+    DownloadError,
+)
+
+from .flacfetch_client import get_flacfetch_client, FlacfetchServiceError
+from backend.config import get_settings
+from backend.services.fake_workers import fake_workers_enabled
+
+logger = logging.getLogger(__name__)
+
+
+# Re-export exception under backend's naming convention for compatibility
+AudioSearchError = AudioFetcherError
+
+
+# Also alias AudioFetchResult as AudioDownloadResult for backwards compatibility
+AudioDownloadResult = AudioFetchResult
+
+
+# ---------------------------------------------------------------------------
+# Bulk Mode: tier-1 auto-selection.
+#
+# This is a faithful port of the frontend confidence-tier logic in
+# frontend/lib/audio-search-utils.ts (categorizeResult / getBestResult /
+# checkFilenameMismatch / getSearchConfidence). It operates on the dicts
+# produced by AudioSearchResult.to_dict() (keys: is_lossless, quality_data,
+# seeders, provider, release_type, target_file, title, index).
+#
+# MAINTENANCE SEAM: if the frontend tier rule changes, update both. The
+# parity tests in backend/tests/test_bulk_foundations.py guard the behaviour.
+# ---------------------------------------------------------------------------
+
+# Seeders a lossless torrent needs to count as "BEST CHOICE" (and so be auto-picked).
+# A lossless torrent with even ~10 seeders is almost always the right source.
+BEST_CHOICE_MIN_SEEDERS = 10
+
+_BEST_RESULT_PRIORITY = [
+    "BEST CHOICE",
+    "STUDIO ALBUMS",
+    "HI-RES 24-BIT",
+    "SINGLES",
+    "COMPILATIONS",
+    "SPOTIFY",
+    "YOUTUBE",
+    "OTHER",
+]
+
+
+def _categorize_result(result: Dict[str, Any]) -> str:
+    """Port of categorizeResult() from audio-search-utils.ts."""
+    is_lossless = result.get("is_lossless") is True
+    quality_data = result.get("quality_data") or {}
+    is_24bit = quality_data.get("bit_depth") == 24
+    seeders = result.get("seeders") or 0
+    provider = (result.get("provider") or "").lower()
+    release_type = (result.get("release_type") or "").lower()
+    media = (quality_data.get("media") or "").lower()
+
+    if provider == "spotify":
+        return "SPOTIFY"
+    if provider == "youtube" or not is_lossless:
+        return "YOUTUBE"
+    # Vinyl rips checked before BEST CHOICE (surface noise -> poor for karaoke)
+    if is_lossless and media == "vinyl":
+        return "VINYL RIPS"
+    if is_lossless and seeders >= BEST_CHOICE_MIN_SEEDERS:
+        return "BEST CHOICE"
+    if is_lossless and is_24bit:
+        return "HI-RES 24-BIT"
+    if is_lossless and (
+        release_type == "live album" or release_type == "bootleg" or "live" in release_type
+    ):
+        return "LIVE VERSIONS"
+    if is_lossless and release_type in ("compilation", "soundtrack", "anthology"):
+        return "COMPILATIONS"
+    if is_lossless and release_type in ("single", "ep"):
+        return "SINGLES"
+    if is_lossless and (release_type == "album" or not release_type):
+        return "STUDIO ALBUMS"
+    return "OTHER"
+
+
+def _get_best_result(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Port of getBestResult() — highest-priority category, skipping vinyl."""
+    if not results:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    best_priority = float("inf")
+    for result in results:
+        category = _categorize_result(result)
+        if category == "VINYL RIPS":
+            continue
+        try:
+            priority = _BEST_RESULT_PRIORITY.index(category)
+        except ValueError:
+            priority = float("inf")
+        if priority < best_priority:
+            best = result
+            best_priority = priority
+        elif priority == best_priority and best is not None:
+            if (result.get("seeders") or 0) > (best.get("seeders") or 0):
+                best = result
+    return best if best is not None else results[0]
+
+
+def _check_filename_mismatch(search_title: str, result: Dict[str, Any]) -> bool:
+    """Port of checkFilenameMismatch() — True if the file is clearly another track."""
+    if len(search_title) < 3:
+        return False
+
+    target_file = result.get("target_file")
+    if target_file:
+        raw_filename = target_file.split("/")[-1] or target_file
+        without_ext = re.sub(r"\.[^.]+$", "", raw_filename)
+        filename = re.sub(r"^\d{1,3}\s*[-.\s]\s*", "", without_ext)
+    elif result.get("title"):
+        filename = result["title"]
+    else:
+        return False
+
+    def normalize(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"[_\-.]+", " ", s)
+        s = re.sub(r"[^a-z0-9\s]", "", s)
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    norm_title = normalize(search_title)
+    norm_file = normalize(filename)
+    if not norm_file or not norm_title:
+        return False
+
+    # Stricter than the frontend's substring check (intentional — for the bulk
+    # AUTO-select path we'd rather park an uncertain match than auto-pick the
+    # wrong track). A match requires every title word to appear as a whole word
+    # in the filename, so "One" no longer matches "Someone".
+    title_tokens = [t for t in norm_title.split() if t]
+    file_tokens = set(norm_file.split())
+    if not title_tokens:
+        return False
+    matches = all(tok in file_tokens for tok in title_tokens)
+    return not matches
+
+
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i]
+        for j in range(1, len(b) + 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1])))
+        prev = cur
+    return prev[len(b)]
+
+
+def _norm_artist(x: str) -> str:
+    """Lowercase, accents folded, "&"/"+" as "and", punctuation dropped, a leading
+    "the" removed. Unicode-aware: CJK/Cyrillic names survive (unlike [a-z0-9])."""
+    x = unicodedata.normalize("NFKD", (x or "").casefold())
+    x = "".join(ch for ch in x if not unicodedata.combining(ch))
+    x = re.sub(r"\s*[&+]\s*", " and ", x)
+    x = re.sub(r"[^\w\s]|_", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+    return re.sub(r"^the\s+", "", x)
+
+
+def is_artist_match(search_artist: str, result: Dict[str, Any]) -> bool:
+    """Port of isArtistMatch() — the result's artist is the one searched for.
+
+    "The Killers" vs "Killers", "X, Someone" vs "X" and "Simon & Garfunkel" vs
+    "Simon and Garfunkel" match; small typos are tolerated for names of 5+
+    characters. A searched name that normalizes to nothing can't be compared, so
+    it isn't held against the result (mirrors _check_filename_mismatch).
+    """
+    raw_have = result.get("artist") or ""
+    if search_artist and search_artist.strip().casefold() == raw_have.strip().casefold():
+        return True
+    want = _norm_artist(search_artist)
+    have = _norm_artist(raw_have)
+    if not want:
+        return True
+    if len(want) < 2 or not have:
+        return False
+    if have == want or f" {want} " in f" {have} " or f" {have} " in f" {want} ":
+        return True
+    if len(want) < 5:
+        return False
+    return _edit_distance(want, have) <= len(want) // 5
+
+
+def pick_auto_selection(
+    results: List[Dict[str, Any]], search_title: str = "", search_artist: str = ""
+) -> Optional[int]:
+    """Return the index to auto-select, or None if no confident lossless pick.
+
+    Tier-1 rule (mirrors getSearchConfidence): the best result must be in the
+    BEST CHOICE category (lossless, BEST_CHOICE_MIN_SEEDERS+ seeders, non-vinyl),
+    its filename must match ``search_title`` (the song the user searched for),
+    and, when ``search_artist`` is given, its artist must match too (a
+    well-seeded cover or tribute isn't a perfect match). Otherwise we defer to
+    human selection.
+    """
+    if not results:
+        return None
+    # Require a usable title before auto-selecting: a blank/too-short title can't
+    # be verified against the filename, so defer to human selection.
+    if len((search_title or "").strip()) < 3:
+        return None
+    best = _get_best_result(results)
+    if best is None:
+        return None
+    if not _is_confident_pick(best, search_title, search_artist):
+        return None
+    return best.get("index")
+
+
+def _is_confident_pick(result: Dict[str, Any], search_title: str, search_artist: str = "") -> bool:
+    """BEST CHOICE category, filename names the track, and (if given) the right artist."""
+    if _categorize_result(result) != "BEST CHOICE":
+        return False
+    if _check_filename_mismatch(search_title, result):
+        return False
+    if search_artist and not is_artist_match(search_artist, result):
+        return False
+    return True
+
+
+class AudioSearchService:
+    """
+    Service for searching and downloading audio files.
+    
+    This is a thin wrapper around karaoke_gen.audio_fetcher.FlacFetcher that adds
+    backend-specific functionality:
+    - Caches raw results for API-based selection (client picks by index)
+    - Provides Firestore-compatible serialization
+    - Manages service lifecycle as singleton
+    - Remote flacfetch service integration for torrent downloads
+    
+    When FLACFETCH_API_URL is configured, this service uses the remote flacfetch
+    HTTP API for search and download operations. This enables torrent downloads
+    which are not possible in Cloud Run due to network restrictions.
+    
+    The actual flacfetch integration is in karaoke_gen.audio_fetcher.FlacFetcher,
+    which is shared between local CLI and cloud backend.
+    """
+    
+    # Sentinel value to indicate "use environment variable"
+    _USE_ENV = object()
+    
+    def __init__(
+        self,
+        red_api_key: Optional[str] = _USE_ENV,
+        red_api_url: Optional[str] = _USE_ENV,
+        ops_api_key: Optional[str] = _USE_ENV,
+        ops_api_url: Optional[str] = _USE_ENV,
+    ):
+        """
+        Initialize the audio search service.
+        
+        Args:
+            red_api_key: API key for RED tracker (optional, uses env if not provided)
+            red_api_url: Base URL for RED tracker API (optional, uses env if not provided)
+            ops_api_key: API key for OPS tracker (optional, uses env if not provided)
+            ops_api_url: Base URL for OPS tracker API (optional, uses env if not provided)
+        """
+        # Use environment variables if not explicitly provided
+        if red_api_key is self._USE_ENV:
+            red_api_key = os.environ.get("RED_API_KEY")
+        if red_api_url is self._USE_ENV:
+            red_api_url = os.environ.get("RED_API_URL")
+            
+        if ops_api_key is self._USE_ENV:
+            ops_api_key = os.environ.get("OPS_API_KEY")
+        if ops_api_url is self._USE_ENV:
+            ops_api_url = os.environ.get("OPS_API_URL")
+        
+        # Check for remote flacfetch client
+        self._remote_client = get_flacfetch_client()
+        
+        # Log which mode we're using
+        if self._remote_client:
+            logger.info("AudioSearchService using REMOTE flacfetch service (torrent downloads enabled)")
+        else:
+            logger.info("AudioSearchService using LOCAL flacfetch (YouTube only in Cloud Run)")
+        
+        # Delegate to shared FlacFetcher implementation (for local mode or fallback)
+        self._fetcher = FlacFetcher(
+            red_api_key=red_api_key,
+            red_api_url=red_api_url,
+            ops_api_key=ops_api_key,
+            ops_api_url=ops_api_url,
+        )
+        
+        # Cache search results for API-based selection flow
+        # Key: index, Value: AudioSearchResult (with raw_result)
+        self._cached_results: List[AudioSearchResult] = []
+        
+        # Cache for remote search results (search_id -> results)
+        self._remote_search_id: Optional[str] = None
+    
+    def search(self, artist: str, title: str) -> List[AudioSearchResult]:
+        """
+        Search for audio matching the given artist and title.
+        
+        Results are cached internally for later download via download().
+        
+        If a remote flacfetch service is configured (FLACFETCH_API_URL), uses that
+        for better torrent download support. Otherwise falls back to local flacfetch.
+        
+        Args:
+            artist: The artist name to search for
+            title: The track title to search for
+            
+        Returns:
+            List of AudioSearchResult objects
+            
+        Raises:
+            NoResultsError: If no results are found
+            AudioSearchError: For other errors (e.g., flacfetch not installed)
+        """
+        try:
+            # Try remote flacfetch service first if configured
+            if self._remote_client:
+                return self._search_remote(artist, title)
+            
+            # Fallback to local flacfetch
+            results = self._fetcher.search(artist, title)
+            
+            # Cache results for later download
+            self._cached_results = results
+            self._remote_search_id = None
+            
+            logger.info(f"Found {len(results)} results for: {artist} - {title}")
+            return results
+            
+        except (NoResultsError, AudioFetcherError):
+            # Re-raise these as-is
+            raise
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            raise AudioSearchError(f"Search failed: {e}") from e
+    
+    def _search_remote(self, artist: str, title: str) -> List[AudioSearchResult]:
+        """
+        Search using the remote flacfetch service.
+        
+        Runs async code in a sync context for compatibility with existing API.
+        """
+        try:
+            # Enable nested event loops (needed when called from FastAPI async context)
+            # Apply to the current loop if one exists, otherwise it's a no-op
+            try:
+                loop = asyncio.get_running_loop()
+                nest_asyncio.apply(loop)
+            except RuntimeError:
+                pass  # No running loop, nest_asyncio not needed
+            
+            # Run async search in sync context
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                response = loop.run_until_complete(
+                    self._remote_client.search(artist, title)
+                )
+            finally:
+                loop.close()
+            
+            # Check for empty results
+            if not response.get("results"):
+                raise NoResultsError(f"No results found for: {artist} - {title}")
+            
+            # Store search_id for download
+            self._remote_search_id = response.get("search_id")
+            
+            # Convert remote results to AudioSearchResult objects
+            results = []
+            for item in response.get("results", []):
+                result = AudioSearchResult(
+                    title=item.get("title", "Unknown"),
+                    artist=item.get("artist", "Unknown"),
+                    url=item.get("download_url", ""),  # May be empty for remote
+                    provider=item.get("provider", "Unknown"),
+                    duration=item.get("duration_seconds"),
+                    quality=item.get("quality", ""),
+                    # source_id: use explicit source_id field first (YouTube video ID, Spotify track ID),
+                    # fall back to info_hash for torrent sources (RED/OPS)
+                    source_id=item.get("source_id") or item.get("info_hash"),
+                    index=item.get("index", 0),
+                    seeders=item.get("seeders"),
+                    target_file=item.get("target_file"),
+                    # Store full remote data in raw_result for rich display
+                    raw_result=item,
+                )
+                results.append(result)
+            
+            # Cache results
+            self._cached_results = results
+            
+            logger.info(f"Found {len(results)} results from remote flacfetch for: {artist} - {title}")
+            return results
+            
+        except FlacfetchServiceError as e:
+            # flacfetch is the sole downloader. The remote service was explicitly
+            # configured, so a failure here must NOT silently downgrade to the
+            # local YouTube-only fetcher — that hides the outage and ships a worse
+            # source than the user expected (the 2026-06-08 incident class).
+            # Fail loudly. (Fallback audit 2026-06-09, Theme 1.)
+            logger.error(f"Remote flacfetch search failed (not falling back to local): {e}")
+            # Clear cached state so a later download() can't consume stale results
+            # from a previous successful search on this (singleton) instance.
+            self._remote_search_id = None
+            self._cached_results = []
+            raise AudioSearchError(f"Remote flacfetch search failed: {e}") from e
+    
+    def select_best(self, results: List[AudioSearchResult]) -> int:
+        """
+        Select the best result from a list of search results.
+        
+        Uses flacfetch's built-in quality ranking to select the best source.
+        
+        Args:
+            results: List of search results
+            
+        Returns:
+            Index of the best result
+        """
+        return self._fetcher.select_best(results)
+    
+    def download(
+        self,
+        result_index: int,
+        output_dir: str,
+        output_filename: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+        remote_search_id: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Download audio from a cached search result.
+
+        This method uses the cached results from the last search() call.
+        The API flow is:
+        1. Client calls search() -> gets list of results
+        2. Client picks an index
+        3. Client calls download(index) -> gets downloaded file
+
+        If a remote flacfetch service is configured and the search was performed
+        remotely (for torrent sources), uses the remote service for download.
+
+        Args:
+            result_index: Index of the result to download (from search results)
+            output_dir: Directory to save the downloaded file
+            output_filename: Optional filename (without extension)
+            gcs_path: Optional GCS path for remote uploads (e.g., "uploads/job123/audio/")
+            remote_search_id: Optional search_id for remote downloads. If provided,
+                uses this instead of the cached _remote_search_id. This is important
+                for concurrent requests where the service-level cache may be stale.
+
+        Returns:
+            AudioDownloadResult with the downloaded file path
+
+        Raises:
+            DownloadError: If download fails or no cached result for index
+        """
+        # Use provided search_id or fall back to service-level cache
+        effective_search_id = remote_search_id or self._remote_search_id
+
+        # Check if we have local cached results
+        has_local_cache = result_index >= 0 and result_index < len(self._cached_results)
+
+        # If no local cache but we have remote search_id, use remote download
+        # This handles multi-instance deployments where the cache doesn't persist
+        if not has_local_cache:
+            if effective_search_id and self._remote_client:
+                logger.info(f"No local cache, using remote download with search_id={effective_search_id}, index={result_index}")
+                return self._download_remote(result_index, output_dir, output_filename, gcs_path, effective_search_id)
+            else:
+                # Provide clear error message based on whether cache is empty or index out of bounds
+                if len(self._cached_results) == 0:
+                    raise DownloadError(
+                        f"No cached result for index {result_index}. "
+                        "No cached results available. Run search() first."
+                    )
+                raise DownloadError(
+                    f"No cached result for index {result_index}. "
+                    f"Available indices: 0-{len(self._cached_results) - 1}. "
+                    "Run search() first."
+                )
+
+        result = self._cached_results[result_index]
+
+        logger.info(f"Downloading: {result.artist} - {result.title} from {result.provider}")
+
+        # Check if this was a remote search (torrent sources need remote download)
+        if effective_search_id and self._remote_client:
+            # Check if this is a torrent source that needs remote handling
+            is_torrent = result.provider in ["RED", "OPS"]
+
+            if is_torrent:
+                return self._download_remote(result_index, output_dir, output_filename, gcs_path, effective_search_id)
+        
+        # Delegate to shared FlacFetcher (local download)
+        fetch_result = self._fetcher.download(result, output_dir, output_filename)
+        
+        logger.info(f"Downloaded to: {fetch_result.filepath}")
+        
+        return fetch_result
+    
+    def download_by_id(
+        self,
+        source_name: str,
+        source_id: str,
+        output_dir: str,
+        output_filename: Optional[str] = None,
+        target_file: Optional[str] = None,
+        download_url: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Download audio directly by source ID (no prior search required).
+
+        This is the preferred method when you have stored the source_id from a
+        previous search and want to download later without re-searching. This
+        avoids unnecessary API calls to private trackers.
+
+        Args:
+            source_name: Provider name (RED, OPS, YouTube, Spotify)
+            source_id: Source-specific ID (torrent ID, video ID, track ID)
+            output_dir: Directory to save the downloaded file
+            output_filename: Optional filename (without extension)
+            target_file: For torrents, specific file to extract from the torrent
+            download_url: For YouTube/Spotify, direct URL (optional)
+            gcs_path: Optional GCS path for remote uploads
+
+        Returns:
+            AudioDownloadResult with the downloaded file path
+
+        Raises:
+            DownloadError: If download fails
+        """
+        logger.info(f"Download by ID: {source_name} ID={source_id}")
+
+        # For torrent sources, must use remote client
+        if source_name in ["RED", "OPS"]:
+            if not self._remote_client:
+                raise DownloadError(
+                    f"Cannot download from {source_name} without remote flacfetch service"
+                )
+            return self._download_by_id_remote(
+                source_name=source_name,
+                source_id=source_id,
+                output_dir=output_dir,
+                output_filename=output_filename,
+                target_file=target_file,
+                download_url=download_url,
+                gcs_path=gcs_path,
+            )
+
+        # For YouTube/Spotify, can use local flacfetch via FetchManager.download_by_id
+        # But we currently only have remote support, so use remote if available
+        if self._remote_client:
+            return self._download_by_id_remote(
+                source_name=source_name,
+                source_id=source_id,
+                output_dir=output_dir,
+                output_filename=output_filename,
+                target_file=target_file,
+                download_url=download_url,
+                gcs_path=gcs_path,
+            )
+
+        # Local download for YouTube/Spotify (fallback)
+        # Use the local fetcher's download_by_id if available
+        raise DownloadError(
+            f"Local download_by_id not yet implemented for {source_name}. "
+            "Configure FLACFETCH_API_URL for remote downloads."
+        )
+
+    def _download_by_id_remote(
+        self,
+        source_name: str,
+        source_id: str,
+        output_dir: str,  # Not used for remote downloads (files go to GCS or remote server)
+        output_filename: Optional[str] = None,
+        target_file: Optional[str] = None,
+        download_url: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Download by ID using the remote flacfetch service.
+
+        Note: output_dir is accepted for API compatibility but ignored for remote
+        downloads. Remote downloads either go to GCS (if gcs_path is set) or to
+        the remote server's download directory.
+        """
+        # output_dir is intentionally unused - remote downloads don't use local paths
+        _ = output_dir
+        try:
+            # Enable nested event loops
+            try:
+                running_loop = asyncio.get_running_loop()
+                nest_asyncio.apply(running_loop)
+            except RuntimeError:
+                pass
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                # Start download
+                download_id = loop.run_until_complete(
+                    self._remote_client.download_by_id(
+                        source_name=source_name,
+                        source_id=source_id,
+                        output_filename=output_filename,
+                        target_file=target_file,
+                        download_url=download_url,
+                        gcs_path=gcs_path,
+                    )
+                )
+
+                logger.info(f"Remote download by ID started: {download_id}")
+
+                # Wait for completion
+                def log_progress(status):
+                    progress = status.get("progress", 0)
+                    speed = status.get("download_speed_kbps", 0)
+                    logger.debug(f"Download progress: {progress:.1f}% ({speed:.1f} KB/s)")
+
+                final_status = loop.run_until_complete(
+                    self._remote_client.wait_for_download(
+                        download_id,
+                        timeout=600,
+                        progress_callback=log_progress,
+                    )
+                )
+            finally:
+                loop.close()
+
+            # Determine file path
+            filepath = final_status.get("gcs_path") or final_status.get("output_path")
+
+            if not filepath:
+                raise DownloadError("Remote download completed but no file path returned")
+
+            logger.info(f"Remote download by ID complete: {filepath}")
+
+            return AudioDownloadResult(
+                filepath=filepath,
+                artist="",  # Not available without search
+                title="",   # Not available without search
+                provider=source_name,
+                quality="",  # Not available without search
+            )
+
+        except FlacfetchServiceError as e:
+            raise DownloadError(f"Remote download by ID failed: {e}") from e
+        except Exception as e:
+            logger.error(f"Remote download by ID error: {e}")
+            raise DownloadError(f"Remote download by ID failed: {e}") from e
+
+    def _download_remote(
+        self,
+        result_index: int,
+        output_dir: str,
+        output_filename: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+        search_id: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Download using the remote flacfetch service.
+
+        The remote service downloads via torrent and optionally uploads to GCS.
+
+        Args:
+            result_index: Index of the result to download
+            output_dir: Directory to save downloaded file
+            output_filename: Optional filename
+            gcs_path: Optional GCS path for remote uploads
+            search_id: Remote search ID to use (overrides self._remote_search_id)
+        """
+        effective_search_id = search_id or self._remote_search_id
+        if not effective_search_id:
+            raise DownloadError("No remote search ID - run search() first")
+
+        # Try to get local result for metadata, but it's optional
+        # The remote service maintains its own cache by search_id
+        result = None
+        if result_index >= 0 and result_index < len(self._cached_results):
+            result = self._cached_results[result_index]
+
+        try:
+            # Enable nested event loops (needed when called from FastAPI async context)
+            try:
+                running_loop = asyncio.get_running_loop()
+                nest_asyncio.apply(running_loop)
+            except RuntimeError:
+                pass  # No running loop, nest_asyncio not needed
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                # Start download
+                download_id = loop.run_until_complete(
+                    self._remote_client.download(
+                        search_id=effective_search_id,
+                        result_index=result_index,
+                        output_filename=output_filename,
+                        gcs_path=gcs_path,
+                    )
+                )
+                
+                logger.info(f"Remote download started: {download_id}")
+                
+                # Wait for completion with progress logging
+                def log_progress(status):
+                    progress = status.get("progress", 0)
+                    speed = status.get("download_speed_kbps", 0)
+                    logger.debug(f"Download progress: {progress:.1f}% ({speed:.1f} KB/s)")
+                
+                final_status = loop.run_until_complete(
+                    self._remote_client.wait_for_download(
+                        download_id,
+                        timeout=600,  # 10 minute timeout
+                        progress_callback=log_progress,
+                    )
+                )
+            finally:
+                loop.close()
+            
+            # Determine file path
+            filepath = final_status.get("gcs_path") or final_status.get("output_path")
+            
+            if not filepath:
+                raise DownloadError("Remote download completed but no file path returned")
+            
+            logger.info(f"Remote download complete: {filepath}")
+
+            # Use local result metadata if available, otherwise use empty strings
+            # (the actual download is handled by the remote service using search_id)
+            return AudioDownloadResult(
+                filepath=filepath,
+                artist=result.artist if result else "",
+                title=result.title if result else "",
+                provider=result.provider if result else "remote",
+                quality=result.quality if result else "",
+            )
+            
+        except FlacfetchServiceError as e:
+            raise DownloadError(f"Remote download failed: {e}") from e
+        except Exception as e:
+            logger.error(f"Remote download error: {e}")
+            raise DownloadError(f"Remote download failed: {e}") from e
+    
+    def search_and_download_auto(
+        self,
+        artist: str,
+        title: str,
+        output_dir: str,
+        output_filename: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Search for audio and automatically download the best result.
+        
+        This is a convenience method that combines search(), select_best(),
+        and download() for automated/non-interactive usage.
+        
+        Args:
+            artist: The artist name to search for
+            title: The track title to search for
+            output_dir: Directory to save the downloaded file
+            output_filename: Optional filename (without extension)
+            gcs_path: Optional GCS path for remote uploads
+            
+        Returns:
+            AudioDownloadResult with the downloaded file path
+            
+        Raises:
+            NoResultsError: If no results are found
+            DownloadError: If download fails
+        """
+        # Search
+        results = self.search(artist, title)
+        
+        # Select best
+        best_index = self.select_best(results)
+        best_result = results[best_index]
+        logger.info(
+            f"Auto-selected result {best_index}: "
+            f"{best_result.artist} - {best_result.title} ({best_result.provider})"
+        )
+        
+        # Download
+        return self.download(best_index, output_dir, output_filename, gcs_path)
+    
+    async def search_async(self, artist: str, title: str) -> List[AudioSearchResult]:
+        """
+        Async version of search for use in async routes.
+
+        Runs the sync search in a thread executor to avoid blocking
+        the event loop.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.search, artist, title)
+
+    async def download_async(
+        self,
+        result_index: int,
+        output_dir: str,
+        output_filename: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+        remote_search_id: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Async version of download for use in async routes.
+
+        Runs the sync download in a thread executor to avoid blocking
+        the event loop.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.download(result_index, output_dir, output_filename, gcs_path, remote_search_id)
+        )
+
+    async def download_by_id_async(
+        self,
+        source_name: str,
+        source_id: str,
+        output_dir: str,
+        output_filename: Optional[str] = None,
+        target_file: Optional[str] = None,
+        download_url: Optional[str] = None,
+        gcs_path: Optional[str] = None,
+    ) -> AudioDownloadResult:
+        """
+        Async version of download_by_id for use in async routes.
+
+        Runs the sync download_by_id in a thread executor to avoid blocking
+        the event loop.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.download_by_id(
+                source_name, source_id, output_dir, output_filename,
+                target_file, download_url, gcs_path
+            )
+        )
+    
+    def is_remote_enabled(self) -> bool:
+        """Check if remote flacfetch service is configured."""
+        return self._remote_client is not None
+
+    @property
+    def last_remote_search_id(self) -> Optional[str]:
+        """Get the search_id from the last remote search.
+
+        This should be stored in job state_data after search and passed
+        back to download() to ensure correct remote download handling.
+        """
+        return self._remote_search_id
+    
+    async def check_remote_health(self) -> Optional[dict]:
+        """
+        Check health of remote flacfetch service.
+        
+        Returns:
+            Health status dict if remote service is configured and healthy,
+            None if not configured or unhealthy.
+        """
+        if not self._remote_client:
+            return None
+        
+        try:
+            return await self._remote_client.health_check()
+        except Exception as e:
+            logger.warning(f"Remote flacfetch health check failed: {e}")
+            return None
+
+
+# Singleton instance
+_audio_search_service: Optional[AudioSearchService] = None
+
+
+def get_audio_search_service() -> AudioSearchService:
+    """Get the singleton AudioSearchService instance."""
+    global _audio_search_service
+    if _audio_search_service is None:
+        if fake_workers_enabled(get_settings()):
+            # Local stack: deterministic offline results (see fake_workers/search.py).
+            from backend.services.fake_workers.search import FakeAudioSearchService
+
+            _audio_search_service = FakeAudioSearchService()
+        else:
+            _audio_search_service = AudioSearchService()
+    return _audio_search_service

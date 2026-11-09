@@ -1,0 +1,465 @@
+"""
+Google Cloud Storage operations for file management.
+"""
+import concurrent.futures
+import logging
+import os
+import json
+import threading
+from typing import Optional, BinaryIO, Any, Dict
+from pathlib import Path
+from google.cloud import storage
+from google.cloud.exceptions import NotFound
+from datetime import timedelta
+
+from backend.config import settings
+
+# The bucket is publicly readable, and GCS serves publicly readable objects that
+# lack an explicit Cache-Control with ``public, max-age=3600`` — reads (including
+# the backend's own authenticated API reads) can then be answered from an edge
+# cache for up to an hour after the object is overwritten. Mutable state written
+# by the backend must never be cached.
+NO_STORE_CACHE_CONTROL = "no-store"
+
+
+logger = logging.getLogger(__name__)
+
+
+# --- Signed-URL generation hardening (incident 2026-09-17) ---------------------
+# On Cloud Run we have no private key, so signing goes through the IAM signBlob API
+# over the network. google-cloud-storage gives that call a ~120s per-attempt
+# timeout PLUS retries, so a stalled IAM/metadata endpoint hangs the calling worker
+# thread for minutes. When enough review-page loads (each signs 2-3 audio URLs) hit
+# a stall at once, the request thread pool is exhausted and the whole service goes
+# unavailable — exactly what took gen down on 2026-09-17.
+#
+# Defense: run every sign on a DEDICATED, bounded thread pool and give it a short
+# wall-clock budget. A stall then (a) fails fast for the caller instead of hanging,
+# and (b) is confined to this pool so it can never starve GCS data-plane reads/writes
+# or the request handlers. Callers treat signing as best-effort (see the review
+# endpoint's fail-soft handling).
+SIGNED_URL_TIMEOUT_S = float(os.getenv("SIGNED_URL_TIMEOUT_S", "12"))
+_SIGNING_MAX_WORKERS = int(os.getenv("SIGNED_URL_MAX_WORKERS", "8"))
+_SIGNING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_SIGNING_MAX_WORKERS,
+    thread_name_prefix="gcs-sign",
+)
+# Bounded admission in front of the executor. If every worker is blocked on a stalled
+# signBlob, the executor's queue is unbounded — a burst of callers would each wait the
+# full SIGNED_URL_TIMEOUT_S then cancel a still-queued future. Cap total in-flight
+# (running + queued) so, once saturated, extra callers fail *immediately* instead of
+# waiting out the budget, and the queue can't grow without bound. Slack above the
+# worker count absorbs normal bursts (a job-detail load signs ~20 URLs concurrently).
+_SIGNING_MAX_INFLIGHT = int(os.getenv("SIGNED_URL_MAX_INFLIGHT", str(_SIGNING_MAX_WORKERS * 6)))
+_SIGNING_SLOTS = threading.BoundedSemaphore(_SIGNING_MAX_INFLIGHT)
+
+
+class SignedUrlTimeout(Exception):
+    """A signed-URL generation exceeded ``SIGNED_URL_TIMEOUT_S`` (IAM signBlob stall)."""
+
+
+class StorageService:
+    """Service for Google Cloud Storage operations."""
+    
+    def __init__(self):
+        """Initialize GCS client."""
+        self.client = storage.Client(project=settings.google_cloud_project)
+        self.bucket = self.client.bucket(settings.gcs_bucket_name)
+    
+    def upload_file(self, local_path: str, destination_path: str) -> str:
+        """Upload a file to GCS."""
+        try:
+            blob = self.bucket.blob(destination_path)
+            blob.upload_from_filename(local_path)
+            logger.info(f"Uploaded {local_path} to gs://{settings.gcs_bucket_name}/{destination_path}")
+            return destination_path
+        except Exception as e:
+            logger.error(f"Error uploading file {local_path}: {e}")
+            raise
+    
+    def upload_fileobj(
+        self,
+        file_obj: BinaryIO,
+        destination_path: str,
+        content_type: Optional[str] = None,
+        cache_control: Optional[str] = None,
+    ) -> str:
+        """Upload a file object to GCS.
+
+        Pass ``cache_control=NO_STORE_CACHE_CONTROL`` for objects that may be
+        overwritten in place and must be visible immediately (e.g. theme assets).
+        """
+        try:
+            blob = self.bucket.blob(destination_path)
+            if content_type:
+                blob.content_type = content_type
+            if cache_control:
+                blob.cache_control = cache_control
+            blob.upload_from_file(file_obj, rewind=True)
+            logger.info(f"Uploaded file object to gs://{settings.gcs_bucket_name}/{destination_path}")
+            return destination_path
+        except Exception as e:
+            logger.error(f"Error uploading file object: {e}")
+            raise
+    
+    def download_file(self, source_path: str, destination_path: str) -> str:
+        """Download a file from GCS."""
+        try:
+            blob = self.bucket.blob(source_path)
+            blob.download_to_filename(destination_path)
+            logger.info(f"Downloaded gs://{settings.gcs_bucket_name}/{source_path} to {destination_path}")
+            return destination_path
+        except NotFound:
+            # A missing object is a routine "not found", not a server-side failure.
+            # Log at warning so it doesn't trip the error-monitor, and let the caller
+            # decide how to surface it (e.g. the download route returns HTTP 404).
+            logger.warning(f"Object not found downloading {source_path}")
+            raise
+        except Exception as e:
+            logger.error(f"Error downloading file {source_path}: {e}")
+            raise
+
+    def download_bytes(self, source_path: str) -> bytes:
+        """Download an object from GCS fully into memory. Only use for small
+        objects (e.g. transcoded review audio); large files should stream."""
+        try:
+            blob = self.bucket.blob(source_path)
+            return blob.download_as_bytes()
+        except NotFound:
+            logger.warning(f"Object not found downloading {source_path}")
+            raise
+        except Exception as e:
+            logger.error(f"Error downloading bytes {source_path}: {e}")
+            raise
+
+    def copy_blob(self, source_path: str, destination_path: str) -> str:
+        """Server-side copy of a blob within the bucket (no download/upload)."""
+        try:
+            src = self.bucket.blob(source_path)
+            self.bucket.copy_blob(src, self.bucket, destination_path)
+            logger.info(f"Copied gs://{settings.gcs_bucket_name}/{source_path} -> {destination_path}")
+            return destination_path
+        except Exception as e:
+            logger.error(f"Error copying blob {source_path} -> {destination_path}: {e}")
+            raise
+
+    def generate_signed_url(self, blob_path: str, expiration_minutes: int = 60) -> str:
+        """Generate a signed URL for downloading a file.
+        
+        In Cloud Run, this uses the IAM signBlob API since we don't have
+        a private key available. Requires the service account to have
+        roles/iam.serviceAccountTokenCreator on itself.
+        """
+        return self._generate_signed_url_internal(blob_path, "GET", expiration_minutes)
+    
+    def generate_signed_upload_url(self, blob_path: str, content_type: str = "application/octet-stream", expiration_minutes: int = 60) -> str:
+        """Generate a signed URL for uploading a file directly to GCS.
+        
+        This allows clients to upload files directly to GCS without going through
+        the backend, bypassing any request body size limits.
+        
+        Args:
+            blob_path: The destination path in GCS
+            content_type: The expected content type of the upload
+            expiration_minutes: How long the URL is valid for
+            
+        Returns:
+            A signed URL that accepts PUT requests with the file content
+        """
+        return self._generate_signed_url_internal(blob_path, "PUT", expiration_minutes, content_type)
+
+    def create_resumable_upload_session(
+        self,
+        blob_path: str,
+        content_type: str = "application/octet-stream",
+        origin: Optional[str] = None,
+    ) -> str:
+        """Create a GCS resumable upload session and return its session URI.
+
+        Unlike a signed PUT URL (single-shot: any interruption restarts the whole
+        file), a resumable session accepts chunked uploads with Content-Range and
+        supports querying the persisted offset after a failure, so clients on
+        flaky connections can resume mid-file with no wasted bandwidth. Session
+        URIs are unauthenticated capability tokens valid for ~1 week.
+
+        Args:
+            blob_path: The destination path in GCS.
+            content_type: Content type fixed at session creation.
+            origin: Browser Origin that will upload. When set, GCS answers CORS
+                preflights on the session URI for that origin itself — no bucket
+                CORS config is needed for the chunk PUTs.
+
+        Returns:
+            The resumable session URI the client PUTs chunks to.
+        """
+        try:
+            blob = self.bucket.blob(blob_path)
+            session_uri = blob.create_resumable_upload_session(
+                content_type=content_type,
+                origin=origin,
+            )
+            logger.info(f"Created resumable upload session for {blob_path} (origin={origin})")
+            return session_uri
+        except Exception as e:
+            logger.error(f"Error creating resumable upload session for {blob_path}: {e}")
+            raise
+
+
+    def _generate_signed_url_internal(self, blob_path: str, method: str, expiration_minutes: int = 60, content_type: Optional[str] = None) -> str:
+        """Internal method to generate signed URLs for GET or PUT operations."""
+        import google.auth
+        from google.auth.transport import requests
+
+        # Local development against fake-gcs-server: real URL signing requires
+        # service-account credentials, which contributors don't have. The emulator
+        # serves objects unauthenticated, so return a plain emulator URL instead.
+        emulator_host = os.getenv("STORAGE_EMULATOR_HOST")
+        if emulator_host:
+            from urllib.parse import quote
+
+            base = emulator_host.rstrip("/")
+            if method == "GET":
+                url = f"{base}/download/storage/v1/b/{self.bucket.name}/o/{quote(blob_path, safe='')}?alt=media"
+            else:
+                # fake-gcs-server treats a PUT with X-Goog signature params as a
+                # signed-URL upload without validating the signature. Requires the
+                # server to run with -public-host matching this host.
+                url = (
+                    f"{base}/{self.bucket.name}/{quote(blob_path)}"
+                    "?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Signature=local-dev"
+                )
+            logger.info(f"Generated emulator {method} URL for {blob_path} (STORAGE_EMULATOR_HOST set)")
+            return url
+
+        def _sign() -> str:
+            """The actual (blocking, network-bound) signing work.
+
+            Run on the dedicated signing pool with a wall-clock timeout so a stalled
+            IAM signBlob can't hang the caller — see module docstring above.
+            """
+            blob = self.bucket.blob(blob_path)
+
+            # Get default credentials and refresh to ensure we have a valid token
+            credentials, project = google.auth.default()
+
+            # Common kwargs for signed URL generation
+            kwargs = {
+                "version": "v4",
+                "expiration": timedelta(minutes=expiration_minutes),
+                "method": method,
+            }
+
+            # For PUT requests, we need to specify the content type in headers
+            if method == "PUT" and content_type:
+                kwargs["headers"] = {"Content-Type": content_type}
+
+            # Check if we're using compute credentials (Cloud Run/GCE)
+            # These need to use IAM signBlob via service_account_email + access_token
+            if hasattr(credentials, 'service_account_email'):
+                # Refresh credentials to get a valid access token
+                auth_request = requests.Request()
+                credentials.refresh(auth_request)
+
+                kwargs["service_account_email"] = credentials.service_account_email
+                kwargs["access_token"] = credentials.token
+
+            return blob.generate_signed_url(**kwargs)
+
+        # Bounded admission: refuse immediately when signing is saturated (all workers
+        # stalled + queue full) instead of enqueuing work that would just time out.
+        if not _SIGNING_SLOTS.acquire(blocking=False):
+            logger.error(
+                f"Signing saturated (>{_SIGNING_MAX_INFLIGHT} in flight) — refusing signed "
+                f"{method} URL for {blob_path}; IAM signBlob likely stalled"
+            )
+            raise SignedUrlTimeout(f"Signing saturated for {blob_path}")
+
+        future = _SIGNING_EXECUTOR.submit(_sign)
+        # Release the slot whenever the work settles — success, error, OR cancellation
+        # (cancelling a still-queued future fires done callbacks, so queued-but-abandoned
+        # work frees its slot; a running future frees it only when it actually returns).
+        future.add_done_callback(lambda _f: _SIGNING_SLOTS.release())
+        try:
+            url = future.result(timeout=SIGNED_URL_TIMEOUT_S)
+            logger.info(f"Generated signed {method} URL for {blob_path}")
+            return url
+        except concurrent.futures.TimeoutError:
+            # Don't wait on the leaked thread — it caps itself at the library's own
+            # ~120s timeout and frees its (bounded) pool slot on its own. We bail now.
+            future.cancel()
+            logger.error(
+                f"Timed out (>{SIGNED_URL_TIMEOUT_S:g}s) generating signed {method} URL "
+                f"for {blob_path} — IAM signBlob likely stalled"
+            )
+            raise SignedUrlTimeout(
+                f"Signed URL generation timed out for {blob_path}"
+            )
+        except Exception as e:
+            logger.error(f"Error generating signed {method} URL for {blob_path}: {e}")
+            raise
+    
+    def delete_file(self, blob_path: str, ignore_missing: bool = False,
+                    if_generation_match: Optional[int] = None) -> bool:
+        """Delete a file from GCS.
+
+        Args:
+            blob_path: Path of the object to delete.
+            ignore_missing: If True, a missing object (404 NotFound) is treated as a
+                successful no-op and logged at debug level instead of error. Use for
+                best-effort deletes over a template of possible paths (e.g. job
+                restart/regen) where many files legitimately never existed.
+
+        Returns:
+            True if an object was actually deleted, False if it was already absent
+            (only possible when ignore_missing=True; otherwise a missing object raises).
+        """
+        try:
+            blob = self.bucket.blob(blob_path)
+            if if_generation_match is not None:
+                # Only delete the exact version that was planned/logged; a newer
+                # write since then raises PreconditionFailed.
+                blob.delete(if_generation_match=if_generation_match)
+            else:
+                blob.delete()
+            logger.info(f"Deleted gs://{settings.gcs_bucket_name}/{blob_path}")
+            return True
+        except NotFound:
+            if ignore_missing:
+                logger.debug(f"File already absent, skipping delete: {blob_path}")
+                return False
+            logger.error(f"Error deleting file {blob_path}: 404 object not found")
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting file {blob_path}: {e}")
+            raise
+    
+    def delete_folder(self, prefix: str) -> int:
+        """
+        Delete all files in GCS with a given prefix (folder).
+        
+        Args:
+            prefix: The folder prefix to delete (e.g., "uploads/abc123/")
+            
+        Returns:
+            Number of files deleted
+        """
+        try:
+            blobs = list(self.bucket.list_blobs(prefix=prefix))
+            deleted_count = 0
+            
+            for blob in blobs:
+                try:
+                    blob.delete()
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Error deleting blob {blob.name}: {e}")
+            
+            if deleted_count > 0:
+                logger.info(f"Deleted {deleted_count} files from gs://{settings.gcs_bucket_name}/{prefix}")
+            
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Error deleting folder {prefix}: {e}")
+            return 0  # Don't raise - folder deletion shouldn't break operations
+    
+    def list_files(self, prefix: str) -> list:
+        """List files in GCS with a given prefix."""
+        try:
+            blobs = self.bucket.list_blobs(prefix=prefix)
+            return [blob.name for blob in blobs]
+        except Exception as e:
+            logger.error(f"Error listing files with prefix {prefix}: {e}")
+            raise
+    
+    def list_files_with_sizes(self, prefix: str) -> list:
+        """List ``(name, size_bytes)`` for every object under ``prefix``."""
+        try:
+            return [(blob.name, int(blob.size or 0)) for blob in self.bucket.list_blobs(prefix=prefix)]
+        except Exception as e:
+            logger.error(f"Error listing files with prefix {prefix}: {e}")
+            raise
+
+    def list_blob_meta(self, prefix: str) -> list:
+        """List ``{name, size, generation, updated}`` for every object under ``prefix``."""
+        try:
+            return [
+                {"name": b.name, "size": int(b.size or 0), "generation": b.generation, "updated": b.updated}
+                for b in self.bucket.list_blobs(prefix=prefix)
+            ]
+        except Exception as e:
+            logger.error(f"Error listing files with prefix {prefix}: {e}")
+            raise
+
+    def upload_text(self, destination_path: str, text: str, content_type: str = "text/plain") -> str:
+        """Upload a text object (overwrites)."""
+        blob = self.bucket.blob(destination_path)
+        blob.cache_control = NO_STORE_CACHE_CONTROL
+        blob.upload_from_string(text, content_type=content_type)
+        return destination_path
+
+    def get_file_size(self, blob_path: str) -> Optional[int]:
+        """Size in bytes of a GCS object, or None if it doesn't exist."""
+        blob = self.bucket.get_blob(blob_path)
+        return blob.size if blob is not None else None
+
+    def file_exists(self, blob_path: str) -> bool:
+        """Check if a file exists in GCS."""
+        try:
+            blob = self.bucket.blob(blob_path)
+            return blob.exists()
+        except Exception as e:
+            logger.error(f"Error checking file existence {blob_path}: {e}")
+            raise
+    
+    def upload_json(
+        self,
+        destination_path: str,
+        data: Dict[str, Any],
+        if_generation_match: Optional[int] = None,
+    ) -> str:
+        """Upload a JSON object to GCS.
+
+        ``if_generation_match=0`` makes the write a create-only operation: GCS raises
+        ``PreconditionFailed`` (412) if the object already exists, so concurrent
+        writers can't clobber each other. Callers that need this must handle the
+        exception.
+        """
+        try:
+            blob = self.bucket.blob(destination_path)
+            blob.content_type = "application/json"
+            # JSON objects are mutable state (configs, registries, corrections) —
+            # never let GCS edge-cache them, or overwrites stay invisible for ~1h.
+            blob.cache_control = NO_STORE_CACHE_CONTROL
+            upload_kwargs = {"content_type": "application/json"}
+            if if_generation_match is not None:
+                upload_kwargs["if_generation_match"] = if_generation_match
+            blob.upload_from_string(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                **upload_kwargs,
+            )
+            logger.info(f"Uploaded JSON to gs://{settings.gcs_bucket_name}/{destination_path}")
+            return destination_path
+        except Exception as e:
+            logger.error(f"Error uploading JSON to {destination_path}: {e}")
+            raise
+    
+    def download_json(self, source_path: str) -> Dict[str, Any]:
+        """Download and parse a JSON file from GCS, always reading the latest version.
+
+        Objects written before ``upload_json`` set ``no-store`` carry GCS's default
+        public cache policy, so a plain download can return a stale cached copy.
+        Resolving the live generation first (metadata request, not cached) and
+        downloading that exact generation bypasses any cached copy.
+        """
+        try:
+            blob = self.bucket.get_blob(source_path)
+            if blob is None:
+                raise NotFound(f"gs://{settings.gcs_bucket_name}/{source_path} not found")
+            content = blob.download_as_text()
+            data = json.loads(content)
+            logger.info(f"Downloaded JSON from gs://{settings.gcs_bucket_name}/{source_path}")
+            return data
+        except Exception as e:
+            logger.error(f"Error downloading JSON from {source_path}: {e}")
+            raise
+

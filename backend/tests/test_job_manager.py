@@ -1,0 +1,1201 @@
+"""
+Unit tests for Job Manager service.
+
+Tests the job lifecycle management without requiring actual Firestore connection.
+Uses mocking to isolate the business logic.
+"""
+import pytest
+from unittest.mock import Mock, MagicMock, patch, AsyncMock
+from datetime import datetime, UTC
+
+# Mock Firestore before importing JobManager
+import sys
+sys.modules['google.cloud.firestore'] = MagicMock()
+
+from backend.services.job_manager import JobManager
+from backend.models.job import Job, JobCreate, JobStatus
+from backend.exceptions import InvalidStateTransitionError
+
+
+@pytest.fixture
+def mock_firestore_service():
+    """Mock FirestoreService."""
+    with patch('backend.services.job_manager.FirestoreService') as mock:
+        service = Mock()
+        mock.return_value = service
+        yield service
+
+
+@pytest.fixture
+def job_manager(mock_firestore_service):
+    """Create JobManager with mocked dependencies."""
+    return JobManager()
+
+
+class TestJobCreation:
+    """Test job creation logic."""
+
+    def test_create_job_requires_theme_id(self, job_manager, mock_firestore_service):
+        """Test that jobs without theme_id are rejected."""
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song"
+            # No theme_id - should fail
+        )
+
+        with pytest.raises(ValueError, match="theme_id is required"):
+            job_manager.create_job(job_create)
+
+        # Verify Firestore was NOT called
+        mock_firestore_service.create_job.assert_not_called()
+
+    def test_create_job_with_url(self, job_manager, mock_firestore_service):
+        """Test creating a job with YouTube URL."""
+        job_create = JobCreate(
+            url="https://youtube.com/watch?v=test",
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad"  # Required for all jobs
+        )
+        
+        # The actual create_job method creates the job and returns it
+        job = job_manager.create_job(job_create)
+        
+        assert job.job_id is not None
+        assert job.status == JobStatus.PENDING
+        assert job.url == "https://youtube.com/watch?v=test"
+        assert job.artist == "Test Artist"
+        assert job.title == "Test Song"
+        assert job.progress == 0
+        
+        # Verify Firestore was called
+        mock_firestore_service.create_job.assert_called_once()
+    
+    def test_create_job_without_url(self, job_manager, mock_firestore_service):
+        """Test creating a job without URL (for file upload)."""
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad"  # Required for all jobs
+        )
+        
+        job = job_manager.create_job(job_create)
+        
+        assert job.artist == "Test Artist"
+        assert job.title == "Test Song"
+        assert job.url is None
+    
+    def test_create_job_generates_unique_id(self, job_manager, mock_firestore_service):
+        """Test that each job gets a unique ID."""
+        job_create = JobCreate(theme_id="nomad")  # Required for all jobs
+
+        # Create multiple jobs
+        ids = []
+        for i in range(5):
+            mock_firestore_service.create_job.return_value = Job(
+                job_id=f"test{i}",
+                status=JobStatus.PENDING,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC)
+            )
+            job = job_manager.create_job(job_create)
+            ids.append(job.job_id)
+        
+        # All IDs should be unique
+        assert len(ids) == len(set(ids))
+    
+    def test_create_job_sets_initial_status(self, job_manager, mock_firestore_service):
+        """Test that new jobs start with PENDING status."""
+        job_create = JobCreate(theme_id="nomad")  # Required for all jobs
+
+        mock_firestore_service.create_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+        
+        job = job_manager.create_job(job_create)
+        
+        assert job.status == JobStatus.PENDING
+        assert job.progress == 0
+    
+    def test_create_job_with_distribution_settings(self, job_manager, mock_firestore_service):
+        """Test that distribution settings are passed from JobCreate to Job.
+
+        This was a bug where brand_prefix, dropbox_path, gdrive_folder_id, and
+        discord_webhook_url were NOT being passed to the Job constructor.
+        """
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad",  # Required for all jobs
+            brand_prefix="NOMAD",
+            discord_webhook_url="https://discord.com/webhook/test",
+            dropbox_path="/Karaoke/Tracks-Organized",
+            gdrive_folder_id="1abc123xyz",
+            enable_youtube_upload=True,
+        )
+        
+        job = job_manager.create_job(job_create)
+        
+        # Verify distribution settings are passed through
+        assert job.brand_prefix == "NOMAD"
+        assert job.discord_webhook_url == "https://discord.com/webhook/test"
+        assert job.dropbox_path == "/Karaoke/Tracks-Organized"
+        assert job.gdrive_folder_id == "1abc123xyz"
+        assert job.enable_youtube_upload is True
+        
+        # Verify Firestore was called with job containing these fields
+        mock_firestore_service.create_job.assert_called_once()
+        created_job = mock_firestore_service.create_job.call_args[0][0]
+        assert created_job.brand_prefix == "NOMAD"
+        assert created_job.dropbox_path == "/Karaoke/Tracks-Organized"
+
+
+class TestJobRetrieval:
+    """Test job retrieval logic."""
+    
+    def test_get_existing_job(self, job_manager, mock_firestore_service):
+        """Test retrieving an existing job."""
+        expected_job = Job(
+            job_id="test123",
+            status=JobStatus.SEPARATING_STAGE1,
+            progress=25,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+        
+        mock_firestore_service.get_job.return_value = expected_job
+        
+        job = job_manager.get_job("test123")
+        
+        assert job.job_id == "test123"
+        assert job.status == JobStatus.SEPARATING_STAGE1
+        assert job.progress == 25
+        
+        mock_firestore_service.get_job.assert_called_once_with("test123")
+    
+    def test_get_nonexistent_job(self, job_manager, mock_firestore_service):
+        """Test retrieving a nonexistent job returns None."""
+        mock_firestore_service.get_job.return_value = None
+        
+        job = job_manager.get_job("nonexistent")
+        
+        assert job is None
+
+
+class TestJobUpdate:
+    """Test job update logic."""
+    
+    def test_update_job_status(self, job_manager, mock_firestore_service):
+        """Test updating job status."""
+        # Setup: job exists
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            progress=0,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        # Update status
+        updates = {"status": JobStatus.SEPARATING_STAGE1, "progress": 25}
+        job_manager.update_job("test123", updates)
+        
+        # Verify update was called
+        mock_firestore_service.update_job.assert_called_once()
+        call_args = mock_firestore_service.update_job.call_args
+        assert call_args[0][0] == "test123"  # job_id
+        assert "status" in call_args[0][1]  # updates dict
+    
+    def test_update_job_multiple_fields(self, job_manager, mock_firestore_service):
+        """Test updating multiple fields at once."""
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            progress=0,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            timeline=[]
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        updates = {"status": JobStatus.SEPARATING_STAGE1, "progress": 25}
+        job_manager.update_job("test123", updates)
+        
+        # Verify update was called
+        call_args = mock_firestore_service.update_job.call_args
+        updates_dict = call_args[0][1]
+        assert "status" in updates_dict
+        assert "progress" in updates_dict
+    
+    def test_update_input_media_gcs_path(self, job_manager, mock_firestore_service):
+        """Test updating input_media_gcs_path field."""
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            progress=0,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        updates = {"input_media_gcs_path": "uploads/test123/file.flac"}
+        job_manager.update_job("test123", updates)
+        
+        # Verify update was called with input_media_gcs_path
+        call_args = mock_firestore_service.update_job.call_args
+        updates_dict = call_args[0][1]
+        assert "input_media_gcs_path" in updates_dict
+        assert updates_dict["input_media_gcs_path"] == "uploads/test123/file.flac"
+
+
+class TestJobStatusTransitions:
+    """Test valid job status transitions."""
+    
+    def test_pending_to_downloading(self, job_manager, mock_firestore_service):
+        """Test transition from PENDING to DOWNLOADING."""
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            progress=0,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        job_manager.update_job("test123", {"status": JobStatus.DOWNLOADING})
+        
+        # Should succeed (valid transition)
+        mock_firestore_service.update_job.assert_called_once()
+    
+    def test_downloading_to_separating(self, job_manager, mock_firestore_service):
+        """Test transition from DOWNLOADING to SEPARATING_STAGE1."""
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.DOWNLOADING,
+            progress=0,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        job_manager.update_job("test123", {"status": JobStatus.SEPARATING_STAGE1})
+        
+        mock_firestore_service.update_job.assert_called_once()
+
+
+class TestJobFailure:
+    """Test job failure handling."""
+    
+    def test_fail_job_logs_warning_not_error(self, job_manager, mock_firestore_service, caplog):
+        """ops_alerts' job-failed alert is the one alert; an ERROR here made a second one."""
+        import logging
+
+        mock_firestore_service.get_job.return_value = None
+        with caplog.at_level(logging.INFO, logger="backend.services.job_manager"):
+            job_manager.fail_job("job-1", "Download failed: boom")
+        records = [r for r in caplog.records if "job-1 failed" in r.getMessage()]
+        assert [r.levelno for r in records] == [logging.WARNING]
+
+    def test_mark_job_failed_logs_warning_not_error(self, job_manager, mock_firestore_service, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="backend.services.job_manager"):
+            job_manager.mark_job_failed("job-2", "boom")
+        records = [r for r in caplog.records if "job-2 failed" in r.getMessage()]
+        assert [r.levelno for r in records] == [logging.WARNING]
+
+    def test_mark_job_as_failed(self, job_manager, mock_firestore_service):
+        """Test marking a job as failed."""
+        error_message = "Audio separation failed"
+        job_manager.mark_job_failed("test123", error_message)
+        
+        # mark_job_failed calls firestore.update_job_status
+        mock_firestore_service.update_job_status.assert_called_once()
+        call_args = mock_firestore_service.update_job_status.call_args
+        assert call_args[1]['job_id'] == "test123"
+        assert call_args[1]['status'] == JobStatus.FAILED
+        assert 'error_message' in call_args[1]
+    
+    def test_mark_job_error(self, job_manager, mock_firestore_service):
+        """Test marking a job with an error."""
+        error_message = "Test error"
+        job_manager.mark_job_error("test123", error_message)
+        
+        # mark_job_error calls firestore.update_job_status
+        mock_firestore_service.update_job_status.assert_called_once()
+        call_args = mock_firestore_service.update_job_status.call_args
+        assert call_args[1]['job_id'] == "test123"
+        assert call_args[1]['error_message'] == error_message
+
+
+class TestMadeForYouFieldMapping:
+    """
+    CRITICAL: Test that made-for-you fields are properly copied from JobCreate to Job.
+
+    These tests verify that JobManager.create_job() properly maps all fields from
+    JobCreate to the Job object that gets persisted to Firestore.
+
+    Bug context (2026-01-09): Production made-for-you orders were created with
+    made_for_you=False, customer_email=None, customer_notes=None because
+    JobManager.create_job() wasn't copying these fields from JobCreate to Job.
+    """
+
+    def test_create_job_copies_made_for_you_flag(self, job_manager, mock_firestore_service):
+        """
+        CRITICAL: made_for_you flag must be copied from JobCreate to Job.
+
+        This flag is essential for:
+        - Ownership transfer on job completion
+        - Email suppression for intermediate states
+        - Identifying made-for-you jobs in admin UI
+        """
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad",
+            made_for_you=True,  # This MUST be copied to the Job
+        )
+
+        job = job_manager.create_job(job_create)
+
+        # CRITICAL ASSERTION: made_for_you must be True on the created Job
+        assert job.made_for_you is True, \
+            "made_for_you=True on JobCreate must be copied to Job"
+
+        # Also verify what was saved to Firestore
+        mock_firestore_service.create_job.assert_called_once()
+        saved_job = mock_firestore_service.create_job.call_args[0][0]
+        assert saved_job.made_for_you is True, \
+            "made_for_you=True must be persisted to Firestore"
+
+    def test_create_job_copies_customer_email(self, job_manager, mock_firestore_service):
+        """
+        CRITICAL: customer_email must be copied from JobCreate to Job.
+
+        This field is essential for:
+        - Ownership transfer on job completion (transferring to this email)
+        - Sending completion email with download links to customer
+        """
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad",
+            made_for_you=True,
+            customer_email="customer@example.com",  # This MUST be copied to the Job
+        )
+
+        job = job_manager.create_job(job_create)
+
+        # CRITICAL ASSERTION: customer_email must be copied
+        assert job.customer_email == "customer@example.com", \
+            "customer_email on JobCreate must be copied to Job"
+
+        # Also verify what was saved to Firestore
+        saved_job = mock_firestore_service.create_job.call_args[0][0]
+        assert saved_job.customer_email == "customer@example.com", \
+            "customer_email must be persisted to Firestore"
+
+    def test_create_job_copies_customer_notes(self, job_manager, mock_firestore_service):
+        """
+        customer_notes must be copied from JobCreate to Job.
+
+        Customer notes contain special requests that admin needs to see.
+        """
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad",
+            made_for_you=True,
+            customer_notes="Please make this perfect for my wedding!",
+        )
+
+        job = job_manager.create_job(job_create)
+
+        assert job.customer_notes == "Please make this perfect for my wedding!", \
+            "customer_notes on JobCreate must be copied to Job"
+
+        saved_job = mock_firestore_service.create_job.call_args[0][0]
+        assert saved_job.customer_notes == "Please make this perfect for my wedding!", \
+            "customer_notes must be persisted to Firestore"
+
+    def test_create_job_full_made_for_you_config(self, job_manager, mock_firestore_service):
+        """
+        Test complete made-for-you job creation with all fields.
+
+        This is the realistic scenario: a made-for-you order creates a job with:
+        - made_for_you=True
+        - user_email=admin (owner during processing)
+        - customer_email=customer (for final delivery)
+        - customer_notes=notes (customer's special requests)
+        """
+        job_create = JobCreate(
+            artist="Avril Lavigne",
+            title="Complicated",
+            theme_id="nomad",
+            made_for_you=True,
+            user_email="admin@nomadkaraoke.com",
+            customer_email="customer@example.com",
+            customer_notes="Anniversary gift!",
+            # Distribution settings that should also be applied
+            enable_youtube_upload=True,
+            dropbox_path="/Production/Ready",
+            brand_prefix="NOMAD",
+        )
+
+        job = job_manager.create_job(job_create, is_admin=True)
+
+        # Verify all made-for-you fields
+        assert job.made_for_you is True
+        assert job.user_email == "admin@nomadkaraoke.com"
+        assert job.customer_email == "customer@example.com"
+        assert job.customer_notes == "Anniversary gift!"
+
+        # Verify distribution settings too
+        assert job.enable_youtube_upload is True
+        assert job.dropbox_path == "/Production/Ready"
+        assert job.brand_prefix == "NOMAD"
+
+    def test_create_job_made_for_you_false_by_default(self, job_manager, mock_firestore_service):
+        """
+        Regular jobs should have made_for_you=False by default.
+        """
+        job_create = JobCreate(
+            artist="Test Artist",
+            title="Test Song",
+            theme_id="nomad",
+            # No made_for_you specified - should default to False
+        )
+
+        job = job_manager.create_job(job_create)
+
+        assert job.made_for_you is False
+        assert job.customer_email is None
+        assert job.customer_notes is None
+
+
+class TestJobDeletion:
+    """Test job deletion logic."""
+
+    def test_delete_job(self, job_manager, mock_firestore_service):
+        """Test deleting a job."""
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.COMPLETE,
+            progress=100,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            output_files={}  # Empty dict so iteration works
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        job_manager.delete_job("test123")
+        
+        # Verify delete was called
+        mock_firestore_service.delete_job.assert_called_once_with("test123")
+    
+    def test_delete_job_with_files(self, job_manager, mock_firestore_service):
+        """Test deleting a job and its files."""
+        existing_job = Job(
+            job_id="test123",
+            status=JobStatus.COMPLETE,
+            progress=100,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            output_files={}  # Empty dict so iteration works
+        )
+        mock_firestore_service.get_job.return_value = existing_job
+        
+        job_manager.delete_job("test123", delete_files=True)
+        
+        # Verify delete was called
+        mock_firestore_service.delete_job.assert_called_once_with("test123")
+
+
+class TestDeleteStateDataKeys:
+    """Tests for delete_state_data_key and delete_state_data_keys methods.
+
+    These methods are used to clear worker progress keys from state_data,
+    which is critical for allowing workers to re-run after admin resets.
+    """
+
+    def test_delete_state_data_key_success(self, job_manager, mock_firestore_service):
+        """Test deleting a single key from state_data."""
+        # Setup mock to return success
+        mock_firestore_service.db = Mock()
+        mock_job_ref = Mock()
+        mock_firestore_service.db.collection.return_value.document.return_value = mock_job_ref
+
+        result = job_manager.delete_state_data_key("test123", "render_progress")
+
+        assert result is True
+        # Verify update was called with DELETE_FIELD for the key
+        mock_job_ref.update.assert_called_once()
+        call_args = mock_job_ref.update.call_args[0][0]
+        assert "state_data.render_progress" in call_args
+
+    def test_delete_state_data_key_handles_exception(self, job_manager, mock_firestore_service):
+        """Test that delete_state_data_key handles exceptions gracefully."""
+        mock_firestore_service.db = Mock()
+        mock_job_ref = Mock()
+        mock_job_ref.update.side_effect = Exception("Firestore error")
+        mock_firestore_service.db.collection.return_value.document.return_value = mock_job_ref
+
+        result = job_manager.delete_state_data_key("test123", "render_progress")
+
+        assert result is False
+
+    def test_delete_state_data_keys_success(self, job_manager, mock_firestore_service):
+        """Test deleting multiple keys from state_data in one operation."""
+        mock_firestore_service.db = Mock()
+        mock_job_ref = Mock()
+        mock_firestore_service.db.collection.return_value.document.return_value = mock_job_ref
+
+        keys_to_delete = ["render_progress", "video_progress", "encoding_progress"]
+        result = job_manager.delete_state_data_keys("test123", keys_to_delete)
+
+        assert result == keys_to_delete
+        # Verify single update was called with all keys
+        mock_job_ref.update.assert_called_once()
+        call_args = mock_job_ref.update.call_args[0][0]
+        assert "state_data.render_progress" in call_args
+        assert "state_data.video_progress" in call_args
+        assert "state_data.encoding_progress" in call_args
+
+    def test_delete_state_data_keys_empty_list(self, job_manager, mock_firestore_service):
+        """Test that empty list returns empty without calling Firestore."""
+        mock_firestore_service.db = Mock()
+
+        result = job_manager.delete_state_data_keys("test123", [])
+
+        assert result == []
+        # Should NOT call Firestore for empty list
+        mock_firestore_service.db.collection.assert_not_called()
+
+    def test_delete_state_data_keys_handles_exception(self, job_manager, mock_firestore_service):
+        """Test that delete_state_data_keys handles exceptions gracefully."""
+        mock_firestore_service.db = Mock()
+        mock_job_ref = Mock()
+        mock_job_ref.update.side_effect = Exception("Firestore error")
+        mock_firestore_service.db.collection.return_value.document.return_value = mock_job_ref
+
+        result = job_manager.delete_state_data_keys("test123", ["render_progress"])
+
+        assert result == []
+
+
+# =============================================================================
+# InvalidStateTransitionError Tests
+# =============================================================================
+
+class TestInvalidStateTransitionError:
+    """Tests for InvalidStateTransitionError exception."""
+
+    def test_exception_stores_all_attributes(self):
+        """Test exception stores job_id, from_status, to_status, and valid_transitions."""
+        error = InvalidStateTransitionError(
+            message="Test error",
+            job_id="test-123",
+            from_status="pending",
+            to_status="generating_screens",
+            valid_transitions=["downloading", "searching_audio", "failed"]
+        )
+
+        assert error.message == "Test error"
+        assert error.job_id == "test-123"
+        assert error.from_status == "pending"
+        assert error.to_status == "generating_screens"
+        assert error.valid_transitions == ["downloading", "searching_audio", "failed"]
+        assert str(error) == "Test error"
+
+    def test_exception_defaults(self):
+        """Test exception has sensible defaults."""
+        error = InvalidStateTransitionError(message="Minimal error")
+
+        assert error.message == "Minimal error"
+        assert error.job_id == ""
+        assert error.from_status == ""
+        assert error.to_status == ""
+        assert error.valid_transitions == []
+
+
+# =============================================================================
+# State Transition Validation Tests (raise_on_invalid behavior)
+# =============================================================================
+
+class TestValidateStateTransitionRaisesBehavior:
+    """Tests for validate_state_transition with raise_on_invalid parameter."""
+
+    def test_invalid_transition_raises_by_default(self, job_manager, mock_firestore_service):
+        """Test that invalid transition raises InvalidStateTransitionError by default."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        # PENDING cannot transition directly to GENERATING_SCREENS
+        with pytest.raises(InvalidStateTransitionError) as exc_info:
+            job_manager.validate_state_transition("test123", JobStatus.GENERATING_SCREENS)
+
+        error = exc_info.value
+        assert error.job_id == "test123"
+        assert error.from_status == JobStatus.PENDING
+        assert error.to_status == "generating_screens"
+        assert "downloading" in error.valid_transitions
+
+    def test_invalid_transition_returns_false_when_not_raising(self, job_manager, mock_firestore_service):
+        """Test that invalid transition returns False when raise_on_invalid=False."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        # PENDING cannot transition directly to GENERATING_SCREENS
+        result = job_manager.validate_state_transition(
+            "test123",
+            JobStatus.GENERATING_SCREENS,
+            raise_on_invalid=False
+        )
+
+        assert result is False
+
+    def test_valid_transition_returns_true(self, job_manager, mock_firestore_service):
+        """Test that valid transition returns True."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        # PENDING can transition to DOWNLOADING
+        result = job_manager.validate_state_transition("test123", JobStatus.DOWNLOADING)
+
+        assert result is True
+
+    def test_job_not_found_raises_value_error(self, job_manager, mock_firestore_service):
+        """Test that missing job raises ValueError when raise_on_invalid=True."""
+        mock_firestore_service.get_job.return_value = None
+
+        with pytest.raises(ValueError, match="Job nonexistent not found"):
+            job_manager.validate_state_transition("nonexistent", JobStatus.DOWNLOADING)
+
+    def test_job_not_found_returns_false_when_not_raising(self, job_manager, mock_firestore_service):
+        """Test that missing job returns False when raise_on_invalid=False."""
+        mock_firestore_service.get_job.return_value = None
+
+        result = job_manager.validate_state_transition(
+            "nonexistent",
+            JobStatus.DOWNLOADING,
+            raise_on_invalid=False
+        )
+
+        assert result is False
+
+
+class TestTransitionToStateRaisesBehavior:
+    """Tests for transition_to_state with raise_on_invalid parameter."""
+
+    def test_invalid_transition_raises_by_default(self, job_manager, mock_firestore_service):
+        """Test that invalid transition raises InvalidStateTransitionError by default."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        # PENDING cannot transition directly to AWAITING_REVIEW
+        with pytest.raises(InvalidStateTransitionError) as exc_info:
+            job_manager.transition_to_state("test123", JobStatus.AWAITING_REVIEW)
+
+        error = exc_info.value
+        assert error.job_id == "test123"
+
+    def test_invalid_transition_message_uses_consistent_status_names(
+        self, job_manager, mock_firestore_service
+    ):
+        """The error message must render both states using their string values.
+
+        Regression: previously rendered 'downloading -> JobStatus.DOWNLOADING'
+        because current_status was deserialized as str (use_enum_values=True)
+        while new_status remained an enum. This made debugging confusing.
+        """
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.DOWNLOADING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        with pytest.raises(InvalidStateTransitionError) as exc_info:
+            job_manager.transition_to_state("test123", JobStatus.DOWNLOADING)
+
+        message = str(exc_info.value)
+        assert "downloading -> downloading" in message, (
+            f"Expected 'downloading -> downloading' in message, got: {message}"
+        )
+        assert "JobStatus." not in message, (
+            f"Expected no 'JobStatus.' prefix in message, got: {message}"
+        )
+
+    def test_invalid_transition_returns_false_when_not_raising(self, job_manager, mock_firestore_service):
+        """Test that invalid transition returns False when raise_on_invalid=False."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        result = job_manager.transition_to_state(
+            "test123",
+            JobStatus.AWAITING_REVIEW,
+            raise_on_invalid=False
+        )
+
+        assert result is False
+        # Verify update was NOT called since transition was invalid
+        mock_firestore_service.update_job.assert_not_called()
+
+    def test_valid_transition_updates_job(self, job_manager, mock_firestore_service):
+        """Test that valid transition updates the job."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC)
+        )
+
+        result = job_manager.transition_to_state(
+            "test123",
+            JobStatus.DOWNLOADING,
+            progress=15,
+            message="Starting processing"
+        )
+
+        assert result is True
+        # transition_to_state uses update_job_status internally
+        mock_firestore_service.update_job_status.assert_called()
+        call_kwargs = mock_firestore_service.update_job_status.call_args.kwargs
+        assert call_kwargs['job_id'] == "test123"
+        assert call_kwargs['status'] == JobStatus.DOWNLOADING
+
+
+# =============================================================================
+# start_job_processing Tests
+# =============================================================================
+
+class TestStartJobProcessing:
+    """Tests for start_job_processing method."""
+
+    @pytest.mark.asyncio
+    async def test_raises_if_job_not_found(self, job_manager, mock_firestore_service):
+        """Test raises ValueError if job doesn't exist."""
+        mock_firestore_service.get_job.return_value = None
+
+        with pytest.raises(ValueError, match="Job missing-job not found"):
+            await job_manager.start_job_processing("missing-job")
+
+    @pytest.mark.asyncio
+    async def test_raises_if_missing_input_media_path(self, job_manager, mock_firestore_service):
+        """Test raises ValueError if job has no input_media_gcs_path."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path=None  # Missing
+        )
+
+        with pytest.raises(ValueError, match="missing input_media_gcs_path"):
+            await job_manager.start_job_processing("test123")
+
+    @pytest.mark.asyncio
+    async def test_raises_if_invalid_state_transition(self, job_manager, mock_firestore_service):
+        """Test raises InvalidStateTransitionError if job can't transition to DOWNLOADING."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.AWAITING_REVIEW,  # Can't go back to DOWNLOADING
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="gs://bucket/audio.mp3"
+        )
+
+        with pytest.raises(InvalidStateTransitionError):
+            await job_manager.start_job_processing("test123")
+
+    @pytest.mark.asyncio
+    async def test_transitions_and_triggers_workers(self, job_manager, mock_firestore_service):
+        """Test successful flow: transitions to DOWNLOADING and triggers workers."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="gs://bucket/audio.mp3"
+        )
+
+        with patch('backend.services.worker_service.get_worker_service') as mock_get_worker, \
+             patch('backend.services.job_manager.reconcile_and_maybe_pause', AsyncMock(return_value=False)):
+            mock_worker = Mock()
+            mock_worker.trigger_audio_worker = AsyncMock()
+            mock_worker.trigger_lyrics_worker = AsyncMock()
+            mock_get_worker.return_value = mock_worker
+
+            await job_manager.start_job_processing("test123")
+
+            # Verify transition was called (uses update_job_status internally)
+            mock_firestore_service.update_job_status.assert_called()
+            call_kwargs = mock_firestore_service.update_job_status.call_args.kwargs
+            assert call_kwargs['status'] == JobStatus.DOWNLOADING
+
+            # Verify both workers were triggered
+            mock_worker.trigger_audio_worker.assert_called_once_with("test123")
+            mock_worker.trigger_lyrics_worker.assert_called_once_with("test123")
+
+    @pytest.mark.asyncio
+    async def test_requires_audio_edit_parks_at_editor_instead_of_processing(self, job_manager, mock_firestore_service):
+        """Uploads with "edit audio first" must stop at the audio editor.
+
+        Regression: only the download worker honored requires_audio_edit, so file
+        uploads (and URL/search fallbacks via start_job_processing) skipped the editor.
+        """
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="uploads/test123/audio/song.flac",
+            state_data={"requires_audio_edit": True},
+        )
+        reconcile = AsyncMock(return_value=False)
+
+        with patch('backend.services.worker_service.get_worker_service') as mock_get_worker, \
+             patch('backend.services.job_manager.reconcile_and_maybe_pause', reconcile), \
+             patch('backend.workers.audio_download_worker.enter_audio_edit') as mock_enter:
+            mock_worker = Mock()
+            mock_worker.trigger_audio_worker = AsyncMock()
+            mock_worker.trigger_lyrics_worker = AsyncMock()
+            mock_get_worker.return_value = mock_worker
+
+            await job_manager.start_job_processing("test123")
+
+        mock_enter.assert_called_once_with(job_manager, "test123", "uploads/test123/audio/song.flac")
+        mock_worker.trigger_audio_worker.assert_not_called()
+        mock_worker.trigger_lyrics_worker.assert_not_called()
+        # Duration reconcile happens at audio-edit submit, on the edited audio
+        reconcile.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_audio_edit_park_failure_fails_job(self, job_manager, mock_firestore_service):
+        """A failure while parking at the editor must fail the job, not strand it at DOWNLOADING."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="uploads/test123/audio/song.flac",
+            state_data={"requires_audio_edit": True},
+        )
+        with patch('backend.workers.audio_download_worker.enter_audio_edit',
+                   side_effect=RuntimeError("transition failed")), \
+             patch.object(job_manager, 'fail_job') as mock_fail:
+            with pytest.raises(RuntimeError, match="transition failed"):
+                await job_manager.start_job_processing("test123")
+        mock_fail.assert_called_once()
+        assert "Audio edit preparation failed" in mock_fail.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_workers_triggered_in_parallel(self, job_manager, mock_firestore_service):
+        """Test that audio and lyrics workers are triggered concurrently."""
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="gs://bucket/audio.mp3"
+        )
+
+        call_order = []
+
+        async def track_audio(*args):
+            call_order.append(('audio_start', datetime.now()))
+            # Simulate some work
+            call_order.append(('audio_end', datetime.now()))
+
+        async def track_lyrics(*args):
+            call_order.append(('lyrics_start', datetime.now()))
+            # Simulate some work
+            call_order.append(('lyrics_end', datetime.now()))
+
+        with patch('backend.services.worker_service.get_worker_service') as mock_get_worker, \
+             patch('backend.services.job_manager.reconcile_and_maybe_pause', AsyncMock(return_value=False)):
+            mock_worker = Mock()
+            mock_worker.trigger_audio_worker = AsyncMock(side_effect=track_audio)
+            mock_worker.trigger_lyrics_worker = AsyncMock(side_effect=track_lyrics)
+            mock_get_worker.return_value = mock_worker
+
+            await job_manager.start_job_processing("test123")
+
+            # Both workers should have been called
+            assert any('audio_start' in str(c) for c in call_order)
+            assert any('lyrics_start' in str(c) for c in call_order)
+
+
+    @pytest.mark.asyncio
+    async def test_skips_audio_worker_when_existing_instrumental(self, job_manager, mock_firestore_service):
+        """Test that audio separation is skipped when job has existing instrumental.
+
+        Jobs with existing_instrumental_gcs_path (e.g. tenant uploads) don't need
+        GPU-powered audio separation. Only lyrics worker should be triggered.
+        """
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="gs://bucket/audio.mp3",
+            existing_instrumental_gcs_path="uploads/test123/audio/existing_instrumental.mp3"
+        )
+
+        with patch('backend.services.worker_service.get_worker_service') as mock_get_worker, \
+             patch('backend.services.job_manager.reconcile_and_maybe_pause', AsyncMock(return_value=False)):
+            mock_worker = Mock()
+            mock_worker.trigger_audio_worker = AsyncMock()
+            mock_worker.trigger_lyrics_worker = AsyncMock()
+            mock_get_worker.return_value = mock_worker
+
+            await job_manager.start_job_processing("test123")
+
+            # Audio worker should NOT be triggered
+            mock_worker.trigger_audio_worker.assert_not_called()
+
+            # Lyrics worker should still be triggered
+            mock_worker.trigger_lyrics_worker.assert_called_once_with("test123")
+
+            # audio_complete should be set via update_state_data, which now writes
+            # an atomic dot-path field ("state_data.audio_complete") rather than
+            # re-persisting the whole state_data map.
+            update_calls = mock_firestore_service.update_job.call_args_list
+            audio_complete_set = any(
+                call.args[1].get('state_data.audio_complete') is True
+                for call in update_calls
+                if len(call.args) > 1 and isinstance(call.args[1], dict)
+            )
+            assert audio_complete_set, "audio_complete should be set to True in state_data"
+
+    @pytest.mark.asyncio
+    async def test_triggers_both_workers_when_no_existing_instrumental(self, job_manager, mock_firestore_service):
+        """Test that both workers are triggered when no existing instrumental.
+
+        Normal jobs (without existing_instrumental_gcs_path) should trigger
+        both audio and lyrics workers in parallel.
+        """
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="gs://bucket/audio.mp3",
+            existing_instrumental_gcs_path=None  # No existing instrumental
+        )
+
+        with patch('backend.services.worker_service.get_worker_service') as mock_get_worker, \
+             patch('backend.services.job_manager.reconcile_and_maybe_pause', AsyncMock(return_value=False)):
+            mock_worker = Mock()
+            mock_worker.trigger_audio_worker = AsyncMock()
+            mock_worker.trigger_lyrics_worker = AsyncMock()
+            mock_get_worker.return_value = mock_worker
+
+            await job_manager.start_job_processing("test123")
+
+            # Both workers should be triggered
+            mock_worker.trigger_audio_worker.assert_called_once_with("test123")
+            mock_worker.trigger_lyrics_worker.assert_called_once_with("test123")
+
+    @pytest.mark.asyncio
+    async def test_workers_not_triggered_when_reconcile_pauses(self, job_manager, mock_firestore_service):
+        """When reconcile_and_maybe_pause returns True, start_job_processing must NOT
+        trigger any downstream workers.
+
+        This is the caller-callee contract gap: if the ``if await
+        reconcile_and_maybe_pause(job_id): return`` guard were deleted from
+        start_job_processing, all other tests would still pass because they all
+        use return_value=False.  This test uses return_value=True so the deletion
+        would cause it to fail — proving the guard is there and effective.
+        """
+        mock_firestore_service.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            input_media_gcs_path="gs://bucket/audio.mp3",
+        )
+
+        with patch("backend.services.worker_service.get_worker_service") as mock_get_worker, \
+             patch(
+                 "backend.services.job_manager.reconcile_and_maybe_pause",
+                 AsyncMock(return_value=True),  # job paused/cancelled
+             ) as mock_ramp:
+            mock_worker = Mock()
+            mock_worker.trigger_audio_worker = AsyncMock()
+            mock_worker.trigger_lyrics_worker = AsyncMock()
+            mock_get_worker.return_value = mock_worker
+
+            await job_manager.start_job_processing("test123")
+
+            # reconcile was called
+            mock_ramp.assert_awaited_once_with("test123")
+
+            # workers must NOT have been triggered
+            mock_worker.trigger_audio_worker.assert_not_called()
+            mock_worker.trigger_lyrics_worker.assert_not_called()
+
+
+class TestAtomicNestedUpdates:
+    """update_state_data / update_file_url must write atomic dot-path fields.
+
+    Previously both copied the whole map and re-persisted it, so two workers
+    updating different keys concurrently could clobber each other's writes
+    (lost-update race — e.g. a backing_vocals stem vanishing while the audio and
+    screens workers ran in parallel). Writing a single nested field path lets
+    Firestore merge sibling entries server-side.
+    """
+
+    def _job(self, job_id="job-1", file_urls=None, state_data=None):
+        return Job(
+            job_id=job_id,
+            status=JobStatus.SEPARATING_STAGE1,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            file_urls=file_urls or {},
+            state_data=state_data or {},
+        )
+
+    def test_update_state_data_writes_dotted_field(self, job_manager, mock_firestore_service):
+        mock_firestore_service.get_job.return_value = self._job()
+
+        job_manager.update_state_data("job-1", "audio_complete", True)
+
+        mock_firestore_service.update_job.assert_called_once()
+        args = mock_firestore_service.update_job.call_args.args
+        assert args[0] == "job-1"
+        assert args[1] == {"state_data.audio_complete": True}
+        # Must NOT re-persist the whole map.
+        assert "state_data" not in args[1]
+
+    def test_update_file_url_writes_dotted_field(self, job_manager, mock_firestore_service):
+        mock_firestore_service.get_job.return_value = self._job()
+
+        job_manager.update_file_url("job-1", "stems", "backing_vocals", "jobs/job-1/stems/backing_vocals.flac")
+
+        mock_firestore_service.update_job.assert_called_once()
+        args = mock_firestore_service.update_job.call_args.args
+        assert args[1] == {"file_urls.stems.backing_vocals": "jobs/job-1/stems/backing_vocals.flac"}
+        assert "file_urls" not in args[1]
+
+    def test_concurrent_stem_registrations_do_not_clobber(self, job_manager, mock_firestore_service):
+        """Two stem registrations issue independent field-path writes.
+
+        With the old copy-and-rewrite approach, a registration built from a stale
+        snapshot would drop a sibling stem written in between. Independent dot-path
+        writes target different fields, so Firestore never loses either.
+        """
+        # Both callers see the same stale snapshot (missing each other's write).
+        mock_firestore_service.get_job.return_value = self._job(
+            file_urls={"stems": {"lead_vocals": "jobs/job-1/stems/lead_vocals.flac"}}
+        )
+
+        job_manager.update_file_url("job-1", "stems", "backing_vocals", "bv.flac")
+        job_manager.update_file_url("job-1", "stems", "instrumental_with_backing", "iwb.flac")
+
+        writes = [c.args[1] for c in mock_firestore_service.update_job.call_args_list]
+        assert {"file_urls.stems.backing_vocals": "bv.flac"} in writes
+        assert {"file_urls.stems.instrumental_with_backing": "iwb.flac"} in writes
+        # Neither write rewrites the whole map, so neither can drop the other.
+        assert all("file_urls" not in w for w in writes)
+
+    def test_missing_job_is_a_noop(self, job_manager, mock_firestore_service):
+        mock_firestore_service.get_job.return_value = None
+
+        job_manager.update_state_data("gone", "k", "v")
+        job_manager.update_file_url("gone", "stems", "backing_vocals", "x.flac")
+
+        mock_firestore_service.update_job.assert_not_called()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+
+class TestGetOutputUrls:
+    """get_output_urls signs output_files plus the final MP4s in file_urls['finals']."""
+
+    @pytest.fixture
+    def signer(self, job_manager):
+        job_manager.storage = Mock()
+        job_manager.storage.generate_signed_url.side_effect = lambda path, expiration_minutes=60: f"signed://{path}?exp={expiration_minutes}"
+        return job_manager.storage
+
+    def _job(self, job_manager, **kwargs):
+        job = Mock(output_files=kwargs.get("output_files", {}), file_urls=kwargs.get("file_urls", {}))
+        job_manager.get_job = Mock(return_value=job)
+
+    def test_signs_only_mp4_finals(self, job_manager, signer):
+        self._job(job_manager, file_urls={"finals": {
+            "lossy_720p_mp4": "jobs/j/finals/720.mp4",
+            "lossy_4k_mp4": "jobs/j/finals/4k.mp4",
+            "lossless_4k_mkv": "jobs/j/finals/4k.mkv",
+            "cdg_zip": "jobs/j/finals/x.zip",
+        }})
+        urls = job_manager.get_output_urls("j")
+        assert set(urls) == {"lossy_720p_mp4", "lossy_4k_mp4"}
+        assert urls["lossy_720p_mp4"] == "signed://jobs/j/finals/720.mp4?exp=120"
+
+    def test_output_files_win_on_collision(self, job_manager, signer):
+        self._job(
+            job_manager,
+            output_files={"lossy_720p_mp4": "legacy/720.mp4", "other": "legacy/o.bin"},
+            file_urls={"finals": {"lossy_720p_mp4": "jobs/j/finals/720.mp4"}},
+        )
+        urls = job_manager.get_output_urls("j")
+        assert urls["lossy_720p_mp4"] == "signed://legacy/720.mp4?exp=120"
+        assert urls["other"] == "signed://legacy/o.bin?exp=120"
+        assert signer.generate_signed_url.call_count == 2
+
+    def test_empty_when_nothing_to_sign(self, job_manager, signer):
+        self._job(job_manager)
+        assert job_manager.get_output_urls("j") == {}
+        self._job(job_manager, file_urls={"finals": None, "videos": {"a_mp4": "x"}})
+        assert job_manager.get_output_urls("j") == {}
+        signer.generate_signed_url.assert_not_called()
+
+    def test_missing_job(self, job_manager, signer):
+        job_manager.get_job = Mock(return_value=None)
+        assert job_manager.get_output_urls("j") == {}
+
+    def test_signing_failure_skips_entry_without_raising(self, job_manager, signer):
+        signer.generate_signed_url.side_effect = TimeoutError("iam stalled")
+        self._job(job_manager, file_urls={"finals": {"lossy_720p_mp4": "p", "lossy_4k_mp4": "q"}})
+        assert job_manager.get_output_urls("j") == {}
+        # Fail fast: a stalled signer is not retried for every remaining final
+        assert signer.generate_signed_url.call_count == 1
+
+    def test_malformed_final_entry_skipped_not_fatal(self, job_manager, signer):
+        self._job(job_manager, file_urls={"finals": {
+            "bad_none_mp4": None,
+            "bad_dict_mp4": {"x": 1},
+            "lossy_720p_mp4": "jobs/j/finals/720.mp4",
+        }})
+        urls = job_manager.get_output_urls("j")
+        assert urls == {"lossy_720p_mp4": "signed://jobs/j/finals/720.mp4?exp=120"}
+        assert signer.generate_signed_url.call_count == 1

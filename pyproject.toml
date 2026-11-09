@@ -1,0 +1,206 @@
+[tool.poetry]
+name = "karaoke-gen"
+version = "0.294.2"
+description = "Generate karaoke videos with synchronized lyrics. Handles the entire process from downloading audio and lyrics to creating the final video with title screens."
+authors = ["Andrew Beveridge <andrew@beveridge.uk>"]
+license = "MIT"
+readme = "README.md"
+packages = [
+    { include = "karaoke_gen" },
+    { include = "backend" }
+]
+include = [
+    # The Next.js static export is generated at build time and gitignored (see #876).
+    # Poetry's plain-string include respects .gitignore and would DROP a gitignored
+    # path from the wheel; the dict form with an explicit `format` overrides .gitignore
+    # so the built frontend is still bundled (needed for the CLI local-review UI).
+    # Wheel-only: the sdist would balloon past PyPI's 10 GB cap, so bundle in the wheel only.
+    { path = "karaoke_gen/nextjs_frontend/out/**/*", format = ["wheel"] },
+    "karaoke_gen/lyrics_transcriber/output/fonts/*",
+    "karaoke_gen/lyrics_transcriber/output/cdgmaker/images/*",
+    "karaoke_gen/lyrics_transcriber/output/cdgmaker/transitions/*",
+    # Skip/include lists for the YouTube description backfill worker (must ship in
+    # the Cloud Run image so the scheduled worker can read them).
+    "backend/data/youtube_backfill/*.txt"
+]
+homepage = "https://github.com/nomadkaraoke/karaoke-gen"
+repository = "https://github.com/nomadkaraoke/karaoke-gen"
+documentation = "https://github.com/nomadkaraoke/karaoke-gen/blob/main/README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+torch = ">=2.7"
+requests = ">=2"
+beautifulsoup4 = ">=4"
+flacfetch = ">=0.9.0"
+lyricsgenius = ">=3"
+fetch-lyrics-from-genius = ">=0.1"
+pillow = ">=10.1"
+pyinstaller = ">=6.3"
+google-api-python-client = "2.193.0"
+google-auth = "2.49.1"
+google-auth-oauthlib = "1.3.0"
+google-auth-httplib2 = "0.3.0"
+thefuzz = ">=0.22"
+numpy = ">=2"
+audio-separator = { version = ">=0.43.0", extras = ["cpu"] }
+lyrics-converter = ">=0.2.1"
+# lyrics_transcriber is now a subpackage of karaoke_gen (karaoke_gen/lyrics_transcriber/)
+# Dependencies from vendored lyrics_transcriber:
+mutagen = ">=1.47"  # For LRCLIB provider to get track duration for better matching
+python-slugify = ">=8"
+syrics = ">=0"
+karaoke-lyrics-processor = ">=0.6"
+dropbox = ">=12"
+spacy = ">=3.8.7"
+srsly = ">=2.5.1"
+tqdm = ">=4.67"
+python-levenshtein = ">=0.26"
+transformers = ">=4.47"
+metaphone = ">=0.6"
+nltk = ">=3.9"
+spacy-syllables = ">=3"
+syllables = ">=1"
+fonttools = ">=4.55"
+ollama = ">=0.4.7"
+shortuuid = ">=1.0.13"
+nest-asyncio = ">=1.5"
+openai = ">=1.63.2"
+langgraph = ">=0.2.0"
+langchain = ">=0.3.0"
+langchain-core = ">=0.3.0"
+langchain-openai = ">=0.2.0"
+langchain-anthropic = ">=0.2.0"
+anthropic = ">=0.109.0"  # direct dep: auto-correct structured outputs (output_config)
+langchain-ollama = ">=0.2.0"
+langchain-google-genai = ">=2.0.0"
+langfuse = ">=3.0.0"
+jiwer = ">=3.0.0"
+kbputils = "^0.0.16"
+attrs = ">=24.2.0"
+cattrs = ">=24.1.2"
+toml = ">=0.10"
+argparse = ">=1.4.0"
+psutil = "^7.0.0"
+pyperclip = "*"
+pytest-asyncio = "*"
+ffmpeg-python = "^0.2.0"
+python-multipart = "^0.0.20"
+python-docx = ">=1.1.0"
+yt-dlp = ">=2024.0.0"
+matplotlib = ">=3"
+# Backend API dependencies
+fastapi = ">=0.104.0"
+uvicorn = { version = ">=0.24.0", extras = ["standard"] }
+pydantic = ">=2.5.0"
+pydantic-settings = ">=2.1.0"
+httpx = ">=0.25.0"
+tenacity = "^8.2.0"  # Retry logic for external service calls
+google-cloud-firestore = "2.26.0"
+google-cloud-compute = "^1.0.0"
+# AWS encoding worker control (EC2 start/stop/describe) — backend/services/aws_encoding_compute.py
+boto3 = "^1.34"
+google-cloud-storage = "3.10.1"
+google-cloud-secret-manager = "2.26.0"
+google-cloud-monitoring = "2.29.1"  # Cloud Monitoring for YouTube API quota metrics
+google-cloud-tasks = "2.21.0"  # Cloud Tasks for worker coordination (Phase 1 scalability)
+google-cloud-run = "0.15.0"  # Cloud Run Jobs for long-running video encoding (Phase 2 scalability)
+google-cloud-logging = ">=3.9.0"  # Cloud Logging for error monitoring
+python-dotenv = ">=1.0.0"
+pydub = ">=0.25.1"
+# Google / Apple ID-token verification (JWKS) for mobile sign-in
+pyjwt = { version = ">=2.8.0", extras = ["crypto"] }
+# Payment and email services
+stripe = "^14.1.0"
+email-validator = ">=2.0.0"  # For Pydantic EmailStr validation
+# Web Push notifications
+pywebpush = ">=2.0.0"
+# OpenTelemetry for distributed tracing
+opentelemetry-api = ">=1.20.0"
+opentelemetry-sdk = ">=1.20.0"
+opentelemetry-instrumentation-fastapi = ">=0.41b0"
+opentelemetry-instrumentation-httpx = ">=0.41b0"
+opentelemetry-instrumentation-logging = ">=0.41b0"
+opentelemetry-exporter-gcp-trace = ">=1.6.0"
+opentelemetry-resourcedetector-gcp = ">=1.6.0a0"
+# Optional: Local Whisper transcription (install with: pip install karaoke-gen[local-whisper])
+whisper-timestamped = { version = ">=1.15.0", optional = true }
+aiohttp = "^3.13.2"
+
+[tool.poetry.group.dev.dependencies]
+black = ">=23"
+poetry = "*"
+pytest = ">=7.0"
+pytest-cov = ">=4.0"
+pytest-mock = ">=3.10"
+pytest-asyncio = "*"
+
+# Make dev dependencies available as optional extras for pip install
+# These need to be declared as optional dependencies first
+[tool.poetry.dependencies.black]
+version = ">=23"
+optional = true
+
+[tool.poetry.dependencies.pytest]
+version = ">=7.0"
+optional = true
+
+[tool.poetry.dependencies.pytest-cov]
+version = ">=4.0"
+optional = true
+
+[tool.poetry.dependencies.pytest-mock]
+version = ">=3.10"
+optional = true
+
+[tool.poetry.extras]
+# Local Whisper transcription support - optional, heavy dependencies
+# Install with: pip install karaoke-gen[local-whisper]
+# For CPU-only installation (recommended for systems without GPU):
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+#   pip install karaoke-gen[local-whisper]
+local-whisper = ["whisper-timestamped"]
+
+# Development/testing dependencies (pytest-asyncio is already a main dependency)
+# Install with: pip install -e ".[dev]" or pip install -e ".[local-whisper,dev]"
+dev = ["black", "pytest", "pytest-cov", "pytest-mock"]
+
+[tool.poetry.scripts]
+karaoke-gen = 'karaoke_gen.utils.gen_cli:main'
+karaoke-gen-remote = 'karaoke_gen.utils.remote_cli:main'
+karaoke-bulk = 'karaoke_gen.utils.bulk_cli:main'
+
+[tool.black]
+line-length = 140
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/integration", "backend/tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "--asyncio-mode=auto",
+    "-v",
+    "--tb=short",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "asyncio: mark test as async",
+    "emulator: marks tests requiring GCP emulators",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+    "ignore::RuntimeWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+# Exclude lyrics_transcriber subpackage from coverage since it was a separate vendored package
+# with its own test suite - including it in karaoke_gen coverage would unfairly lower the percentage
+omit = [
+    "karaoke_gen/lyrics_transcriber/*",
+]

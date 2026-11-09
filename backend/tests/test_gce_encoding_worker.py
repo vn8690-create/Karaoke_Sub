@@ -1,0 +1,749 @@
+"""
+Tests for GCE Encoding Worker (gce_encoding/main.py).
+
+These tests verify the file-finding logic in the GCE encoding worker,
+particularly ensuring that instrumental selection is respected.
+
+NOTE: This test file is self-contained and doesn't import the full app
+to avoid dependency issues in CI/CD environments.
+"""
+
+import pytest
+import re
+from pathlib import Path
+from packaging.version import Version
+
+
+# Copy the find_file function here to test it in isolation
+# This avoids importing the full gce_encoding module which has GCS dependencies
+def find_file(work_dir: Path, *patterns):
+    '''Find a file matching any of the given glob patterns.'''
+    for pattern in patterns:
+        matches = list(work_dir.glob(f"**/{pattern}"))
+        if matches:
+            return matches[0]
+    return None
+
+
+class TestFindFile:
+    """Test the find_file function used to locate input files."""
+
+    def test_find_file_single_match(self, tmp_path):
+        """Test finding a file with a single match."""
+        # Create test file
+        test_file = tmp_path / "test_instrumental.flac"
+        test_file.touch()
+
+        result = find_file(tmp_path, "*instrumental*.flac")
+        assert result is not None
+        assert result.name == "test_instrumental.flac"
+
+    def test_find_file_no_match(self, tmp_path):
+        """Test finding a file with no matches returns None."""
+        result = find_file(tmp_path, "*nonexistent*.flac")
+        assert result is None
+
+    def test_find_file_priority_order(self, tmp_path):
+        """Test that find_file returns first matching pattern."""
+        # Create multiple files that match different patterns
+        first = tmp_path / "first_pattern.flac"
+        second = tmp_path / "second_pattern.flac"
+        first.touch()
+        second.touch()
+
+        # First pattern should win
+        result = find_file(tmp_path, "*first*.flac", "*second*.flac")
+        assert result.name == "first_pattern.flac"
+
+
+class TestInstrumentalSelection:
+    """Test that instrumental selection is properly respected."""
+
+    def test_clean_instrumental_prioritized_when_selected(self, tmp_path):
+        """Test that clean instrumental is found when 'clean' is selected.
+
+        When both instrumentals exist and 'clean' is selected,
+        the clean version should be found.
+        """
+        # Create both instrumental files (as they exist in GCS)
+        clean = tmp_path / "Artist - Title (Instrumental Clean).flac"
+        backing = tmp_path / "Artist - Title (Instrumental Backing).flac"
+        clean.touch()
+        backing.touch()
+
+        # Simulate finding instrumental with 'clean' selection
+        # (mimics the logic in run_encoding when instrumental_selection == 'clean')
+        result = find_file(
+            tmp_path,
+            "*instrumental_clean*.flac", "*Instrumental Clean*.flac",
+            "*instrumental*.flac", "*Instrumental*.flac",
+            "*instrumental*.wav"
+        )
+
+        assert result is not None
+        assert "Clean" in result.name
+
+    def test_backing_instrumental_prioritized_when_selected(self, tmp_path):
+        """Test that backing instrumental is found when 'with_backing' is selected.
+
+        When both instrumentals exist and 'with_backing' is selected,
+        the backing version should be found.
+
+        This test would have caught the bug where the GCE worker always
+        used the clean instrumental regardless of user selection.
+        """
+        # Create both instrumental files (as they exist in GCS)
+        clean = tmp_path / "Artist - Title (Instrumental Clean).flac"
+        backing = tmp_path / "Artist - Title (Instrumental Backing).flac"
+        clean.touch()
+        backing.touch()
+
+        # Simulate finding instrumental with 'with_backing' selection
+        # (mimics the logic in run_encoding when instrumental_selection == 'with_backing')
+        result = find_file(
+            tmp_path,
+            "*instrumental_with_backing*.flac", "*Instrumental Backing*.flac",
+            "*with_backing*.flac", "*Backing*.flac",
+            "*instrumental*.flac", "*Instrumental*.flac",
+            "*instrumental*.wav"
+        )
+
+        assert result is not None
+        assert "Backing" in result.name
+
+    def test_backing_instrumental_with_stem_naming(self, tmp_path):
+        """Test finding backing instrumental with GCS stem naming convention.
+
+        In GCS, stems are named like 'stems/instrumental_with_backing.flac'
+        """
+        stems_dir = tmp_path / "stems"
+        stems_dir.mkdir()
+
+        clean = stems_dir / "instrumental_clean.flac"
+        backing = stems_dir / "instrumental_with_backing.flac"
+        clean.touch()
+        backing.touch()
+
+        # Simulate finding instrumental with 'with_backing' selection
+        result = find_file(
+            tmp_path,
+            "*instrumental_with_backing*.flac", "*Instrumental Backing*.flac",
+            "*with_backing*.flac", "*Backing*.flac",
+            "*instrumental*.flac", "*Instrumental*.flac",
+            "*instrumental*.wav"
+        )
+
+        assert result is not None
+        assert "with_backing" in result.name
+
+    def test_fallback_to_generic_when_specific_not_found(self, tmp_path):
+        """Test fallback to generic pattern when specific not found."""
+        # Only create a generically named instrumental
+        generic = tmp_path / "instrumental.flac"
+        generic.touch()
+
+        # Both clean and backing selections should fall back
+        for selection in ["clean", "with_backing"]:
+            if selection == "with_backing":
+                patterns = (
+                    "*instrumental_with_backing*.flac", "*Instrumental Backing*.flac",
+                    "*with_backing*.flac", "*Backing*.flac",
+                    "*instrumental*.flac", "*Instrumental*.flac",
+                    "*instrumental*.wav"
+                )
+            else:
+                patterns = (
+                    "*instrumental_clean*.flac", "*Instrumental Clean*.flac",
+                    "*instrumental*.flac", "*Instrumental*.flac",
+                    "*instrumental*.wav"
+                )
+
+            result = find_file(tmp_path, *patterns)
+            assert result is not None
+            assert result.name == "instrumental.flac"
+
+
+class TestExistingInstrumental:
+    """Test that existing (user-uploaded) instrumentals are found correctly."""
+
+    def test_existing_instrumental_found_by_pattern(self, tmp_path):
+        """Test that existing_instrumental file is found when present."""
+        existing = tmp_path / "existing_instrumental.mp3"
+        existing.touch()
+
+        result = find_file(tmp_path, "*existing_instrumental*", "*Instrumental User*")
+        assert result is not None
+        assert "existing_instrumental" in result.name
+
+    def test_instrumental_user_found_by_pattern(self, tmp_path):
+        """Test that Instrumental User file is found when present."""
+        user_file = tmp_path / "Artist - Title (Instrumental User).mp3"
+        user_file.touch()
+
+        result = find_file(tmp_path, "*existing_instrumental*", "*Instrumental User*")
+        assert result is not None
+        assert "Instrumental User" in result.name
+
+    def test_existing_instrumental_takes_priority_over_separated(self, tmp_path):
+        """When existing instrumental is present alongside separated stems,
+        the existing_instrumental config should cause it to be found first.
+
+        This tests the logic flow: if config has existing_instrumental,
+        we search for *existing_instrumental* patterns BEFORE checking
+        instrumental_selection.
+        """
+        # Create both types
+        existing = tmp_path / "existing_instrumental.flac"
+        separated = tmp_path / "instrumental_clean.flac"
+        custom = tmp_path / "custom_instrumental.flac"
+        existing.touch()
+        separated.touch()
+        custom.touch()
+
+        # existing_instrumental pattern should find the right file
+        result = find_file(tmp_path, "*existing_instrumental*", "*Instrumental User*")
+        assert result is not None
+        assert "existing_instrumental" in result.name
+
+    def test_existing_instrumental_not_found_returns_none(self, tmp_path):
+        """When no existing instrumental file exists, find_file returns None."""
+        # Only separated stems exist
+        tmp_path_file = tmp_path / "instrumental_clean.flac"
+        tmp_path_file.touch()
+
+        result = find_file(tmp_path, "*existing_instrumental*", "*Instrumental User*")
+        assert result is None
+
+
+class TestInstrumentalSelectionRegression:
+    """Regression tests for instrumental selection bug.
+
+    Bug: User selected 'with_backing' instrumental in the UI but the final
+    video used the clean instrumental instead.
+
+    Root cause: The GCE worker's find_file() always prioritized
+    '*instrumental_clean*' patterns before generic patterns, ignoring
+    the user's selection.
+    """
+
+    def test_bug_scenario_both_instrumentals_present(self, tmp_path):
+        """Recreate the exact bug scenario where both instrumentals exist.
+
+        This is the key regression test. When both instrumentals are downloaded
+        from GCS (which happens with the GCE worker), the correct one must
+        be selected based on the user's choice.
+        """
+        # Setup: Both instrumentals in stems/ (as downloaded from GCS)
+        stems = tmp_path / "stems"
+        stems.mkdir()
+
+        (stems / "instrumental_clean.flac").touch()
+        (stems / "instrumental_with_backing.flac").touch()
+
+        # Also have properly named versions in the root (from _setup_working_directory)
+        (tmp_path / "Artist - Song (Instrumental Clean).flac").touch()
+        (tmp_path / "Artist - Song (Instrumental Backing).flac").touch()
+
+        # When user selected 'with_backing', the backing version MUST be found
+        backing_patterns = (
+            "*instrumental_with_backing*.flac", "*Instrumental Backing*.flac",
+            "*with_backing*.flac", "*Backing*.flac",
+            "*instrumental*.flac", "*Instrumental*.flac",
+            "*instrumental*.wav"
+        )
+        result = find_file(tmp_path, *backing_patterns)
+
+        assert result is not None
+        # Must find a backing-related file, not the clean one
+        name = result.name.lower()
+        assert "backing" in name or "with_backing" in name, \
+            f"Expected backing instrumental but found: {result.name}"
+
+    def test_clean_selection_still_works(self, tmp_path):
+        """Verify clean selection still works correctly after the fix."""
+        stems = tmp_path / "stems"
+        stems.mkdir()
+
+        (stems / "instrumental_clean.flac").touch()
+        (stems / "instrumental_with_backing.flac").touch()
+
+        (tmp_path / "Artist - Song (Instrumental Clean).flac").touch()
+        (tmp_path / "Artist - Song (Instrumental Backing).flac").touch()
+
+        # When user selected 'clean', the clean version must be found
+        clean_patterns = (
+            "*instrumental_clean*.flac", "*Instrumental Clean*.flac",
+            "*instrumental*.flac", "*Instrumental*.flac",
+            "*instrumental*.wav"
+        )
+        result = find_file(tmp_path, *clean_patterns)
+
+        assert result is not None
+        name = result.name.lower()
+        assert "clean" in name, f"Expected clean instrumental but found: {result.name}"
+
+
+class TestWheelFilenameFiltering:
+    """Test wheel filename filtering to prevent installation of invalid wheels.
+
+    Bug: The ensure_latest_wheel() function downloads all wheels including
+    karaoke_gen-current.whl, which is not a valid PEP 427 wheel filename
+    (missing version and platform tags). When pip tries to install it,
+    it fails with: "Invalid wheel filename (wrong number of parts)"
+
+    Fix: Filter out wheels containing '-current' before selecting which to install.
+    """
+
+    def filter_wheels(self, wheels):
+        """Replicate the filtering logic from ensure_latest_wheel()."""
+        return [w for w in wheels if '-current' not in w]
+
+    def test_filters_out_current_wheel(self):
+        """Test that karaoke_gen-current.whl is filtered out."""
+        wheels = [
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-current.whl",
+            "/tmp/karaoke_gen-0.115.0-py3-none-any.whl",
+        ]
+
+        filtered = self.filter_wheels(wheels)
+
+        assert len(filtered) == 2
+        assert "/tmp/karaoke_gen-current.whl" not in filtered
+        assert "/tmp/karaoke_gen-0.116.0-py3-none-any.whl" in filtered
+        assert "/tmp/karaoke_gen-0.115.0-py3-none-any.whl" in filtered
+
+    def test_returns_empty_when_only_current_wheel(self):
+        """Test that filtering returns empty list when only current wheel exists."""
+        wheels = ["/tmp/karaoke_gen-current.whl"]
+
+        filtered = self.filter_wheels(wheels)
+
+        assert filtered == []
+
+    def test_selects_latest_version_after_filtering(self):
+        """Test that the latest version is selected after filtering out current.
+
+        Note: This test verifies filtering but uses simple sorting.
+        See TestWheelVersionSorting for comprehensive semantic version sorting tests.
+        """
+        wheels = [
+            "/tmp/karaoke_gen-0.114.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-current.whl",
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.115.0-py3-none-any.whl",
+        ]
+
+        filtered = self.filter_wheels(wheels)
+
+        # Verify current wheel was filtered out
+        assert len(filtered) == 3
+        assert all("-current" not in w for w in filtered)
+
+    def test_no_filtering_when_no_current_wheel(self):
+        """Test that valid wheels pass through when no current wheel exists."""
+        wheels = [
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.115.0-py3-none-any.whl",
+        ]
+
+        filtered = self.filter_wheels(wheels)
+
+        assert len(filtered) == 2
+        assert filtered == wheels
+
+    def test_filters_current_in_different_paths(self):
+        """Test that current wheel is filtered regardless of path."""
+        wheels = [
+            "/different/path/karaoke_gen-current.whl",
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+        ]
+
+        filtered = self.filter_wheels(wheels)
+
+        assert len(filtered) == 1
+        assert "/tmp/karaoke_gen-0.116.0-py3-none-any.whl" in filtered
+
+
+class TestWheelVersionSorting:
+    """Test semantic version sorting for wheel selection.
+
+    Bug: The ensure_latest_wheel() function uses sorted(wheels)[-1] which does
+    alphabetical sorting, not semantic version sorting. This causes version 0.99.9
+    to be selected over 0.116.1 because string comparison puts '9' > '1'.
+
+    Fix: Extract version from filename using regex and sort by packaging.version.Version
+    """
+
+    def extract_version(self, wheel_path):
+        """Replicate the version extraction logic from ensure_latest_wheel()."""
+        match = re.search(r'karaoke_gen-([0-9.]+)-', wheel_path)
+        if match:
+            return Version(match.group(1))
+        return Version("0.0.0")  # Fallback for unparseable filenames
+
+    def select_latest_wheel(self, wheels):
+        """Replicate the full selection logic from ensure_latest_wheel()."""
+        # Filter out -current wheels
+        filtered = [w for w in wheels if '-current' not in w]
+        if not filtered:
+            return None
+        # Sort by semantic version
+        filtered.sort(key=self.extract_version, reverse=True)
+        return filtered[0]
+
+    def test_semantic_version_sorting_regression(self):
+        """Test the exact bug: 0.99.9 should NOT be selected over 0.116.1"""
+        wheels = [
+            "/tmp/karaoke_gen-0.99.9-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.1-py3-none-any.whl",
+        ]
+
+        latest = self.select_latest_wheel(wheels)
+
+        # Semantic version: 0.116.1 > 0.99.9
+        assert "0.116.1" in latest
+        assert "0.99.9" not in latest
+
+    def test_alphabetical_would_fail(self):
+        """Demonstrate that alphabetical sorting gives wrong result."""
+        wheels = [
+            "/tmp/karaoke_gen-0.99.9-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.1-py3-none-any.whl",
+        ]
+
+        # This is the OLD buggy behavior (alphabetical)
+        alphabetical_latest = sorted(wheels)[-1]
+
+        # Alphabetical puts 0.99.9 last (WRONG!)
+        assert "0.99.9" in alphabetical_latest
+
+    def test_version_extraction(self):
+        """Test that version is correctly extracted from wheel filename."""
+        test_cases = [
+            ("/tmp/karaoke_gen-0.116.1-py3-none-any.whl", "0.116.1"),
+            ("/tmp/karaoke_gen-0.99.9-py3-none-any.whl", "0.99.9"),
+            ("/tmp/karaoke_gen-1.0.0-py3-none-any.whl", "1.0.0"),
+            ("/tmp/karaoke_gen-0.1.2-py3-none-any.whl", "0.1.2"),
+        ]
+
+        for wheel_path, expected_version in test_cases:
+            version = self.extract_version(wheel_path)
+            assert str(version) == expected_version
+
+    def test_version_extraction_fallback(self):
+        """Test that unparseable filenames get fallback version."""
+        invalid_wheels = [
+            "/tmp/karaoke_gen-current.whl",
+            "/tmp/karaoke_gen-latest.whl",
+            "/tmp/invalid-filename.whl",
+        ]
+
+        for wheel in invalid_wheels:
+            version = self.extract_version(wheel)
+            assert version == Version("0.0.0")
+
+    def test_complex_version_sorting(self):
+        """Test sorting with multiple versions including patch, minor, major."""
+        wheels = [
+            "/tmp/karaoke_gen-0.99.9-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.1-py3-none-any.whl",
+            "/tmp/karaoke_gen-1.0.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.115.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.1.0-py3-none-any.whl",
+        ]
+
+        latest = self.select_latest_wheel(wheels)
+
+        # 1.0.0 is the highest version
+        assert "1.0.0" in latest
+
+    def test_version_sorting_with_current_wheel(self):
+        """Test that current wheel is filtered before version sorting."""
+        wheels = [
+            "/tmp/karaoke_gen-0.99.9-py3-none-any.whl",
+            "/tmp/karaoke_gen-current.whl",
+            "/tmp/karaoke_gen-0.116.1-py3-none-any.whl",
+        ]
+
+        latest = self.select_latest_wheel(wheels)
+
+        # Current is filtered out, 0.116.1 is selected
+        assert "0.116.1" in latest
+        assert "current" not in latest
+
+    def test_patch_version_comparison(self):
+        """Test that patch versions are compared correctly."""
+        wheels = [
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.1-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.2-py3-none-any.whl",
+        ]
+
+        latest = self.select_latest_wheel(wheels)
+
+        assert "0.116.2" in latest
+
+    def test_minor_version_comparison(self):
+        """Test that minor versions are compared correctly."""
+        wheels = [
+            "/tmp/karaoke_gen-0.115.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.116.0-py3-none-any.whl",
+            "/tmp/karaoke_gen-0.200.0-py3-none-any.whl",
+        ]
+
+        latest = self.select_latest_wheel(wheels)
+
+        assert "0.200.0" in latest
+
+    def test_empty_wheels_list(self):
+        """Test that empty list returns None."""
+        wheels = []
+        latest = self.select_latest_wheel(wheels)
+        assert latest is None
+
+    def test_only_current_wheel_returns_none(self):
+        """Test that list with only current wheel returns None."""
+        wheels = ["/tmp/karaoke_gen-current.whl"]
+        latest = self.select_latest_wheel(wheels)
+        assert latest is None
+
+
+class TestScreenVideoStaging:
+    """Test that the standalone screen MOVs are copied into outputs/ for upload.
+
+    Mirrors the copy logic in run_encoding (kept self-contained, like the other
+    tests in this file). Regression: (Title).mov / (End).mov disappeared from the
+    Dropbox folder after #647/#650 moved screen generation into this encoder.
+    """
+
+    @staticmethod
+    def stage_screen_videos(title_video, end_video, output_dir: Path, base_name: str):
+        """Replicates run_encoding's screen-video staging step."""
+        import shutil
+        for screen_video, suffix in ((title_video, "Title"), (end_video, "End")):
+            if screen_video and Path(screen_video).is_file():
+                dest = output_dir / f"{base_name} ({suffix}).mov"
+                shutil.copy2(screen_video, dest)
+
+    def test_copies_title_and_end_with_canonical_names(self, tmp_path):
+        screens = tmp_path / "screens"
+        screens.mkdir()
+        title = screens / "title.mov"
+        end = screens / "end.mov"
+        title.write_bytes(b"title-mov-bytes")
+        end.write_bytes(b"end-mov-bytes")
+        outputs = tmp_path / "outputs"
+        outputs.mkdir()
+
+        self.stage_screen_videos(title, end, outputs, "Artist - Title")
+
+        assert (outputs / "Artist - Title (Title).mov").read_bytes() == b"title-mov-bytes"
+        assert (outputs / "Artist - Title (End).mov").read_bytes() == b"end-mov-bytes"
+
+    def test_skips_missing_end_video(self, tmp_path):
+        screens = tmp_path / "screens"
+        screens.mkdir()
+        title = screens / "title.mov"
+        title.write_bytes(b"title-mov-bytes")
+        outputs = tmp_path / "outputs"
+        outputs.mkdir()
+
+        # end_video is None (no end screen) — must not raise
+        self.stage_screen_videos(title, None, outputs, "Artist - Title")
+
+        assert (outputs / "Artist - Title (Title).mov").is_file()
+        assert not (outputs / "Artist - Title (End).mov").exists()
+
+
+class TestEnsureLatestWheelVerification:
+    """Test ensure_latest_wheel() install-retry + import-verification behavior.
+
+    Regression: a freshly-provisioned worker installs the wheel with --no-deps
+    at boot and relies on ensure_latest_wheel() to install the full dependency
+    tree at the first job. A transient/partial install could leave the env
+    importable-but-broken (`pip` exits 0 while `tenacity` is still missing),
+    and the return value was ignored, so the job proceeded and died with
+    "No module named 'tenacity'" deep inside render_video.
+
+    Fix: verify the render/encode import chain (via subprocess) and only return
+    True when it imports; retry a failed/partial install; callers fail fast.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_wheel_cache(self, monkeypatch):
+        """ensure_latest_wheel caches the verified version in a module global and
+        can fast-path when the installed version already matches. Reset the cache
+        and pin the "installed" version to None around each test so these
+        download/install-flow tests run deterministically regardless of the test
+        venv's real karaoke-gen version."""
+        from backend.services.gce_encoding import main
+        main._verified_wheel_version = None
+        monkeypatch.setattr(main, "_installed_karaoke_gen_version", lambda: None)
+        yield
+        main._verified_wheel_version = None
+
+    # A couple of versioned wheels plus the (filtered-out) current wheel, as
+    # `gsutil ls` would emit them.
+    DEFAULT_LS = (
+        "gs://karaoke-gen-storage-nomadkaraoke/wheels/karaoke_gen-0.192.5-py3-none-any.whl\n"
+        "gs://karaoke-gen-storage-nomadkaraoke/wheels/karaoke_gen-0.192.6-py3-none-any.whl\n"
+        "gs://karaoke-gen-storage-nomadkaraoke/wheels/karaoke_gen-current.whl\n"
+    )
+
+    def _completed(self, returncode=0, stdout="", stderr=""):
+        import subprocess
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _side_effect(self, ls_stdout=None, ls_rc=0, cp_rc=0, install_rc=0, verify_results=None):
+        """Build a subprocess.run side_effect keyed on the command.
+
+        Models the download flow (gsutil ls -> gsutil cp of a single wheel),
+        the pip install, and the import-verification subprocess.
+
+        verify_results: list of booleans consumed in order, one per verify call
+        (True -> returncode 0). Lets a test model "install succeeded but imports
+        fail, then a retry fixes them".
+        """
+        import sys
+        ls = self.DEFAULT_LS if ls_stdout is None else ls_stdout
+        verify_iter = iter(verify_results or [])
+
+        def side_effect(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "gsutil" and cmd[1] == "ls":
+                return self._completed(returncode=ls_rc, stdout=ls)
+            if cmd and cmd[0] == "gsutil" and cmd[1] == "cp":
+                return self._completed(returncode=cp_rc)
+            if len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == "-m":
+                # pip install ...
+                return self._completed(returncode=install_rc)
+            if len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == "-c":
+                # import verification subprocess
+                ok = next(verify_iter, False)
+                return self._completed(
+                    returncode=0 if ok else 1,
+                    stderr="" if ok else "ModuleNotFoundError: No module named 'tenacity'",
+                )
+            return self._completed(returncode=0)
+
+        return side_effect
+
+    def test_downloads_only_latest_single_wheel(self, monkeypatch):
+        """Must `gsutil cp` exactly one wheel (the latest version), not the whole dir."""
+        from backend.services.gce_encoding import main
+
+        cp_targets = []
+        base = self._side_effect(verify_results=[True])
+
+        def spy(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "gsutil" and cmd[1] == "cp":
+                cp_targets.append(cmd[2])
+            return base(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(main.subprocess, "run", spy)
+
+        assert main.ensure_latest_wheel() is True
+        assert cp_targets == [
+            "gs://karaoke-gen-storage-nomadkaraoke/wheels/karaoke_gen-0.192.6-py3-none-any.whl"
+        ]
+
+    def test_returns_true_when_install_and_imports_succeed(self, monkeypatch):
+        from backend.services.gce_encoding import main
+        monkeypatch.setattr(main.subprocess, "run", self._side_effect(verify_results=[True]))
+        assert main.ensure_latest_wheel() is True
+
+    def test_returns_false_when_pip_ok_but_imports_broken(self, monkeypatch):
+        """The core regression: pip exits 0 but a dependency is missing."""
+        from backend.services.gce_encoding import main
+        # install always "succeeds", verification always fails -> not ready.
+        monkeypatch.setattr(main.subprocess, "run",
+                            self._side_effect(install_rc=0, verify_results=[False, False, False]))
+        assert main.ensure_latest_wheel() is False
+
+    def test_retries_and_succeeds_after_partial_install(self, monkeypatch):
+        """First attempt leaves deps missing; a retry completes them."""
+        from backend.services.gce_encoding import main
+        monkeypatch.setattr(main.subprocess, "run", self._side_effect(verify_results=[False, True]))
+        assert main.ensure_latest_wheel() is True
+
+    def test_returns_false_when_no_wheel_found(self, monkeypatch):
+        """Only the current wheel exists (filtered out) -> no versioned wheel."""
+        from backend.services.gce_encoding import main
+        only_current = "gs://karaoke-gen-storage-nomadkaraoke/wheels/karaoke_gen-current.whl\n"
+        monkeypatch.setattr(main.subprocess, "run", self._side_effect(ls_stdout=only_current))
+        assert main.ensure_latest_wheel() is False
+
+    def test_returns_false_when_download_fails(self, monkeypatch):
+        """A failed single-wheel copy is reported, not silently installed."""
+        from backend.services.gce_encoding import main
+        monkeypatch.setattr(main.subprocess, "run", self._side_effect(cp_rc=1))
+        assert main.ensure_latest_wheel() is False
+
+    def test_install_timeout_then_success(self, monkeypatch):
+        """A timed-out first install must not abort the whole routine."""
+        import sys
+        import subprocess
+        from backend.services.gce_encoding import main
+
+        state = {"install_calls": 0}
+        base = self._side_effect()
+
+        def side_effect(cmd, *args, **kwargs):
+            if len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == "-m":
+                state["install_calls"] += 1
+                if state["install_calls"] == 1:
+                    raise subprocess.TimeoutExpired(cmd, main.WHEEL_INSTALL_TIMEOUT)
+                return self._completed(returncode=0)
+            if len(cmd) >= 2 and cmd[0] == sys.executable and cmd[1] == "-c":
+                # Imports fail after the timed-out first install, succeed after retry.
+                return self._completed(returncode=0 if state["install_calls"] >= 2 else 1,
+                                       stderr="ModuleNotFoundError")
+            return base(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(main.subprocess, "run", side_effect)
+        assert main.ensure_latest_wheel() is True
+
+
+class TestVerifyWheelImports:
+    """Test the verify_wheel_imports() helper in isolation."""
+
+    def test_true_on_clean_import(self, monkeypatch):
+        import subprocess
+        from backend.services.gce_encoding import main
+        monkeypatch.setattr(main.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""))
+        assert main.verify_wheel_imports() is True
+
+    def test_false_on_import_error(self, monkeypatch):
+        import subprocess
+        from backend.services.gce_encoding import main
+        monkeypatch.setattr(
+            main.subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                [], 1, "", "ModuleNotFoundError: No module named 'tenacity'"))
+        assert main.verify_wheel_imports() is False
+
+    def test_false_on_timeout(self, monkeypatch):
+        import subprocess
+        from backend.services.gce_encoding import main
+
+        def _timeout(*a, **k):
+            raise subprocess.TimeoutExpired(["python", "-c"], 180)
+
+        monkeypatch.setattr(main.subprocess, "run", _timeout)
+        assert main.verify_wheel_imports() is False
+
+
+class TestGcsCli:
+    """The AWS worker (WIF auth) can't use gsutil; GCE workers keep it."""
+
+    def test_gce_worker_uses_gsutil(self, monkeypatch):
+        from backend.services.gce_encoding import main as worker
+        monkeypatch.delenv("ENCODING_WORKER_PROVIDER", raising=False)
+        assert worker._gcs_cli() == ["gsutil"]
+
+    def test_aws_worker_uses_gcloud_storage(self, monkeypatch):
+        from backend.services.gce_encoding import main as worker
+        monkeypatch.setenv("ENCODING_WORKER_PROVIDER", "aws")
+        assert worker._gcs_cli() == ["gcloud", "storage"]

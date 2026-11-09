@@ -1,0 +1,616 @@
+import { createRef } from 'react'
+import { render, screen, act, fireEvent } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import PreviewVideoSection, { PreviewVideoHandle } from '../PreviewVideoSection'
+import type { CorrectionData } from '@/lib/lyrics-review/types'
+
+// The preview flow is async: POST /preview-video returns either "success"
+// (video already exists) or "generating" (encode continues on a GCE worker,
+// which can cold-start for minutes). In the generating case the component
+// polls getPreviewVideoStatus until "ready"/"error" — it must NOT depend on
+// the POST staying open (Cloudflare cuts connections at ~100s).
+
+const data = { corrected_segments: [], metadata: {} } as unknown as CorrectionData
+
+function makeApiClient(overrides: Record<string, jest.Mock> = {}) {
+  return {
+    generatePreviewVideo: jest.fn().mockResolvedValue({
+      status: 'success',
+      preview_hash: 'hash1',
+    }),
+    getPreviewVideoStatus: jest.fn().mockResolvedValue({ status: 'generating' }),
+    getPreviewVideoUrl: jest.fn((hash: string) => `http://test/preview/${hash}`),
+    ...overrides,
+  }
+}
+
+function renderSection(apiClient: ReturnType<typeof makeApiClient>) {
+  return render(
+    <PreviewVideoSection apiClient={apiClient} isModalOpen={true} updatedData={data} />
+  )
+}
+
+const flush = () => act(async () => { await Promise.resolve() })
+
+describe('PreviewVideoSection', () => {
+  beforeEach(() => {
+    jest.useFakeTimers()
+  })
+
+  afterEach(() => {
+    jest.useRealTimers()
+  })
+
+  it('shows the video immediately when the preview already exists (cache hit)', async () => {
+    const apiClient = makeApiClient()
+    renderSection(apiClient)
+    await flush()
+
+    const video = document.querySelector('video')
+    expect(video).not.toBeNull()
+    expect(video!.src).toBe('http://test/preview/hash1')
+    expect(apiClient.getPreviewVideoStatus).not.toHaveBeenCalled()
+  })
+
+  it('explains the preview is a quick sync-check render, not the final look', async () => {
+    renderSection(makeApiClient())
+    await flush()
+
+    const note = screen.getByTestId('preview-differs-note')
+    expect(note).toHaveTextContent(/plain black background/)
+    expect(note).not.toHaveTextContent(/Translated lyrics/)
+  })
+
+  it('says translated lyrics are added after review when the job has a translation language', async () => {
+    render(
+      <PreviewVideoSection
+        apiClient={makeApiClient()}
+        isModalOpen={true}
+        updatedData={data}
+        translationLanguage="es"
+      />
+    )
+    await flush()
+
+    expect(screen.getByTestId('preview-differs-note')).toHaveTextContent(
+      'Translated lyrics (Spanish) are added after review'
+    )
+  })
+
+  it('polls the status endpoint until ready when encoding runs in background', async () => {
+    const apiClient = makeApiClient({
+      generatePreviewVideo: jest.fn().mockResolvedValue({
+        status: 'generating',
+        preview_hash: 'hash2',
+      }),
+      getPreviewVideoStatus: jest
+        .fn()
+        .mockResolvedValueOnce({ status: 'generating' })
+        .mockResolvedValueOnce({ status: 'ready' }),
+    })
+    renderSection(apiClient)
+    await flush()
+
+    // Encoding state shown, no video yet
+    expect(screen.getByText('Encoding preview video...')).toBeInTheDocument()
+    expect(document.querySelector('video')).toBeNull()
+
+    await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+    expect(apiClient.getPreviewVideoStatus).toHaveBeenCalledTimes(1)
+    expect(document.querySelector('video')).toBeNull()
+
+    await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+    expect(apiClient.getPreviewVideoStatus).toHaveBeenCalledTimes(2)
+    const video = document.querySelector('video')
+    expect(video).not.toBeNull()
+    expect(video!.src).toBe('http://test/preview/hash2')
+  })
+
+  it('keeps polling through transient status-poll failures', async () => {
+    const apiClient = makeApiClient({
+      generatePreviewVideo: jest.fn().mockResolvedValue({
+        status: 'generating',
+        preview_hash: 'hash3',
+      }),
+      getPreviewVideoStatus: jest
+        .fn()
+        .mockRejectedValueOnce(new Error('network blip'))
+        .mockResolvedValueOnce({ status: 'ready' }),
+    })
+    renderSection(apiClient)
+    await flush()
+
+    await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+    expect(document.querySelector('video')).toBeNull()
+
+    await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+    expect(document.querySelector('video')).not.toBeNull()
+  })
+
+  it('surfaces a background encode failure reported by the status endpoint', async () => {
+    const apiClient = makeApiClient({
+      generatePreviewVideo: jest.fn().mockResolvedValue({
+        status: 'generating',
+        preview_hash: 'hash4',
+      }),
+      getPreviewVideoStatus: jest.fn().mockResolvedValue({
+        status: 'error',
+        message: 'encoder exploded',
+      }),
+    })
+    renderSection(apiClient)
+    await flush()
+
+    await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+    expect(screen.getByText('encoder exploded')).toBeInTheDocument()
+    // Polling must stop after a terminal error
+    await act(async () => { await jest.advanceTimersByTimeAsync(9000) })
+    expect(apiClient.getPreviewVideoStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('times out with an error after polling too long', async () => {
+    const apiClient = makeApiClient({
+      generatePreviewVideo: jest.fn().mockResolvedValue({
+        status: 'generating',
+        preview_hash: 'hash5',
+      }),
+      getPreviewVideoStatus: jest.fn().mockResolvedValue({ status: 'generating' }),
+    })
+    renderSection(apiClient)
+    await flush()
+
+    await act(async () => { await jest.advanceTimersByTimeAsync(5 * 60 * 1000 + 5000) })
+    expect(
+      screen.getByText('The preview video is taking longer than expected. Please try again.')
+    ).toBeInTheDocument()
+  })
+
+  it('Retry re-runs generation after an error', async () => {
+    const apiClient = makeApiClient({
+      generatePreviewVideo: jest
+        .fn()
+        .mockRejectedValueOnce(new Error('boom'))
+        .mockResolvedValueOnce({ status: 'success', preview_hash: 'hash6' }),
+    })
+    renderSection(apiClient)
+    await flush()
+
+    expect(screen.getByText('boom')).toBeInTheDocument()
+
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime })
+    await user.click(screen.getByRole('button', { name: 'Retry' }))
+    await act(async () => { await jest.advanceTimersByTimeAsync(0) })
+
+    expect(apiClient.generatePreviewVideo).toHaveBeenCalledTimes(2)
+    const video = document.querySelector('video')
+    expect(video).not.toBeNull()
+    expect(video!.src).toBe('http://test/preview/hash6')
+  })
+
+  it('shows an error when the server responds without a preview hash', async () => {
+    const apiClient = makeApiClient({
+      generatePreviewVideo: jest.fn().mockResolvedValue({ status: 'success' }),
+    })
+    renderSection(apiClient)
+    await flush()
+
+    expect(screen.getByText('Failed to generate preview video')).toBeInTheDocument()
+  })
+
+  const instrumentalOptions = [
+    { id: 'clean', label: 'Clean', audio_url: 'http://test/clean.ogg' },
+    { id: 'with_backing', label: 'Backing', audio_url: 'http://test/backing.ogg' },
+  ]
+
+  it('shows an audio toggle and a hidden stem player when instrumental options exist', async () => {
+    const apiClient = makeApiClient()
+    render(
+      <PreviewVideoSection
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="with_backing"
+      />
+    )
+    await flush()
+
+    expect(screen.getByRole('button', { name: /original \(with vocals\)/i })).toBeInTheDocument()
+    // Pill names the auto-selected variant (with_backing).
+    expect(screen.getByRole('button', { name: /instrumental \(plus backing vocals\)/i })).toBeInTheDocument()
+    // Hidden stem player points at the auto-selected (with_backing) stem.
+    const audio = document.querySelector('audio')
+    expect(audio).not.toBeNull()
+    expect(audio!.src).toBe('http://test/backing.ogg')
+  })
+
+  it('does not show the audio toggle when no instrumental options are available', async () => {
+    const apiClient = makeApiClient()
+    renderSection(apiClient)
+    await flush()
+
+    expect(screen.queryByRole('button', { name: /original \(with vocals\)/i })).not.toBeInTheDocument()
+    expect(document.querySelector('audio')).toBeNull()
+  })
+
+  it('mutes the video when switching to the instrumental track', async () => {
+    const apiClient = makeApiClient()
+    render(
+      <PreviewVideoSection
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="clean"
+      />
+    )
+    await flush()
+
+    const video = document.querySelector('video') as HTMLVideoElement
+    expect(video.muted).toBe(false)
+
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime })
+    // autoSelection=clean → pill reads "Instrumental (clean)".
+    await user.click(screen.getByRole('button', { name: /instrumental \(clean\)/i }))
+    await flush()
+
+    expect(video.muted).toBe(true)
+  })
+
+  it('always shows the single Instrumental preview pill (final choice lives in the modal)', async () => {
+    const apiClient = makeApiClient()
+    render(
+      <PreviewVideoSection
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="with_backing"
+      />
+    )
+    await flush()
+
+    expect(screen.getByRole('button', { name: /instrumental \(plus backing vocals\)/i })).toBeInTheDocument()
+    // No decision pills here anymore — those moved to the modal's radio group.
+    expect(screen.queryByRole('button', { name: /instrumental \+ backing vocals/i })).not.toBeInTheDocument()
+    // Hidden stem player starts on the auto-selected (with_backing) stem.
+    expect((document.querySelector('audio') as HTMLAudioElement).src).toBe('http://test/backing.ogg')
+  })
+
+  it('auditionInstrumental swaps the stem, mutes the video, and seeks/plays', async () => {
+    const apiClient = makeApiClient()
+    const ref = createRef<PreviewVideoHandle>()
+    render(
+      <PreviewVideoSection
+        ref={ref}
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="with_backing"
+      />
+    )
+    await flush()
+
+    const video = document.querySelector('video') as HTMLVideoElement
+    expect((document.querySelector('audio') as HTMLAudioElement).src).toBe('http://test/backing.ogg')
+    expect(video.muted).toBe(false)
+    // Pill starts on the backing variant.
+    expect(screen.getByRole('button', { name: /instrumental \(plus backing vocals\)/i })).toBeInTheDocument()
+
+    act(() => {
+      ref.current!.auditionInstrumental('clean', 5)
+    })
+    await flush()
+
+    // Stem swapped to clean, video muted (stem plays instead), and it seeked.
+    expect((document.querySelector('audio') as HTMLAudioElement).src).toBe('http://test/clean.ogg')
+    expect(video.muted).toBe(true)
+    expect(video.currentTime).toBe(5)
+    // Pill label tracks the new selection.
+    expect(screen.getByRole('button', { name: /instrumental \(clean\)/i })).toBeInTheDocument()
+  })
+
+  it('re-fetches a fresh signed URL and swaps it in when the stem fails to load', async () => {
+    // Simulates the expired-signed-URL case: the baked-in stem URL 404s/expires,
+    // the <audio> fires `error`, and the component silently re-signs and retries.
+    const refreshInstrumentalUrls = jest.fn().mockResolvedValue([
+      { id: 'clean', label: 'Clean', audio_url: 'http://test/clean-fresh.ogg' },
+      { id: 'with_backing', label: 'Backing', audio_url: 'http://test/backing-fresh.ogg' },
+    ])
+    const apiClient = makeApiClient({ refreshInstrumentalUrls })
+    render(
+      <PreviewVideoSection
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="with_backing"
+      />
+    )
+    await flush()
+
+    const audio = document.querySelector('audio') as HTMLAudioElement
+    expect(audio.src).toBe('http://test/backing.ogg')
+
+    await act(async () => {
+      fireEvent.error(audio)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(refreshInstrumentalUrls).toHaveBeenCalledTimes(1)
+    // Same selected variant (with_backing), but now the freshly-signed URL.
+    expect((document.querySelector('audio') as HTMLAudioElement).src).toBe(
+      'http://test/backing-fresh.ogg'
+    )
+  })
+
+  it('stops re-fetching after the cap so a broken stem cannot loop', async () => {
+    // Refresh keeps returning the same (still-broken) URL, so each swap re-errors.
+    const refreshInstrumentalUrls = jest.fn().mockResolvedValue([
+      { id: 'with_backing', label: 'Backing', audio_url: 'http://test/backing.ogg' },
+    ])
+    const apiClient = makeApiClient({ refreshInstrumentalUrls })
+    render(
+      <PreviewVideoSection
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="with_backing"
+      />
+    )
+    await flush()
+
+    const audio = document.querySelector('audio') as HTMLAudioElement
+    for (let i = 0; i < 6; i++) {
+      await act(async () => {
+        fireEvent.error(audio)
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+    }
+
+    // Capped at MAX_URL_REFRESHES (3) — no infinite refresh↔error loop.
+    expect(refreshInstrumentalUrls).toHaveBeenCalledTimes(3)
+  })
+
+  describe('standalone stem playback while encoding', () => {
+    // jsdom media elements can't actually play; emulate enough of play()/pause()
+    // for the standalone (no-video-yet) audition flow: toggle `paused` and fire
+    // the corresponding events like a real element would.
+    let playSpy: jest.SpyInstance
+    let pauseSpy: jest.SpyInstance
+
+    const setPaused = (el: HTMLMediaElement, paused: boolean) =>
+      Object.defineProperty(el, 'paused', { configurable: true, get: () => paused })
+
+    beforeEach(() => {
+      playSpy = jest
+        .spyOn(HTMLMediaElement.prototype, 'play')
+        .mockImplementation(function (this: HTMLMediaElement) {
+          setPaused(this, false)
+          this.dispatchEvent(new Event('play'))
+          return Promise.resolve()
+        })
+      pauseSpy = jest
+        .spyOn(HTMLMediaElement.prototype, 'pause')
+        .mockImplementation(function (this: HTMLMediaElement) {
+          setPaused(this, true)
+          this.dispatchEvent(new Event('pause'))
+        })
+    })
+
+    afterEach(() => {
+      playSpy.mockRestore()
+      pauseSpy.mockRestore()
+    })
+
+    function makeEncodingClient() {
+      // POST returns "generating" and status polling never resolves — the
+      // component sits in the 'encoding' state for the whole test.
+      return makeApiClient({
+        generatePreviewVideo: jest.fn().mockResolvedValue({
+          status: 'generating',
+          preview_hash: 'hash-encoding',
+        }),
+        getPreviewVideoStatus: jest.fn().mockResolvedValue({ status: 'generating' }),
+      })
+    }
+
+    function renderEncoding(extraProps: Record<string, unknown> = {}) {
+      const ref = createRef<PreviewVideoHandle>()
+      const onTimeUpdate = jest.fn()
+      const utils = render(
+        <PreviewVideoSection
+          ref={ref}
+          apiClient={makeEncodingClient()}
+          isModalOpen={true}
+          updatedData={data}
+          instrumentalOptions={instrumentalOptions as any}
+          autoSelection="with_backing"
+          onTimeUpdate={onTimeUpdate}
+          {...extraProps}
+        />
+      )
+      return { ref, onTimeUpdate, ...utils }
+    }
+
+    it('mounts the stem player before the video is ready', async () => {
+      renderEncoding()
+      await flush()
+
+      expect(screen.getByText('Encoding preview video...')).toBeInTheDocument()
+      expect(document.querySelector('video')).toBeNull()
+      const audio = document.querySelector('audio')
+      expect(audio).not.toBeNull()
+      expect(audio!.src).toBe('http://test/backing.ogg')
+    })
+
+    it('auditionInstrumental seeks and plays the stem directly while encoding', async () => {
+      const { ref, onTimeUpdate } = renderEncoding()
+      await flush()
+
+      const audio = document.querySelector('audio') as HTMLAudioElement
+      act(() => {
+        ref.current!.auditionInstrumental('with_backing', 12)
+      })
+      await flush()
+
+      expect(audio.currentTime).toBe(12)
+      expect(playSpy).toHaveBeenCalled()
+      expect(audio.muted).toBe(false)
+
+      // The stem's clock drives the waveform playhead while there's no video.
+      audio.currentTime = 13.5
+      fireEvent.timeUpdate(audio)
+      expect(onTimeUpdate).toHaveBeenCalledWith(13.5)
+    })
+
+    it('shows a stop control while the stem plays and stops on click', async () => {
+      const { ref } = renderEncoding()
+      await flush()
+
+      expect(screen.queryByRole('button', { name: 'Stop audio' })).not.toBeInTheDocument()
+
+      act(() => {
+        ref.current!.auditionInstrumental('with_backing', 5)
+      })
+      await flush()
+
+      const stop = screen.getByRole('button', { name: 'Stop audio' })
+      const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime })
+      await user.click(stop)
+      await flush()
+
+      expect(pauseSpy).toHaveBeenCalled()
+      expect((document.querySelector('audio') as HTMLAudioElement).muted).toBe(true)
+      expect(screen.queryByRole('button', { name: 'Stop audio' })).not.toBeInTheDocument()
+    })
+
+    it('shows a loading indicator until the stem actually starts playing', async () => {
+      const { ref } = renderEncoding()
+      await flush()
+      const audio = document.querySelector('audio') as HTMLAudioElement
+
+      act(() => {
+        ref.current!.auditionInstrumental('with_backing', 5)
+      })
+      await flush()
+
+      // play() was called but no sound yet — don't claim "Playing" over silence.
+      expect(screen.getByTestId('standalone-audio-loading')).toBeInTheDocument()
+      expect(screen.queryByText(/^Playing:/)).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Stop audio' })).toBeInTheDocument()
+
+      act(() => {
+        fireEvent.playing(audio)
+      })
+      expect(screen.queryByTestId('standalone-audio-loading')).not.toBeInTheDocument()
+      expect(screen.getByText(/^Playing:/)).toBeInTheDocument()
+
+      // A mid-play stall (seek into unbuffered audio) shows loading again.
+      act(() => {
+        fireEvent.waiting(audio)
+      })
+      expect(screen.getByTestId('standalone-audio-loading')).toBeInTheDocument()
+    })
+
+    it('swaps the stem and keeps playing from the clicked position while encoding', async () => {
+      // Start on the clean stem; a waveform click auditions with_backing at 5s.
+      const { ref } = renderEncoding({ autoSelection: 'clean' })
+      await flush()
+
+      expect((document.querySelector('audio') as HTMLAudioElement).src).toBe(
+        'http://test/clean.ogg'
+      )
+
+      act(() => {
+        ref.current!.auditionInstrumental('with_backing', 5)
+      })
+      await flush()
+
+      const audio = document.querySelector('audio') as HTMLAudioElement
+      expect(audio.src).toBe('http://test/backing.ogg')
+      expect(audio.currentTime).toBe(5)
+      expect(playSpy).toHaveBeenCalled()
+    })
+
+    it('does not start playback when auditioning without a seek (radio click) while encoding', async () => {
+      const { ref } = renderEncoding({ autoSelection: 'with_backing' })
+      await flush()
+
+      act(() => {
+        ref.current!.auditionInstrumental('with_backing')
+      })
+      await flush()
+
+      expect(playSpy).not.toHaveBeenCalled()
+      expect(screen.queryByRole('button', { name: 'Stop audio' })).not.toBeInTheDocument()
+    })
+
+    it('hands playback position off to the video when encoding completes', async () => {
+      const apiClient = makeApiClient({
+        generatePreviewVideo: jest.fn().mockResolvedValue({
+          status: 'generating',
+          preview_hash: 'hash-handoff',
+        }),
+        getPreviewVideoStatus: jest
+          .fn()
+          .mockResolvedValueOnce({ status: 'generating' })
+          .mockResolvedValueOnce({ status: 'ready' }),
+      })
+      const ref = createRef<PreviewVideoHandle>()
+      render(
+        <PreviewVideoSection
+          ref={ref}
+          apiClient={apiClient}
+          isModalOpen={true}
+          updatedData={data}
+          instrumentalOptions={instrumentalOptions as any}
+          autoSelection="with_backing"
+        />
+      )
+      await flush()
+
+      act(() => {
+        ref.current!.auditionInstrumental('with_backing', 30)
+      })
+      const audio = document.querySelector('audio') as HTMLAudioElement
+      expect(audio.currentTime).toBe(30)
+
+      // Encoding completes on the second poll.
+      await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+      await act(async () => { await jest.advanceTimersByTimeAsync(3000) })
+
+      const video = document.querySelector('video') as HTMLVideoElement
+      expect(video).not.toBeNull()
+      // Video picks up where the standalone stem audition was, still instrumental.
+      expect(video.currentTime).toBe(30)
+      expect(video.muted).toBe(true)
+    })
+  })
+
+  it('does nothing on a stem error when no refresh function is provided', async () => {
+    const apiClient = makeApiClient()
+    render(
+      <PreviewVideoSection
+        apiClient={apiClient}
+        isModalOpen={true}
+        updatedData={data}
+        instrumentalOptions={instrumentalOptions as any}
+        autoSelection="with_backing"
+      />
+    )
+    await flush()
+
+    const audio = document.querySelector('audio') as HTMLAudioElement
+    // Must not throw when the client can't re-sign (e.g. older client shape).
+    await act(async () => {
+      fireEvent.error(audio)
+      await Promise.resolve()
+    })
+    expect(audio.src).toBe('http://test/backing.ogg')
+  })
+})

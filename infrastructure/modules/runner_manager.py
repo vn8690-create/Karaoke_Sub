@@ -1,0 +1,342 @@
+"""
+GitHub Actions Runner Manager - Ephemeral runner dispatcher.
+
+Creates the infrastructure that turns a `workflow_job.queued` GitHub webhook
+into a single-use GCE VM via JIT registration, plus a scheduled orphan-cleanup
+pass:
+
+1. Cloud Function (Gen2) — webhook entry point + scheduler entry point
+2. Cloud Scheduler — invokes the cleanup + stalled-job re-dispatch pass every 5 minutes
+3. IAM bindings — permissions to create/delete Compute Engine instances and
+   read the webhook secret + GitHub PAT from Secret Manager
+
+Manual setup required (one-time):
+1. Create the webhook secret:
+   python -c "import secrets; print(secrets.token_hex(32))" | \
+     gcloud secrets versions add github-webhook-secret --data-file=-
+
+2. Configure the GitHub org webhook at:
+   https://github.com/organizations/nomadkaraoke/settings/hooks
+   - Payload URL: <Cloud Function URL from pulumi output>
+   - Content type: application/json
+   - Secret: <value from step 1>
+   - Events: Workflow jobs
+"""
+
+import base64
+import json
+from pathlib import Path
+
+import pulumi
+import pulumi_gcp as gcp
+from config import (
+    PROJECT_ID,
+    REGION,
+    ZONE,
+    RunnerManagerConfig,
+    SecretNames,
+)
+
+
+# Optional fallback zone for ephemeral GPU runners when the primary zone is
+# exhausted. Default us-east4-c — uses ephemeral external IPs (no NAT there).
+_pulumi_config = pulumi.Config()
+RUNNER_FALLBACK_ZONE = _pulumi_config.get("runnerFallbackZone", "us-east4-c")
+
+
+def create_runner_manager_service_account() -> gcp.serviceaccount.Account:
+    """Create service account for the runner manager Cloud Function."""
+    return gcp.serviceaccount.Account(
+        "runner-manager-sa",
+        account_id="runner-manager",
+        display_name="GitHub Runner Manager",
+        description="Service account for the GitHub Actions runner manager Cloud Function",
+    )
+
+
+def grant_runner_manager_permissions(
+    service_account: gcp.serviceaccount.Account,
+    webhook_secret: gcp.secretmanager.Secret,
+    pat_secret: gcp.secretmanager.Secret,
+    runner_service_account: gcp.serviceaccount.Account | None = None,
+) -> dict:
+    """Grant permissions to the runner manager service account."""
+    bindings = {}
+
+    # Grant Compute Instance Admin - needed to start/stop VMs
+    bindings["compute_admin"] = gcp.projects.IAMMember(
+        "runner-manager-compute-admin",
+        project=PROJECT_ID,
+        role="roles/compute.instanceAdmin.v1",
+        member=service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+    )
+
+    # Grant Service Account User on the runner SA — required to set metadata
+    # on VMs that run as the runner service account. Without this, metadata
+    # writes fail with SERVICE_ACCOUNT_ACCESS_DENIED.
+    if runner_service_account is not None:
+        bindings["runner_sa_user"] = gcp.serviceaccount.IAMMember(
+            "runner-manager-runner-sa-user",
+            service_account_id=runner_service_account.name,
+            role="roles/iam.serviceAccountUser",
+            member=service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+        )
+
+    # Grant Secret Manager accessor for webhook secret
+    bindings["webhook_secret_accessor"] = gcp.secretmanager.SecretIamMember(
+        "runner-manager-webhook-secret-access",
+        secret_id=webhook_secret.id,
+        role="roles/secretmanager.secretAccessor",
+        member=service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+    )
+
+    # Grant Secret Manager accessor for GitHub PAT (for checking pending jobs)
+    bindings["pat_secret_accessor"] = gcp.secretmanager.SecretIamMember(
+        "runner-manager-pat-secret-access",
+        secret_id=pat_secret.id,
+        role="roles/secretmanager.secretAccessor",
+        member=service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+    )
+
+    # Grant logging writer
+    bindings["logging_writer"] = gcp.projects.IAMMember(
+        "runner-manager-logging-writer",
+        project=PROJECT_ID,
+        role="roles/logging.logWriter",
+        member=service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+    )
+
+    return bindings
+
+
+def create_function_storage_bucket() -> gcp.storage.Bucket:
+    """Create a GCS bucket for Cloud Function source code."""
+    return gcp.storage.Bucket(
+        "runner-manager-source-bucket",
+        name=f"{PROJECT_ID}-runner-manager-source",
+        location=REGION,
+        uniform_bucket_level_access=True,
+        lifecycle_rules=[
+            gcp.storage.BucketLifecycleRuleArgs(
+                action=gcp.storage.BucketLifecycleRuleActionArgs(type="Delete"),
+                condition=gcp.storage.BucketLifecycleRuleConditionArgs(age=7),
+            )
+        ],
+    )
+
+
+def create_function_source_archive(bucket: gcp.storage.Bucket) -> gcp.storage.BucketObject:
+    """Create a GCS object with the Cloud Function source code."""
+    source_dir = Path(__file__).parent.parent / "functions" / "runner_manager"
+
+    return gcp.storage.BucketObject(
+        "runner-manager-source",
+        bucket=bucket.name,
+        name="runner-manager-source.zip",
+        source=pulumi.FileArchive(str(source_dir)),
+    )
+
+
+def create_cloud_function(
+    service_account: gcp.serviceaccount.Account,
+    bucket: gcp.storage.Bucket,
+    source_archive: gcp.storage.BucketObject,
+    permissions: dict,
+    runner_service_account: gcp.serviceaccount.Account | None = None,
+) -> gcp.cloudfunctionsv2.Function:
+    """Create the Cloud Function (Gen2) for runner management."""
+    env_vars = {
+        "GCP_PROJECT": PROJECT_ID,
+        "GCP_ZONE": ZONE,
+        "GCP_FALLBACK_ZONE": RUNNER_FALLBACK_ZONE,
+        "WEBHOOK_SECRET_NAME": SecretNames.GITHUB_WEBHOOK_SECRET,
+        "RUNNER_PAT_SECRET_NAME": SecretNames.GITHUB_RUNNER_PAT,
+        "GITHUB_ORG": "nomadkaraoke",
+    }
+
+    # Service account used by ephemeral VMs at runtime (gcloud auth + secret reads).
+    if runner_service_account is not None:
+        env_vars["RUNNER_SERVICE_ACCOUNT"] = runner_service_account.email
+
+    return gcp.cloudfunctionsv2.Function(
+        "runner-manager-function",
+        name=RunnerManagerConfig.FUNCTION_NAME,
+        location=REGION,
+        description="Manages GitHub Actions runner VM lifecycle (auto-start/stop)",
+        build_config=gcp.cloudfunctionsv2.FunctionBuildConfigArgs(
+            runtime="python312",
+            entry_point="handle_request",
+            source=gcp.cloudfunctionsv2.FunctionBuildConfigSourceArgs(
+                storage_source=gcp.cloudfunctionsv2.FunctionBuildConfigSourceStorageSourceArgs(
+                    bucket=bucket.name,
+                    object=source_archive.name,
+                    # Pin to the current generation so Pulumi treats the source
+                    # bundle being replaced (new code commit) as a diff on the
+                    # Function itself, forcing a redeploy. Without this, the
+                    # bucket-object replaces in place and the live function
+                    # keeps serving the previous staged copy.
+                    generation=source_archive.generation,
+                ),
+            ),
+        ),
+        service_config=gcp.cloudfunctionsv2.FunctionServiceConfigArgs(
+            available_memory=RunnerManagerConfig.FUNCTION_MEMORY,
+            timeout_seconds=RunnerManagerConfig.FUNCTION_TIMEOUT,
+            service_account_email=service_account.email,
+            environment_variables=env_vars,
+            min_instance_count=0,  # Scale to zero when not in use
+            max_instance_count=RunnerManagerConfig.FUNCTION_MAX_INSTANCES,
+        ),
+        opts=pulumi.ResourceOptions(
+            depends_on=list(permissions.values()),
+        ),
+    )
+
+
+def allow_unauthenticated_invocation(
+    function: gcp.cloudfunctionsv2.Function,
+) -> gcp.cloudfunctionsv2.FunctionIamMember:
+    """
+    Allow unauthenticated invocations of the Cloud Function.
+
+    Required for GitHub webhooks since GitHub doesn't support GCP auth.
+    Security is provided by webhook signature verification.
+    """
+    return gcp.cloudfunctionsv2.FunctionIamMember(
+        "runner-manager-public-invoker",
+        project=PROJECT_ID,
+        location=REGION,
+        cloud_function=function.name,
+        role="roles/cloudfunctions.invoker",
+        member="allUsers",
+    )
+
+
+def create_scheduler_service_account() -> gcp.serviceaccount.Account:
+    """Create service account for Cloud Scheduler to invoke the function."""
+    return gcp.serviceaccount.Account(
+        "runner-manager-scheduler-sa",
+        account_id="runner-manager-scheduler",
+        display_name="Runner Manager Scheduler",
+        description="Service account for Cloud Scheduler to trigger runner idle checks",
+    )
+
+
+def grant_scheduler_invoker_permission(
+    scheduler_sa: gcp.serviceaccount.Account,
+    function: gcp.cloudfunctionsv2.Function,
+) -> gcp.cloudfunctionsv2.FunctionIamMember:
+    """Grant the scheduler service account permission to invoke the function."""
+    return gcp.cloudfunctionsv2.FunctionIamMember(
+        "runner-manager-scheduler-invoker",
+        project=PROJECT_ID,
+        location=REGION,
+        cloud_function=function.name,
+        role="roles/cloudfunctions.invoker",
+        member=scheduler_sa.email.apply(lambda email: f"serviceAccount:{email}"),
+    )
+
+
+def create_idle_check_scheduler(
+    scheduler_sa: gcp.serviceaccount.Account,
+    function: gcp.cloudfunctionsv2.Function,
+) -> gcp.cloudscheduler.Job:
+    """Create the Cloud Scheduler job that drives the orphan-cleanup pass.
+
+    The resource name + ``?action=check_idle`` query parameter are preserved
+    from the original legacy-mode behaviour so Pulumi doesn't recreate the job
+    (and so the Cloud Function keeps routing the request). The function now
+    interprets every scheduler tick as an orphan-cleanup invocation.
+    """
+    return gcp.cloudscheduler.Job(
+        "runner-manager-idle-check",
+        name="runner-manager-idle-check",
+        description="Triggers orphan-cleanup + stalled-job re-dispatch for ephemeral GHA runners every 5 minutes",
+        schedule=RunnerManagerConfig.IDLE_CHECK_SCHEDULE,
+        time_zone="UTC",
+        region=REGION,
+        http_target=gcp.cloudscheduler.JobHttpTargetArgs(
+            uri=function.url.apply(lambda url: f"{url}?action=check_idle"),
+            http_method="POST",
+            headers={
+                "Content-Type": "application/json",
+            },
+            body=base64.b64encode(json.dumps({"trigger": "scheduler"}).encode()).decode(),
+            oidc_token=gcp.cloudscheduler.JobHttpTargetOidcTokenArgs(
+                service_account_email=scheduler_sa.email,
+                audience=function.url,
+            ),
+        ),
+        # The pass now scans every org repo and may launch VMs (each insert
+        # confirm blocks up to 90s). Match the function timeout so a slow tick
+        # isn't treated as failed and retried while still running — a
+        # concurrent retry could re-dispatch the same stalled jobs twice.
+        attempt_deadline=f"{RunnerManagerConfig.FUNCTION_TIMEOUT}s",
+        retry_config=gcp.cloudscheduler.JobRetryConfigArgs(
+            retry_count=2,
+            max_retry_duration="60s",
+        ),
+    )
+
+
+def create_runner_manager_resources(
+    webhook_secret: gcp.secretmanager.Secret,
+    pat_secret: gcp.secretmanager.Secret,
+    runner_service_account: gcp.serviceaccount.Account | None = None,
+) -> dict:
+    """
+    Create all resources for the GitHub Actions runner manager.
+
+    Args:
+        webhook_secret: The webhook secret for signature verification.
+        pat_secret: The GitHub PAT secret for API calls.
+        runner_service_account: The SA that runner VMs run as (for IAM binding).
+
+    Returns:
+        dict: Dictionary of all created resources.
+    """
+    # Create service accounts
+    function_sa = create_runner_manager_service_account()
+    scheduler_sa = create_scheduler_service_account()
+
+    # Grant permissions to function service account
+    permissions = grant_runner_manager_permissions(
+        function_sa,
+        webhook_secret,
+        pat_secret,
+        runner_service_account,
+    )
+
+    # Create source storage bucket and archive
+    bucket = create_function_storage_bucket()
+    source_archive = create_function_source_archive(bucket)
+
+    # Create the Cloud Function
+    function = create_cloud_function(
+        function_sa,
+        bucket,
+        source_archive,
+        permissions,
+        runner_service_account=runner_service_account,
+    )
+
+    # Allow unauthenticated invocation (GitHub webhooks)
+    public_access = allow_unauthenticated_invocation(function)
+
+    # Grant scheduler permission to invoke function
+    scheduler_invoker = grant_scheduler_invoker_permission(scheduler_sa, function)
+
+    # Create the idle check scheduler job
+    scheduler_job = create_idle_check_scheduler(scheduler_sa, function)
+
+    return {
+        "function_service_account": function_sa,
+        "scheduler_service_account": scheduler_sa,
+        "permissions": permissions,
+        "source_bucket": bucket,
+        "source_archive": source_archive,
+        "function": function,
+        "public_access": public_access,
+        "scheduler_invoker": scheduler_invoker,
+        "scheduler_job": scheduler_job,
+    }

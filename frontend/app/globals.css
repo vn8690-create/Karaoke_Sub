@@ -1,0 +1,266 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* ===========================================
+     Nomad Karaoke Brand Colors
+     See docs/BRAND-STYLE-GUIDE.md for details
+     =========================================== */
+
+  /* Brand Primary Colors */
+  /* Note: Using #ff7acc as default to match old UI - softer/lighter pink */
+  --brand-pink: #ff7acc;
+  --brand-pink-hover: #ff8fd4;
+  --brand-pink-glow: rgba(255, 122, 204, 0.4);
+  --brand-gold: #ffdf6b;
+  --brand-purple: #8b5cf6;
+  --brand-blue: #3b82f6;
+  --brand-soft-pink: #ec4899;
+
+  /* ===========================================
+     Tenant Branding Colors (set dynamically by JS)
+     These are overridden by TenantProvider for white-label portals
+     =========================================== */
+  --tenant-primary: var(--brand-pink);
+  --tenant-secondary: var(--brand-purple);
+  --tenant-accent: var(--brand-gold);
+  --tenant-background: #0f0f0f;
+
+  /* Dark theme (default) */
+  --bg: #0f0f0f;
+  --card: #1a1a1a;
+  --card-border: #2a2a2a;
+  --waveform-bg: #0d1117;
+  --text: #e5e5e5;
+  --text-muted: #888888;
+  --text-subtle: #666666;
+
+  /* Primary uses tenant color (defaults to brand pink) */
+  --primary: var(--tenant-primary);
+  --primary-hover: color-mix(in srgb, var(--tenant-primary) 80%, white 20%);
+
+  --secondary: #252525;
+  --secondary-hover: #333333;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --pink: var(--brand-pink);
+  --blue: var(--brand-blue);
+
+  /* Tailwind compatibility mappings */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card-foreground: var(--text);
+  --popover: var(--card);
+  --popover-foreground: var(--text);
+  --primary-foreground: #ffffff;
+  --secondary-foreground: var(--text);
+  --muted: var(--secondary);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--primary);
+  --accent-foreground: #ffffff;
+  --destructive: var(--danger);
+  --destructive-foreground: #ffffff;
+  --border: var(--card-border);
+  --input: var(--secondary);
+  --ring: var(--primary);
+  --radius: 0.5rem;
+
+  /* Sidebar colors (admin panel) */
+  --sidebar: #1a1a1a;
+  --sidebar-foreground: var(--text);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #252525;
+  --sidebar-accent-foreground: var(--text);
+  --sidebar-border: var(--card-border);
+  --sidebar-ring: var(--primary);
+}
+
+.light {
+  /* Light theme - applied via next-themes class on html element */
+  --bg: #f8fafc;
+  --card: #ffffff;
+  --card-border: #e2e8f0;
+  --waveform-bg: #f1f5f9;
+  --text: #1e293b;
+  --text-muted: #64748b;
+  --text-subtle: #94a3b8;
+  --primary: var(--tenant-primary);
+  --primary-hover: color-mix(in srgb, var(--tenant-primary) 80%, black 20%);
+  --secondary: #f1f5f9;
+  --secondary-hover: #e2e8f0;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --pink: var(--brand-pink);
+  --blue: var(--brand-blue);
+
+  /* Tailwind compatibility - light mode adjustments */
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card-foreground: var(--text);
+  --popover: var(--card);
+  --popover-foreground: var(--text);
+  --muted: var(--secondary);
+  --muted-foreground: var(--text-muted);
+  --border: var(--card-border);
+  --input: var(--secondary);
+
+  /* Sidebar colors - light mode */
+  --sidebar: #ffffff;
+  --sidebar-foreground: var(--text);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f1f5f9;
+  --sidebar-accent-foreground: var(--text);
+  --sidebar-border: var(--card-border);
+  --sidebar-ring: var(--primary);
+}
+
+@theme inline {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "SF Mono", Monaco, "Cascadia Code", monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  /* Radial gradient background overlay (like decide.nomadkaraoke.com) */
+  body::after {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background:
+      radial-gradient(ellipse at 20% 0%, rgba(139, 92, 246, 0.12) 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 100%, rgba(255, 122, 204, 0.1) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 50%, rgba(255, 223, 107, 0.03) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  /* Light mode uses subtle pink tints */
+  .light body::after {
+    background:
+      radial-gradient(ellipse at 20% 0%, rgba(139, 92, 246, 0.08) 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 100%, rgba(255, 122, 204, 0.06) 0%, transparent 50%),
+      radial-gradient(ellipse at 50% 50%, rgba(255, 223, 107, 0.02) 0%, transparent 70%);
+  }
+}
+
+/* Landing page utilities */
+@layer utilities {
+  /* Glow effect for primary buttons - uses brand pink */
+  .btn-glow {
+    box-shadow: 0 0 20px var(--brand-pink-glow);
+  }
+  .btn-glow:hover {
+    box-shadow: 0 0 30px rgba(255, 122, 204, 0.6);
+  }
+
+  /* Gradient text - flows to brand pink */
+  .gradient-text {
+    background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 50%, #ff7acc 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Card hover effect */
+  .card-hover {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  .card-hover:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+  }
+
+  /* Animated background gradient - subtle brand integration */
+  /* animated-gradient class - now just ensures min-height, gradient provided by body::after */
+  .animated-gradient {
+    /* Background is now provided by body::after radial gradient */
+    background: transparent;
+  }
+
+  /* Theme-aware color utilities - use CSS variables for theme switching */
+  .text-dark-300 { color: var(--text); }
+  .text-dark-400 { color: var(--text-muted); }
+  .text-dark-500 { color: var(--text-subtle); }
+  .bg-dark-700 { background-color: var(--secondary); }
+  .bg-dark-800 { background-color: var(--card); }
+  .bg-dark-900 { background-color: var(--bg); }
+  .border-dark-600 { border-color: var(--card-border); }
+  .border-dark-700 { border-color: var(--card-border); }
+
+  /* Primary color utilities - now brand pink */
+  .text-primary-400 { color: #ff8fd4; } /* Lighter pink */
+  .text-primary-500 { color: var(--brand-pink); }
+  .bg-primary-500 { background-color: var(--brand-pink); }
+  .hover\:bg-primary-600:hover { background-color: var(--brand-pink-hover); }
+
+  /* Brand accent utilities */
+  .text-brand-pink { color: var(--brand-pink); }
+  .text-brand-gold { color: var(--brand-gold); }
+  .bg-brand-pink { background-color: var(--brand-pink); }
+  .bg-brand-gold { background-color: var(--brand-gold); }
+  .border-brand-pink { border-color: var(--brand-pink); }
+
+  /* Fade in animation for cold start messages */
+  @keyframes fade-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .animate-fade-in {
+    animation: fade-in 0.3s ease-out forwards;
+  }
+
+  /* Lyrics review flash animation for highlighted words */
+  @keyframes lyrics-flash {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; background-color: rgba(251, 191, 36, 0.4); }
+  }
+  .animate-lyrics-flash {
+    animation: lyrics-flash 0.5s ease-in-out;
+  }
+}

@@ -1,0 +1,97 @@
+"use client"
+
+import { useTranslations } from 'next-intl'
+import { X, ExternalLink, Youtube, AlertTriangle } from "lucide-react"
+import type { CommunityCheckResponse } from "@/lib/api"
+
+interface CommunityVersionBannerProps {
+  data: CommunityCheckResponse
+  onDismiss: () => void
+  /** Overrides the default "check before using a credit" line (e.g. on the free
+   *  requests board, where nothing is charged). */
+  subtitle?: string
+}
+
+export function CommunityVersionBanner({ data, onDismiss, subtitle }: CommunityVersionBannerProps) {
+  const t = useTranslations('communityVersion')
+  if (!data.has_community || data.songs.length === 0) return null
+
+  // Collect all community tracks across songs, take top 3
+  const allTracks = data.songs.flatMap((song) =>
+    song.community_tracks.map((track) => ({
+      ...track,
+      songArtist: song.artist,
+      songTitle: song.title,
+    }))
+  )
+  const displayTracks = allTracks.slice(0, 3)
+
+  return (
+    <div
+      className="relative rounded-lg p-3 border"
+      style={{
+        borderColor: "rgba(34, 197, 94, 0.4)",
+        backgroundColor: "rgba(34, 197, 94, 0.06)",
+      }}
+    >
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="absolute top-2 right-2 p-1 rounded hover:bg-black/10 transition-colors"
+        style={{ color: "var(--text-muted)" }}
+        aria-label="Dismiss"
+      >
+        <X className="w-3.5 h-3.5" />
+      </button>
+
+      <div className="pr-6">
+        <p className="text-sm font-medium flex items-center gap-1.5" style={{ color: "rgb(34, 197, 94)" }}>
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          {t('exists')}
+        </p>
+        <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+          {subtitle ?? t('checkFirst')}
+        </p>
+
+        <div className="mt-2 space-y-1.5">
+          {displayTracks.map((track, i) => (
+            <a
+              key={i}
+              href={track.youtube_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-2 text-xs rounded px-2 py-1.5 transition-colors hover:bg-black/5"
+              style={{ color: "var(--text)" }}
+            >
+              <ExternalLink className="w-3.5 h-3.5 shrink-0" style={{ color: "rgb(34, 197, 94)" }} />
+              <span className="truncate">
+                {track.brand_name}
+                {track.brand_code && (
+                  <span
+                    className="ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-medium"
+                    style={{
+                      backgroundColor: "rgba(34, 197, 94, 0.15)",
+                      color: "rgb(34, 197, 94)",
+                    }}
+                  >
+                    {t('community')}
+                  </span>
+                )}
+              </span>
+              <span className="ml-auto shrink-0 text-[10px] flex items-center gap-1" style={{ color: "var(--text-muted)" }}>
+                <Youtube className="w-3 h-3 text-red-500" />
+                {t('watchOnYoutube')}
+              </span>
+            </a>
+          ))}
+        </div>
+
+        {allTracks.length > 3 && (
+          <p className="text-[10px] mt-1.5" style={{ color: "var(--text-muted)" }}>
+            {t('moreVersions', { count: allTracks.length - 3 })}
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}

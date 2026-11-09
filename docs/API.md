@@ -1,0 +1,3540 @@
+# API Reference
+
+Base URL: `https://api.nomadkaraoke.com` (production) or `http://localhost:8000` (local)
+
+> **Edge:** production traffic must go through `https://api.nomadkaraoke.com`
+> (proxied by Cloudflare — WAF + rate limiting). The Cloud Run origin is
+> **origin-locked**: requests hitting the raw `*.run.app` URL directly are
+> rejected with `403` unless they carry the Cloudflare-injected `X-Edge-Auth`
+> header (`/` and `/api/health*` are exempt for probes). See
+> [ARCHITECTURE.md § Edge Security](ARCHITECTURE.md#edge-security-cloudflare).
+
+## Authentication
+
+All endpoints except `/health` and `/api/themes` require authentication.
+
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" ...
+```
+
+## Endpoints
+
+### Health
+
+```http
+GET /health
+```
+
+No auth required. Returns service status.
+
+#### Encoding Worker Health
+
+```http
+GET /health/encoding-worker
+```
+
+No auth required. Returns GCE encoding worker status for frontend display.
+
+Response:
+```json
+{
+  "available": true,
+  "status": "ok",
+  "version": "0.95.1",
+  "active_jobs": 0,
+  "queue_length": 0
+}
+```
+
+Status values:
+- `ok` - Worker is healthy and available
+- `offline` - Worker is unavailable (includes `error` field)
+- `not_configured` - Encoding worker not configured on backend
+
+#### Flacfetch Service Health
+
+```http
+GET /health/flacfetch
+```
+
+No auth required. Returns flacfetch service status for frontend display.
+
+Response:
+```json
+{
+  "available": true,
+  "status": "ok",
+  "version": "1.2.3"
+}
+```
+
+Status values:
+- `ok` - Flacfetch service is healthy and available
+- `offline` - Service is unavailable (includes `error` field)
+- `not_configured` - Flacfetch service not configured on backend
+
+### Jobs
+
+#### Create Job from URL
+
+```http
+POST /api/jobs
+Content-Type: application/json
+
+{
+  "url": "https://www.youtube.com/watch?v=...",
+  "artist": "Artist Name",       // optional, auto-detected if omitted
+  "title": "Song Title",         // optional, auto-detected if omitted
+  "is_private": false,           // optional
+  "duration_seconds": 245.3,     // optional — from /api/jobs/estimate; drives pre-flight credit deduction
+  "acknowledged_credits": 1      // optional — if provided, server validates it equals the computed cost; 409 on mismatch
+}
+```
+
+Creates a job from a YouTube (or other supported) URL. Credit cost is `max(1, ceil(minutes/10))`
+(10-minute tiers). If `duration_seconds` is omitted the system deducts 1 credit as a hold and
+settles the true cost after download (see [Duration-Based Pricing](#duration-based-pricing)).
+Admin jobs bypass all credit deduction.
+
+`acknowledged_credits` is **optional**. If provided, the server validates it equals the
+server-computed credit cost and returns 409 on mismatch (race-condition guard for the UI). If
+omitted, the server charges the computed cost without client confirmation.
+
+Returns `JobResponse` (job id, status, etc.).
+
+**Errors:**
+- `402` — Insufficient credits (see [Credit Enforcement](#credit-enforcement))
+- `409` — `acknowledged_credits` was provided and does not match server-computed cost; client should refresh and re-confirm
+- `422` — Input exceeds 60-minute hard limit
+
+#### Estimate URL Duration (pre-flight)
+
+```http
+POST /api/jobs/estimate
+Content-Type: application/json
+
+{"url": "https://www.youtube.com/watch?v=..."}
+```
+
+Probes the URL (via flacfetch `/check-youtube`) **without creating a job or downloading audio**.
+Use this before `POST /api/jobs` to show the user the credit cost.
+
+Response:
+```json
+{
+  "duration_seconds": 245.3,
+  "credits": 1,
+  "blocked": false,
+  "source": "youtube_metadata"
+}
+```
+
+- `duration_seconds`: `null` if the probe fails (bot challenge, unsupported URL, etc.)
+- `source`: `"youtube_metadata"` | `"unknown"` (probe failed)
+- `blocked`: `true` when `duration_seconds > 3600` (60 min) — create will be rejected
+- `credits`: computed from `max(1, ceil(duration_seconds / 600))`; `1` when duration unknown
+
+When `duration_seconds` is `null`, warn the user that the final cost will be confirmed after
+download and create the job with a 1-credit hold.
+
+#### Confirm Duration (resume paused job)
+
+```http
+POST /api/jobs/{job_id}/confirm-duration
+Content-Type: application/json
+
+{"acknowledged_credits": 3}
+```
+
+Called when a job is paused in `AWAITING_DURATION_CONFIRM` state. The only pause reason is
+**`reconcile`** (`state_data.duration_confirm_reason`): the measured audio costs more than was
+already charged (URL, upload and search jobs alike).
+
+`acknowledged_credits` must equal the new total: `state_data.credits_charged +
+state_data.pending_additional_credits`. Reconcile writes `credits_charged` alongside
+`pending_additional_credits` when it pauses, and `GET /api/jobs/{id}` / `GET /api/jobs` always
+return a resolved `state_data.credits_charged` (filled in the response for legacy jobs that lack
+it, via `job_credits.get_credits_charged`), so clients should read it rather than defaulting.
+On success `credits_charged` becomes the new total, which is what a later cancel/expiry refunds.
+
+On success, deducts the owed credits and resumes by triggering both audio and lyrics workers.
+Returns the updated job.
+
+**Errors:**
+- `402` — Insufficient credits; user should buy more and retry
+- `409` — `acknowledged_credits` doesn't match server's current figure (race/refresh); client should re-fetch the job and re-show the dialog
+
+#### Create Job with Upload
+
+```http
+POST /api/jobs/upload
+Content-Type: multipart/form-data
+
+file: <audio file>
+artist: "Artist Name"
+title: "Song Title"
+is_private: false  # Optional. If true, Dropbox uses Tracks-NonPublished/NOMADNP, no YouTube/GDrive
+```
+
+Returns job ID. Triggers async processing. Max request body ~32MB (Cloud Run limit). For larger files, use the signed URL upload flow below.
+
+#### Create Job with Signed URL Upload (large files)
+
+Three-step flow that bypasses Cloud Run's 32MB body limit. Used automatically by the frontend for files ≥25MB.
+
+**Step 1: Create job and get signed URLs**
+```http
+POST /api/jobs/create-with-upload-urls
+Content-Type: application/json
+
+{
+  "artist": "Artist Name",
+  "title": "Song Title",
+  "files": [{"filename": "song.wav", "content_type": "audio/wav", "file_type": "audio"}],
+  "is_private": false
+}
+```
+
+Returns `job_id` and `upload_urls` list. Each entry has `file_type`, `upload_url` (signed GCS URL), and `content_type`.
+
+**Step 2: Upload file directly to GCS**
+```http
+PUT <upload_url>
+Content-Type: audio/wav
+
+<file bytes>
+```
+
+Direct PUT to GCS signed URL — does not go through the backend.
+
+**Step 3: Notify backend**
+```http
+POST /api/jobs/{job_id}/uploads-complete
+Content-Type: application/json
+
+{"uploaded_files": ["audio"]}
+```
+
+Triggers async processing.
+
+Between steps 1 and 3 the job is `pending` with `state_data.awaiting_upload: true` (shown as
+"Waiting for upload" on the dashboard; cleared by `uploads-complete`). The web client cancels
+its own job (refunding the credit) when the upload fails. As a backstop, the hourly
+`process-stale-reviews` run (`backend/workers/stale_upload_processor.py`) cancels and refunds
+jobs still awaiting upload 6h after creation (signed URLs expire at 60 min, but an in-flight
+PUT can outlast that), or 24h if some files already landed under `uploads/{job_id}/`. Tenant
+bulk (`batch_id`) jobs are exempt.
+
+A signed-in user can't finalize another user's job (admins and email-less API tokens can).
+
+With an `existing_instrumental` file whose length differs from the mix by >0.5s, the backend
+lines the instrumental up with the mix (`backend/services/instrumental_conform.py`): it finds the
+start offset by FFT cross-correlation at 25% and 75% of the song (±15s), trims/pads the start,
+then trims the end with a 2s fade or pads it with silence to the mix length. The conformed FLAC
+is stored at `uploads/{job_id}/conformed/existing_instrumental.flac` (becomes
+`existing_instrumental_gcs_path`; the original upload is kept) and the adjustment is recorded in
+`state_data.instrumental_conformed` (`start_trimmed_seconds`, `end_trimmed_seconds`,
+`correlation`, `original_gcs_path`, …). Only when that fails — correlation < 0.3 (wrong file) or
+the two offsets differ by >20 ms (edited differently mid-song) — is the job cancelled (credit
+refunded) with 400
+`{detail: {error: "duration_mismatch", message, audio_duration, instrumental_duration, difference}}`.
+
+**Optional fields:**
+- `requires_audio_edit`: pause at the audio editor after upload (stored in `state_data`).
+- `upload_mode`: `"signed_put"` (default) or `"resumable"`. With `"resumable"`, each
+  `upload_urls` entry has `resumable: true` and `upload_url` is a **GCS resumable session
+  URI** — upload in 256KiB-aligned chunks with `Content-Range` headers, query the persisted
+  offset after an interruption (`PUT` with `Content-Range: bytes */<total>` → `308` +
+  `Range` header), and resume mid-file. Sessions are created with the caller's `Origin` so
+  GCS answers session CORS itself. Used by the tenant bulk-upload flow
+  (`frontend/lib/resumable-upload.ts`).
+- `batch_id`: groups jobs created together in one bulk batch — stamped into
+  `state_data.batch_id` with `created_from: "tenant-bulk"`.
+- `track_code` (tenant portals only; `400` elsewhere): the tenant's own catalogue code,
+  e.g. `"VS6588"`. Letters/digits optionally joined by `-`/`_`, max 24 chars, upper-cased.
+  Stored as the job's `keep_brand_code`, so the delivery folder and every output file are
+  named `VS6588 - Artist - Title …` instead of an allocated `<PREFIX>-NNNN` code.
+
+#### Get Job Status
+
+```http
+GET /api/jobs/{job_id}
+```
+
+Response includes:
+- `status` - Current job state
+- `file_urls` - GCS paths of outputs (when ready)
+- `download_urls` - (complete jobs only) short-lived (120 min) signed GCS URLs, keyed by output name. Includes the final MP4s from `file_urls.finals` keyed by finals key (e.g. `lossy_720p_mp4`, `lossy_4k_mp4`, `with_vocals_mp4`); non-MP4 finals (mkv, zips) are not included. Signed URLs support HTTP Range (streaming/progress) unlike the `/download/...` proxy. Purged outputs still get a URL that returns 404
+- `state_data` - Worker progress details
+- `timeline` - Processing history
+
+#### List Jobs
+
+```http
+GET /api/jobs
+GET /api/jobs?status=complete
+GET /api/jobs?limit=10&offset=0
+GET /api/jobs?exclude_test=false
+GET /api/jobs?fields=summary&hide_completed=true
+GET /api/jobs?fields=summary&search=bohemian
+```
+
+Query parameters:
+- `exclude_test` (bool, default: true) - Admin only: filter out jobs from test users
+- `status` - Filter by job status
+- `limit` / `offset` - Pagination
+- `fields` (string, optional) - Set to `summary` to return only dashboard-required fields using Firestore field projection. Reduces payload from ~16MB to <500KB for large job lists.
+- `hide_completed` (bool, default: false) - Exclude successful completions (complete, prep_complete) server-side. Failed jobs remain visible.
+- `search` (string, optional) - Text search filter (summary mode only). Case-insensitive substring match against artist, title, audio_search_artist, audio_search_title, and job_id. When active, fetches up to 1000 results internally and filters in Python.
+
+#### Retry Job
+
+```http
+POST /api/jobs/{job_id}/retry
+Content-Type: application/json
+
+{"keep_trying": false}   # body optional
+```
+
+Resumes a `failed`/`cancelled` job from its last checkpoint. `409` while a Cloud
+Run auto-retry is pending. For an audio-download failure it re-runs the download.
+`keep_trying: true` retries a **stalled torrent** (`error_details.code ==
+"audio_download_stalled"`) with the extended stall budget (1 hour instead of 20
+minutes; see `backend/services/audio_download_limits.py`).
+
+#### Choose Different Audio
+
+```http
+POST /api/jobs/{job_id}/choose-different-audio
+```
+
+For a `failed` job whose `error_details.stage == "audio_download"`: moves it back
+to `awaiting_audio_selection` using its saved search results, so the owner can
+pick another source via the Select Audio dialog. `400` if the job isn't an
+audio-download failure or has no saved results, `403` for non-owners, `409` while
+an auto-retry is pending.
+
+#### Delete Job
+
+```http
+DELETE /api/jobs/{job_id}
+```
+
+#### Change Visibility
+
+Toggle a completed job between public and private. Only the job owner or admin can use this.
+
+```http
+POST /api/jobs/{job_id}/change-visibility
+Content-Type: application/json
+
+{
+  "target_visibility": "private"  // or "public"
+}
+```
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Job changed to private. Outputs redistributed to private destination.",
+  "previous_visibility": "public",
+  "new_visibility": "private",
+  "reprocessing_required": false
+}
+```
+
+**Two flows depending on direction:**
+- **Public → Private**: Fast (~1-2 min). Deletes distributed outputs (YouTube/Dropbox/GDrive), keeps GCS finals, redistributes to private destination.
+- **Private → Public**: Slow (~15-30 min). Clears custom styles, resets to Nomad theme, regenerates screens, re-renders and re-encodes video.
+
+**Validation:** Job must be `complete`, not a tenant job, not already at target visibility, and no concurrent visibility change in progress.
+
+### Re-render With Current Theme (tenant jobs)
+
+Re-render a finished tenant track with the tenant's **current** theme, e.g. after editing it in "Theme & style". Jobs snapshot the theme at creation. A theme save re-applies the theme to tracks that haven't started rendering (see Tenant Theme Editor → Save), but finished tracks keep the old look until they are re-rendered.
+
+```http
+POST /api/jobs/{job_id}/rerender
+```
+
+Response: `{"status": "processing", "job_id": "abc123", "theme_id": "randy-vild"}`
+
+Re-snapshots the tenant theme onto the job (`style_params_gcs_path`, `style_assets`), deletes the old screens and `videos/with_vocals`, then goes `LYRICS_COMPLETE` (with `state_data.regen_restore_status = "review_complete"`) → screens → render → encode → `complete`. It reuses the reviewed `corrections_updated.json` and `instrumental_selection`, so there's no review step. Free (tenant jobs are never charged). About 10-15 minutes.
+
+**Access:** the job owner, if still on the tenant allowlist, or an admin.
+
+**Validation (400):** tenant job; `complete` (or `failed` mid re-render); outputs not deleted; has a theme, reviewed lyrics and an instrumental selection; never published to YouTube/GDrive. A tenant Dropbox archive (e.g. `RVILD-0001 - Artist - Title`) is refreshed in place: the re-render reuses the job's brand code (`state_data.theme_rerender.brand_code` → orchestrator `keep_brand_code`), and Dropbox uploads overwrite. **409** if the job left `complete` in the meantime (e.g. a double-click already started a re-render).
+
+### Regenerate Video (storage retention)
+
+Rebuild a finished track's archived video files. Storage retention (see
+docs/ARCHITECTURE.md § Storage Retention) keeps the 720p final and the CDG/TXT
+packages of tracks completed >30 days ago and archives the rest.
+
+```http
+POST /api/jobs/{job_id}/regenerate
+```
+
+Response: `{"status": "processing", "job_id": "abc123", "needs_stems": true, "message": "..."}`
+
+Claims the job (`complete` → `lyrics_complete` with `state_data.regen_restore_status = "review_complete"` and the `state_data.regenerate` marker) and triggers the screens worker. If `stems_purged_at` is set the screens worker first re-runs audio separation from `input_media_gcs_path` (`state_data.stems_restore`), then screens → render → encode, using the existing reviewed lyrics, `instrumental_selection` and style. **GCS only**: no brand-code allocation, no YouTube/Dropbox/Google Drive upload, no Discord post; published links are kept. The owner is emailed/pushed on completion; regenerate completions don't count as new jobs. On success `renders_purged_at` is cleared and `renders_regenerated_at` set.
+
+**Access:** the job owner or an admin (admin token, e.g. kjbox with `X-Client-Id: kjbox`). **Limits** (customers only, rolling 24h): `REGENERATE_MAX_PER_JOB_PER_DAY` (3) and `REGENERATE_MAX_PER_USER_PER_DAY` (10) → **429**. **400** when not regenerable (not `complete`, outputs deleted, prep/finalise-only, no reviewed lyrics/instrumental selection, input audio gone); **409** while a re-render / visibility change / purge is in progress. A failed regenerate is resumed by `POST /api/jobs/{id}/retry` (`retry_stage: "regenerate"`).
+
+Downloads of archived files (`GET /api/jobs/{id}/download/{category}/{key}`) return **410** with `detail = {"code": "output_archived", "message": ..., "regenerate_url": "/api/jobs/{id}/regenerate"}`.
+
+Admin variant (optional quiet run, no rate limit): `POST /api/admin/jobs/{job_id}/regenerate` with `{"notify_customer": false}`.
+
+**User inputs** (what regenerate/re-render needs) live in `jobs/{id}/input/**`: every pipeline worker copies `uploads/{id}/**` there on entry and repoints the job (`backend/services/input_persistence.py`; `uploads/` expires after 180 days). Backfill for jobs no worker will touch again: `POST /api/admin/persist-uploads` (admin; `?dry_run=false` to apply) → `{dry_run, jobs: {job_id: {copied, updated} | {would_copy} | {orphan: n} | {error}}}`; folders without a job document are reported as `orphan` and left in place.
+
+A public → private visibility change on a track whose finals were archived regenerates them first (`after: "change_to_private"`), then runs the redistribution automatically.
+
+### Review
+
+The combined review flow allows users to review lyrics AND select instrumental track in a single session.
+
+**Auto-approval:** jobs default to `review_mode="auto"` — when the auto-approval scorer is fully
+confident (lyrics verified against a synced reference with every gap covered by the auto-applied
+AI suggestions, AND no audible backing vocals), the review screens are skipped entirely: the AI
+suggestions are applied server-side, the clean instrumental is selected, and the job goes
+straight to render. All other jobs stop at review as before. The verdict for every job is
+recorded in `processing_metadata.auto_approval` (fields: `mode`, `outcome`, per-axis verdicts +
+signals). Set `review_mode="always_review"` (admin job PATCH) to force the review screens;
+global kill switch: `AUTO_APPROVAL_ENFORCE_ENABLED=false`.
+
+#### Get Correction Data
+
+```http
+GET /api/review/{job_id}/correction-data
+```
+
+Returns lyrics correction data plus instrumental options for the review UI.
+
+Response includes:
+- `correction_data` - Lyrics and segments for editing
+- `instrumental_options` - Available instrumental tracks (`clean`, `with_backing`). Each
+  option's `audio_url` is a **relative same-origin proxy path** (`/api/review/{job_id}/instrumental-audio/{option_id}`),
+  not a signed GCS URL — since v0.229.0 the review hot path performs **no URL signing** (it
+  used to sign 2-3 URLs per load via IAM signBlob, which could stall). The frontend turns
+  the path into an absolute, token-authenticated `<audio>` src.
+- `backing_vocals_analysis` - Analysis data to help with selection
+  - Its `recommended_selection` is the unified recommendation (`unified_backing_recommendation` in `backend/services/auto_approval/instrumental.py`): the 3-stem scorer's confident verdict, else `clean` when the backing stem looks like the lead, else the analyzer heuristic (kept as `heuristic_recommended_selection`). Every endpoint that serves the analysis applies it, so older jobs are consistent too.
+
+#### Instrumental Stems / Separation Status
+
+```http
+GET /api/review/{job_id}/instrumental-urls
+```
+
+Returns `{instrumental_options, audio_complete, job_status, backing_vocals_analysis, auto_approval}`.
+Review opens as soon as **lyrics** finish, while audio separation usually lands 2-3 minutes
+later, so `correction-data` fetched at page load often has no stems. The review page polls
+this every 15 s (max 10 min) while it loaded without stems, and once `audio_complete` is true
+overlays the fresh stems, backing analysis and auto-approval verdict so the finish modal's
+instrumental chooser appears without a reload (the modal shows a "still separating" spinner
+meanwhile). `audio_complete` is set only after stems, review OGGs and the backing analysis are
+all written. The preview modal also calls it on a stem `<audio>` load error.
+
+#### Complete Review
+
+```http
+POST /api/review/{job_id}/complete
+Content-Type: application/json
+
+{
+  "corrections": [...],
+  "corrected_segments": [...],
+  "instrumental_selection": "clean"  // Required: "clean" or "with_backing"
+}
+```
+
+Saves corrections, stores instrumental selection, and triggers video rendering. The instrumental selection is now required as part of the combined review flow.
+
+#### Mark sync as reference (admin only)
+
+```
+POST /api/review/{job_id}/sync-reference
+{"verified": true, "notes": "optional"}
+```
+Admin users only (403 otherwise). Stores `state_data.sync_reference = {verified, by, at, notes}`.
+Verified jobs form the word-timing reference set for aligner training/evaluation (full-auto v2).
+The lyrics review modal shows the checkbox to admins; unticked jobs are treated as unverified.
+
+#### Generate Preview
+
+```http
+POST /api/review/{job_id}/preview-video
+Content-Type: application/json
+
+{
+  "corrections": [...],
+  "corrected_segments": [...],
+  "use_background_image": false  // optional, default: false
+}
+```
+
+Generates a preview video during review. Returns `{"status": "success", "preview_hash": "..."}` when the video is immediately available (cache hit — the hash is deterministic over the correction data — or local render), or `{"status": "generating", "preview_hash": "..."}` when encoding continues in the background on a GCE worker. In the generating case, poll the status endpoint below; the request never waits for the encoder (cold-starting a worker VM can take minutes, longer than Cloudflare's edge timeout).
+
+The `use_background_image` option controls whether the preview renders with the theme's background image (slower, ~30-60s) or a solid black background (faster, ~10s). Defaults to black background for speed.
+
+#### Poll Preview Status
+
+```http
+GET /api/review/{job_id}/preview-video/{preview_hash}/status
+```
+
+Returns `{"status": "ready" | "generating" | "error", "preview_hash": "...", "message"?: "..."}`. Backed by GCS (mp4 existence / error marker), so polls work across Cloud Run instances. Once ready, fetch the video via `GET /api/review/{job_id}/preview-video/{preview_hash}`.
+
+#### Stream Audio
+
+```http
+GET /api/review/{job_id}/audio/{stem_type}
+```
+
+Redirects to a signed GCS URL for review playback. Audio is served as OGG Opus (~3 MB) transcoded from the original FLAC (~35 MB). Transcoding happens eagerly during screen generation; if the transcoded file is missing, falls back to the original FLAC.
+
+#### Stream Instrumental Audio (same-origin proxy)
+
+```http
+GET /api/review/{job_id}/instrumental-audio/{option_id}   // option_id: "clean" | "with_backing"
+```
+
+Streams the transcoded OGG bytes for an instrumental option **through the API** (no GCS
+signed URL / redirect), with HTTP Range support (`206`) so `<audio>` can seek. Auth via
+`require_review_auth`; because this URL is used as a raw media `src`, the token rides in
+the query string (`?token=` for a full/owner token, `?review_token=` for a review link) —
+the same mechanism as `/audio/vocals`. The stem GCS path is resolved server-side from
+`option_id`. Added in v0.229.0 to remove IAM signBlob from the review load path (Option B).
+
+#### Waveform Data (review page)
+
+```http
+GET /api/review/{job_id}/waveform-data?num_points=1000
+```
+
+Returns `{amplitudes, duration_seconds, duration, sample_rate}` for canvas rendering of the
+backing-vocals waveform. Served from a **persistent GCS cache**
+(`jobs/{job_id}/review-audio/waveform_review_{num_points}.json`, validated against the source
+stem path + `num_points`), pre-computed by `screens_worker` before the job reaches review. A
+cache miss decodes the transcoded review OGG off the event loop, bounded by
+`REVIEW_WAVEFORM_MAX_CONCURRENCY` (default 4) — added in v0.230.0 after uncached in-request
+decoding wedged the service under concurrent review-page loads.
+
+Note: `/audio/vocals` (and the instrumental proxy above) serve from a bounded in-memory LRU,
+honor HTTP Range (`206`), and set `Cache-Control: private, max-age=600`.
+
+#### Create Custom Instrumental
+
+```http
+POST /api/jobs/{job_id}/create-custom-instrumental
+Content-Type: application/json
+
+{
+  "mute_regions": [
+    {"start_seconds": 17.0, "end_seconds": 42.0},
+    {"start_seconds": 53.8, "end_seconds": 71.4}
+  ]
+}
+```
+
+Creates a custom instrumental by muting selected regions of backing vocals, combining with the clean instrumental, and uploading to GCS. Returns a signed audio URL for immediate playback.
+
+Response:
+```json
+{
+  "status": "success",
+  "message": "Custom instrumental created with 2 mute regions",
+  "audio_url": "https://storage.googleapis.com/...",
+  "muted_duration_seconds": 42.6
+}
+```
+
+#### Upload Custom Instrumental
+
+```http
+POST /api/jobs/{job_id}/upload-instrumental
+Content-Type: multipart/form-data
+
+file: <audio file (mp3, wav, flac, ogg, aac, m4a)>
+```
+
+Uploads an external instrumental audio file for use during review. The uploaded file's duration is validated against the original audio — must match within ±0.5 seconds. Requires job to be in `awaiting_review` or `in_review` state. Kept for CLI/back-compat; files over ~32 MiB exceed Cloud Run's request cap, so the web UI uses the signed-URL flow below.
+
+Response:
+```json
+{
+  "status": "success",
+  "duration_seconds": 240.0,
+  "message": "Custom instrumental uploaded (240.0s)",
+  "audio_url": "https://storage.googleapis.com/...signed FLAC URL for playback (null if signing failed)"
+}
+```
+
+**Signed-URL variant (web UI, any size):**
+
+```http
+POST /api/jobs/{job_id}/instrumental-upload-url
+{"filename": "inst.wav", "content_type": "audio/wav"}
+→ {"upload_url": "<signed PUT>", "gcs_path": "jobs/{job_id}/uploads/custom_instrumental_source.wav", "content_type": "audio/wav"}
+
+PUT <upload_url>            (browser → GCS directly)
+
+POST /api/jobs/{job_id}/instrumental-upload-complete
+{"gcs_path": "jobs/{job_id}/uploads/custom_instrumental_source.wav"}
+→ same response as upload-instrumental
+```
+
+Same ownership/status checks as `upload-instrumental`. Max 200 MB (400 otherwise). Extensions: flac, mp3, wav, m4a, ogg, aac, aif, aiff, opus
+(400 otherwise). `gcs_path` must be this job's `custom_instrumental_source` object (400 otherwise); 404 if the
+upload never landed. Both routes share one processing helper (duration check, FLAC conversion,
+`stems.custom_instrumental`).
+
+Error (duration mismatch):
+```json
+{
+  "detail": "Duration mismatch: uploaded file is 235.0s but original audio is 240.0s. The instrumental must be exactly 240.0s (±0.5s)."
+}
+```
+
+#### Edit Completed Track
+
+```http
+POST /api/jobs/{job_id}/edit
+Content-Type: application/json
+
+{
+  "artist": "Updated Artist",  // optional, only if changing
+  "title": "Updated Title"     // optional, only if changing
+}
+```
+
+Reopens a completed track for editing. Cleans up all distributed outputs (YouTube, Dropbox, GDrive, GCS finals), recycles the brand code, and resets the job to `awaiting_review`. A new review token is issued automatically. No additional credits consumed.
+Because the track was already delivered, an edited job (`edit_count > 0`) is never refunded if it is later
+deleted, cancelled or fails (closes the complete → edit → delete credit loop, v0.268.1).
+
+If `artist` or `title` are provided and differ from current values, title/end screens are deleted and the screens worker is triggered to regenerate them in the background.
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Track reopened for editing. Previous outputs have been removed.",
+  "review_url": "/app/jobs#/abc123/review",
+  "review_token": "...",
+  "metadata_updated": true,
+  "cleanup_results": {
+    "youtube": {"status": "success", "video_id": "xyz"},
+    "dropbox": {"status": "success", "path": "/Karaoke/..."},
+    "gdrive": {"status": "success"},
+    "gcs_finals": {"status": "success", "deleted_count": 4},
+    "brand_code": {"status": "recycled", "code": "NOMAD-1234"}
+  }
+}
+```
+
+**Requirements:** Job must be in `complete` state with `outputs_deleted_at` not set. User must own the job or be admin.
+
+#### Get Style Upload URLs
+
+```http
+POST /api/jobs/{job_id}/style-upload-urls
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "files": [
+    {
+      "filename": "bg.png",
+      "content_type": "image/png",
+      "file_type": "style_karaoke_background"
+    }
+  ]
+}
+```
+
+Returns signed GCS upload URLs for custom style assets (backgrounds). Only available for private jobs before the `GENERATING_SCREENS` pipeline stage. Valid `file_type` values: `style_intro_background`, `style_karaoke_background`, `style_end_background`. Only PNG and JPG images are accepted.
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "job-abc",
+  "upload_urls": [
+    {
+      "file_type": "style_karaoke_background",
+      "gcs_path": "uploads/job-abc/style/karaoke_background.png",
+      "upload_url": "https://storage.googleapis.com/...",
+      "content_type": "image/png"
+    }
+  ]
+}
+```
+
+#### Complete Style Uploads
+
+```http
+POST /api/jobs/{job_id}/style-uploads-complete
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "uploaded_files": ["style_karaoke_background"],
+  "color_overrides": {
+    "artist_color": "#ff0000",
+    "title_color": "#00ff00"
+  }
+}
+```
+
+Finalizes style asset uploads. Verifies files exist in GCS, merges into `job.style_assets`, reloads the theme's `style_params.json` with color overrides and custom background paths. The `color_overrides` field is optional — omit it to keep default theme colors.
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "job-abc",
+  "message": "Style assets applied successfully.",
+  "assets_updated": ["karaoke_background"]
+}
+```
+
+#### Submit Edit Log
+
+```http
+POST /api/jobs/{job_id}/edit-log
+Content-Type: application/json
+
+{
+  "session_id": "abc123",
+  "job_id": "test-job",
+  "audio_hash": "hash",
+  "started_at": "2026-03-01T00:00:00.000Z",
+  "entries": [
+    {
+      "id": "entry-1",
+      "timestamp": "2026-03-01T00:01:00.000Z",
+      "operation": "word_change",
+      "segment_id": "seg-0",
+      "segment_index": 0,
+      "word_ids_before": ["w1"],
+      "word_ids_after": ["w1"],
+      "text_before": "helo",
+      "text_after": "hello",
+      "feedback": { "reason": "misheard_word", "timestamp": "..." }
+    }
+  ]
+}
+```
+
+Stores a session edit log to GCS at `jobs/{job_id}/lyrics/edit_log_{session_id}.json`. Tracks all user edits and optional feedback reasons for transcription improvement. Called automatically on review submission.
+
+#### Submit Annotations
+
+```http
+POST /api/review/{job_id}/v1/annotations
+Content-Type: application/json
+
+{
+  "annotations": [
+    { "annotation_type": "SOUND_ALIKE", "original_text": "helo" }
+  ]
+}
+```
+
+Stores annotations to `jobs/{job_id}/lyrics/annotations.json`. Merges with existing annotations if present.
+
+#### Add Reference Lyrics (Paste)
+
+```http
+POST /api/review/{job_id}/add-lyrics
+Content-Type: application/json
+
+{
+  "source": "manual",
+  "lyrics": "Full lyrics text...",
+  "force": "false"
+}
+```
+
+Adds user-pasted lyrics as a new reference source, re-runs the correction pipeline with all sources, and uploads updated corrections to GCS. The `force` flag (default `false`, sent as a string because the body is typed `Dict[str, str]`) bypasses the relevance threshold — use when the transcription is poor and a low match % doesn't mean wrong song.
+
+Returns `{ "status": "success", "data": <CorrectionData> }` when the source is kept.
+
+If the relevance filter drops the source (below the 30% anchor-match threshold), the corrections are **not** persisted and the response is instead:
+
+```json
+{
+  "status": "rejected",
+  "rejection": { "relevance": 0.013, "matched_words": 3, "total_words": 230 },
+  "data": { "...": "CorrectionData from the discarded rerun" }
+}
+```
+
+The frontend paste tab shows the match % and offers "Add Anyway", which retries with `force: "true"`.
+
+#### AI Auto-Correct Suggestions
+
+```http
+POST /api/review/{job_id}/auto-correct
+Content-Type: application/json
+
+{
+  "segments": [ "...client's current corrected_segments..." ],
+  "reference_lyrics": { "genius": { "segments": [...] } },
+  "artist": "Twenty One Pilots",
+  "title": "Chlorine",
+  "settings": {
+    "suggest_adlib_removal": true,
+    "allow_insertions": true,
+    "min_confidence": 0.0,
+    "compare_models": true
+  }
+}
+```
+
+AI correction suggestions for the lyrics review UI. Stateless: one whole-song
+LLM call per model (Claude models use the Anthropic API via the
+`anthropic-api-key` secret, Gemini models use the Gemini Developer API, key `gemini-api-key`) compares the
+client's current transcription against the reference sources and returns
+word-id-keyed suggestions. Nothing is applied server-side — the reviewer
+accepts/rejects each suggestion in the UI and persistence flows through the
+existing corrections/complete paths.
+
+The review UI always requests the multi-model path (`compare_models: true`)
+and auto-runs once on load, so suggestions appear without a click. To make
+that load instant, suggestions are **proactively pre-generated and cached**
+once transcription + references are ready: the lyrics worker fires an internal
+trigger (`POST /api/internal/workers/auto-correct`) that runs the same
+multi-model generation on the API service (gated by
+`AUTO_CORRECT_PROACTIVE_ENABLED`; best-effort — it never blocks or fails the
+karaoke job). Because the proactive run uses the same default settings the UI
+sends, the on-load request is normally a cache hit with no extra cost.
+
+With `"compare_models": true`, every model in `AUTO_CORRECT_COMPARE_MODELS`
+(semicolon-separated) is queried in parallel; identical suggestions are
+deduplicated with a per-suggestion `consensus` count, and suggestions that
+target overlapping words with different outcomes share a `conflict_group`
+(the UI accepts at most one per group). A model failure in compare mode is
+reported in `warnings` while remaining model results are returned; only if
+all models fail does the endpoint return 502.
+
+Returns:
+
+```json
+{
+  "suggestions": [
+    {
+      "id": "uuid",
+      "op": "replace",
+      "word_ids": ["w3"],
+      "segment_ids": ["seg-1"],
+      "original_text": "glory",
+      "new_text": "chlorine",
+      "reason": "All references read 'chlorine' here",
+      "category": "mishearing",
+      "confidence": 0.95,
+      "models": ["claude-opus-5-5", "gemini-3.8-flash"],
+      "consensus": 2,
+      "total_models": 2,
+      "conflict_group": null
+    }
+  ],
+  "model": "claude-opus-5-5, gemini-3.8-flash",
+  "elapsed_seconds": 27.4,
+  "settings_applied": { "suggest_adlib_removal": true, "allow_insertions": true, "min_confidence": 0.0 },
+  "warnings": [],
+  "cached": false
+}
+```
+
+Results are cached per job in GCS
+(`jobs/{job_id}/lyrics/auto_correct_cache/{hash}.json`), keyed on the exact
+input: word ids + texts, reference lyrics texts, settings, and the resolved
+model list. Re-running on unmodified lyrics returns the previous result with
+`"cached": true` and incurs no LLM cost; any edit to the lyrics, references,
+or settings produces a new key and a fresh run. Cache reads/writes are
+best-effort — storage failures degrade to a normal uncached run.
+
+`op` is `replace` | `delete` | `insert_after` (for `insert_after`, `word_ids`
+holds the anchor word). Errors: `422` when no reference lyrics are available,
+`400` for invalid settings, `429` when the model provider is temporarily
+rate-limited (transient — retryable; the service already retries with backoff
+before surfacing this), `502` when the model call otherwise fails or returns
+malformed output. Design/eval background:
+`docs/archive/2026-06-10-lyrics-auto-correction-reeval-plan.md`.
+
+#### Search Reference Lyrics
+
+```http
+POST /api/review/{job_id}/search-lyrics
+Content-Type: application/json
+
+{
+  "artist": "Billie Eilish",
+  "title": "What Was I Made For",
+  "force_sources": []
+}
+```
+
+Searches all configured lyrics providers (Genius, Spotify, Musixmatch, LRCLIB) with the given artist/title. Results are filtered through the relevance threshold (30% word match minimum) — sources below are rejected as likely wrong-song matches. Sources in `force_sources` bypass the threshold.
+
+**Success response** (at least one source passed):
+```json
+{
+  "status": "success",
+  "data": { "...CorrectionData..." },
+  "sources_added": ["genius", "lrclib"],
+  "sources_rejected": {
+    "spotify": { "relevance": 0.12, "matched_words": 18, "total_words": 150, "track_name": "...", "artist_names": "..." }
+  },
+  "sources_not_found": ["musixmatch"]
+}
+```
+
+**No results response** (all filtered or nothing found):
+```json
+{
+  "status": "no_results",
+  "message": "No matching lyrics found from any provider",
+  "sources_rejected": { "genius": { "relevance": 0.05, "..." } },
+  "sources_not_found": ["lrclib", "musixmatch"]
+}
+```
+
+#### Review Sessions
+
+Server-side backup/restore of lyrics review editing sessions. Correction data is stored in GCS; metadata in Firestore subcollection `jobs/{job_id}/review_sessions/{session_id}`.
+
+##### Save Review Session
+
+```http
+POST /api/review/{job_id}/sessions
+Content-Type: application/json
+
+{
+  "correction_data": { "corrected_segments": [...], "original_segments": [...] },
+  "edit_count": 5,
+  "trigger": "auto",  // "auto" | "preview" | "manual"
+  "summary": {
+    "total_segments": 10,
+    "total_words": 100,
+    "corrections_made": 5,
+    "changed_words": [{"original": "hello", "corrected": "hallo", "segment_index": 0}]
+  }
+}
+```
+
+Deduplicates via SHA-256 hash of correction_data. Returns `{"status": "skipped", "reason": "identical_data"}` if data hasn't changed since last save.
+
+Auth: Review token (same as correction data access).
+
+##### List Review Sessions
+
+```http
+GET /api/review/{job_id}/sessions
+```
+
+Returns session metadata (no correction_data). Ordered by most recent first.
+
+##### Get Review Session
+
+```http
+GET /api/review/{job_id}/sessions/{session_id}
+```
+
+Returns full session including correction_data downloaded from GCS.
+
+##### Delete Review Session
+
+```http
+DELETE /api/review/{job_id}/sessions/{session_id}
+```
+
+Deletes both GCS data and Firestore metadata.
+
+##### Search Review Sessions (Cross-Job)
+
+```http
+GET /api/review/sessions/search?q=artist+name&limit=20
+```
+
+Searches across all jobs. Requires admin auth. Matches against artist, title, and job_id fields.
+
+### Instrumental Selection (Finalise-Only Jobs)
+
+For finalise-only jobs (where audio prep was done externally), instrumental selection is handled separately:
+
+```http
+POST /api/jobs/{job_id}/select-instrumental
+Content-Type: application/json
+
+{
+  "selection": "clean"  // or "with_backing"
+}
+```
+
+**Note**: For normal jobs, instrumental selection is now part of the combined review flow (see `/api/review/{job_id}/complete` above).
+
+### Catalog (Song Lookup)
+
+Proxies to karaoke-decide's MusicBrainz + Spotify catalog for autocomplete, and scrapes karaokenerds.com for community karaoke version detection. All endpoints require authentication and are rate-limited (20 requests/minute per user). Results are cached in-memory (5 min for catalog, 1 hour for community checks).
+
+#### Search Artists
+
+```http
+GET /api/catalog/artists?q=queen&limit=10
+```
+
+Response:
+```json
+[
+  {
+    "name": "Queen",
+    "mbid": "0383dadf-...",
+    "disambiguation": null,
+    "artist_type": "Group",
+    "spotify_id": "1dfeR4HaWDbWqFHLkxsg1d",
+    "popularity": 85,
+    "genres": ["rock"],
+    "tags": ["classic rock"]
+  }
+]
+```
+
+#### Search Tracks
+
+```http
+GET /api/catalog/tracks?q=bohemian&artist=queen&limit=10
+```
+
+Response:
+```json
+[
+  {
+    "track_name": "Bohemian Rhapsody - Remastered 2011",
+    "artist_name": "Queen",
+    "track_id": "4u7EnebtmKWzUH433cf5Qv",
+    "artist_id": "1dfeR4HaWDbWqFHLkxsg1d",
+    "popularity": 81,
+    "duration_ms": 354320,
+    "explicit": false
+  }
+]
+```
+
+The `artist` query parameter is optional but recommended — filters results by artist for more relevant suggestions.
+
+#### Check Community Versions
+
+```http
+POST /api/catalog/community-check
+Content-Type: application/json
+
+{
+  "artist": "Queen",
+  "title": "Bohemian Rhapsody"
+}
+```
+
+Response:
+```json
+{
+  "has_community": true,
+  "songs": [
+    {
+      "title": "Bohemian Rhapsody",
+      "artist": "Queen",
+      "community_tracks": [
+        {
+          "brand_name": "ObsKure Karaoke",
+          "brand_code": "OBSK",
+          "youtube_url": "https://www.youtube.com/watch?v=...",
+          "is_community": true
+        }
+      ]
+    }
+  ],
+  "best_youtube_url": "https://www.youtube.com/watch?v=..."
+}
+```
+
+When `has_community` is true, the frontend shows a dismissible green banner suggesting the user check existing versions before creating a new one.
+
+#### Match Judge (artist/title formatting + match acceptance)
+
+```http
+POST /api/catalog/match-judge
+Content-Type: application/json
+
+{
+  "artist": "paramore",
+  "title": "big man, little dignity",
+  "audio_confidence_tier": 1,
+  "stage": "full"
+}
+```
+
+Decides the official formatting for a typed artist/title and whether it matches a
+real song. A deterministic normalizer + the catalog run first; a light Gemini
+Gemini model (`MATCH_JUDGE_MODEL`, default `gemini-3.8-flash`) is consulted
+**only** when those aren't confident. `audio_confidence_tier` (1=strong..3=weak,
+optional) lets the judge tell whether weak audio results hint at a typo. The call
+never blocks job creation — on timeout/error it returns a `none` verdict. Disable
+the AI layer with `MATCH_JUDGE_ENABLED=false` (deterministic+catalog still run).
+
+> **In practice the correction comes from Gemini.** The catalog pass is only confident when the
+> typed text *equals* a catalog entry after case, punctuation and accent folding. The catalog it
+> queries (decide `/api/catalog/tracks`) is BigQuery prefix-only `LIKE 'q%'`, so any typo
+> ("the stokes" / "max picu") gets zero candidates. Most job submissions therefore go
+> `fast … needs_ai=True` then `full … engine=ai`, which prod logs confirm. kjbox's singer search
+> is designing an on-device typo-tolerant matcher that uses Gemini only as a fallback. Read
+> `kjbox/docs/SONG-IDENTIFICATION.md` before reusing this judge for free-text search.
+
+**Live Spotify + grounding (v0.294.0).** When the catalogue can't confirm the typed song, the judge
+(both stages) runs a live Spotify search through decide's partner route
+(`GET /api/partner/gen/spotify-search`, `X-Partner-Secret`, via
+`catalog_proxy_service.spotify_search`). The catalogue is a July 2025 snapshot, so new releases are
+missing from it.
+- An exact match after normalisation is a confident `catalog` verdict with reason
+  "… (live Spotify)" and **no Gemini call**. Example: "Cole Phillips" / "Roll of dice" → "Roll of Dice".
+- Gemini also gets the Spotify results as candidates.
+- **Grounding rule:** a confident AI `cosmetic` / `content` verdict must name a song that is in the
+  candidates or in one more Spotify lookup of the AI's song. Otherwise it comes back
+  `confident: false` with reason "… [unconfirmed: not in catalog or Spotify]". Clients show that as
+  "Did you mean…?" and never apply it.
+- Every live result is kept forever by decide (Firestore query cache + BigQuery `spotify_live_tracks`), and kn-data-sync adds those songs to the daily song-id export. So a song looked up once is known to the kjbox on-device matcher, decide's song search and the mobile app's offline index from the next build on (v0.294.2).
+- Spotify unavailable means no evidence, so AI corrections aren't confident. That is conservative on
+  purpose. Incident: kjbox 2026-11-05, job `f01c9997`, "Roll of Dice" became "Roll of the Dice".
+
+`stage` (optional, `"fast"` | `"full"`, default `"full"`) supports a two-call
+pattern the frontend uses to keep the tidy off the critical path:
+
+- `"fast"` — catalog-only pass (no AI, `audio_confidence_tier` ignored). The
+  client fires this on mount, in parallel with the audio search. Returns a
+  confident catalog verdict when it can, otherwise `needs_ai: true` (a marker
+  telling the client to follow up with a `"full"` call once the tier is known).
+- `"full"` — the complete pipeline. Runs the AI judge when the catalog isn't
+  confident, **and** when a confident catalog match coincides with a weak audio
+  tier (`>= 3`) — a weak tier means the match may be a junk/typo'd entry, so the
+  AI verifies it and can override.
+
+Response:
+```json
+{
+  "kind": "cosmetic",
+  "confident": true,
+  "canonical_artist": "Paramore",
+  "canonical_title": "Big Man, Little Dignity",
+  "alternatives": [],
+  "engine": "catalog",
+  "reason": "formatting differs from catalog",
+  "needs_ai": false
+}
+```
+
+`kind` drives the Step 2 UI: `cosmetic` → silent tidy with a two-way toggle
+("keep what I typed" ⇄ "use tidied version"); `content` (confident) → applied
+with a "Corrected … · Undo" toggle, re-searching audio only when the original
+results were weak; `ambiguous` (or unconfident `content`) → an ask-first "Did you
+mean?" prompt; `none` → no change. `needs_ai` is only ever `true` on a `"fast"`
+verdict that couldn't decide; it is always `false` on a `"full"` verdict.
+
+Until the judge settles, the Step 2 audio-selection buttons are disabled with a
+subtle "Checking song details…" indicator, so a user can never advance with
+un-tidied metadata; a 12s timeout guarantees the gate releases.
+
+### Audio Search
+
+#### Search for Audio
+
+```http
+POST /api/audio-search/search
+Content-Type: application/json
+
+{
+  "artist": "Artist Name",
+  "title": "Song Title",
+  "auto_download": false,
+  "theme_id": "nomad",
+  "display_artist": "Display Artist (optional)",
+  "display_title": "Display Title (optional)"
+}
+```
+
+Searches for audio sources (flacfetch integration). Creates a job and returns search results.
+
+**Key fields:**
+- `artist`, `title` - Used to search for audio on trackers
+- `display_artist`, `display_title` - Optional overrides for how artist/title appear on title screens and filenames. If omitted, search values are used.
+- `auto_download` - If true, automatically selects best result and starts processing
+- `theme_id` - Video theme to use
+
+**Use case:** Search for "Jeremy Kushnier" but display "Footloose (Broadway Cast)" on the karaoke video.
+
+#### Get Search Results
+
+```http
+GET /api/audio-search/{job_id}/results
+```
+
+Returns cached search results for a job awaiting audio selection.
+
+#### Select Audio Source
+
+```http
+POST /api/audio-search/{job_id}/select
+Content-Type: application/json
+
+{
+  "selection_index": 0,
+  "acknowledged_credits": 2   // optional — if provided, server validates it equals the computed total; 409 on mismatch
+}
+```
+
+Selects an audio source from the search results and starts processing. Credits are deducted here
+based on the selected result's duration (`max(1, ceil(minutes/10))`). Torrent results display an
+"estimated" label because metadata may differ from actual audio length; the cost is reconciled
+post-download and may trigger an `AWAITING_DURATION_CONFIRM` pause if the actual duration is longer.
+
+`acknowledged_credits` is **optional**. If provided, the server validates it equals the
+server-computed credit total and returns 409 on mismatch. If omitted, the server deducts the
+computed cost without client confirmation.
+
+#### Recover a Parked Job (re-search / provide own audio)
+
+When a search returns nothing usable (0 results, a transient failure, or the auto-picked
+source is unusable) the job stays in `AWAITING_AUDIO_SELECTION` with no selectable sources.
+These endpoints let the user out of that dead-end without creating a new job or re-charging
+base credits (the job was already charged at creation; final duration billing is reconciled
+post-download). All require the job to be in `AWAITING_AUDIO_SELECTION` (else `400`).
+
+```http
+POST /api/audio-search/{job_id}/research
+Content-Type: application/json
+
+{ "artist": "Arctic Monkeys", "title": "The View From the Afternoon" }  // both optional
+```
+
+Re-runs the audio search. Blank/omitted fields re-use the job's existing search terms (a plain
+retry); provided values are applied to the job's search terms **and** display artist/title, then
+searched. Returns the same shape as `/search` (`results`, `results_count`). An empty result set is
+a normal `200` (not an error) so the client can offer the manual fallback below. `502` on a hard
+search-service error.
+
+```http
+POST /api/audio-search/{job_id}/provide-url
+Content-Type: application/json
+
+{ "url": "https://youtube.com/watch?v=..." }
+```
+
+Attaches a YouTube/yt-dlp URL to the parked job, downloads it, and starts processing
+(`AWAITING_AUDIO_SELECTION → DOWNLOADING_AUDIO → DOWNLOADING`). Rejects DRM/streaming links and
+unavailable videos with `400`; `502` if the download fails (the job is returned to the queue).
+
+```http
+POST /api/audio-search/{job_id}/attach-upload-url        // → { upload_url, gcs_path }
+POST /api/audio-search/{job_id}/attach-upload-complete   // after PUTting the file
+```
+
+Two-step manual file upload for a parked job: request a signed GCS upload URL, `PUT` the audio
+file to it, then call `attach-upload-complete` to point the job at the file and start processing.
+
+#### Standalone Search (Guided Flow — Step 2)
+
+```http
+POST /api/audio-search/search-standalone
+Content-Type: application/json
+
+{
+  "artist": "Artist Name",
+  "title": "Song Title"
+}
+```
+
+Searches for audio **without creating a job**. Returns a search session (7-day TTL).
+Credits are checked here but **not deducted** — deduction happens at job creation.
+
+**Response:**
+```json
+{
+  "search_session_id": "uuid",
+  "results": [...],
+  "results_count": 3
+}
+```
+
+No results returns `results: []` (not a 404). Use `search_session_id` with the create-from-search endpoint below.
+
+#### Create Job from Search Session (Guided Flow — Step 3)
+
+```http
+POST /api/jobs/create-from-search
+Content-Type: application/json
+
+{
+  "search_session_id": "uuid",
+  "selection_index": 0,
+  "artist": "ABBA",
+  "title": "Waterloo",
+  "display_artist": "ABBA (Display)",
+  "display_title": "Waterloo (Karaoke)",
+  "is_private": false
+}
+```
+
+Creates the job from a previously completed standalone search session. All final field values
+(is_private, display overrides) are set at creation time — no patching needed afterward.
+The job goes directly to `DOWNLOADING_AUDIO` (skips `AWAITING_AUDIO_SELECTION`).
+The session is consumed (deleted) on success.
+
+Returns 404 with "Search expired — please search again" if the session has expired.
+
+### Themes
+
+```http
+GET /api/themes
+```
+
+No auth required. Returns available video themes.
+
+```http
+GET /api/themes/translation-preview?language=es
+```
+
+No auth required. Returns `{"image": "data:image/jpeg;base64,..."}`: a real karaoke-video frame
+of the default theme with sample lyrics and their translation (in `language`) beneath each line —
+the preview shown when a user turns on translated lyrics at job creation. `language` is one of the
+33 UI locale codes (400 otherwise). Sample translations are pre-generated
+(`backend/services/translation_preview_samples.py`), so no LLM call is made.
+
+### Translated Lyrics
+
+Every job-creation endpoint (URL, search, upload, bulk `settings`) accepts an optional
+`translation_language` (UI locale code, e.g. `"en"`, `"es"`, `"he"`; omitted/unsupported = off;
+admin job PATCH can set it, `""` clears it). After lyrics review, the render worker translates the
+final lyrics line by line (`LYRICS_TRANSLATION_MODEL`, default `gemini-3.8-flash`) into
+`jobs/{id}/lyrics/translations.json` and the landscape + portrait videos show each translation in
+smaller text beneath its line (3 lines per screen). Outcome in `state_data.lyrics_translation`
+(`status`: `translated` / `same_language` / `failed`; a failure renders without translations).
+See [archive/2026-10-01-translated-lyrics-plan.md](archive/2026-10-01-translated-lyrics-plan.md).
+
+### Tenant Config
+
+```http
+GET /api/tenant/config
+GET /api/tenant/config?tenant=vocalstar
+```
+
+No auth required. Returns tenant configuration for white-label portals.
+
+**Detection priority**:
+1. `X-Tenant-ID` header (explicitly set by frontend)
+2. `tenant` query parameter (development/testing only, disabled in production)
+3. Host header subdomain detection (e.g., `vocalstar.nomadkaraoke.com`)
+
+Response:
+```json
+{
+  "tenant": {
+    "id": "vocalstar",
+    "name": "Vocal Star",
+    "subdomain": "vocalstar.nomadkaraoke.com",
+    "is_active": true,
+    "branding": {
+      "logo_url": "https://storage.googleapis.com/...",
+      "logo_height": 60,
+      "primary_color": "#ffff00",
+      "secondary_color": "#006CF9",
+      "accent_color": "#ffffff",
+      "background_color": "#000000",
+      "favicon_url": null,
+      "site_title": "Vocal Star Karaoke Generator",
+      "tagline": "Whoever You Are, Be a Vocal Star!"
+    },
+    "features": {
+      "audio_search": false,
+      "file_upload": true,
+      "youtube_url": false,
+      "youtube_upload": false,
+      "dropbox_upload": false,
+      "gdrive_upload": false,
+      "theme_selection": false,
+      "color_overrides": false,
+      "enable_cdg": true,
+      "enable_4k": true,
+      "admin_access": false
+    },
+    "defaults": {
+      "theme_id": "vocalstar",
+      "locked_theme": "vocalstar",
+      "distribution_mode": "download_only"
+    }
+  },
+  "is_default": false
+}
+```
+
+When no tenant is detected, returns `tenant: null` with `is_default: true` and the default Nomad Karaoke configuration is used.
+
+```http
+GET /api/tenant/config/{tenant_id}
+```
+
+Get specific tenant config by ID. Returns 404 if tenant not found or inactive.
+
+#### Tenant Asset Proxy
+
+```http
+GET /api/tenant/asset/{tenant_id}/{filename}
+```
+
+Serves tenant assets (logos, etc.) from GCS. No authentication required. Returns the file with appropriate content-type headers.
+
+- `tenant_id`: Tenant identifier (e.g., `singa`, `vocalstar`)
+- `filename`: Asset filename (e.g., `logo.png`)
+- Returns 404 if asset not found
+
+Used by the frontend `TenantLogo` component to load tenant logos. Tenant configs store logo paths as `https://api.nomadkaraoke.com/api/tenant/asset/{tenant_id}/logo.png` (the frontend also converts legacy `gs://` paths to this format as a fallback).
+
+#### Tenant Bulk Upload — Filename Analysis
+
+```http
+POST /api/tenant/bulk/analyze
+Content-Type: application/json
+Authorization: Bearer <tenant session token>
+
+{"filenames": ["S1100-1 Eddy Grant - I Don't Wanna Dance Guide.mp3", "S1100-2 Eddy Grant - I Don't Wanna Dance BV.mp3", "cover.png"]}
+```
+
+Analyses a flat list of filenames (from a browser folder pick) into proposed karaoke jobs:
+pairs each **Mixed** (with-vocals) file with its **Instrumental** counterpart and extracts
+Artist/Title. Pure analysis — filenames only, no uploads, no state written.
+
+- **Auth:** tenant session required; gated on the tenant's `features.bulk_upload` flag (403 otherwise).
+- **Limits:** max 100 audio files per request (non-audio files don't count toward the cap; 2000-filename payload guard).
+- **Two passes:** deterministic regex for the `S<code>-<1|2> Artist - Title <Guide|BV|Instru>`
+  convention, then a Gemini pass (`backend/services/tenant_bulk/analyze.py`) for
+  whatever the regex couldn't confidently pair. Falls back to regex-only if the model errors.
+- **Track codes:** a leading catalogue code (`VS6588 Artist - Title Guide.mp3`: 1-4 capitals +
+  3-8 digits) is split off and returned as `track_code`; files are only paired when code AND
+  song match, and LLM pairs with two different codes are rejected.
+
+Response:
+```json
+{
+  "rows": [{"artist": "Eddy Grant", "title": "I Don't Wanna Dance",
+             "mixed_filename": "…Guide.mp3", "instrumental_filename": "…BV.mp3",
+             "confidence": "high", "warning": null, "track_code": null}],
+  "unpaired": [{"filename": "…", "reason": "no_instrumental", "artist": "…", "title": "…", "role": "mixed"}],
+  "ignored": [{"filename": "cover.png", "reason": "non_audio"}]
+}
+```
+
+The tenant portal's Bulk mode (`TenantBulkFlow.tsx`) renders these rows as an editable review
+table, then submits each confirmed row through the standard signed-URL upload flow
+(`upload_mode: "resumable"`, `batch_id` grouping).
+
+#### Tenant Theme Editor (tenant users)
+
+```
+GET  /api/tenant/theme              → {theme_id, style_params, images[], fonts[]}
+POST /api/tenant/theme/assets       (multipart `file`) → {name}
+POST /api/tenant/theme/preview      {style_params, sample?: {artist, title, lyrics[]}} → {title_card, karaoke_frame, end_screen}
+PUT  /api/tenant/theme              {style_params} → GET fields + {refreshed_jobs, outdated_job_ids[]}
+GET  /api/tenant/theme/outdated-jobs → {theme_updated_at, job_ids[]}
+POST /api/tenant/theme/rerender-outdated → {started[], failed: {job_id: reason}}
+Authorization: Bearer <session/token>   (on the tenant portal: subdomain or X-Tenant-ID)
+```
+
+Self-service theme editing for **any user allowed on the tenant** (its email/domain allowlist; admins
+always). Tenant context may come from the client-controlled `X-Tenant-ID` header, so every endpoint
+re-checks membership (`require_tenant_member`): non-members/spoofed headers → 403, no/inactive tenant →
+404, a token scoped to another tenant → 403.
+
+- **Uploads** (PNG/JPG/GIF/WEBP ≤15 MB, TTF/OTF) are verified with PIL and stored content-addressed as
+  `<stem>-<sha8>.<ext>` under `themes/<id>/assets/` (`no-store`), so they never overwrite an asset
+  existing jobs use.
+- **Preview** renders the draft with the production renderers (`services/theme_preview_service.py`):
+  title card via `VideoGenerator.create_title_video(duration=0)`, end screen via
+  `VideoGenerator.create_end_video(duration=0)`, karaoke frame via
+  `SegmentResizer` → `SubtitlesGenerator.generate_ass` → one ffmpeg frame (same `ass` filter/background
+  as the real render) with the first line half-sung. Returns 1280×720 JPEG data URLs (~2 s; ≤2
+  concurrent; identical drafts cached). A screen the theme leaves out is `null`. 400 invalid draft,
+  422 render failure, 504 timeout.
+- **Leaving out the title card / end screen**: `intro.enabled` / `end.enabled` (optional bool, absent
+  = included; deliberately not in `DEFAULT_INTRO_STYLE`/`DEFAULT_END_STYLE`, which double as the
+  required-field lists). Read via `style_loader.screen_enabled`. The screens worker skips an omitted
+  screen and records `state_data.screens_included = {title, end}`; the render prerequisites, `/retry`
+  ladder (`_has_title_screen`), orchestrator and encoding config read that marker. The GCE encoder gets
+  explicit `include_title_screen` / `include_end_screen` = false (its loose `*title*.png` /
+  `*end*.png` globs would otherwise rebuild an omitted screen from `style/*_background.png`), and
+  `LocalEncodingService.encode_lossless_mp4` / the portrait renderer concat only the included segments.
+  No `(Title).mov` / `(End).mov` is delivered and the original-vocals guide gets no intro offset.
+- **Save** applies to new jobs **and to the tenant's tracks that haven't started rendering**
+  (`services/theme_change_service.py`). Each such job's style snapshot is replaced
+  (`theme_applied_at` set). Jobs whose screens may already exist (`generating_screens` →
+  `in_review`, `render_pending_capacity`) also get `state_data.theme_screens_stale`. When the render
+  worker picks one up, it diverts once through the screens worker (`LYRICS_COMPLETE` +
+  `regen_restore_status=review_complete`), which regenerates the title/end screens and re-triggers the
+  render, so a user who is mid-review is never interrupted. `review_complete` and later jobs are left
+  alone. `refreshed_jobs` counts the jobs updated. `outdated_job_ids` lists the caller's finished tracks
+  made with an older theme, where "older" means the theme's `style_params.json` write time is later
+  than `theme_applied_at`, falling back to `created_at`. Members see their own tracks; admins see all
+  of the tenant's tracks. Editing a finished tenant track (`POST /api/jobs/{id}/edit`) also re-applies
+  the current theme when the track's copy is outdated.
+- **Rerender-outdated** starts `POST /api/jobs/{id}/rerender` for every outdated track, **quietly**:
+  the `theme_rerender.notify_customer=false` marker suppresses the per-track completion email/push.
+- **Save validation** is stricter than the admin console: asset fields must
+  be basenames already in the theme's assets (no paths / `gs://`), numeric/colour/region bounds are
+  checked, and the font is made consistent with the render pipeline — `intro.font` is applied to
+  `karaoke.font_path`/`end.font`/`cdg.font_path`, `karaoke.font` is set to the TTF family name libass
+  matches, and a chosen bundled font is copied into the theme's assets. The one exception is a
+  distinct, available `cdg.font_path` (e.g. a condensed face so lyric lines fit the 300x216 CDG
+  screen): it's kept and rendered via its own `cdg_font` style asset, while the CDG title card and
+  outro use the main font (`cdg.title_font_path`). Tenants can't change their config/allowlist
+  through this API.
+- **CDG title card ("up card") keys** (all optional; defaults reproduce the original layout):
+  `title_font_size` (30), `artist_font_size` (25), `title_max_height` (200),
+  `title_separator_text` (e.g. `"MADE FAMOUS BY"`) + `title_separator_color` +
+  `title_separator_font_size`, and `title_block_top` — center the title block (and the outro) in
+  the area below this y offset, for a logo baked into `title_screen_background`.
+
+UI: user menu → **Theme & style** on tenant portals (`components/tenant-theme/`). After a save, the
+editor says how many in-progress tracks were updated and offers **Re-render all N** for outdated
+finished tracks. Their job cards show an **Older theme** badge on Re-render
+(`lib/tenant-theme-outdated.ts`). On portal cards, admins see only this Re-render, not the admin one.
+
+#### Tenant Provisioning (Admin Only)
+
+```
+GET  /api/admin/tenants
+GET  /api/admin/tenants/_template
+GET  /api/admin/tenants/{id}
+POST /api/admin/tenants           (multipart/form-data)
+PUT  /api/admin/tenants/{id}      (multipart/form-data)
+DELETE /api/admin/tenants/{id}
+POST /api/admin/tenants/{id}/domain
+Authorization: Bearer <admin token>
+```
+
+**Lifecycle (v0.246.0):** creating a tenant also provisions its portal at `{id}.nomadkaraoke.com`
+(Cloudflare Pages custom domain on `karaoke-gen-tenant` + proxied CNAME, via
+`services/tenant_domain_service.py` and the `cloudflare-tenant-domains-token` secret). If the
+hostname already has a non-tenant DNS record → `409` before anything is written; if Cloudflare
+fails → the GCS side is rolled back and `502` is returned. `subdomain` must equal
+`{id}.nomadkaraoke.com`. Create and `GET /{id}` responses include
+`domain: {hostname, state: active|provisioning|missing, dns_ok, pages_status}` (certificate issuance
+usually takes ~1 min). `POST /{id}/domain` idempotently (re)provisions (backfill/retry).
+`DELETE /{id}` → `204`: removes the subdomain (only records pointing at the tenant Pages project),
+theme (assets, style_params, registry entry — kept if default or shared) and config/logo; jobs are
+kept. `502` if Cloudflare removal fails (nothing in GCS is deleted, so it can be retried).
+
+**Portal access:** `allowed_emails` (individual addresses, e.g. a client's gmail) and
+`allowed_email_domains` (form fields on create; `config.auth.*` on `PUT`). Either non-empty → only
+listed emails/domains receive magic links (always — the legacy `require_email_domain` flag no
+longer loosens a non-empty allowlist); both empty → **admins only** (never an open portal).
+
+**Tenant users never touch consumer credits** (v0.247.0): tenant-portal sign-ins skip the welcome
+credit (no AI credit eval, no credits-denied/welcome emails, `credit_status: not_applicable`) and
+referral attribution; tenant jobs (`tenant_id` set) are never credit-checked or charged and are created
+with `payment_bypassed` (no duration-credit pauses, no refunds). Tenants are billed under a separate
+agreement. The frontend hides credits, Buy Credits and Referrals on tenant portals. `@nomadkaraoke.com` admins can
+always sign in.
+
+Admin-only endpoints (`require_admin`) that mint and manage white-label tenants from the admin panel
+(`/admin/tenants`), replacing the hand-run `scripts/setup-*-tenant.py` recipe.
+
+- **`GET`** returns a summary list of all tenants (`id`, `name`, `subdomain`, `is_active`,
+  `locked_theme`, `dropbox_path`, `brand_prefix`, `created_at`) read from `tenants/*/config.json` in GCS.
+- **`POST`** (multipart) creates a tenant. Form fields: `name` (required), optional `tenant_id`
+  (slug, derived from name if omitted), `subdomain`, `allowed_email_domains` (comma-separated),
+  `artist_color`/`title_color`/`sung_lyrics_color`/`unsung_lyrics_color` (hex), `tagline`,
+  `distribution_mode` (`download_only`|`all`|`cloud_only`), `dropbox_path`, `brand_prefix`; optional
+  image files `karaoke_background`, `intro_background`, `end_background`, `logo` (PNG/JPG/GIF/WEBP,
+  ≤15MB). It derives a **self-contained theme** from the default Nomad theme (copies its assets so
+  every `background_image` basename resolves against the new theme's own `assets/`), applies the
+  colour overrides, overlays any provided backgrounds, registers the theme in
+  `themes/_metadata.json`, and writes `tenants/{id}/config.json` with B2B defaults (audio search off,
+  YouTube/GDrive off, `theme_selection` off, `locked_theme={id}`, jobs private). Returns the public
+  config plus a `preview_url` (`?preview_tenant={id}`) that drives the tenant — including its bulk
+  flow — **without any DNS setup**. For **full theme customisation** at create time, pass a
+  `style_params` field (full theme JSON string) — when present it is authoritative and the colour
+  fields are ignored. **Dropbox delivery** (v0.254.0): `dropbox_path` and `brand_prefix` must be set
+  together (the worker skips the upload unless both are set — outputs are filed as
+  `<PREFIX>-0001 - Artist - Title`); the path is normalized (leading `/`, no trailing `/`), the prefix
+  uppercased and must be 2-12 alphanumerics starting with a letter, and must not be the consumer
+  `DEFAULT_BRAND_PREFIX`/`DEFAULT_PRIVATE_BRAND_PREFIX` or another tenant's prefix (brand-code counters
+  are keyed by prefix alone). The Dropbox folder is **created up front** (idempotent) so the first job
+  delivers and its completion email carries a folder link; `features.dropbox_upload` always follows
+  the path. Both blank = download only (completion emails then have no Dropbox link — the admin UI
+  warns). The admin UI pre-fills `/MediaUnsynced/Karaoke/Tracks-<PascalName>` + a prefix derived from
+  the name (Vocal Star → VSTAR, Randy Vild → RVILD). Errors: 400 (bad slug/reserved/invalid
+  colour/image/JSON/half-set or bad delivery), 409 (exists / prefix taken), 502 (Cloudflare or Dropbox
+  folder creation failed).
+- **`GET /_template`** returns the default Nomad theme's full `style_params` — a starting point for
+  editing a new theme (the admin UI seeds its JSON editor from this).
+- **`GET /{id}`** returns a tenant's full config, its theme `style_params`, its `assets` list, and a
+  `preview_url` (for the manage/edit view). 404 if not found.
+- **`PUT /{id}`** (multipart) updates a tenant so a client's feedback can be iterated on: `config`
+  (partial TenantConfig JSON, merged one level deep — `id` immutable), `style_params` (full theme
+  JSON, replaces the theme), an optional `logo` image (updates `branding.logo_url`), and repeatable
+  `assets` file uploads (images **or fonts**; each file's name becomes the theme asset name, so
+  uploading `karaoke_background.jpg` replaces it). Re-render jobs to apply an updated theme.
+  Changing `defaults.dropbox_path`/`brand_prefix` applies the same delivery validation as create and
+  creates a new folder. **Existing jobs keep the `dropbox_path`/`brand_prefix` copied at job creation**
+  — backfill them on the job docs if a tenant gains Dropbox delivery mid-flight.
+  Errors: 400 (invalid JSON/theme/delivery), 404 (not found), 409 (prefix taken), 502 (Dropbox).
+
+  Implemented in `backend/services/tenant_admin_service.py` + `backend/api/routes/tenant_admin.py`.
+
+### Internal (Admin Only)
+
+These endpoints are used by workers and require admin tokens.
+
+```http
+POST /api/internal/jobs/{job_id}/trigger-audio
+POST /api/internal/jobs/{job_id}/trigger-lyrics
+POST /api/internal/jobs/{job_id}/trigger-screens
+POST /api/internal/jobs/{job_id}/trigger-render-video
+POST /api/internal/jobs/{job_id}/trigger-video
+```
+
+#### Vocal gaps (missing-lyrics detector, shadow mode)
+
+```http
+POST /api/internal/jobs/{job_id}/vocal-gaps[?dry_run=true]
+POST /api/internal/youtube-comments/run[?dry_run=true&max_replies=N]   # hourly YouTube comment auto-reply (docs/REQUESTS-BOARD.md)
+```
+
+Finds sung stretches with no transcribed words — transcription can silently drop whole
+lines, which then render as a fake "INSTRUMENTAL" section. Downloads the job's lead-vocal
+stem server-side, analyzes the job's current lyrics (`corrections_updated.json` if present)
+and stores `state_data.vocal_gaps` (skipped with `dry_run=true`). Never changes job status.
+The same analysis runs automatically in the auto-approval executor once stems exist.
+
+```json
+{
+  "job_id": "5710831e",
+  "status": "checked",
+  "stored": true,
+  "vocal_gaps": {
+    "version": "0.1.0",
+    "gaps": [{"start": 20.66, "end": 32.4, "duration": 11.74, "active_fraction": 0.96,
+              "longest_run_s": 11.76, "suspect": true,
+              "reference_lines": {"genius": ["…", "…", "…"]}}],
+    "suspect_count": 1, "max_suspect_run_s": 11.76,
+    "source": "backfill", "lyrics_source": "corrections_updated", "analyzed_at": "…"
+  }
+}
+```
+
+`status` is one of `checked`, `no_job`, `no_corrections`, `no_lead_stem`, `error`.
+Bulk calibration: `scripts/audit_vocal_gaps.py`.
+
+## Job States
+
+| State | Description |
+|-------|-------------|
+| `pending` | Created, not started |
+| `downloading` | Processing input |
+| `awaiting_duration_confirm` | **Human checkpoint** — cost confirmation required before heavy processing begins (see [Duration-Based Pricing](#duration-based-pricing)) |
+| `separating_stage1` | Audio separation (1/2) |
+| `separating_stage2` | Audio separation (2/2) |
+| `transcribing` | Lyrics transcription |
+| `generating_screens` | Title/end screens + backing vocals analysis |
+| `awaiting_review` | Waiting for combined human review (lyrics + instrumental) |
+| `in_review` | Human reviewing |
+| `review_complete` | Review submitted with instrumental selection |
+| `rendering_video` | Generating karaoke video |
+| `instrumental_selected` | Instrumental selection confirmed, ready for video |
+| `generating_video` | Final encoding |
+| `complete` | Done |
+| `failed` | Error |
+
+**Note**: `awaiting_instrumental_selection` exists for backwards compatibility with historical jobs but is no longer used for new jobs. Instrumental selection is now part of the combined review flow.
+
+## Error Responses
+
+```json
+{
+  "detail": "Error message"
+}
+```
+
+Common status codes:
+- `400` - Bad request
+- `401` - Unauthorized
+- `402` - Insufficient credits (see [Credit Enforcement](#credit-enforcement))
+- `404` - Job not found
+- `429` - Rate limit exceeded
+- `500` - Server error
+
+## User Authentication
+
+### Send Magic Link
+
+```http
+POST /api/users/auth/magic-link
+Content-Type: application/json
+
+{"email": "user@example.com", "device_fingerprint": "optional-fp-string"}
+```
+
+The `device_fingerprint` field is optional. If provided, it's used alongside the client IP for signup rate limiting (max 2 new accounts per IP or fingerprint per 24 hours). Existing users are never rate limited. Rate-limited requests receive a silent 200 response (anti-enumeration).
+
+The optional `purpose` field controls sign-in context. `purpose: "requests_board"` is used by the public voting board: it creates a passwordless identity **only** — no welcome credit is granted and the per-IP signup limit is skipped (so many voters on a shared venue WiFi can all sign in). The verify response for a board sign-in returns `redirect_path: "/requests"` so the frontend lands the user back on the board.
+
+The optional `attribution` object carries first-touch marketing data captured by the frontend (`frontend/lib/attribution.ts`): `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`, `referrer`, `landing_path`, `captured_at`. It is only used when the request **creates** the account. The backend whitelists and sanitises it (`backend/services/signup_attribution.py`), stores it as `signup_attribution`, and sets `signup_source` to the `utm_source`. If there is no `utm_source`, it uses the referrer's channel instead (`youtube`, `google`, `website`, `decide`, ...).
+
+### Verify Magic Link
+
+```http
+GET /api/users/auth/verify?token=TOKEN
+```
+
+Returns session token, user info, and `credits_granted` (number of welcome credits granted on this verification, 0 for returning users). Welcome credits are granted on first verification, not at account creation.
+
+**Admin Login Token**: The same endpoint supports admin login tokens embedded in notification emails. When a made-for-you order is received, the admin notification email includes a link with `?admin_token=TOKEN` that auto-logs the admin into the app. The frontend detects this parameter and calls the verify endpoint to authenticate. Admin tokens expire after 24 hours.
+
+### Send Sign-In Code
+
+```http
+POST /api/users/auth/send-code
+Content-Type: application/json
+
+{"email": "user@example.com", "locale": "de", "device_fingerprint": "optional", "referral_code": "optional", "attribution": {}}
+```
+
+→ `202 {"status": "sent"}`. Emails a **6-digit code and a regular magic link** (either one signs in). Use it where
+a link can't bring the user back into the same session, for example the mobile app or another device. Only
+`email` is required. `locale` picks the email language; if it's missing, `Accept-Language` is used. The other fields
+work the same as on `POST /auth/magic-link`.
+
+- The code is stored only as an HMAC (pepper `LOGIN_CODE_PEPPER`; if that's unset, it's derived from the first
+  `ADMIN_TOKENS` entry). It expires after 10 minutes and works once. Collections: `login_codes`, `login_code_uses`.
+- Throttles per rolling hour: `LOGIN_CODES_PER_EMAIL_PER_HOUR` (default 5) and `LOGIN_CODES_PER_IP_PER_HOUR` (default
+  20; hashed IP, collection `login_code_ip_sends`). Both are checked in the same Firestore transaction as the code
+  write. Over either limit → `429 {"detail": "too_many_codes"}`.
+- The abuse checks match the magic-link endpoint. A disposable domain → `422`, unless the tenant allowlisted the address. These
+  pretend success (`202`, no email): a blocked email or IP, the new-user per-IP/fingerprint signup cap, or an email outside the
+  tenant's allowed domains. With no email provider in production, or no pepper in production → `503`.
+- The magic link in the email comes from the same `create_magic_link` machinery as `POST /auth/magic-link`. So, like
+  that endpoint, the **account is created at send time**, with `signup_ip`, fingerprint and attribution recorded.
+- New users get the welcome-credit AI evaluation precomputed in the background. It's stored on both the code record
+  and the magic-link doc. Test emails, users who already got the credit, and tenant portals skip it.
+
+### Verify Sign-In Code
+
+```http
+POST /api/users/auth/verify-code
+Content-Type: application/json
+
+{"email": "user@example.com", "code": "042917"}
+```
+
+→ `200` with the same body as `GET /auth/verify` (`VerifyMagicLinkResponse`: `status: "success"`, `session_token`,
+`user`, `message`, `credits_granted`, `credit_status`, `tenant_subdomain`). The post-verification steps are shared
+(`complete_verified_login`): welcome credit (not on tenant portals), referral attribution, locale persistence,
+the session (with the fingerprint recorded at send), and the first-login welcome email.
+
+Errors: `401 {"detail": "invalid_code"}` (wrong code), `401 {"detail": "expired"}` (no code, expired, superseded
+or already used), `429 {"detail": "too_many_attempts"}` (the 6th guess burns the code, even if it's right).
+Requesting a new code invalidates the previous one.
+
+### Google / Apple Sign-In (mobile app)
+
+```http
+POST /api/users/auth/google
+POST /api/users/auth/apple
+Content-Type: application/json
+
+{"id_token": "<ID token from the native SDK>", "locale": "de", "device_fingerprint": "optional", "referral_code": "optional", "attribution": {}}
+```
+
+→ `200` with the same `VerifyMagicLinkResponse` as `verify-code`. Only `id_token` is required; the other fields work
+like `send-code`'s. `backend/services/social_identity.py` checks the RS256 signature against the provider's JWKS
+(`https://www.googleapis.com/oauth2/v3/certs` / `https://appleid.apple.com/auth/keys`, one cached `PyJWKClient`
+per URL), the issuer (`accounts.google.com` or `https://accounts.google.com` / `https://appleid.apple.com`), expiry,
+the audience, and `email_verified` (Apple may send the string `"true"`).
+
+- Audiences: `GOOGLE_OAUTH_CLIENT_IDS` (comma-separated; defaults to the Web and iOS clients, see
+  [ARCHITECTURE.md § Mobile app sign-in](ARCHITECTURE.md#mobile-app-sign-in)) and `APPLE_SIGNIN_AUDIENCES`
+  (default `com.nomadkaraoke.mobile`).
+- The user is found or created **by email**, through the same code as the email-code sign-in: the abuse checks
+  (`_sign_in_checks`) and the post-verification steps (`finish_verified_sign_in` → `complete_verified_login`). An
+  email that already signed up by magic link or code gets the same account and no second welcome credit.
+- Apple "Hide My Email" addresses (`@privaterelay.appleid.com`) are accepted as their own account and never count
+  as disposable.
+- Errors: `401 {"detail": "invalid_token"}` (bad signature, issuer, audience, expiry, or unverified email; no user is
+  created), `503 {"detail": "google_not_configured"}` (no Google audience configured), `503 {"detail":
+"identity_provider_unavailable"}` (the provider's JWKS couldn't be fetched; retryable), `422` disposable domain (same
+  message as `send-code`), `422 {"detail": "sign_in_not_allowed"}` (blocked email or IP, or outside a tenant's
+  allowed domains), `429 {"detail": "signup_rate_limited"}` (the new-user per-IP/fingerprint cap). Unlike
+  `send-code` there's no email to hide behind, so these refusals are explicit.
+- Local stack only (`FAKE_WORKERS`): `id_token: "fake:<email>"` signs in as `<email>` with no network call, on
+  either route, even with no audience configured. Outside fake mode it's `401 invalid_token`.
+
+### App → Web Handoff Link
+
+```http
+POST /api/users/auth/handoff-token
+Authorization: Bearer <session token>
+Content-Type: application/json
+
+{"target": "job_review", "job_id": "abc123", "locale": "es"}
+```
+
+→ `200 {"url": "https://gen.nomadkaraoke.com/es/auth/verify?token=…&handoff=1", "expires_in_seconds": 120}`.
+A signed-in web link to the caller's own job review, for the mobile app's "Review on the web". `target` is an
+allowlist (only `job_review` today). The token is a `job_review:<id>` magic link (`create_admin_login_token` with
+`expiry_seconds=120`), single-use like every magic link; after verifying, `redirect_path` is
+`/app/jobs#/<id>/review`. The token is stored with `handoff: true`, which `GET /api/users/auth/link-status` reports
+(`{"status": "valid", "handoff": true}`; every other token says `false`). The verify page signs in at once, without
+the email-scanner "Complete Sign-In" tap, only when the URL has `handoff=1` **and** the server says `handoff: true`;
+otherwise it shows the tap. A used or expired link shows the normal "link expired" state. `locale` may be any of the
+web app's 33 locales (`WEB_LOCALES` in `backend/i18n.py`, kept in sync with `frontend/i18n/routing.ts` by a test);
+anything else falls back to `en`.
+
+Errors: `401 {"detail": "invalid_session"}`, `404 {"detail": "not_found"}` (missing or not the caller's job: same
+answer), `409 {"detail": "not_in_review"}` (status isn't `awaiting_review` / `in_review`), `422` unknown target.
+The ownership/status check is shared with kjbox's review link (`get_owned_review_job`).
+
+### Resend Magic Link From Token
+
+```http
+POST /api/users/auth/resend-from-token
+Content-Type: application/json
+
+{"token": "PREVIOUSLY_ISSUED_TOKEN"}
+```
+
+Used by the verify failure UI to give users a one-click recovery when their sign-in link has expired or already been used. The endpoint looks up the token in Firestore, mints a fresh magic link for the same email, and sends it. The original token is a 32-byte cryptographic secret only the email recipient could possess, so resending to the recorded address adds no new attack surface.
+
+Responses — `status` is either `"sent"` (a fresh link was emailed) or `"no_token"` (the token was not found in Firestore):
+
+Successful resend:
+
+```json
+{
+  "status": "sent",
+  "masked_email": "ho***@ya***.com",
+  "message": "If this email is registered, you will receive a sign-in link shortly."
+}
+```
+
+Token not recognised (the UI should fall back to the standard sign-in form):
+
+```json
+{
+  "status": "no_token",
+  "masked_email": null,
+  "message": "We couldn't recognise that sign-in link. Please go back and request a new one from the sign-in form."
+}
+```
+
+A short per-token cooldown applies — repeated resend attempts for the same token within 60 seconds return `status: "sent"` without re-sending the email. Tenant context, referral code, and device fingerprint from the original token are preserved on the new link.
+
+### Get Current User
+
+```http
+GET /api/users/me
+Authorization: Bearer SESSION_TOKEN
+```
+
+Response includes `feedback_eligible: bool` indicating whether the user can earn credits by submitting feedback (requires 2+ completed jobs and no prior feedback submission).
+
+Mobile-app fields: `app_user_id` (stable RevenueCat app user id; links IAP purchases to the account), `capabilities.account_deletion` (true only when `ACCOUNT_DELETION_ENABLED` is set), and `push_prefs` (`{ready, review, problems}` booleans, default all true).
+
+### Logout
+
+```http
+POST /api/users/auth/logout
+Authorization: Bearer SESSION_TOKEN
+```
+
+### Claim Welcome Credit
+
+```http
+POST /api/users/claim-welcome-credit
+Authorization: Bearer SESSION_TOKEN
+```
+
+Grants the standard one-time welcome credit to a signed-in user (idempotent — once per account, with the usual abuse evaluation). Powers the voting board's "Make it yourself now" conversion: board sign-in grants no credit, so this claims it before sending the user into the generator. Returns `{status, credits, credits_granted}`.
+
+## Mobile App Endpoints
+
+### Push Preferences
+
+```http
+PATCH /api/users/me/push-prefs
+Authorization: Bearer SESSION_TOKEN
+{"ready": true, "review": false, "problems": true}   # any subset
+```
+
+Returns the merged `{ready, review, problems}`. Read the current values from `push_prefs` on `GET /api/users/me`. Both Expo and Web Push honour them.
+
+### Expo Push Token
+
+```http
+POST   /api/push/expo-token   {"token": "ExponentPushToken[...]", "platform": "ios|android", "device_id": "..."}   -> 204
+DELETE /api/push/expo-token   {"token": "ExponentPushToken[...]"}                        -> 204
+```
+
+Registers/removes the signed-in user's device for native push (sent via the Expo push service).
+
+### Account Deletion (App Store 5.1.1(v) / Google Play)
+
+All three return `404` unless `ACCOUNT_DELETION_ENABLED` is set (keep unset in prod until the app release ships).
+
+```http
+GET    /api/users/me/deletion-preview   -> credits lost, videos cancelled; 409 {"code"} if deletion is refused
+DELETE /api/users/me                    {"apple_authorization_code": "..."}  (body optional)
+```
+
+`DELETE` cancels active jobs, erases decide and RevenueCat data, revokes Sign in with Apple (best-effort, when `apple_authorization_code` is given), deletes user-supplied inputs in GCS, revokes Dropbox share links (published outputs are kept), anonymises kept records and deletes the user doc. It returns `{"deleted": true, "summary": {...}}`. `409 {"code"}` = refused (`admin`, `referral_balance`, `connect_account`, `order_in_progress`), `503 {"step"}` = a step failed; safe to retry. Deletions are queued for kjbox to erase its copy (below). The web equivalent is the `/account/delete` page.
+
+### RevenueCat Webhook
+
+```http
+POST /api/users/webhooks/revenuecat
+Authorization: <REVENUECAT_WEBHOOK_AUTH value>
+```
+
+Credits in-app credit-pack purchases (and reverses refunds). `503` while `REVENUECAT_WEBHOOK_AUTH` is unset, `401` on mismatch, `400` on malformed body. Handled outcomes (including duplicates and unmatched users) return 200; a Firestore failure returns 5xx so RevenueCat retries. Code: `backend/services/iap_service.py`.
+
+### kjbox Account Deletions (partner, `X-Kjbox-Secret`)
+
+```http
+GET  /api/kjbox/account-deletions?since=ISO8601   -> {"deletions": [{id, email_hash, created_at}]}
+POST /api/kjbox/account-deletions/{id}/ack        -> 204 (404 if unknown)
+```
+
+kjbox pulls pending deletions (only the sha256 of the email), erases matching data, then acks.
+
+### Test-Support Routes (local E2E stack only)
+
+Mounted only when fake workers are enabled (never in production): `POST /api/test/fake-iap/purchase` and `/refund` simulate RevenueCat events (`product_id`, `email` or `app_user_id`, optional `transaction_id`); `GET`/`DELETE /api/test/push-outbox?to=` inspect/clear captured pushes.
+
+### Mobile App Config (env)
+
+| Env | Purpose |
+|-----|---------|
+| `REVENUECAT_WEBHOOK_AUTH` / `REVENUECAT_SECRET_API_KEY` | Webhook auth header / RevenueCat REST key (Secret Manager `revenuecat-webhook-auth`, `revenuecat-secret-api-key`) |
+| `REVENUECAT_PROJECT_ID` | RevenueCat project for the v2 customer delete on account deletion (default `9ea947ce`) |
+| `ACCOUNT_DELETION_ENABLED` | Enables the account-deletion endpoints and `capabilities.account_deletion`; unset in prod until release |
+| `APP_REVIEW_DEMO_EMAIL` / `APP_REVIEW_DEMO_CODE` | App Review demo sign-in: that email accepts the fixed code (`app-review-demo-code`); leave `APP_REVIEW_DEMO_EMAIL` unset in prod except during review |
+| `APPLE_SIWA_KEY_P8` / `APPLE_SIWA_KEY_ID` | Sign in with Apple key, used to revoke tokens on account deletion (not yet provisioned) |
+
+## Requests Voting Board
+
+Public Hacker-News-style board (served at `requests.nomadkaraoke.com`) where anyone signed in with an email magic link can submit a song request and cast **one vote per calendar day**. Phase 1 = the board (below); Phase 2 = the daily automation (internal endpoints at the end of this section), built and deployed dark behind `COMMUNITY_DAILY_PICK_ENABLED`.
+
+### List Board
+
+```http
+GET /api/requests-board/requests
+```
+
+Public (auth optional). Returns `{requests: [...], published: [...], voted_today, your_vote_request_id}`. Each request is `{id, artist, title, status, source, vote_count, created_at, youtube_url, was_corrected, your_vote}` — never includes voter emails. `requests` are open items ranked by `vote_count` desc; `published` are recently-made tracks with `youtube_url`. When the caller is signed in, `your_vote` (+1/-1/null) and `voted_today` are annotated.
+
+### Submit Request
+
+```http
+POST /api/requests-board/requests
+Authorization: Bearer SESSION_TOKEN
+
+{"artist": "beatles", "title": "hey jude"}
+```
+
+Auto-corrects artist/title via the same `match_judge` used in job submission, dedupes against existing open requests (a re-submission counts as an up-vote), and records the submitter's endorsement as their daily vote. Returns `{status: "created"|"already_exists", request, canonical_artist, canonical_title, was_corrected}`. One request per person per day: `429 {detail: {code: "submission_limit"}}`. Submitting spends the day's single vote, so `409 {detail: {code: "vote_already_used"}}` if it's already on another request.
+
+### Vote
+
+```http
+POST /api/requests-board/requests/{request_id}/vote
+Authorization: Bearer SESSION_TOKEN
+
+{"direction": "up", "confirm_delete": false}
+```
+
+Casts/moves/undoes the caller's single daily vote (one total per person per UTC day). Voting the same request+direction again toggles the vote off (frees the day's vote); voting a different request or direction moves it. Removing a request's **last up-vote** (toggle off, move away, or flip to a down-vote) deletes the request: without `confirm_delete: true` that is refused with `409 {detail: {code: "would_delete_request"}}`; with it the vote is applied and the response has `request_deleted: true`. Returns the updated request. `404` if the request no longer exists.
+
+### My Daily Vote Status
+
+```http
+GET /api/requests-board/me
+Authorization: Bearer SESSION_TOKEN
+```
+
+Returns `{voted_today, request_id, value}` for the caller.
+
+### Daily Community Pick (Phase 2, internal)
+
+```http
+POST /api/internal/community-daily-pick[?dry_run=true]
+X-Admin-Token: ADMIN_TOKEN
+```
+
+Internal (admin/OIDC). Called daily by Cloud Scheduler (noon US Eastern). Claims the UTC day with a create-only lock (`daily_community_pick/{YYYY-MM-DD}` → one free track/day total), picks the top open request with net votes ≥ 0, grants the requester a free credit, and submits the job as that user. Idempotent (resumable per-day lock phase + per-request guard flags). `dry_run=true` — or the master switch `COMMUNITY_DAILY_PICK_ENABLED` being off — shadow-runs (logs the pick, makes nothing). Returns a summary `{status: made|shadow|empty|already_done|error, ...}`.
+
+### Community Ownership Handoff (Phase 2, internal)
+
+```http
+POST /api/internal/community-handoffs
+X-Admin-Token: ADMIN_TOKEN
+```
+
+Internal (admin/OIDC). Called hourly by Cloud Scheduler. For each in-progress community pick whose owner hasn't completed their review within 24h (and whose job is blocked waiting on the owner), reassigns the job to the next up-voter (oldest-first, skipping those already tried) and emails them — up to 5 voters, then parks the track (`stalled`). Returns `{status, checked, handed_off, parked, errors}`.
+
+### Community Publish Reconcile (internal)
+
+```http
+POST /api/internal/community-requests/reconcile
+X-Admin-Token: ADMIN_TOKEN
+```
+
+Internal (admin/OIDC). Idempotent safety net / backfill. A community pick advances to `published` (and fans out "your track is live" emails to up-voters) when its job goes live on YouTube — this now fires from both publish paths (the `youtube_upload_queue` processor and the direct video-worker distribution). This endpoint reconciles any pick still stuck at `in_progress` whose job actually has a YouTube URL, running the publish transition for each. Returns `{scanned, published: [{request_id, job_id, youtube_url}]}`.
+
+### Community Requests History (admin)
+
+```http
+GET /api/admin/community-requests
+X-Admin-Token: ADMIN_TOKEN
+```
+
+Admin. Full history of requests-board submissions across every status (newest first), surfaced at `/admin/community-requests`. Each item: `{id, artist, title, status, submitted_by, owner_email, vote_count, job_id, youtube_url, review_state, created_at, picked_at}` — who asked, how it was voted, which job made it, and where it landed on YouTube.
+
+### Community Review Queue (existing-version, admin)
+
+```http
+GET  /api/admin/community-reviews
+POST /api/admin/community-reviews/{request_id}   {"action": "make" | "reject" | "keep"}
+X-Admin-Token: ADMIN_TOKEN
+```
+
+Admin. The daily picker KaraokeNerds-checks each candidate; a request that already has a community karaoke version is flagged (`review_state=pending`) instead of auto-made, and the picker skips to the next clean request. `GET` lists flagged picks `{id, artist, title, submitted_by, vote_count, upvoter_count, community_versions, community_checked_at}`. `POST` resolves one: `make` = clear the flag and make our version now (grants the credit + creates the job like a normal pick); `reject` = mark `rejected` and email every up-voter a link to the existing community version; `keep` = leave it on the board, snoozing re-review for `COMMUNITY_REVIEW_SNOOZE_DAYS` (default 30). The public board also runs the same check at submission time (`POST /api/catalog/community-check`) to soft-warn requesters.
+
+## Credits & Payments (PR #90)
+
+### List Credit Packages
+
+```http
+GET /api/users/credits/packages
+```
+
+No auth required. Returns available packages and prices.
+
+### Create Checkout Session (Credits)
+
+```http
+POST /api/users/credits/checkout
+Content-Type: application/json
+
+{"package_id": "5_credits", "email": "user@example.com", "return_to": "app"}
+```
+
+Returns Stripe checkout URL. Supports Apple Pay, Google Pay, Link, and other payment methods based on customer device.
+
+`return_to` is optional and only accepts `"app"` (the mobile app; the client never sends a URL, so there's no
+open redirect). Live Stripe only takes `https` return URLs, so gen points them at its own bounce on the public API
+(`BACKEND_URL`, default `https://api.nomadkaraoke.com`; `LOCAL_STACK_API_URL` on the local stack):
+`success_url = …/api/users/credits/app-return?status=success&session_id={CHECKOUT_SESSION_ID}`,
+`cancel_url = …/api/users/credits/app-return?status=cancelled`. Without `return_to` the web defaults are unchanged.
+
+### App Checkout Return (bounce)
+
+```http
+GET /api/users/credits/app-return?status=success|cancelled[&session_id=…]
+```
+
+→ `302`, `Location: nomadkaraoke://checkout?status=success|cancelled` (scheme = `MOBILE_APP_SCHEME`). Any other
+`status` → `cancelled`; `session_id` is never forwarded. The body is a tiny HTML page with a "Return to the app"
+link for browsers that block scheme redirects. Credits come from the Stripe webhook, never from this bounce. The app
+opens checkout with `WebBrowser.openAuthSessionAsync(checkout_url, "nomadkaraoke://checkout")`.
+
+### Create Checkout Session (Made For You)
+
+```http
+POST /api/users/made-for-you/checkout
+Content-Type: application/json
+
+{
+  "email": "customer@example.com",
+  "artist": "Queen",
+  "title": "Bohemian Rhapsody",
+  "source_type": "search",
+  "youtube_url": null,
+  "notes": "Optional special requests"
+}
+```
+
+Creates a $15 checkout for the full-service "Made For You" karaoke video. Supports all enabled payment methods.
+
+**source_type**: `search` (find audio automatically), `youtube` (use provided URL)
+
+#### Made-For-You Order Flow
+
+After payment completes via Stripe webhook:
+
+1. **Job Creation**: Job is created with `made_for_you=true`, owned by admin during processing
+2. **Audio Search**: System searches for audio sources automatically
+3. **Admin Notification**: Admin receives email with link to select audio source
+4. **Customer Confirmation**: Customer receives order confirmation email
+5. **Pause at Audio Selection**: Job enters `AWAITING_AUDIO_SELECTION` state
+6. **Admin Selects Audio**: Admin reviews and selects audio source in admin UI
+7. **Processing**: Job processes through normal pipeline (admin handles any intermediate steps)
+8. **Completion**: On completion, ownership transfers to customer (`user_email` = `customer_email`)
+9. **Delivery Email**: Customer receives completion email with download links
+
+**Key fields on job document:**
+- `made_for_you: bool` - Flag for made-for-you orders (default: false)
+- `customer_email: str` - Customer's email for final delivery
+- `customer_notes: str` - Optional notes from customer
+
+**Email suppression**: Intermediate reminder emails (lyrics review, instrumental selection) are suppressed for made-for-you jobs since admin handles these directly. Only order confirmation and final delivery emails go to customer
+
+### Credit Enforcement
+
+#### Duration-Based Pricing
+
+Credits are charged proportionally to audio duration: `max(1, ceil(minutes / 10))` per job.
+
+| Duration | Credits |
+|----------|---------|
+| 0:00 – 10:00 | 1 |
+| 10:01 – 20:00 | 2 |
+| 20:01 – 30:00 | 3 |
+| 30:01 – 40:00 | 4 |
+| 40:01 – 50:00 | 5 |
+| 50:01 – 60:00 | 6 |
+| 60:01+ | **blocked** (hard limit) |
+
+Inputs over 60 minutes are rejected at creation time (HTTP 422). The backend
+`duration_to_credits()` util (`backend/services/pricing.py`) is the single source of truth —
+the frontend mirrors the constants for display only. See
+`docs/archive/2026-06-04-long-duration-input-handling-design.md` for full design details.
+
+#### Credit Deduction Flow
+
+Credits are deducted N-atomically (not always just 1) at the earliest point duration is known:
+
+- **URL jobs**: deducted at `POST /api/jobs` using the `duration_seconds` from `/api/jobs/estimate`.
+  If duration is unknown, 1 credit is held and reconciled post-download.
+- **Audio search select**: deducted at `/api/audio-search/{job_id}/select` from the result's duration.
+- **Upload jobs**: 1 credit is charged at job creation (same as URL jobs without a known duration).
+  After the audio lands in GCS, the same reconciliation checkpoint runs: ffprobe measures the actual
+  duration; if the cost exceeds the 1-credit hold the job pauses in `AWAITING_DURATION_CONFIRM`
+  (reason `reconcile`) for the user to pay the delta; if it costs less an auto-refund is issued.
+
+A reconciliation checkpoint runs immediately before audio separation + transcription is triggered.
+If the actual measured duration costs more than was charged, the job pauses in
+`AWAITING_DURATION_CONFIRM` for the user to pay the difference. If it costs less, a silent
+auto-refund is issued. If the actual duration exceeds 60 minutes, all charged credits are refunded
+and the job is cancelled.
+
+Admin users bypass credit checks entirely. New users receive 1 welcome credit. Users can earn 1
+additional free credit by submitting product feedback after completing 2+ jobs (see
+[User Feedback for Credits](#user-feedback-for-credits)).
+
+#### 402 Response
+
+When a user has insufficient credits, job creation or confirmation returns HTTP 402:
+
+```json
+{
+  "detail": "You're out of credits. Buy more to continue creating karaoke videos.",
+  "credits_available": 0,
+  "credits_required": 3,
+  "buy_url": "/#pricing"
+}
+```
+
+### Stripe Webhook
+
+```http
+POST /api/users/webhooks/stripe
+```
+
+Handles `checkout.session.completed` events.
+
+### User Feedback for Credits
+
+Users who have completed 2+ jobs can submit feedback to earn 1 free credit.
+
+#### Check Eligibility
+
+```http
+GET /api/users/feedback/eligibility
+Authorization: Bearer SESSION_TOKEN
+```
+
+Response:
+```json
+{
+  "eligible": true,
+  "has_submitted": false,
+  "jobs_completed": 3,
+  "credits_reward": 1
+}
+```
+
+#### Submit Feedback
+
+```http
+POST /api/users/feedback
+Authorization: Bearer SESSION_TOKEN
+Content-Type: application/json
+
+{
+  "overall_rating": 4,
+  "ease_of_use_rating": 5,
+  "lyrics_accuracy_rating": 4,
+  "correction_experience_rating": 3,
+  "what_went_well": "The lyrics sync was really accurate...",
+  "what_could_improve": "Would love more theme options...",
+  "additional_comments": "",
+  "would_recommend": true,
+  "would_use_again": true
+}
+```
+
+Requirements:
+- User must have completed 2+ jobs
+- At least one text field must have >50 characters
+- User can only submit once (duplicate prevention)
+
+Grants 1 credit on success. Feedback stored in `user_feedback` Firestore collection.
+
+The `/api/users/me` response includes `feedback_eligible: bool` so the frontend can show/hide feedback prompts without an extra API call.
+
+## Admin Endpoints
+
+All admin endpoints require an admin-role session token.
+
+### Test Data Filtering
+
+Most admin list/stats endpoints support an `exclude_test` query parameter (default: `true`) to filter out E2E test data:
+- Test users: email addresses ending in `@inbox.testmail.app`
+- Test jobs: jobs created by test users
+
+```http
+GET /api/admin/stats/overview?exclude_test=true   # Default - hide test data
+GET /api/admin/stats/overview?exclude_test=false  # Show all data including tests
+```
+
+The frontend admin dashboard includes a "Show test data" toggle that controls this filter globally.
+
+### Admin Dashboard Stats
+
+```http
+GET /api/admin/stats/overview
+GET /api/admin/stats/overview?exclude_test=false
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Returns platform statistics:
+```json
+{
+  "total_users": 100,
+  "active_users_7d": 25,
+  "active_users_30d": 60,
+  "total_jobs": 500,
+  "jobs_last_7d": 50,
+  "jobs_last_30d": 150,
+  "jobs_by_status": {
+    "pending": 5,
+    "processing": 3,
+    "awaiting_review": 10,
+    "complete": 400,
+    "failed": 20
+  },
+  "total_credits_issued_30d": 200
+}
+```
+
+### List Users (Admin)
+
+```http
+GET /api/users/admin/users
+GET /api/users/admin/users?search=user@example.com
+GET /api/users/admin/users?limit=20&offset=0&sort_by=created_at&sort_order=desc
+GET /api/users/admin/users?exclude_test=false
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Query parameters:
+- `exclude_test` (bool, default: true) - Filter out test users
+- `limit` / `offset` - Pagination
+- `search` - Email prefix search
+- `sort_by` / `sort_order` - Sorting
+
+Returns paginated user list with total count.
+
+### User Detail (Admin)
+
+```http
+GET /api/users/admin/users/{email}/detail
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Returns full user profile including:
+- User info and stats
+- `locale` (email locale: en/es/de) and `ui_locale` (full UI language, any of 33)
+- Recent credit transactions (last 20)
+- Recent jobs (last 10, each with its `locale`)
+- Active sessions count
+- `signup_source`, `signup_venue`, `signup_attribution` (acquisition channel + first-touch UTM/referrer)
+
+### Attribution Summary (Admin)
+
+```http
+GET /api/users/admin/attribution-summary?days=90
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Funnel by acquisition channel for consumer accounts created in the last `days` (test and tenant users excluded): `signups`, `verified`, `made_job`, `paid`, `revenue_cents` per `signup_source`. Accounts with no recorded source show as `"direct / unknown"`, as do all accounts created before attribution capture shipped (October 2026).
+
+### Email History (Admin)
+
+List every email ever sent to a user, then fetch one for full-fidelity preview.
+Merges the Postmark Messages API (last ~45 days, with delivery metadata) with a
+persisted Firestore `email_log` (permanent), de-duplicated by message id.
+
+```http
+GET /api/admin/users/{email}/emails
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Response: `{ email, count, postmark_available, emails: [{ message_id, source,
+subject, to, from_email, sent_at, status, email_type, has_stored_html }] }`.
+
+```http
+GET /api/admin/emails/{message_id}?source=postmark
+Authorization: Bearer ADMIN_TOKEN
+```
+
+`source` is `postmark` (default; falls back to the stored log on 404/expiry) or
+`log` (read the persisted copy directly). Returns the full rendered `html_body`,
+`text_body`, addressing, `status`, `delivered_at`, `open_count`, `click_count`,
+`bounce`, and the raw `events`.
+
+### Create User (Admin)
+
+Create a user account directly — e.g. to grant credits, submit jobs on behalf of,
+or impersonate someone who has never logged in. The user can later log in normally
+via magic link with the same email.
+
+```http
+POST /api/users/admin/users
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "display_name": "Optional Name",
+  "initial_credits": 3,
+  "credit_reason": "made-for-you order"
+}
+```
+
+Response (201):
+```json
+{
+  "status": "success",
+  "email": "user@example.com",
+  "credits": 3,
+  "message": "Created user user@example.com with 3 credit(s)"
+}
+```
+
+Notes:
+- `display_name`, `initial_credits` (0-1000), and `credit_reason` are optional
+- If `initial_credits` > 0, `welcome_credits_granted` is set so the user does NOT
+  also receive the automatic welcome credit on first login
+- Returns 409 if the user already exists
+
+### Add Credits (Admin)
+
+```http
+POST /api/users/admin/credits
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "amount": 5,
+  "reason": "Beta reward"
+}
+```
+
+### Impersonate User (Admin)
+
+Allows admins to view the application as any user by creating a session token for that user.
+
+```http
+POST /api/admin/users/{email}/impersonate
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Response:
+```json
+{
+  "session_token": "impersonation-session-token",
+  "user_email": "user@example.com",
+  "message": "Now impersonating user@example.com"
+}
+```
+
+Notes:
+- Creates a real session for the target user (auditable in Firestore)
+- Admin cannot impersonate themselves
+- Returns 404 if user doesn't exist
+- The frontend stores the original admin token in memory (not localStorage) for security
+
+### Set User Role (Admin)
+
+```http
+POST /api/users/admin/users/{email}/role
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{"role": "admin"}
+```
+
+Note: This endpoint exists but is not exposed in the admin UI. Use database operations for role changes.
+
+### Enable/Disable User (Admin)
+
+```http
+POST /api/users/admin/users/{email}/enable
+POST /api/users/admin/users/{email}/disable
+Authorization: Bearer ADMIN_TOKEN
+```
+
+### Delete Job (Admin)
+
+```http
+DELETE /api/jobs/{job_id}?delete_files=true
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Admins can delete any job. Regular users can only delete their own jobs.
+
+### Audio Search Management (Admin)
+
+#### List Audio Searches
+
+```http
+GET /api/admin/audio-searches
+GET /api/admin/audio-searches?limit=50&status_filter=awaiting_audio_selection
+GET /api/admin/audio-searches?exclude_test=false
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Query parameters:
+- `exclude_test` (bool, default: true) - Filter out searches from test users
+- `limit` - Max results to return
+- `status_filter` - Filter by job status
+
+Returns jobs with cached audio search results. Useful for:
+- Monitoring search activity
+- Identifying stale cached results (YouTube-only when lossless should be available)
+- Clearing cache for specific jobs
+
+Response:
+```json
+{
+  "jobs": [
+    {
+      "job_id": "abc123",
+      "status": "awaiting_audio_selection",
+      "user_email": "user@example.com",
+      "audio_search_artist": "Artist Name",
+      "audio_search_title": "Song Title",
+      "created_at": "2026-01-03T12:00:00Z",
+      "results_count": 5,
+      "has_lossless": false,
+      "providers": ["YouTube"],
+      "results_summary": [...]
+    }
+  ],
+  "total": 1
+}
+```
+
+#### Clear Audio Search Cache
+
+```http
+POST /api/admin/audio-searches/{job_id}/clear-cache
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Clears cached search results and resets job to `pending` status, allowing a new search.
+
+Use when:
+- Cached results are stale (e.g., flacfetch was updated with new providers)
+- User wants to search again
+- Results appear incomplete (YouTube-only when lossless should exist)
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Cleared 5 cached search results. Job reset to pending. Flacfetch cache also cleared.",
+  "previous_status": "awaiting_audio_selection",
+  "new_status": "pending",
+  "results_cleared": 5,
+  "flacfetch_cache_cleared": true,
+  "flacfetch_error": null
+}
+```
+
+Note: This endpoint now also clears the flacfetch GCS cache for the artist/title combination, ensuring the next search hits trackers fresh.
+
+#### Clear All Flacfetch Cache
+
+```http
+DELETE /api/admin/cache
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Clears the entire flacfetch search cache (GCS-backed). Use when flacfetch has been updated and you want all subsequent searches to use fresh tracker results.
+
+Response:
+```json
+{
+  "status": "success",
+  "message": "Cleared 15 cache entries from flacfetch.",
+  "deleted_count": 15
+}
+```
+
+#### Get Flacfetch Cache Stats
+
+```http
+GET /api/admin/cache/stats
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Returns statistics about the flacfetch search cache.
+
+Response:
+```json
+{
+  "count": 42,
+  "total_size_bytes": 128000,
+  "oldest_entry": "2025-12-15T10:30:00Z",
+  "newest_entry": "2026-01-03T15:45:00Z",
+  "configured": true
+}
+```
+
+### Email Notifications (Admin)
+
+#### Get Completion Message
+
+```http
+GET /api/admin/jobs/{job_id}/completion-message
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Returns the rendered completion message for a job (for copying to clipboard).
+
+Response:
+```json
+{
+  "job_id": "abc123",
+  "message": "Hi there! Your karaoke video is ready...",
+  "subject": "Your Karaoke Video is Ready! 🎤",
+  "youtube_url": "https://youtube.com/watch?v=...",
+  "dropbox_url": "https://dropbox.com/..."
+}
+```
+
+#### Send Completion Email
+
+```http
+POST /api/admin/jobs/{job_id}/send-completion-email
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "to_email": "customer@example.com",
+  "cc_admin": true
+}
+```
+
+Sends the job completion email to the specified address. When `cc_admin` is true (default), CCs gen@nomadkaraoke.com.
+
+Returns **409** if the job was meant to deliver to Dropbox but has no `state_data.dropbox_link`
+(e.g. the Dropbox was full). Fix the Dropbox upload first, or pass
+`"allow_missing_dropbox_link": true` to send anyway (the Dropbox section is then left out of the
+email; a placeholder link is never rendered). A successful send clears
+`state_data.completion_email_held`.
+
+Response:
+```json
+{
+  "success": true,
+  "job_id": "abc123",
+  "to_email": "customer@example.com",
+  "message": "Completion email sent successfully"
+}
+```
+
+### Job Files (Admin)
+
+#### Get Job Files
+
+```http
+GET /api/admin/jobs/{job_id}/files
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Returns all files associated with a job with signed download URLs (2-hour expiry).
+
+Response:
+```json
+{
+  "job_id": "abc123",
+  "artist": "Artist Name",
+  "title": "Song Title",
+  "files": [
+    {
+      "name": "input.flac",
+      "path": "jobs/abc123/input.flac",
+      "download_url": "https://storage.googleapis.com/signed-url...",
+      "category": "input",
+      "file_key": "input"
+    }
+  ],
+  "total_files": 1
+}
+```
+
+Categories: `input`, `stems`, `lyrics`, `screens`, `videos`, `finals`, `packages`
+
+### Job Updates (Admin)
+
+#### Update Job Fields
+
+```http
+PATCH /api/admin/jobs/{job_id}
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "artist": "New Artist",
+  "title": "New Title"
+}
+```
+
+Updates editable job fields. Allowed fields: `artist`, `title`, `user_email`, `theme_id`, `brand_prefix`, `discord_webhook_url`, `youtube_description`, `youtube_description_template`, `customer_email`, `customer_notes`, `enable_cdg`, `enable_txt`, `enable_youtube_upload`, `non_interactive`, `prep_only`, `is_private`.
+
+**Note:** Setting `is_private=true` on a completed job with existing outputs triggers automatic output deletion.
+
+**Note:** `user_email` is trimmed and lowercased before saving. If no account exists
+for that email, one is auto-created (so the recipient can log in and see the job,
+and the admin can impersonate them immediately). The response message notes when
+an account was created.
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "updated_fields": ["artist", "title"],
+  "message": "Successfully updated 2 field(s)"
+}
+```
+
+Non-editable fields (job_id, status, created_at, file_urls, state_data) return 400.
+
+#### Reset Job State
+
+```http
+POST /api/admin/jobs/{job_id}/reset
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "target_state": "awaiting_review"
+}
+```
+
+Resets a job to a specific workflow checkpoint for re-processing.
+
+Allowed target states:
+- `pending` - Restart from beginning (clears all processing data)
+- `awaiting_audio_selection` - Re-select audio source
+- `awaiting_review` - Re-do combined review (lyrics + instrumental selection)
+- `instrumental_selected` - **Reprocess video** (preserves all settings, triggers video worker automatically)
+
+**Note**: With the combined review flow, `awaiting_instrumental_selection` is no longer a valid reset target for new jobs. Use `awaiting_review` instead to re-select the instrumental.
+
+The `instrumental_selected` state is useful for re-encoding and re-distributing a job after using "Delete Outputs":
+1. Delete outputs → Removes YouTube/Dropbox/GDrive files, recycles brand code
+2. Reset to `instrumental_selected` → Clears video state, keeps settings, auto-triggers video worker
+3. Job re-processes with same instrumental, lyrics, and distribution settings
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "previous_status": "complete",
+  "new_status": "awaiting_review",
+  "message": "Job reset from complete to awaiting_review",
+  "cleared_data": ["review_complete", "corrected_lyrics", "instrumental_selection"],
+  "worker_triggered": null,
+  "worker_trigger_error": null
+}
+```
+
+When resetting to `instrumental_selected`, the response includes worker trigger status:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "previous_status": "complete",
+  "new_status": "instrumental_selected",
+  "message": "Job reset from complete to instrumental_selected",
+  "cleared_data": ["video_progress", "render_progress", "screens_progress", "encoding_progress", "distribution", "brand_code", "youtube_url", "youtube_video_id", "dropbox_link", "gdrive_files"],
+  "worker_triggered": true,
+  "worker_trigger_error": null
+}
+```
+
+If the worker trigger fails, `worker_triggered` will be `false` and `worker_trigger_error` will contain an error message. The job reset still succeeds, but you'll need to manually trigger the worker using the endpoint below.
+
+#### Trigger Worker (Manual)
+
+```http
+POST /api/admin/jobs/{job_id}/trigger-worker
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "worker_type": "video"
+}
+```
+
+Manually triggers a worker for a job. Use this when the auto-trigger fails after a reset, or to re-run processing without resetting state.
+
+Supported worker types:
+- `video` - Video processing worker (for jobs in `instrumental_selected` state)
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "worker_type": "video",
+  "triggered": true,
+  "message": "Video worker triggered successfully for job abc123",
+  "error": null
+}
+```
+
+#### Regenerate Screens
+
+```http
+POST /api/admin/jobs/{job_id}/regenerate-screens
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Regenerates title and end screen videos using the **current** artist/title metadata. Use this after editing artist or title fields to update the screens without full reprocessing.
+
+Requirements:
+- Job must have audio and lyrics processing complete
+- Job must be in an allowed state: `complete`, `failed`, `awaiting_review`, `in_review`, `awaiting_instrumental_selection`, `instrumental_selected`, `prep_complete`
+
+The endpoint:
+1. Deletes existing screen files from GCS
+2. Triggers the screens worker to regenerate with current metadata
+3. Returns immediately (does not wait for completion)
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Screens regeneration started",
+  "previous_screens_deleted": true,
+  "worker_triggered": true,
+  "error": null
+}
+```
+
+Screen generation takes 30-60 seconds. Monitor progress via job timeline or logs.
+
+#### Re-render Any Completed Job (Admin)
+
+```http
+POST /api/admin/jobs/{job_id}/rerender
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{"notify_customer": false}
+```
+
+Rebuilds a completed job end to end with the **current renderer** (e.g. after a renderer bug fix): title/end screens, the karaoke video, every encoded format, CDG/TXT packages, then distribution. It reuses the reviewed `corrections_updated.json`, `state_data.instrumental_selection` and the job's **existing style snapshot** (`style_params_gcs_path` / `style_assets` — no theme re-snapshot), so there is no review step. Works for consumer and tenant, public and private jobs. Surfaced as the admin-only "Re-render" button on job cards in `/app`.
+
+- **Body** (optional): `notify_customer` (default `false`). When false, the completion email + push, the follow-up email of a quota-deferred YouTube upload, and the Discord "new video" post are skipped. Community-pick voters who were already notified aren't re-emailed; an owed (never/partially sent) "it's live" fan-out still goes out. The community request gets the new YouTube URL.
+- **Published outputs** are deleted up front (YouTube video, Google Drive files, Dropbox folder `{dropbox_path}/{brand_code} - {Artist} - {Title}`; private jobs use the private Dropbox path) and re-published at the end of the pipeline — but only for destinations the job will still publish to (YouTube: `enable_youtube_upload`, not private, credentials configured; Dropbox: `dropbox_path` + `brand_prefix`; GDrive: `gdrive_folder_id`). Others are left in place (`cleanup_results.<dest>.status = "kept"`, listed in `warnings`) and keep their link. A pending quota-deferred YouTube upload for the job is cancelled (atomically with the claim) only when YouTube will be re-published (otherwise it stays queued, with a warning); if that upload is currently in progress the request is refused with **409** — retry in a few minutes. While the re-render runs, the YouTube queue won't start an upload for the job. Admin re-render completions don't count towards the user's completed-jobs total. The **brand code is kept** (not recycled): `state_data.admin_rerender.brand_code` → orchestrator `keep_brand_code`. YouTube gets a new upload, so the **YouTube URL changes**. Cleanup failures are logged but don't abort (re-uploads replace same-named leftovers).
+- Marker `state_data.admin_rerender` (`requested_by`, `requested_at`, `notify_customer`, `brand_code`, `previous_outputs`, `cleanup_results`) is cleared on success; it also records the job's `review_token` and stops applying once the job goes back through review (and admin reset/restart/delete-outputs, Edit and private→public visibility clear it). A failed admin re-render keeps it: an **admin** `POST /api/jobs/{id}/retry` (customers get 403 while the marker is active) re-runs the re-render (`retry_stage: "admin_rerender"`) while screens are missing, otherwise the normal render/video retry resumes it, still keeping the brand code and the notification choice.
+
+Response:
+```json
+{
+  "status": "processing",
+  "job_id": "abc123",
+  "message": "Re-render started. Published outputs will be replaced when it completes.",
+  "brand_code": "NOMAD-1234",
+  "notify_customer": false,
+  "previous_outputs": {"youtube_url": "https://www.youtube.com/watch?v=...", "brand_code": "NOMAD-1234", "dropbox_link": "...", "gdrive_files": {"mp4": "..."}},
+  "cleanup_results": {"youtube": {"status": "success", "video_id": "..."}, "dropbox": {"status": "success", "path": "..."}, "gdrive": {"status": "success", "files": {}}, "youtube_queue": {"status": "skipped", "reason": "no queue entry"}, "brand_code": {"status": "kept", "code": "NOMAD-1234"}},
+  "warnings": []
+}
+```
+
+Errors: **403** non-admin; **404** unknown job; **400** not `complete` (or `failed`/`cancelled` after an admin re-render), outputs deleted, prep/finalise-only, visibility change in progress, or missing reviewed lyrics / instrumental selection; **409** the job left `complete` meanwhile (double-click) or a YouTube upload for it is in progress; **500** something failed after the claim (output deletion etc.) / **503** the screens worker couldn't be triggered — in both cases the job is set `failed` with the marker kept, so an admin can retry it.
+
+#### Prepare Review Audio
+
+```http
+POST /api/admin/jobs/{job_id}/prepare-review-audio
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Transcodes all review audio files (input + stems) to OGG Opus 128kbps for fast browser playback. Idempotent — skips files already transcoded.
+
+Use this to backfill existing jobs created before eager transcoding was deployed, or to re-transcode after stems are regenerated.
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "transcoded_files": [
+    "jobs/abc123/review-audio/song.ogg",
+    "jobs/abc123/review-audio/instrumental_clean.ogg"
+  ],
+  "message": "Transcoded 2 files to OGG Opus"
+}
+```
+
+#### Restart Job
+
+```http
+POST /api/admin/jobs/{job_id}/restart
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "preserve_audio_stems": true,
+  "delete_outputs": true
+}
+```
+
+Fully restarts a job from the beginning. Unlike the reset endpoint (which just changes state), restart actually **triggers workers** to begin processing.
+
+Options:
+- `preserve_audio_stems` (default: false) - If true, keeps existing audio separation and lyrics. Only regenerates screens and video with current metadata. Good for fixing title/artist typos.
+- `delete_outputs` (default: true) - Delete existing output files from GCS.
+
+Behavior by job type:
+- **YouTube URL jobs**: Re-downloads audio, then triggers audio/lyrics workers
+- **Audio search jobs**: Transitions to `awaiting_audio_selection` for admin to re-select
+- **File upload jobs**: Triggers audio/lyrics workers directly
+
+When `preserve_audio_stems=true`:
+- Validates audio and lyrics processing completed previously
+- Clears screens/video/encoding state only
+- Triggers screens worker immediately
+
+Allowed states: `pending`, `complete`, `failed`, `awaiting_review`, `awaiting_audio_selection`, `awaiting_instrumental_selection`, `instrumental_selected`, `prep_complete`
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Job restarted from complete to downloading",
+  "previous_status": "complete",
+  "new_status": "downloading",
+  "cleared_data": ["audio_complete", "lyrics_complete", "screens_progress", "..."],
+  "deleted_gcs_paths": ["jobs/abc123/screens/title.mov", "..."],
+  "workers_triggered": ["download", "audio", "lyrics"],
+  "error": null
+}
+```
+
+#### Override Audio Source
+
+```http
+POST /api/admin/jobs/{job_id}/override-audio-source
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{
+  "source_type": "audio_search"
+}
+```
+
+Switches a job's audio source from YouTube URL to audio search mode. Use this when a Made-For-You order was submitted with a YouTube URL but you want to find higher quality audio.
+
+Currently only supports switching to `audio_search` mode, which:
+1. Clears existing audio-related state (URL, downloaded file, stems, transcription)
+2. Performs an audio search using the job's artist/title
+3. Stores search results in state_data
+4. Transitions job to `awaiting_audio_selection` with results ready
+5. Admin can then select an audio source from the search results in the UI
+
+Allowed states: `pending`, `complete`, `failed`, `awaiting_review`, `awaiting_audio_selection`, `instrumental_selected`, `prep_complete`
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Found 5 audio sources - select one in the admin panel.",
+  "previous_source": "youtube",
+  "new_source": "audio_search",
+  "cleared_data": ["audio_complete", "lyrics_complete", "url", "input_media_gcs_path", "..."],
+  "new_status": "awaiting_audio_selection",
+  "search_results_count": 5,
+  "error": null
+}
+```
+
+If no audio sources found:
+```json
+{
+  "status": "error",
+  "job_id": "abc123",
+  "message": "No audio sources found for: Artist - Title",
+  "previous_source": "youtube",
+  "new_source": "audio_search",
+  "cleared_data": ["..."],
+  "new_status": "failed",
+  "search_results_count": null,
+  "error": "No audio sources found for: Artist - Title"
+}
+```
+
+#### Delete Job Outputs
+
+```http
+POST /api/admin/jobs/{job_id}/delete-outputs
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Deletes all distributed outputs (YouTube, Dropbox, Google Drive) for a job and recycles the brand code. The job record is preserved. Use this to fix quality issues: delete outputs, reset to `awaiting_review`, correct lyrics, and re-process.
+
+Requirements:
+- Job must be in terminal state (`complete`, `prep_complete`, `failed`, or `cancelled`)
+- Outputs must not already be deleted (checks `outputs_deleted_at`)
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Outputs deleted successfully",
+  "deleted_services": {
+    "youtube": {"status": "success", "video_id": "dQw4w9WgXcQ"},
+    "dropbox": {"status": "success", "path": "/Karaoke/NOMAD-1234 - Artist - Title"},
+    "gdrive": {"status": "success", "files": {"mp4": true, "mp4_720p": true}},
+    "brand_code": {"status": "recycled", "code": "NOMAD-1234"}
+  },
+  "cleared_state_data": ["youtube_url", "brand_code", "dropbox_link", "gdrive_files"],
+  "outputs_deleted_at": "2026-01-10T12:00:00Z"
+}
+```
+
+Service statuses: `success`, `failed`, `skipped` (not configured or no data), `partial` (some files failed), `error` (exception).
+
+The brand code is automatically recycled after both Dropbox and GDrive cleanup succeed. If either cleanup fails, the brand code is preserved to prevent collisions. Brand code recycling status is returned in `deleted_services.brand_code`. The `DELETE /api/jobs/{id}` endpoint also recycles brand codes before deletion. When the job is re-processed and outputs are re-uploaded, the `outputs_deleted_at` flag is automatically cleared.
+
+#### Clear Worker Progress
+
+```http
+POST /api/admin/jobs/{job_id}/clear-workers
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Clears all worker completion markers from `state_data` to allow re-execution. Use when a job has stale progress keys that prevent workers from running (e.g., after a reset that didn't fully clear state).
+
+Worker progress keys cleared:
+- `audio_progress`
+- `lyrics_progress`
+- `render_progress`
+- `screens_progress`
+- `video_progress`
+- `encoding_progress`
+
+Response:
+```json
+{
+  "status": "success",
+  "job_id": "abc123",
+  "message": "Cleared 3 worker progress keys",
+  "cleared_keys": ["render_progress", "video_progress", "encoding_progress"]
+}
+```
+
+**Why this is needed**: Workers check `state_data.{worker}_progress.stage == 'complete'` for idempotency - if this key exists from a previous run, the worker will skip execution. When re-reviewing or resetting jobs, these keys must be cleared.
+
+### Internal Email Endpoints
+
+These endpoints are used by Cloud Tasks for automated notifications.
+
+#### Check Idle Reminder
+
+```http
+POST /api/internal/jobs/{job_id}/check-idle-reminder
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Called by Cloud Tasks after a job enters a blocking state. Sends a reminder email if the user is still idle and no reminder has been sent yet. Handles two `action_type` cases:
+- `review_reminder` — fires 5 minutes after `awaiting_review` (combined lyrics + instrumental review)
+- `duration_confirm_reminder` — fires 15 minutes after `awaiting_duration_confirm`
+
+**Note**: With the combined review flow, users complete both lyrics review and instrumental selection in one session. The `awaiting_instrumental_selection` state is only used for finalise-only jobs.
+
+### Admin Feedback
+
+```http
+GET /api/admin/feedback
+GET /api/admin/feedback?search=user@example.com&exclude_test=true&limit=50&offset=0
+Authorization: Bearer ADMIN_TOKEN
+```
+
+Lists all user feedback submissions with pagination, search, and aggregate stats.
+
+Response:
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "user_email": "user@example.com",
+      "created_at": "2026-03-01T12:00:00",
+      "overall_rating": 4,
+      "ease_of_use_rating": 5,
+      "lyrics_accuracy_rating": 3,
+      "correction_experience_rating": 4,
+      "what_went_well": "...",
+      "what_could_improve": "...",
+      "additional_comments": null,
+      "would_recommend": true,
+      "would_use_again": true
+    }
+  ],
+  "total": 2,
+  "offset": 0,
+  "limit": 50,
+  "has_more": false,
+  "avg_overall_rating": 4.0,
+  "avg_ease_of_use_rating": 4.5,
+  "avg_lyrics_accuracy_rating": 3.5,
+  "avg_correction_experience_rating": 4.0
+}
+```
+
+An email notification is also sent to `admin@nomadkaraoke.com` (configurable via `ADMIN_NOTIFICATION_EMAIL` env var) whenever a user submits new feedback.
+
+## Rate Limits & Abuse Prevention
+
+### Usage Control
+
+Job creation is controlled by credits (purchased or earned via feedback). There is no per-user daily job limit — users can create as many jobs as their credits allow.
+
+### YouTube Upload Quota
+
+- **YouTube uploads**: Quota-aware, ~33 uploads/day within 10,000 units/day API quota (configurable via `YOUTUBE_QUOTA_DAILY_LIMIT`, `YOUTUBE_QUOTA_UPLOAD_COST`, `YOUTUBE_QUOTA_SAFETY_MARGIN`). Uploads exceeding quota are queued and processed hourly.
+
+### Admin Blocklist & Queue API
+
+```http
+GET /api/admin/rate-limits/blocklists
+POST /api/admin/rate-limits/blocklists/disposable-domains
+DELETE /api/admin/rate-limits/blocklists/disposable-domains/{domain}
+POST /api/admin/rate-limits/blocklists/allowlisted-domains
+DELETE /api/admin/rate-limits/blocklists/allowlisted-domains/{domain}
+POST /api/admin/rate-limits/blocklists/sync
+POST /api/admin/rate-limits/blocklists/blocked-emails
+DELETE /api/admin/rate-limits/blocklists/blocked-emails/{email}
+POST /api/admin/rate-limits/blocklists/blocked-ips
+DELETE /api/admin/rate-limits/blocklists/blocked-ips/{ip}
+POST /api/internal/sync-disposable-domains
+```
+Manage blocklists for disposable email domains, blocked emails, and blocked IPs. The disposable domain list auto-syncs daily from the [disposable-email-domains](https://github.com/disposable-email-domains/disposable-email-domains) repo (~4,800 domains). Admins can add manual domains, and allowlist false positives. The `GET` response includes `external_domains`, `manual_domains`, `allowlisted_domains`, `last_sync_at`, and `last_sync_count`.
+
+### YouTube Upload Queue
+
+```http
+GET /api/admin/rate-limits/youtube-queue
+```
+Returns list of queued/processing/failed YouTube uploads with job details, status, attempt count, and timestamps.
+
+```http
+POST /api/admin/rate-limits/youtube-queue/{job_id}/retry
+```
+Reset a failed upload back to queued status for retry.
+
+```http
+POST /api/admin/rate-limits/youtube-queue/process
+```
+Manually trigger queue processing (normally runs hourly via Cloud Scheduler).
+
+### Internal YouTube Queue Processing
+
+```http
+POST /api/internal/youtube-queue/process
+```
+Called by Cloud Scheduler hourly. Processes queued uploads while quota is available. Returns summary of processed/failed/remaining uploads.
+
+### Internal Stale Review Processing
+
+```http
+POST /api/internal/process-stale-reviews
+```
+Called by Cloud Scheduler hourly. Queries for jobs in `awaiting_review`, `in_review`, or
+`awaiting_duration_confirm` status. Sends reminder emails at 24h; auto-cancels with full credit
+refund at 48h (all `credits_charged` are returned for duration-confirm expirations). Excludes
+made-for-you and tenant jobs. Also cancels (with refund) signed-URL upload jobs whose browser upload
+never finished (`state_data.awaiting_upload` for >= 6h, or >= 24h with partial files; not tenant bulk).
+Returns `{status: "started", message: "..."}` immediately; processing runs in background.
+
+## Referral System
+
+### Get Referral Interstitial (Public)
+
+```http
+GET /api/referrals/r/{code}
+```
+
+No auth required. Returns referral link data for the interstitial page. Increments click count. Returns `valid: false` if code not found or disabled.
+
+### Get Referral Dashboard
+
+```http
+GET /api/referrals/me
+Authorization: Bearer TOKEN
+```
+
+Returns the current user's referral link, stats (clicks, signups, purchases), pending balance, recent earnings, recent payouts, and Stripe Connect status.
+
+### Update Referral Link
+
+```http
+PUT /api/referrals/me
+Authorization: Bearer TOKEN
+Content-Type: application/json
+
+{"display_name": "DJ Tommy", "custom_message": "Best karaoke tool!"}
+```
+
+Update the current user's referral link display name and custom message (shown on interstitial page).
+
+### Start Stripe Connect Onboarding
+
+```http
+POST /api/referrals/me/connect
+Authorization: Bearer TOKEN
+```
+
+Creates a Stripe Connect Express account and returns an onboarding URL. Saves the Connect account ID to the user doc. The dashboard response (`GET /api/referrals/me`) includes `stripe_connect_account` with account status details (payouts_enabled, details_submitted, etc.).
+
+### Get Stripe Connect Dashboard Link
+
+```http
+POST /api/referrals/me/connect/dashboard-link
+Authorization: Bearer TOKEN
+```
+
+Returns a one-time login URL to the Stripe Express dashboard where the user can manage their payout settings, view transfer history, and update bank details.
+
+### Get Stripe Connect Update Link
+
+```http
+POST /api/referrals/me/connect/update-link
+Authorization: Bearer TOKEN
+```
+
+Returns a Stripe AccountLink URL for re-onboarding — allows the user to update their bank account or complete setup if they didn't finish initially.
+
+### Create Vanity Link (Admin)
+
+```http
+POST /api/referrals/admin/vanity
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{"code": "djtommy", "owner_email": "tommy@example.com", "discount_percent": 15, "kickback_percent": 25}
+```
+
+Admin creates a custom vanity referral link with optional override rates.
+
+### List Referral Links (Admin)
+
+```http
+GET /api/referrals/admin/links?limit=50&offset=0
+Authorization: Bearer ADMIN_TOKEN
+```
+
+### Update Any Link (Admin)
+
+```http
+PUT /api/referrals/admin/links/{code}
+Authorization: Bearer ADMIN_TOKEN
+Content-Type: application/json
+
+{"discount_percent": 20, "enabled": false}
+```
+
+### Referral Attribution
+
+Referral codes are passed via the `x-referral-code` HTTP header during magic link verification. Attribution is one-time on first login only.
+
+### Referral Discounts at Checkout
+
+Referred users with an active discount window (default 30 days) automatically receive a Stripe coupon at checkout. The discount replaces `allow_promotion_codes` on the checkout session.
+
+### Referral Earnings
+
+After a credit purchase by a referred user, earnings are recorded automatically in the Stripe webhook handler. When a referrer's pending balance reaches $20 and they have a Stripe Connect account, a payout is triggered automatically.
+
+## Bulk Mode
+
+Submit up to 100 karaoke jobs at once (by text rows or by album lookup). All
+routes require auth.
+
+### Album lookup (MusicBrainz)
+
+Served entirely from our BigQuery MusicBrainz mirror (`karaoke_decide.mb_*`, rebuilt weekly from the
+official dumps by karaoke-decide's `mb-refresh`); the live MusicBrainz API is never called. `404` = release not in the mirror; `502`
+means the BigQuery lookup failed.
+
+- `GET /api/bulk/album/artists?q=<name>` → `[{mbid,name,disambiguation,type,country,alias}]`. Matches the artist name **or any MusicBrainz alias**, accent- and script-insensitive (`maximo park` → Maxïmo Park, `hikaru utada` → 宇多田ヒカル, `宇多田` and `Мумий` work as typed). `alias` is set when only an alias matched. Ranked exact → prefix → substring, name before alias, then popularity. Reads `karaoke_decide.mb_artists_normalized` + `musicbrainz.artist_alias` (~0.4 GB full scan, ~2 s; 10-min cache)
+- `GET /api/bulk/album/albums?artist_mbid=<mbid>` → `[{release_group_mbid,title,primary_type,secondary_types,first_release_date,is_studio}]` (studio albums first)
+- `GET /api/bulk/album/tracklist?artist=<name>&release_group_mbid=<mbid>` (or `&release_mbid=<mbid>` for a specific edition — also pass its album's `release_group_mbid` so the lookup stays cluster-pruned; optional `&locale=<code>` biases representative-pressing choice) → `{release_mbid,canonical_release_mbid,selected_variant_mbid,title,date,tracks:[{position,title,recording_mbid,length_ms,is_extra,extra_reason,available,brands,versions:[{brand,url}]}],editions:[{release_mbid,title,status,date,country,track_count}],variants:[{representative_release_mbid,label,track_count,year,pressing_count,delta_vs_original}]}`. `variants` collapses the release-group's country pressings into distinct tracklists grouped by track count (label `Original`/`Reissue`, `Original` = earliest); load one via its `representative_release_mbid` as `release_mbid`. Each track is enriched with KaraokeNerds community-version availability — `available`/`brands` plus `versions` (per-version `{brand,url}` YouTube links for clickable preview); enrichment is best-effort and never fatal.
+
+### Availability (text mode)
+
+- `POST /api/bulk/availability` body `{tracks:[{artist,title}]}` (≤100) → `{results:[{artist,title,available,brands,brand_count,versions:[{brand,url}]}]}`. Backed by the existing KaraokeNerds community-version scraper (1h cache, bounded concurrency). `versions` carries per-version YouTube links for clickable preview.
+
+### Submit
+
+- `POST /api/bulk/submit` body `{songs:[{artist,title,display_artist?,display_title?,position?}],settings:{auto_select_if_lossless,is_private,skip_audio_edit,skip_customization},album?:{artist,title,release_group_mbid?,release_mbid?}}` → `{batch_id,job_ids,total}`. Album mode sends `album` + each track's `position`.
+  - Credit gate: requires `credits >= len(songs)` (1/song minimum) before any job is created; admins bypass. Returns `402` with `{credits_available,credits_required}` if short (no jobs created). `422` for 0 or >100 songs.
+  - Creates one parked job per song (`auto_download=False`), stamps `state_data.batch_id` + `bulk_settings` (plus `bulk_album` + `bulk_track_position` for an album batch), and dispatches the `bulk-search-job` Cloud Run Job which runs the searches and either auto-selects a confident lossless match or parks the job in `AWAITING_AUDIO_SELECTION`.
+  - Album batches make **one** flacfetch `POST /search/album` call: each track's file is resolved inside the album's torrents, the whole album is taken from one torrent (the first BEST CHOICE torrent, i.e. lossless, non-vinyl, ≥10 seeders), and each track is auto-selected when that torrent's file names it and the artist matches. Tracks no torrent covers, text batches, and album batches whose album search fails fall back to per-track search, **one search at a time** (flacfetch serializes searches on one worker; parallel requests only time out in its queue).
+
+### Progress
+
+- `GET /api/bulk/{batch_id}` → `{batch_id,total,counts:{searching,awaiting_selection,processing,complete,failed},jobs:[{job_id,artist,title,status,auto_selected}]}`. Ownership-scoped (admins see any); `404` for another user's batch. Parked jobs are completed via the existing `/api/audio-search/{job_id}/select` flow, or recovered
+via `/research` (re-search / edit terms) and `/provide-url` · `/attach-upload-*` (own audio) when a
+search returned nothing usable.
+
+## Webhooks
+
+Stripe webhooks implemented at `/api/users/webhooks/stripe`.
+Job status webhooks not yet implemented.
+
+## Client Telemetry
+
+### Degradation Events
+
+```http
+POST /api/client-events
+```
+
+Unauthenticated, rate-limited (120/min/IP — sized so a many-tab burst from one IP is fully recorded), bot-filtered. The frontend reports every
+user-visible degraded-service surface: `banner_reconnecting`, `banner_unavailable`,
+`banner_waking` (the connectivity banner — reported by `BackendStatusBanner`; `banner_waking`
+is the calm "starting up our karaoke servers" cold-start state), `lyrics_load_failed`
+(review page "temporarily unavailable"), `waveform_slow` / `waveform_failed`
+(Waveforms-mode strips late or missing), and `banner_recovered` (sent once when the
+banner clears; `detail.duration_ms` / `peak_status` / `dismissed`). Body: `{type, url,
+job_id?, locale, release, detail?, device_fingerprint?, tab_id?, episode_id?}` — `detail`
+is size-capped server-side (≤12 keys, ≤200 chars per value); URLs are stored query-stripped.
+
+**Identity (v0.264.0):** the frontend sends its session token as `Authorization: Bearer …`
+when signed in; the server resolves and stores `user_email`, `is_admin`, `is_internal`
+(team domains) and `is_test` (automated-test accounts). A client-sent `user_email` is
+ignored. `device_fingerprint` is the FingerprintJS `visitorId` (same one the magic-link
+abuse checks store), `tab_id` is per browser tab, `episode_id` groups one degradation
+episode (first banner → `banner_recovered`), and `tenant` is derived from the page URL.
+`server_loop_stall` docs (written by the backend's event-loop watchdog, `source: "server"`)
+share the collection; clients can't submit that type (422). Their `detail.requests_affected`
+counts requests that waited on the stall (0 = idle instance; the field is absent on events written before v0.268.5).
+Summary: `python scripts/client_events_report.py [--days N] [--all]`.
+
+Each event emits a structured `client_event type=…` INFO log line and is
+best-effort persisted to the Firestore `client_events` collection (a Firestore
+write failure is logged but still returns `202` — telemetry never errors back to
+the client), so frequency can be reviewed later
+(Firestore aggregation, or Cloud Logging correlated with backend symptoms from the
+same window). Reporter: `frontend/lib/degradation-events.ts` (60s per-type throttle,
+localhost no-op). Added in v0.231.0 — see
+`docs/archive/2026-09-18-concurrent-review-reliability-investigation-and-plan.md`.
+
+Crash reports are the separate `POST /api/client-errors` (error-monitor pipeline).
+
+## KaraokeHunt App Interceptor
+
+### Intake
+
+```http
+POST /api/karaokehunt/request
+```
+
+Unauthenticated intake for song requests from the **retired KaraokeHunt mobile
+app**, forwarded by the Cloudflare Worker on `create.karaokehunt.com` (see
+`infrastructure/cloudflare/karaokehunt-interceptor/`). Gated by the
+`X-KH-Forwarder-Secret` header (Secret Manager `karaokehunt-forwarder-secret`;
+503 while unconfigured) plus a 10/min/IP rate limit (`X-KH-Client-IP` = the
+app's real IP, forwarded by the Worker). Body is parsed leniently (the live
+binary's exact schema is unverifiable): `{email, artist, title, input_url?, …}`.
+
+Each request is logged to Firestore `karaokehunt_requests` and converted
+synchronously (`backend/workers/karaokehunt_conversion.py`). The conversion is
+a **one-time freebie per email address**: a later request through the app gets
+no job/board/credit — just a "please uninstall, use gen.nomadkaraoke.com
+directly" email (throttled to one per 7 days per address; outcome
+`repeat_request`). First-time routing: if a **community karaoke version already
+exists** (KaraokeNerds mirror) no job is made — the email links straight to it
+(outcome `community_existing`; new users keep their credit); otherwise new
+emails get an account + 1 credit (`karaokehunt_app_conversion`) and — while
+under the daily cap — a job created as them (conservative `pick_auto_selection`; unconfident matches park
+in `AWAITING_AUDIO_SELECTION`); existing users with credits get the job on
+their own credit; existing users without credits (or requests over the
+`KARAOKEHUNT_DAILY_JOB_CAP`, default 3/day) go to the community requests board.
+Every email (all variants tell them to uninstall the retired app) is
+`send_karaokehunt_conversion` with a 7-day one-click sign-in link. Always returns `200 {"status": "success"}` — the app
+ignores the response, and failures are retried via the endpoint below.
+
+### Reprocess (Admin)
+
+```http
+POST /api/karaokehunt/internal/reprocess/{doc_id}
+```
+
+Admin-token retry for an intake doc whose `outcome` is `error` (or forcing a
+terminal one). Idempotent: durable markers on the doc (`credit_granted`,
+`job_id`) prevent double credits/jobs.
+
+## kjbox Partner API
+
+Server-to-server API for **kjbox** (the KJ device app at live karaoke nights).
+A singer verifies their email inside the kjbox singer page (never visiting the
+gen website) with a 6-digit emailed code; kjbox then searches audio / creates
+gen jobs **as that real gen user** with the returned session token (sending
+`X-Client-Id: kjbox` on `/api/audio-search/search-standalone` and
+`/api/jobs/create-from-search`), so the singer gets normal gen emails.
+
+Every endpoint requires header `X-Kjbox-Secret` (setting `kjbox_partner_secret`,
+env `KJBOX_PARTNER_SECRET`, Secret Manager `kjbox-partner-secret`):
+`503 {"detail": "not configured"}` while unset (deploys dark), `403` if wrong.
+Code: `backend/api/routes/kjbox.py` + `backend/services/kjbox_partner_service.py`.
+
+**`POST /api/kjbox/catalog/resolve` also accepts karaoke-decide** (the mobile app's search): header
+`X-Partner-Secret` (setting `decide_partner_secret`, env `DECIDE_GEN_PARTNER_SECRET`, Secret Manager
+`decide-gen-partner-secret`). Either secret works there (each only in its own header; `403` otherwise,
+`503` when neither is configured); every other kjbox endpoint stays `X-Kjbox-Secret` only. Both
+partners share the in-process verdict cache (same query, same verdict) but have separate AI-call budgets:
+kjbox 120/min, decide 60/min (`429 rate_limited` when exhausted; cache hits are free). Under
+`FAKE_WORKERS` the verdict is scripted from the global fake config (see TESTING.md § Local stack).
+
+**Quick version:** kjbox jobs also get a draft scrolling-lyrics video a few minutes after the audio
+downloads (see ARCHITECTURE.md § "Quick version"). No new endpoint: poll `GET /api/jobs/{job_id}`
+for `state_data.quick_version.status == "ready"`, then download
+`GET /api/jobs/{job_id}/download/quick/video_mp4` (`… (Quick Version).mp4`).
+
+### Send code
+
+```http
+POST /api/kjbox/auth/send-code
+{"email": "singer@example.com", "locale": "es", "venue": "The Dive Bar"}
+```
+
+→ `200 {"status": "sent"}`. Emails a 6-digit code (10-minute expiry; a new code
+invalidates the previous one). Only an HMAC of the code (peppered with the
+partner secret) is stored, in Firestore `kjbox_login_codes` (doc id =
+sha256(email)). **No gen account is created here** — the venue/locale ride on
+the code record and the account is created at verify-code, so unverified
+addresses can't burn the signup cap or get accounts made for them. The
+welcome-credit AI evaluation is precomputed onto the code record so verify is
+instant.
+
+- Disposable domain → `422` (same detail as magic links); blocked email/IP →
+  silently `200 {"status": "sent"}`; malformed email → `422 {"detail": "invalid_email"}`.
+- Max `KJBOX_CODES_PER_EMAIL_PER_HOUR` (default 5) codes per email per rolling
+  hour → `429 {"detail": "too_many_codes"}`. The check, the send-time append and
+  the code write are one Firestore transaction (parallel requests can't exceed
+  it; a transaction giving up under contention also returns this 429).
+
+### Verify code
+
+```http
+POST /api/kjbox/auth/verify-code
+{"email": "singer@example.com", "code": "042917"}
+```
+
+→ `200 {"session_token", "user": <UserPublic, same shape as magic-link verify>,
+"credits_granted": int, "credit_status": str}`. If the email has no gen account
+yet, this is where it is created, with `signup_source="kjbox"` + `signup_venue`
+(no `signup_ip` — the caller's IP is the whole venue's). gen's per-IP signup cap
+does **not** apply; instead max `KJBOX_SIGNUP_CAP_PER_24H` (default 100) new
+**verified** accounts per rolling 24h partner-wide (counted in `kjbox_signups`)
+→ `429 {"detail": "signup_cap"}`, checked before the code is consumed (existing
+users are never capped). Then runs the same post-verification
+steps as `GET /api/users/auth/verify` (shared helper `complete_verified_login`):
+email verified + last login, welcome credit (with the precomputed eval), locale
+persistence (from the send-code `locale`), a normal gen session, and the welcome
+email on first login.
+
+Errors: wrong code → `401 {"detail": "invalid_code"}` (counts an attempt);
+missing/expired/already-used → `401 {"detail": "expired"}`; more than 5 attempts
+→ `429 {"detail": "too_many_attempts"}` and the code is burned. Attempts are an
+atomic increment before a constant-time compare; single use is enforced by a
+create()-only marker in `kjbox_login_code_uses`.
+
+### Google / Apple sign-in (one tap)
+
+```http
+POST /api/kjbox/auth/google      (or /api/kjbox/auth/apple)
+{"id_token": "<Google Identity Services / Sign in with Apple JS ID token>", "locale": "es", "venue": "The Dive Bar"}
+```
+
+→ the same `200` body as verify-code, with no code: the provider has proven the
+email. The token is checked by the same `_verify_identity` as
+`POST /api/users/auth/google|apple` (audiences `GOOGLE_OAUTH_CLIENT_IDS` /
+`APPLE_SIGNIN_AUDIENCES`, which must include the web Services ID used on
+sing.nomadkaraoke.com; `fake:<email>` tokens on the local stack only). The
+venue rules match verify-code: no per-IP signup cap, `KJBOX_SIGNUP_CAP_PER_24H`
+on new accounts (`429 {"detail": "signup_cap"}`), `signup_source="kjbox"` +
+`signup_venue`, no `signup_ip`. Apple "Hide My Email" relay addresses are
+their own account (and never count as disposable). The send-code eligibility
+checks apply, explicitly: disposable domain → `422` (magic-link detail);
+blocked email or IP → `422 {"detail": "sign_in_not_allowed"}`. Errors: `401 {"detail": "invalid_token"}`,
+`503 google_not_configured` / `identity_provider_unavailable`.
+
+### Show credit ("free at the show")
+
+```http
+POST /api/kjbox/credits/show-credit
+Authorization: Bearer <singer session_token>
+{"idempotency_key": "<sha256 hex>", "venue": "The Dive Bar", "only_if_empty": false}
+```
+
+→ `200 {"granted": bool, "credits": int}`. Quietly adds 1 credit (reason
+`kjbox show credit`, **no** credits-added email) so the make-it job is paid for
+by Nomad.
+
+- `only_if_empty` (default `false`): grant only if the user's balance is < 1.
+- `idempotency_key` (≤128 chars) is claimed **only when a credit is actually
+  granted** (stored in `kjbox_show_credits`), so kjbox can call with
+  `only_if_empty=true` at search time and again with the SAME key and
+  `only_if_empty=false` at job creation: the second call grants only if the
+  first didn't. A repeat of an already-granting key returns `granted: false`
+  with the current balance.
+- Max `KJBOX_SHOW_CREDITS_PER_USER_PER_24H` (default 5) grants per user per
+  rolling 24h → `429 {"detail": "show_credit_cap"}` (non-grants don't count).
+- Idempotency check, only-if-empty check, cap check, key claim and the credit
+  increment are one Firestore transaction; if it gives up under contention →
+  `409 {"detail": "busy_retry"}` (nothing written — retry with the same key).
+- Missing/invalid session → `401 {"detail": "invalid_session"}`.
+
+### Singer search auto-correct
+
+```http
+POST /api/kjbox/catalog/resolve
+X-Kjbox-Secret: <partner secret>
+{"query": "rihanna push up on me"}
+→ {"kind": "cosmetic", "confident": true, "typed_artist": "rihanna", "typed_title": "push up on me",
+   "canonical_artist": "Rihanna", "canonical_title": "Push Up On Me", "alternatives": [],
+   "engine": "catalog", "reason": "catalog match"}
+```
+
+Gives a singer's one-line search the same tidy as the job form's
+AudioSourceStep ("Tidied to …" / "Corrected to …"). Two steps
+(`backend/services/match_judge/free_text.py`, `resolve_and_tidy`):
+
+1. **Split + typo fix** — one small Gemini call splits the free text into
+   artist/title and corrects typos (the catalog can't parse a one-line query:
+   decide's track search finds nothing for "rihanna push up on me").
+2. **Catalog tidy** — the chosen song (the AI's canonical pick, or its typed
+   split when it didn't recognise the song) goes through the job flow's own
+   `judge_match(stage="fast")`. A confident catalog match wins: its formatting
+   becomes `canonical_*`, `engine: "catalog"`, kind `cosmetic` when the query
+   already named that song (only casing/punctuation/word order differ), else
+   `content`. No catalog match → the AI verdict, but a confident answer that neither the
+   catalogue nor live Spotify confirms comes back `confident: false` (grounding rule, above).
+   A tidy that timed out keeps the AI verdict with reason `unavailable` (not cached).
+
+**Step 0 (v0.294.0): live Spotify.** Before Gemini, the raw query goes to live Spotify (3 s cap).
+A result whose artist + title *is* the query (either order, after normalising) is answered
+directly: `cosmetic`, `engine: "catalog"`, reason `live Spotify match`. Otherwise the results go to
+Gemini as candidates ("use the listed song's exact artist and title; never 'correct' to a more
+familiar title").
+
+kind `none` keeps the AI's `typed_artist`/`typed_title` split when it has one
+(kjbox pre-fills its make-it form with it). kjbox calls this only when its own
+catalogue search is empty. Model trouble → `kind: "none"` (never 5xx). Results
+are cached per case-folded query (in-process, 2000 entries); calls are capped
+partner-wide at 120/min per instance (`429 rate_limited`; cache hits are free).
+
+### Review emails for kjbox jobs
+
+Jobs whose `request_metadata.client_id` starts with `kjbox` get a **one-click
+sign-in link** (magic-link token, purpose `job_review:<job_id>`, 72h, single use)
+in the review-needed email and the 24h review reminder instead of the bare
+review URL — these singers have never signed in on the gen website. Other jobs
+are unchanged.
+
+```http
+POST /api/kjbox/jobs/{job_id}/review-link
+X-Kjbox-Secret: <partner secret>
+Authorization: Bearer <singer session_token>
+{"locale": "es"}   → {"url": "...", "status": "in_review", "review_started_by": "admin"}
+```
+
+The same one-click review sign-in link, minted on demand for the kjbox singer
+page's "Tap here to review it yourself". Only the job's owner gets one (`404
+not_found` otherwise, also for unknown ids) and only while the job is
+`awaiting_review` / `in_review` (`409 not_in_review`).
+
+`review_started_by` (also `job.state_data.review_started_by`, with
+`review_started_at`) records who opened the review first — set on the
+`awaiting_review → in_review` transition: `"admin"` if an admin other than the
+owner (the KJ) opened it, else `"owner"` (incl. review-token links).
+
+Note: `request_metadata.custom_headers` (all `X-*` request headers, returned to
+the job owner by `GET /api/jobs/{id}`) stores credential-looking headers
+(names containing secret/token/key/auth/password/…) as `"[redacted]"`.
+
+### Vocals Peaks (Waveforms review mode)
+
+```http
+GET /api/review/{job_id}/vocals-peaks?peaks_per_second=400
+```
+
+Pre-computed max-abs peak envelope of the vocal stem:
+`{peaks_b64, encoding: "u8", peaks_per_second, duration_seconds}` — base64 of one
+uint8 per 1/400s bucket (~150 KB for a 5-minute track). Replaces the frontend's
+download+decode of the whole vocals OGG so Waveforms-mode strips paint sub-second.
+Served from a persistent GCS cache (`review-audio/vocals_peaks_{pps}.json`,
+validated against the stem path), pre-computed by `screens_worker`; a miss computes
+off the event loop under the shared waveform semaphore. Returns `202 Retry-After: 15`
+while audio separation is still producing the stem. Auth like `/audio/vocals`
+(`?token=` / `?review_token=`). The frontend falls back to the full audio decode if
+this endpoint fails (`VocalsAudioDataLoader`). Added in v0.232.0.

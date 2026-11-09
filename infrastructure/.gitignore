@@ -1,0 +1,19 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Ignore virtual environment
+venv/
+env/
+ENV/
+
+# Ignore Pulumi local files (state is in Pulumi Cloud)
+.pulumi/
+
+# But don't ignore Pulumi.yaml or stack configs
+!Pulumi.yaml
+!Pulumi.*.yaml
+

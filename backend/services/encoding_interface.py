@@ -1,0 +1,644 @@
+"""
+Encoding Interface.
+
+Defines the abstract interface for video encoding backends, allowing
+the video worker orchestrator to use either GCE or local encoding
+interchangeably.
+
+This follows the Strategy pattern - different encoding implementations
+can be swapped without changing the orchestration logic.
+"""
+
+import logging
+import os
+import re
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, TypedDict
+
+from backend.services.encoding_errors import EncodingJobLostError
+
+logger = logging.getLogger(__name__)
+
+
+class GceEncodeResponse(TypedDict, total=False):
+    """Typed schema for the raw response the GCE encoding worker returns from
+    ``encode_videos`` (forwarded up from ``wait_for_completion`` /
+    ``submit_encoding_job``).
+
+    This is the *single shared definition* of the encode→publish seam contract:
+    both the producer (``EncodingService.encode_videos``) and the consumer
+    (``GCEEncodingBackend.encode``) annotate against it, so the shape can't
+    silently drift between caller and callee. Mock drift on exactly this shape
+    is what hid NOMAD-1632's Failure B (the "empty output_files" / stale-cache
+    case was never in any test corpus). Golden fixtures under
+    ``backend/tests/fixtures/encoding/`` are validated against this schema.
+
+    Keys (``total=False`` — the worker omits most of them on the happy path):
+    - ``status``: terminal/intermediate job state, e.g. ``"complete"``,
+      ``"failed"``, ``"running"``, ``"pending"``. ``encode_videos`` normalises a
+      cached hit to ``"complete"``.
+    - ``output_files``: GCS paths to the encoded finals, classified by
+      :func:`classify_encoded_output`. The worker returns a **list**; a few
+      legacy/short-name paths arrive as a ``dict`` keyed by format token, which
+      ``encode`` still tolerates. **May be an empty list** on a stale/cached job
+      whose finals were deleted from GCS — a *recoverable* condition, NOT a
+      partial/defective result (see the completeness guard in ``encode``).
+    - ``progress``: 0–100 while running.
+    - ``error``: present when ``status == "failed"``.
+    """
+
+    status: str
+    output_files: List[str]
+    progress: int
+    error: str
+
+
+def classify_encoded_output(filename: str) -> Optional[str]:
+    """Classify a GCE-encoded output file by format, robust to artist/title text.
+
+    GCE finals are named ``<artist> - <title> (<format tag>).<ext>``, e.g.
+    ``Nat King Cole - Portrait of Jennie (Final Karaoke Lossy 720p).mp4``. The
+    format is entirely in the trailing parenthetical, so we match on THAT tag only
+    — never the whole filename. Matching the whole filename is what caused the
+    NOMAD-1632 gap: the title "Portrait of Jennie" contains "portrait", so the
+    720p master matched the portrait-video branch (checked before "720p") and was
+    never mapped to ``mp4_720p`` — it published to MP4/ + CDG/ with no 720p, and
+    only the daily GDrive validator caught it. Any song whose artist/title contains
+    a format word ("portrait", "720p", "4k", "lossless", "vocals", …) hit the same
+    class of bug.
+
+    Returns a canonical token or ``None`` if the file isn't a recognised final:
+    ``mp4_4k_lossless``, ``mkv_4k``, ``mp4_4k_lossy``, ``mp4_720p``,
+    ``portrait_mp4``, ``with_vocals_mp4``, ``title_mov``, ``end_mov``,
+    ``cdg_zip``, ``txt_zip``.
+    """
+    name = os.path.basename(filename)
+    stem, ext = os.path.splitext(name)
+    ext = ext.lower()
+
+    # System-generated short canonical names, e.g. jobs/{id}/finals/lossy_720p_mp4.mp4
+    # (uploaded by _upload_results) and packages/cdg_zip.zip. They carry no artist/title
+    # text, so an exact-stem match is unambiguous — and the redistribution flow reads
+    # these back from GCS. Checked first so the underscore forms don't fall through.
+    # (stem, ext) so a mismatched extension can't slip a stray file into a slot.
+    short_name = {
+        ("lossless_4k_mp4", ".mp4"): "mp4_4k_lossless",
+        ("lossless_4k_mkv", ".mkv"): "mkv_4k",
+        ("lossy_4k_mp4", ".mp4"): "mp4_4k_lossy",
+        ("lossy_720p_mp4", ".mp4"): "mp4_720p",
+        ("portrait_1080x1920", ".mp4"): "portrait_mp4",
+        ("cdg_zip", ".zip"): "cdg_zip",
+        ("txt_zip", ".zip"): "txt_zip",
+    }.get((stem.lower(), ext))
+    if short_name:
+        return short_name
+
+    # Otherwise the format tag is the LAST parenthetical group before the extension.
+    # A file without that parenthetical isn't a recognised final. Every branch also
+    # pins the expected extension, so a stray file whose artist/title happens to
+    # contain a format word (e.g. "Artist 720p notes.txt") can't be misclassified
+    # into a slot and then falsely satisfy the completeness guard.
+    match = re.search(r"\(([^()]*)\)[^()]*$", name)
+    if not match:
+        return None
+    tag = match.group(1).lower()
+
+    if "720p" in tag and ext == ".mp4":
+        return "mp4_720p"
+    if ("portrait" in tag or "1080x1920" in tag) and ext == ".mp4":
+        return "portrait_mp4"
+    if "lossless 4k" in tag:
+        if ext == ".mkv":
+            return "mkv_4k"
+        if ext == ".mp4":
+            return "mp4_4k_lossless"
+        return None
+    if "lossy 4k" in tag and ext == ".mp4":
+        return "mp4_4k_lossy"
+    if "with vocals" in tag and ext == ".mp4":
+        return "with_vocals_mp4"
+    if tag == "title" and ext == ".mov":
+        return "title_mov"
+    if tag == "end" and ext == ".mov":
+        return "end_mov"
+    if "cdg" in tag and ext == ".zip":
+        return "cdg_zip"
+    if "txt" in tag and ext == ".zip":
+        return "txt_zip"
+    return None
+
+
+@dataclass
+class EncodingInput:
+    """
+    Input configuration for video encoding.
+
+    Contains all the paths and metadata needed to encode a karaoke video.
+    """
+    # Required input files
+    title_video_path: Optional[str]  # Title card video (MOV); None = theme omits it
+    karaoke_video_path: str  # Main karaoke video with vocals (MOV/MKV)
+    instrumental_audio_path: str  # Instrumental audio track (FLAC)
+
+    # Optional input files
+    end_video_path: Optional[str] = None  # End credits video (MOV)
+
+    # Metadata for output naming
+    artist: str = ""
+    title: str = ""
+    brand_code: Optional[str] = None
+
+    # Output directory
+    output_dir: str = ""
+
+    # Instrumental selection (clean, with_backing, or custom)
+    instrumental_selection: str = "clean"
+
+    # Additional options
+    options: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EncodingOutput:
+    """
+    Output from video encoding.
+
+    Contains paths to all generated video files and status information.
+    """
+    success: bool
+    error_message: Optional[str] = None
+
+    # Output file paths (relative to output_dir or absolute)
+    karaoke_mp4_path: Optional[str] = None  # Karaoke video with instrumental audio
+    with_vocals_mp4_path: Optional[str] = None  # With vocals MP4 version
+    lossless_4k_mp4_path: Optional[str] = None  # Final lossless 4K MP4
+    lossy_4k_mp4_path: Optional[str] = None  # Final lossy 4K MP4
+    lossless_mkv_path: Optional[str] = None  # MKV with FLAC (for YouTube)
+    lossy_720p_mp4_path: Optional[str] = None  # 720p web version
+
+    # Standalone 5-second screen videos generated from the title/end images.
+    # Kept so they land in the Dropbox folder (regression after #647/#650 moved
+    # screen generation to the encoder). Not used downstream.
+    title_mov_path: Optional[str] = None  # "<artist> - <title> (Title).mov"
+    end_mov_path: Optional[str] = None  # "<artist> - <title> (End).mov"
+
+    # Portrait (9:16) karaoke video for phone viewing / social sharing. Additive;
+    # distributed to GCS + Dropbox only (never Drive/YouTube). May be absent when the
+    # portrait render is disabled or fails (it is best-effort).
+    portrait_mp4_path: Optional[str] = None  # "<artist> - <title> (Final Karaoke Portrait 1080x1920).mp4"
+
+    # All output files as a dict for convenience
+    output_files: Dict[str, str] = field(default_factory=dict)
+
+    # Encoding metadata
+    encoding_time_seconds: Optional[float] = None
+    encoding_backend: Optional[str] = None  # "gce" or "local"
+
+
+class EncodingBackend(ABC):
+    """
+    Abstract base class for video encoding backends.
+
+    Implementations:
+    - GCEEncodingBackend: Cloud-based encoding using Google Compute Engine
+    - LocalEncodingBackend: Local FFmpeg-based encoding
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Return the name of this encoding backend."""
+        pass
+
+    @abstractmethod
+    async def encode(self, input_config: EncodingInput) -> EncodingOutput:
+        """
+        Encode video files according to the input configuration.
+
+        This method should:
+        1. Create karaoke video with instrumental audio
+        2. Convert with-vocals video to MP4 if needed
+        3. Encode lossless 4K MP4 (concatenating title + karaoke + end)
+        4. Encode lossy 4K MP4 with AAC audio
+        5. Create MKV with FLAC audio for YouTube
+        6. Encode 720p version for web
+
+        Args:
+            input_config: EncodingInput with all required paths and options
+
+        Returns:
+            EncodingOutput with paths to generated files and status
+        """
+        pass
+
+    @abstractmethod
+    async def is_available(self) -> bool:
+        """
+        Check if this encoding backend is available and configured.
+
+        Returns:
+            True if the backend can be used, False otherwise
+        """
+        pass
+
+    @abstractmethod
+    async def get_status(self) -> Dict[str, Any]:
+        """
+        Get the current status of the encoding backend.
+
+        Returns:
+            Dict with status information (availability, queue length, etc.)
+        """
+        pass
+
+
+class LocalEncodingBackend(EncodingBackend):
+    """
+    Local FFmpeg-based encoding backend.
+
+    Wraps the LocalEncodingService to implement the EncodingBackend interface.
+    Uses asyncio.to_thread() to run synchronous FFmpeg operations asynchronously.
+    """
+
+    def __init__(
+        self,
+        dry_run: bool = False,
+        logger: Optional[logging.Logger] = None,
+    ):
+        """
+        Initialize the local encoding backend.
+
+        Args:
+            dry_run: If True, log operations without executing
+            logger: Optional logger instance
+        """
+        self.dry_run = dry_run
+        self.logger = logger or logging.getLogger(__name__)
+        self._service = None
+
+    @property
+    def name(self) -> str:
+        return "local"
+
+    def _get_service(self):
+        """Lazy-load the local encoding service."""
+        if self._service is None:
+            from backend.services.local_encoding_service import LocalEncodingService
+            self._service = LocalEncodingService(
+                dry_run=self.dry_run,
+                logger=self.logger
+            )
+        return self._service
+
+    async def encode(self, input_config: EncodingInput) -> EncodingOutput:
+        """
+        Encode video using local FFmpeg.
+
+        Args:
+            input_config: Encoding input configuration
+
+        Returns:
+            EncodingOutput with results
+        """
+        import asyncio
+        import time
+        from backend.services.local_encoding_service import EncodingConfig
+
+        start_time = time.time()
+
+        # Build output file paths
+        base_name = f"{input_config.artist} - {input_config.title}"
+        output_dir = input_config.output_dir or "."
+
+        import os
+        config = EncodingConfig(
+            title_video=input_config.title_video_path,
+            karaoke_video=input_config.karaoke_video_path,
+            instrumental_audio=input_config.instrumental_audio_path,
+            end_video=input_config.end_video_path,
+            output_karaoke_mp4=os.path.join(output_dir, f"{base_name} (Karaoke).mp4"),
+            output_with_vocals_mp4=os.path.join(output_dir, f"{base_name} (With Vocals).mp4"),
+            output_lossless_4k_mp4=os.path.join(output_dir, f"{base_name} (Final Karaoke Lossless 4k).mp4"),
+            output_lossy_4k_mp4=os.path.join(output_dir, f"{base_name} (Final Karaoke Lossy 4k).mp4"),
+            output_lossless_mkv=os.path.join(output_dir, f"{base_name} (Final Karaoke Lossless 4k).mkv"),
+            output_720p_mp4=os.path.join(output_dir, f"{base_name} (Final Karaoke Lossy 720p).mp4"),
+            countdown_padding_seconds=input_config.options.get("countdown_padding_seconds"),
+        )
+
+        # Run encoding in thread pool to avoid blocking
+        service = self._get_service()
+        result = await asyncio.to_thread(service.encode_all_formats, config)
+
+        encoding_time = time.time() - start_time
+
+        if result.success:
+            return EncodingOutput(
+                success=True,
+                karaoke_mp4_path=config.output_karaoke_mp4,
+                with_vocals_mp4_path=config.output_with_vocals_mp4,
+                lossless_4k_mp4_path=config.output_lossless_4k_mp4,
+                lossy_4k_mp4_path=config.output_lossy_4k_mp4,
+                lossless_mkv_path=config.output_lossless_mkv,
+                lossy_720p_mp4_path=config.output_720p_mp4,
+                output_files=result.output_files,
+                encoding_time_seconds=encoding_time,
+                encoding_backend=self.name
+            )
+        else:
+            return EncodingOutput(
+                success=False,
+                error_message=result.error,
+                output_files=result.output_files,
+                encoding_time_seconds=encoding_time,
+                encoding_backend=self.name
+            )
+
+    async def is_available(self) -> bool:
+        """Check if local encoding is available (FFmpeg installed)."""
+        import subprocess
+        import asyncio
+
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-version"],
+                capture_output=True,
+                timeout=10
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    async def get_status(self) -> Dict[str, Any]:
+        """Get local encoding status."""
+        available = await self.is_available()
+        service = self._get_service()
+
+        return {
+            "backend": self.name,
+            "available": available,
+            "hwaccel_available": service.hwaccel_available if available else False,
+            "video_encoder": service.video_encoder if available else None,
+        }
+
+
+class GCEEncodingBackend(EncodingBackend):
+    """
+    GCE-based encoding backend.
+
+    Wraps the existing EncodingService to implement the EncodingBackend interface.
+    Submits jobs to a remote GCE worker for high-performance encoding.
+    """
+
+    def __init__(
+        self,
+        dry_run: bool = False,
+        logger: Optional[logging.Logger] = None,
+    ):
+        """
+        Initialize the GCE encoding backend.
+
+        Args:
+            dry_run: Ignored for GCE backend (remote service doesn't support dry run)
+            logger: Optional logger instance
+        """
+        self.dry_run = dry_run  # Stored but not used (GCE is remote)
+        self.logger = logger or logging.getLogger(__name__)
+        self._service = None
+
+    @property
+    def name(self) -> str:
+        return "gce"
+
+    def _get_service(self):
+        """Lazy-load the GCE encoding service."""
+        if self._service is None:
+            from backend.services.encoding_service import get_encoding_service
+            self._service = get_encoding_service()
+        return self._service
+
+    async def encode(self, input_config: EncodingInput) -> EncodingOutput:
+        """
+        Encode video using GCE worker.
+
+        Note: GCE encoding requires files to be in GCS, so this method
+        expects input_config.options to contain 'input_gcs_path' and
+        'output_gcs_path'.
+
+        Args:
+            input_config: Encoding input configuration
+
+        Returns:
+            EncodingOutput with results
+        """
+        import time
+
+        start_time = time.time()
+        service = self._get_service()
+
+        # GCE requires GCS paths
+        input_gcs_path = input_config.options.get("input_gcs_path")
+        output_gcs_path = input_config.options.get("output_gcs_path")
+        job_id = input_config.options.get("job_id", input_config.brand_code or "unknown")
+
+        if not input_gcs_path or not output_gcs_path:
+            return EncodingOutput(
+                success=False,
+                error_message="GCE encoding requires input_gcs_path and output_gcs_path in options",
+                encoding_backend=self.name
+            )
+
+        try:
+            # Build encoding config
+            encoding_config = {
+                "formats": ["mp4_4k_lossless", "mp4_4k_lossy", "mkv_4k", "mp4_720p"],
+                "artist": input_config.artist,
+                "title": input_config.title,
+                "instrumental_selection": input_config.instrumental_selection,
+            }
+
+            # Add countdown padding if present (for audio sync with countdown-padded vocals)
+            # User-supplied instrumental: the encoder downloads it from uploads/
+            # and matches it by name regardless of extension (wav, m4a, ...).
+            existing_instrumental = input_config.options.get("existing_instrumental")
+            if existing_instrumental:
+                encoding_config["existing_instrumental"] = existing_instrumental
+
+            # Screens the theme leaves out: the encoder must skip them rather than
+            # rebuild them from whatever matching PNG it finds in the job folder.
+            # On the AWS box the video worker sits next to the encoder: ask it
+            # to keep local copies so we take them instead of downloading back
+            # from GCS (local_encoded_outputs). Unset everywhere else.
+            if os.environ.get("LOCAL_ENCODED_OUTPUTS_DIR"):
+                encoding_config["stash_local_outputs"] = True
+
+            for flag in ("include_title_screen", "include_end_screen"):
+                if input_config.options.get(flag) is False:
+                    encoding_config[flag] = False
+
+            countdown_padding = input_config.options.get("countdown_padding_seconds")
+            if countdown_padding:
+                encoding_config["countdown_padding_seconds"] = countdown_padding
+                self.logger.info(f"GCE encoding with countdown_padding_seconds={countdown_padding}")
+
+            # Submit and wait for completion
+            result = await service.encode_videos(
+                job_id=job_id,
+                input_gcs_path=input_gcs_path,
+                output_gcs_path=output_gcs_path,
+                encoding_config=encoding_config,
+            )
+
+            encoding_time = time.time() - start_time
+
+            # Extract output file paths from result
+            # Handle case where GCE worker returns a list or unexpected format
+            if isinstance(result, list):
+                # If result is a list, try to find the output_files in the first dict
+                self.logger.warning(f"GCE returned list instead of dict: {result}")
+                result = result[0] if result and isinstance(result[0], dict) else {}
+            if not isinstance(result, dict):
+                self.logger.error(f"Unexpected GCE result type: {type(result)}")
+                result = {}
+            raw_output_files = result.get("output_files", {})
+
+            # Convert output_files from list of paths to dict
+            # GCE worker returns list like: ["path/Artist - Title (Final Karaoke Lossless 4k).mp4", ...]
+            # We need dict like: {"mp4_4k_lossless": "path/...", "mp4_720p": "path/..."}
+            if isinstance(raw_output_files, list):
+                output_files = {}
+                # Classify each returned final by its format tag (the trailing
+                # parenthetical), NOT the whole filename — see classify_encoded_output.
+                # Matching the whole filename misfiled the 720p of "Portrait of Jennie"
+                # as the portrait video (NOMAD-1632).
+                for path in raw_output_files:
+                    if not isinstance(path, str):
+                        continue
+                    key = classify_encoded_output(path)
+                    if key:
+                        output_files[key] = path
+                self.logger.info(f"Converted output_files list to dict: {output_files}")
+            else:
+                output_files = raw_output_files if isinstance(raw_output_files, dict) else {}
+
+            # Completeness guard (defense-in-depth): a worker that returns SOME formats
+            # but not every one we requested — the title-collision mapping bug that
+            # dropped the 720p (NOMAD-1632, fixed above by classify_encoded_output), a
+            # stale-wheel fallback VM, or an output lost before the worker's
+            # glob/upload — must NOT sail through to distribution and publish an
+            # incomplete public release, leaving a sequence gap the daily GDrive
+            # validator only flags ~24h later. Fail loud so the orchestrator errors the
+            # job (retried on a healthy worker) and the alert fires immediately.
+            #
+            # IMPORTANT: only fire on a PARTIAL result. An EMPTY output_files means the
+            # worker returned nothing at all — typically a stale GCE job cache whose
+            # finals were deleted from GCS (admin reset / re-run). That is a normal,
+            # recoverable condition the orchestrator already handles: it downloads zero
+            # files, raises a "stale" RuntimeError from _download_gce_encoded_files, and
+            # re-encodes under a fresh job id. Guarding the empty case here would
+            # short-circuit that recovery and hard-fail real jobs (regression fixed in
+            # v0.222.3).
+            requested_formats = encoding_config.get("formats", [])
+            missing_formats = [f for f in requested_formats if not output_files.get(f)]
+            if output_files and missing_formats:
+                error_message = (
+                    f"Encoder returned an incomplete result: missing {missing_formats} "
+                    f"(requested {requested_formats}, got {sorted(output_files.keys())}). "
+                    "Refusing to publish a partial release."
+                )
+                self.logger.error(f"[job:{job_id}] {error_message}")
+                return EncodingOutput(
+                    success=False,
+                    error_message=error_message,
+                    output_files=output_files,
+                    encoding_time_seconds=encoding_time,
+                    encoding_backend=self.name,
+                )
+
+            return EncodingOutput(
+                success=True,
+                lossless_4k_mp4_path=output_files.get("mp4_4k_lossless"),
+                lossy_4k_mp4_path=output_files.get("mp4_4k_lossy"),
+                lossless_mkv_path=output_files.get("mkv_4k"),
+                lossy_720p_mp4_path=output_files.get("mp4_720p"),
+                with_vocals_mp4_path=output_files.get("with_vocals_mp4"),
+                title_mov_path=output_files.get("title_mov"),
+                end_mov_path=output_files.get("end_mov"),
+                portrait_mp4_path=output_files.get("portrait_mp4"),
+                output_files=output_files,
+                encoding_time_seconds=encoding_time,
+                encoding_backend=self.name
+            )
+
+        except EncodingJobLostError:
+            # The worker lost this job mid-run (OOM/deploy restart). This is
+            # recoverable by resubmitting a fresh job id, so let the orchestrator
+            # decide — do NOT flatten it into success=False (which would fail the
+            # whole render). See video_worker_orchestrator's resubmit wrapper.
+            raise
+        except Exception as e:
+            encoding_time = time.time() - start_time
+            self.logger.error(f"GCE encoding failed: {e}")
+            return EncodingOutput(
+                success=False,
+                error_message=str(e),
+                encoding_time_seconds=encoding_time,
+                encoding_backend=self.name
+            )
+
+    async def is_available(self) -> bool:
+        """Check if GCE encoding is available and configured."""
+        service = self._get_service()
+        return service.is_enabled
+
+    async def get_status(self) -> Dict[str, Any]:
+        """Get GCE encoding status."""
+        service = self._get_service()
+
+        status = {
+            "backend": self.name,
+            "available": service.is_enabled,
+            "configured": service.is_configured,
+        }
+
+        if service.is_configured:
+            try:
+                health = await service.health_check()
+                status["health"] = health
+            except Exception as e:
+                status["health_error"] = str(e)
+
+        return status
+
+
+# Factory function to get an encoding backend
+def get_encoding_backend(
+    backend_type: str = "auto",
+    **kwargs
+) -> EncodingBackend:
+    """
+    Get an encoding backend instance.
+
+    Args:
+        backend_type: Type of backend - "local", "gce", or "auto"
+        **kwargs: Additional arguments for the backend
+
+    Returns:
+        EncodingBackend instance
+
+    Raises:
+        ValueError: If backend_type is unknown
+    """
+    if backend_type == "local":
+        return LocalEncodingBackend(**kwargs)
+    elif backend_type == "gce":
+        return GCEEncodingBackend(**kwargs)
+    elif backend_type == "auto":
+        # Check if GCE is available, otherwise use local
+        gce_backend = GCEEncodingBackend(**kwargs)
+        if gce_backend._get_service().is_enabled:
+            return gce_backend
+        return LocalEncodingBackend(**kwargs)
+    else:
+        raise ValueError(f"Unknown encoding backend type: {backend_type}")

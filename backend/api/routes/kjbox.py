@@ -1,0 +1,625 @@
+"""kjbox partner API — singer email-code sign-in + "free at the show" credits.
+
+kjbox (the KJ device app at live karaoke nights) lets a patron verify their
+email inside the kjbox singer web page, then creates gen jobs AS that real gen
+user (with the returned session token) so they get normal gen delivery emails.
+
+Every endpoint requires ``X-Kjbox-Secret`` (503 until ``KJBOX_PARTNER_SECRET``
+is configured — deploys dark; 403 if wrong). Contract:
+
+- POST /api/kjbox/auth/send-code    {email, locale?, venue?} → {"status": "sent"}
+- POST /api/kjbox/auth/verify-code  {email, code} → {session_token, user,
+                                     credits_granted, credit_status}
+- POST /api/kjbox/auth/google | apple {id_token, locale?, venue?} → same as
+                                     verify-code (one-tap sign-in in the singer page)
+- POST /api/kjbox/credits/show-credit (+ Authorization: Bearer <session>)
+                                     {idempotency_key, venue?, only_if_empty?}
+                                     → {granted, credits}
+
+A venue is many singers behind one IP, so gen's 2-signups-per-IP cap does NOT
+apply here; instead a partner-wide rolling-24h cap on new VERIFIED accounts
+(accounts are only created at verify-code), a per-email code throttle, and a
+per-user daily show-credit cap bound abuse.
+"""
+from __future__ import annotations
+
+import asyncio
+import hmac
+import logging
+import threading
+from datetime import datetime
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
+
+from backend.api.routes.users import (
+    _build_user_public,
+    _mask_email,
+    _precompute_credit_eval,
+    complete_verified_login,
+)
+from backend.config import get_settings, is_production
+from backend.i18n import SUPPORTED_LOCALES, t
+from backend.services.account_deletion_service import (
+    AccountDeletionService,
+    get_account_deletion_service,
+)
+from backend.services.email_service import EmailService, get_email_service
+from backend.services.email_validation_service import get_email_validation_service
+from backend.services.kjbox_partner_service import (
+    CODE_EXPIRY_MINUTES,
+    LOGIN_CODES_COLLECTION,
+    KjboxPartnerService,
+    CodeThrottled,
+    ShowCreditCapReached,
+    TransactionContention,
+    VerifyOutcome,
+)
+from backend.services.user_service import UserService, get_user_service
+from backend.utils.request_helpers import get_client_ip
+from backend.utils.test_data import is_test_email
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/kjbox", tags=["kjbox"])
+
+SIGNUP_SOURCE = "kjbox"
+_MAX_EMAIL_LEN = 254
+_MAX_VENUE_LEN = 200
+
+
+# ------------------------------------------------------------------ auth gate
+
+def require_kjbox_partner(x_kjbox_secret: Optional[str] = Header(default=None)) -> str:
+    """Shared-secret gate. Returns the secret (also used as the code-hash pepper)."""
+    secret = get_settings().kjbox_partner_secret
+    if not secret:
+        raise HTTPException(status_code=503, detail="not configured")
+    if not hmac.compare_digest((x_kjbox_secret or "").encode(), secret.encode()):
+        raise HTTPException(status_code=403, detail="forbidden")
+    return secret
+
+
+def require_resolve_partner(
+    x_kjbox_secret: Optional[str] = Header(default=None),
+    x_partner_secret: Optional[str] = Header(default=None),
+) -> str:
+    """Gate for ``catalog/resolve``: kjbox (``X-Kjbox-Secret``) or karaoke-decide
+    (``X-Partner-Secret``). Returns the partner name ("kjbox" / "decide"), which
+    picks the rate-budget bucket. 503 when neither secret is configured."""
+    settings = get_settings()
+    kjbox_secret = settings.kjbox_partner_secret
+    decide_secret = getattr(settings, "decide_partner_secret", "")
+    if not kjbox_secret and not decide_secret:
+        raise HTTPException(status_code=503, detail="not configured")
+    if kjbox_secret and x_kjbox_secret and hmac.compare_digest(
+            x_kjbox_secret.encode(), kjbox_secret.encode()):
+        return "kjbox"
+    if decide_secret and x_partner_secret and hmac.compare_digest(
+            x_partner_secret.encode(), decide_secret.encode()):
+        return "decide"
+    raise HTTPException(status_code=403, detail="forbidden")
+
+
+def get_kjbox_service(
+    secret: str = Depends(require_kjbox_partner),
+    user_service: UserService = Depends(get_user_service),
+) -> KjboxPartnerService:
+    return KjboxPartnerService(user_service.db, pepper=secret)
+
+
+# --------------------------------------------------------------------- models
+
+class SendCodeRequest(BaseModel):
+    email: str
+    locale: Optional[str] = None
+    venue: Optional[str] = Field(default=None, max_length=_MAX_VENUE_LEN)
+
+
+class SendCodeResponse(BaseModel):
+    status: str
+
+
+class VerifyCodeRequest(BaseModel):
+    email: str
+    code: str = Field(max_length=32)
+
+
+class SocialSignInRequest(BaseModel):
+    # Google Identity Services / Sign in with Apple JS ID token from the singer page
+    # (or ``fake:<email>`` on the local stack).
+    id_token: str = Field(min_length=1, max_length=8192)
+    locale: Optional[str] = None
+    venue: Optional[str] = Field(default=None, max_length=_MAX_VENUE_LEN)
+
+
+class VerifyCodeResponse(BaseModel):
+    session_token: str
+    user: dict
+    credits_granted: int
+    credit_status: str
+
+
+class ShowCreditRequest(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    venue: Optional[str] = Field(default=None, max_length=_MAX_VENUE_LEN)
+    # Grant only if the singer currently has no credits (< 1). The key is claimed
+    # only when a credit is actually granted, so a later call with the same key
+    # and only_if_empty=false grants iff this one didn't.
+    only_if_empty: bool = False
+
+
+class ShowCreditResponse(BaseModel):
+    granted: bool
+    credits: int
+
+
+# -------------------------------------------------------------------- helpers
+
+def _normalize_email(raw: str) -> str:
+    email = (raw or "").strip().lower()
+    local, _, domain = email.partition("@")
+    if (not local or "." not in domain or len(email) > _MAX_EMAIL_LEN
+            or any(c.isspace() for c in email) or email.count("@") != 1):
+        raise HTTPException(status_code=422, detail="invalid_email")
+    return email
+
+
+def _split_locale(raw: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Return (email_locale in en/es/de or None, ui_locale primary subtag or None)."""
+    if not raw:
+        return None, None
+    primary = raw.strip().replace("_", "-").split("-")[0].lower()
+    if not primary.isalpha() or len(primary) < 2:
+        return None, None
+    return (primary if primary in SUPPORTED_LOCALES else None), primary
+
+
+def _pretend_sent() -> SendCodeResponse:
+    return SendCodeResponse(status="sent")
+
+
+# ------------------------------------------------------------------ endpoints
+
+@router.post("/auth/send-code", response_model=SendCodeResponse)
+def send_code(
+    body: SendCodeRequest,
+    http_request: Request,
+    svc: KjboxPartnerService = Depends(get_kjbox_service),
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    settings = get_settings()
+    email = _normalize_email(body.email)
+    email_locale, ui_locale = _split_locale(body.locale)
+    locale = email_locale or "en"
+    venue = (body.venue or "").strip() or None
+
+    email_validation = get_email_validation_service()
+    if email_validation.is_disposable_domain(email):
+        logger.warning(f"kjbox: blocked disposable email {_mask_email(email)}")
+        raise HTTPException(status_code=422, detail=t(locale, "users.disposableEmailBlocked"))
+    if email_validation.is_email_blocked(email):
+        logger.warning(f"kjbox: blocked email {_mask_email(email)} — pretending success")
+        return _pretend_sent()
+    ip_address = get_client_ip(http_request)
+    if ip_address and email_validation.is_ip_blocked(ip_address):
+        logger.warning(f"kjbox: blocked IP {ip_address} — pretending success")
+        return _pretend_sent()
+
+    if not email_service.is_configured() and is_production():
+        logger.error("kjbox: email service not configured - cannot send codes")
+        raise HTTPException(status_code=503, detail="email not configured")
+
+    # No account is created here — only once the email is verified (verify-code),
+    # so unverified addresses can neither burn the signup cap nor create accounts
+    # for other people's emails. Venue/locale ride on the code record until then.
+    user = user_service.get_user(email)
+    try:
+        issued = svc.issue_code(
+            email,
+            max_per_hour=settings.kjbox_codes_per_email_per_hour,
+            needs_credit_eval=(
+                not (user and getattr(user, "welcome_credits_granted", False))
+                and not is_test_email(email)
+            ),
+            locale=email_locale,
+            ui_locale=ui_locale,
+            venue=venue,
+            ip_address=ip_address,
+            user_agent=http_request.headers.get("user-agent"),
+        )
+    except (CodeThrottled, TransactionContention):
+        # Contention on one email's code doc = a burst of parallel sends to the
+        # same address, which is exactly what the throttle exists to stop.
+        raise HTTPException(status_code=429, detail="too_many_codes")
+
+    sent = email_service.send_kjbox_login_code(
+        email, issued.code, expiry_minutes=CODE_EXPIRY_MINUTES, locale=locale,
+    )
+    if not sent:
+        if getattr(email_service, "last_send_suppressed", False):
+            logger.info(f"kjbox: code recipient {_mask_email(email)} is Postmark-suppressed")
+        else:
+            logger.error(f"kjbox: failed to send code email to {_mask_email(email)}")
+
+    # Warm the welcome-credit AI evaluation while the singer reads their email,
+    # so verify-code is instant (same optimisation as magic links).
+    if issued.needs_credit_eval:
+        threading.Thread(
+            target=_precompute_credit_eval,
+            args=(issued.doc_id, email, LOGIN_CODES_COLLECTION),
+            daemon=True,
+        ).start()
+
+    return SendCodeResponse(status="sent")
+
+
+@router.post("/auth/verify-code", response_model=VerifyCodeResponse)
+def verify_code(
+    body: VerifyCodeRequest,
+    http_request: Request,
+    svc: KjboxPartnerService = Depends(get_kjbox_service),
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    settings = get_settings()
+    email = _normalize_email(body.email)
+
+    # New accounts are created (and counted against the partner-wide cap) only
+    # here, after the email is proven. Check the cap BEFORE consuming the code so
+    # a capped singer can retry the same code later.
+    existing = user_service.get_user(email)
+    if existing is None and svc.count_recent_signups() >= settings.kjbox_signup_cap_per_24h:
+        logger.warning("kjbox: partner-wide verified-signup cap reached")
+        raise HTTPException(status_code=429, detail="signup_cap")
+
+    outcome, record = svc.verify_code(email, body.code)
+    if outcome == VerifyOutcome.TOO_MANY_ATTEMPTS:
+        raise HTTPException(status_code=429, detail="too_many_attempts")
+    if outcome == VerifyOutcome.INVALID:
+        raise HTTPException(status_code=401, detail="invalid_code")
+    if outcome != VerifyOutcome.OK or record is None:
+        raise HTTPException(status_code=401, detail="expired")
+
+    precomputed_eval = {
+        k: record.get(k)
+        for k in ("credit_eval_decision", "credit_eval_reasoning", "credit_eval_error")
+        if record.get(k) is not None
+    } or None
+    return _finish_sign_in(
+        email, http_request, svc=svc, user_service=user_service, email_service=email_service,
+        venue=record.get("venue"), email_locale=record.get("locale"),
+        ui_locale=record.get("ui_locale"), precomputed_eval=precomputed_eval, how="verified",
+    )
+
+
+def _finish_sign_in(email, http_request, *, svc, user_service, email_service, venue,
+                    email_locale, ui_locale, precomputed_eval, how):
+    """A proven email (code, or a Google/Apple ID token) → the singer's gen session."""
+    user = user_service.get_user(email)
+    if user is None:
+        # No signup_ip: the caller is the kjbox box, whose IP is the whole
+        # venue's — recording it would trip gen's per-IP cap for everyone there.
+        user = user_service.get_or_create_user(
+            email, signup_source=SIGNUP_SOURCE, signup_venue=venue,
+        )
+        svc.record_signup(email, venue)
+        logger.info(f"kjbox: created verified gen user {_mask_email(email)} (venue={venue!r}, via {how})")
+    # Same first-login definition as magic-link verify (checked before last_login_at is set).
+    is_first_login = user.total_jobs_created == 0 and not user.last_login_at
+    user = user_service.update_user(
+        email, email_verified=True, last_login_at=datetime.utcnow(),
+    ) or user
+
+    result = complete_verified_login(
+        user,
+        user_service=user_service,
+        email_service=email_service,
+        is_first_login=is_first_login,
+        precomputed_eval=precomputed_eval,
+        grant_welcome_credit=True,
+        referral_code=None,
+        locale=email_locale,
+        ui_locale=ui_locale,
+        ip_address=get_client_ip(http_request),
+        user_agent=http_request.headers.get("user-agent"),
+        tenant_id=None,
+        device_fingerprint=None,
+        email_locale=email_locale or user.locale or "en",
+    )
+    logger.info(f"kjbox: {how} {_mask_email(email)} (credit_status={result.credit_status})")
+
+    return VerifyCodeResponse(
+        session_token=result.session.token,
+        user=_build_user_public(result.user).model_dump(mode="json"),
+        credits_granted=result.credits_granted,
+        credit_status=result.credit_status,
+    )
+
+
+def _social_sign_in(provider, body, http_request, svc, user_service, email_service):
+    """Google / Apple one-tap: the provider has proven the email, so no code.
+    Same venue rules as verify-code: no per-IP signup cap, the partner-wide 24h
+    cap on new accounts instead. Apple "Hide My Email" relays are their own account."""
+    from backend.api.routes.login_code import APPLE_RELAY_DOMAIN, _verify_identity
+
+    identity = _verify_identity(provider, body.id_token)   # 401 invalid_token / 503
+    email = _normalize_email(identity.email)
+    email_locale, ui_locale = _split_locale(body.locale)
+
+    # The same eligibility checks as send-code. There's no email to hide a
+    # refusal behind, so (like the app's social sign-in) refusals are explicit.
+    email_validation = get_email_validation_service()
+    is_relay = provider == "apple" and email.endswith("@" + APPLE_RELAY_DOMAIN)
+    if not is_relay and email_validation.is_disposable_domain(email):
+        logger.warning(f"kjbox: {provider} sign-in refused, disposable email {_mask_email(email)}")
+        raise HTTPException(status_code=422, detail=t(email_locale or "en", "users.disposableEmailBlocked"))
+    ip_address = get_client_ip(http_request)
+    if email_validation.is_email_blocked(email) or (ip_address and email_validation.is_ip_blocked(ip_address)):
+        logger.warning(f"kjbox: {provider} sign-in refused, blocked email/IP {_mask_email(email)}")
+        raise HTTPException(status_code=422, detail="sign_in_not_allowed")
+    if user_service.get_user(email) is None and \
+            svc.count_recent_signups() >= get_settings().kjbox_signup_cap_per_24h:
+        logger.warning("kjbox: partner-wide verified-signup cap reached")
+        raise HTTPException(status_code=429, detail="signup_cap")
+    return _finish_sign_in(
+        email, http_request, svc=svc, user_service=user_service, email_service=email_service,
+        venue=(body.venue or None), email_locale=email_locale, ui_locale=ui_locale,
+        precomputed_eval=None, how=f"{provider} sign-in",
+    )
+
+
+@router.post("/auth/google", response_model=VerifyCodeResponse)
+def google_sign_in(
+    body: SocialSignInRequest,
+    http_request: Request,
+    svc: KjboxPartnerService = Depends(get_kjbox_service),
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """Google ID token (audience ``GOOGLE_OAUTH_CLIENT_IDS``) → singer session."""
+    return _social_sign_in("google", body, http_request, svc, user_service, email_service)
+
+
+@router.post("/auth/apple", response_model=VerifyCodeResponse)
+def apple_sign_in(
+    body: SocialSignInRequest,
+    http_request: Request,
+    svc: KjboxPartnerService = Depends(get_kjbox_service),
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """Apple ID token (audience ``APPLE_SIGNIN_AUDIENCES``, incl. the web Services ID) → singer session."""
+    return _social_sign_in("apple", body, http_request, svc, user_service, email_service)
+
+
+@router.post("/credits/show-credit", response_model=ShowCreditResponse)
+def show_credit(
+    body: ShowCreditRequest,
+    svc: KjboxPartnerService = Depends(get_kjbox_service),
+    user_service: UserService = Depends(get_user_service),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Quietly grant +1 credit so a singer's make-it job is free at the show.
+
+    No "credits added" email. Idempotent per ``idempotency_key`` (claimed only
+    when a credit is granted); ``only_if_empty`` grants only at a 0 balance;
+    capped per user per rolling 24h. All decisions + the increment are one
+    Firestore transaction.
+    """
+    settings = get_settings()
+    scheme, _, token = (authorization or "").partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="invalid_session")
+    valid, user, _msg = user_service.validate_session(token)
+    if not valid or not user:
+        raise HTTPException(status_code=401, detail="invalid_session")
+
+    email = user.email.lower()
+    venue = (body.venue or "").strip() or None
+    user_ref = user_service.get_user_doc_ref(email)
+    if user_ref is None:
+        raise HTTPException(status_code=401, detail="invalid_session")
+
+    try:
+        result = svc.grant_show_credit(
+            user_ref,
+            email,
+            body.idempotency_key,
+            venue=venue,
+            only_if_empty=body.only_if_empty,
+            max_per_24h=settings.kjbox_show_credits_per_user_per_24h,
+        )
+    except ShowCreditCapReached:
+        raise HTTPException(status_code=429, detail="show_credit_cap")
+    except LookupError:
+        raise HTTPException(status_code=401, detail="invalid_session")
+    except TransactionContention:
+        # Nothing was written; kjbox retries with the same idempotency key.
+        raise HTTPException(status_code=409, detail="busy_retry")
+
+    if result.granted:
+        logger.info(f"kjbox: show credit granted to {_mask_email(email)} (venue={venue!r}) → {result.credits}")
+    return ShowCreditResponse(granted=result.granted, credits=result.credits)
+
+
+# ------------------------------------------------------------- review link
+
+class ReviewLinkRequest(BaseModel):
+    locale: Optional[str] = None
+
+
+class ReviewLinkResponse(BaseModel):
+    url: str
+    status: str
+    # "admin" = the KJ / support already opened the review; "owner" = the
+    # singer did; None = nobody has opened it yet.
+    review_started_by: Optional[str] = None
+
+
+_REVIEW_LINK_STATUSES = ("awaiting_review", "in_review")
+
+
+# ------------------------------------------------- account deletion queue
+
+@router.get("/account-deletions")
+def list_account_deletions(
+    since: Optional[datetime] = Query(default=None),
+    _secret: str = Depends(require_kjbox_partner),
+    deletion: AccountDeletionService = Depends(get_account_deletion_service),
+):
+    """Deleted gen accounts the box still has to erase (it pulls: it may be offline).
+
+    Only the sha256 of the email is sent; the box hashes the ``gen_email`` values
+    it stores to match. Lists entries still pending for kjbox, created after ``since``.
+    """
+    return {"deletions": deletion.list_kjbox_pending(since)}
+
+
+@router.post("/account-deletions/{entry_id}/ack", status_code=204)
+def ack_account_deletion(
+    entry_id: str,
+    _secret: str = Depends(require_kjbox_partner),
+    deletion: AccountDeletionService = Depends(get_account_deletion_service),
+):
+    """The box erased this account's data; stop listing it. ``entry_id`` = sha256(email)."""
+    if not deletion.ack_kjbox(entry_id):
+        raise HTTPException(status_code=404, detail="not_found")
+    return Response(status_code=204)
+
+
+@router.post("/jobs/{job_id}/review-link", response_model=ReviewLinkResponse)
+async def review_link(
+    job_id: str,
+    body: ReviewLinkRequest,
+    _secret: str = Depends(require_kjbox_partner),
+    user_service: UserService = Depends(get_user_service),
+    authorization: Optional[str] = Header(default=None),
+):
+    """One-click sign-in link straight to the singer's own job's lyrics review.
+
+    Backs the "Tap here to review it yourself" link on the kjbox singer page:
+    the same single-use ``job_review:<id>`` magic link the kjbox review email
+    carries, minted on demand. Only the job's owner (the Bearer session) may
+    get one, and only while the job is in review (409 ``not_in_review``).
+    """
+    scheme, _, token = (authorization or "").partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="invalid_session")
+    locale = body.locale if body.locale in SUPPORTED_LOCALES else "en"
+    # Session check, job read and token mint are blocking Firestore calls —
+    # keep them off the event loop (it serves every in-flight request).
+    url, status, started_by = await asyncio.to_thread(
+        _mint_review_link, user_service, token, job_id, locale)
+    return ReviewLinkResponse(url=url, status=status, review_started_by=started_by)
+
+
+def get_owned_review_job(user_service: UserService, session_token: str, job_id: str):
+    """Blocking: the session owner's job, checked to be in review → (job, status).
+
+    Shared by kjbox's review link and the mobile app's web handoff
+    (``POST /api/users/auth/handoff-token``). Raises 401 ``invalid_session``,
+    404 ``not_found`` (missing or not yours — same answer, so other users' job
+    ids aren't confirmed) or 409 ``not_in_review``.
+    """
+    from backend.services.job_manager import JobManager
+
+    valid, user, _msg = user_service.validate_session(session_token)
+    if not valid or not user:
+        raise HTTPException(status_code=401, detail="invalid_session")
+    job = JobManager().get_job(job_id)
+    if not job or (job.user_email or "").lower() != user.email.lower():
+        raise HTTPException(status_code=404, detail="not_found")
+    status = str(getattr(job.status, "value", job.status))
+    if status not in _REVIEW_LINK_STATUSES:
+        raise HTTPException(status_code=409, detail="not_in_review")
+    return job, status
+
+
+def _mint_review_link(user_service: UserService, token: str, job_id: str, locale: str):
+    """Blocking half of ``review_link`` → (url, status, review_started_by)."""
+    from backend.services.job_notification_service import build_review_login_url
+
+    job, status = get_owned_review_job(user_service, token, job_id)
+    url = build_review_login_url(job.job_id, job.user_email, locale=locale)
+    if not url:
+        raise HTTPException(status_code=502, detail="link_unavailable")
+    started_by = (job.state_data or {}).get("review_started_by") if status == "in_review" else None
+    return url, status, started_by
+
+
+# ---------------------------------------------------------- search resolve
+
+class ResolveRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=200)
+
+
+_RESOLVE_CACHE_MAX = 2000
+_RESOLVE_PER_MINUTE = 120
+_resolve_cache: "dict[str, dict]" = {}
+_RESOLVE_DECIDE_PER_MINUTE = 60   # karaoke-decide's own bucket, so kjbox nights are never starved
+_resolve_calls: "list[float]" = []
+_resolve_calls_decide: "list[float]" = []
+_resolve_lock = threading.Lock()
+
+
+def _resolve_budget_ok(partner: str = "kjbox") -> bool:
+    """Per-partner in-process cap on AI calls (cache hits are free)."""
+    import time
+    now = time.monotonic()
+    if partner == "decide":
+        calls, limit = _resolve_calls_decide, _RESOLVE_DECIDE_PER_MINUTE
+    else:
+        calls, limit = _resolve_calls, _RESOLVE_PER_MINUTE
+    with _resolve_lock:
+        while calls and calls[0] < now - 60:
+            calls.pop(0)
+        if len(calls) >= limit:
+            return False
+        calls.append(now)
+        return True
+
+
+@router.post("/catalog/resolve")
+async def catalog_resolve(body: ResolveRequest, partner: str = Depends(require_resolve_partner)):
+    """Split + auto-correct a singer's free-text song search.
+
+    kjbox calls this only when its own catalogue search found nothing, then
+    shows gen's AudioSourceStep "Tidied to … / keep what I typed" (re-searching
+    when the song changed, and pre-filling its generate form). The AI splits the
+    one-line query; the job flow's judge_match catalog pass then tidies it, so
+    the canonical artist/title match what gen's own job form would use.
+    Response = the match judge verdict shape + typed_artist / typed_title.
+    Never 5xx on model trouble: kind "none".
+    """
+    from backend.services.match_judge.free_text import _none, resolve_and_tidy
+
+    query = " ".join(body.query.split())
+    if not query:
+        raise HTTPException(status_code=422, detail="empty_query")
+    from backend.services.fake_workers import fake_workers_enabled
+    if fake_workers_enabled(get_settings()):
+        # Local E2E stack: scripted verdict, no Gemini, no cache/budget (tests change the knobs).
+        from backend.services.fake_workers.judge import fake_resolve
+        return fake_resolve(query)
+    key = query.casefold()   # shared by both partners: same query -> same verdict
+    with _resolve_lock:
+        hit = _resolve_cache.get(key)
+    if hit is not None:
+        # Same query modulo case/spacing: the verdict applies, but echo THIS
+        # request's text where the verdict fell back to the typed query.
+        if not hit.get("typed_artist"):
+            hit = {**hit, "typed_title": query}
+        return hit
+    if not _resolve_budget_ok(partner):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    verdict = await resolve_and_tidy(query)
+    if verdict.get("reason") != "unavailable":   # don't cache transient failures
+        with _resolve_lock:
+            if len(_resolve_cache) >= _RESOLVE_CACHE_MAX:
+                _resolve_cache.pop(next(iter(_resolve_cache)))
+            _resolve_cache[key] = verdict
+    return verdict or _none(query)

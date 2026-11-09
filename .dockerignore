@@ -1,0 +1,83 @@
+# .dockerignore - Reduce Docker build context size
+# This is critical for fast builds as it reduces upload time and cache invalidation
+
+# Git
+.git/
+.gitignore
+.gitmodules
+
+# Node.js / Frontend (not needed for backend image)
+node_modules/
+frontend/
+frontend-react/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python virtual environments (use Docker's Python instead)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+backend/venv/
+ENV/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing (not needed in production image)
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+tests/
+backend/tests/
+
+# Documentation (not needed in Docker image)
+docs/
+*.md
+!README.md
+
+# Infrastructure (not needed for Docker build)
+infrastructure/
+
+# CI/CD configs
+.github/
+
+# Cloud Build configs (keep for reference but not in image)
+cloudbuild*.yaml
+
+# Local development files
+lyrics_transcriber_local/
+*.local
+.env
+.env.*
+*.bak
+*.tmp
+Thumbs.db
+
+# Large test/sample files
+tests/data/
+*.mp3
+*.wav
+*.mp4
+*.mkv
+*.flac

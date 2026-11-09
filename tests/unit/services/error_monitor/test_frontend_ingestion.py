@@ -1,0 +1,274 @@
+"""Unit tests for frontend error ingestion."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+
+from backend.services.error_monitor.frontend_ingestion import (
+    FrontendErrorReport,
+    RateLimiter,
+    build_pattern_data,
+    is_bot_user_agent,
+    is_opaque_script_error,
+    sanitize_url,
+)
+
+
+@pytest.mark.parametrize("ua", [
+    "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/136.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Mozilla/5.0 (compatible; YandexBot/3.0)",
+    "facebookexternalhit/1.1",
+    "curl/8.4.0",
+    "python-requests/2.31.0",
+    "Some HeadlessChrome/120.0 build",
+])
+def test_is_bot_user_agent_true_for_crawlers(ua):
+    assert is_bot_user_agent(ua) is True
+
+
+@pytest.mark.parametrize("ua", [
+    "Mozilla/5.0 (Android 14; Mobile; rv:138.0) Gecko/138.0 Firefox/138.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0 Safari/537.36",
+    # "robot" must NOT be treated as a bot marker (the "bot" substring inside a
+    # normal word). Neither should "robot/" version-like text.
+    "Mozilla/5.0 MyRobot Browser robot build",
+    "Mozilla/5.0 (compatible; robot/1.0) Chrome/136.0",
+    "",
+    None,
+])
+def test_is_bot_user_agent_false_for_real_browsers(ua):
+    assert is_bot_user_agent(ua) is False
+
+
+def test_sanitize_url_strips_query_and_fragment():
+    assert sanitize_url("https://gen.nomadkaraoke.com/en/app/jobs/?token=abc#/xyz/review") == "https://gen.nomadkaraoke.com/en/app/jobs/"
+
+
+def test_sanitize_url_keeps_path_and_preserves_hash_route_prefix():
+    # For our hash-routed pages we want #/ retained as a coarse indicator, but
+    # the job id inside it is sensitive-ish — drop the fragment entirely.
+    assert sanitize_url("https://gen.nomadkaraoke.com/en/app/jobs/#/abcdef/review") == "https://gen.nomadkaraoke.com/en/app/jobs/"
+
+
+def test_sanitize_url_handles_bad_input():
+    assert sanitize_url("") == ""
+    assert sanitize_url("not a url") == "not a url"[:512]
+
+
+def test_build_pattern_data_uses_stack_when_present():
+    report = FrontendErrorReport(
+        message="TypeError: Cannot read properties of null",
+        stack="TypeError: Cannot read properties of null\n  at foo (app.js:1:2)\n  at bar (app.js:3:4)",
+        url="https://gen.nomadkaraoke.com/en/app/jobs/",
+        user_agent="Mozilla/5.0 (Android 14; Mobile; rv:138.0) Gecko/138.0 Firefox/138.0",
+        release="abc1234",
+        user_email=None,
+        viewport={"w": 412, "h": 915},
+        locale="en",
+        extra=None,
+    )
+
+    data = build_pattern_data(report, now=datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc))
+
+    assert data.service == "frontend"
+    assert data.resource_type == "browser"
+    # normalized_message is what was hashed — stack-based so same message from
+    # different URLs/ids collapses.
+    assert "TypeError" in data.normalized_message
+    assert data.sample_message.startswith("TypeError: Cannot read properties of null")
+    assert data.count == 1
+    # pattern_id is deterministic for same stack
+    data2 = build_pattern_data(report, now=datetime(2026, 4, 20, 9, 0, tzinfo=timezone.utc))
+    assert data.pattern_id == data2.pattern_id
+
+
+def test_build_pattern_data_falls_back_to_message_when_no_stack():
+    report = FrontendErrorReport(
+        message="Network request failed",
+        stack=None,
+        url="https://gen.nomadkaraoke.com/en/app/",
+        user_agent="ua",
+        release="abc",
+        user_email="x@y.com",
+        viewport=None,
+        locale="en",
+        extra=None,
+    )
+    data = build_pattern_data(report, now=datetime(2026, 4, 19, 12, 0, tzinfo=timezone.utc))
+    assert "Network request failed" in data.normalized_message
+
+
+def test_different_errors_produce_different_pattern_ids():
+    a = FrontendErrorReport(
+        message="A", stack="A\n  at foo", url="", user_agent="", release="", user_email=None,
+        viewport=None, locale="en", extra=None,
+    )
+    b = FrontendErrorReport(
+        message="B", stack="B\n  at bar", url="", user_agent="", release="", user_email=None,
+        viewport=None, locale="en", extra=None,
+    )
+    assert build_pattern_data(a, now=datetime.now(tz=timezone.utc)).pattern_id != build_pattern_data(b, now=datetime.now(tz=timezone.utc)).pattern_id
+
+
+def test_rate_limiter_allows_up_to_max():
+    rl = RateLimiter(max_per_minute=3)
+    for i in range(3):
+        assert rl.allow("1.2.3.4", 1000.0 + i) is True
+
+
+def test_rate_limiter_blocks_when_over_limit():
+    rl = RateLimiter(max_per_minute=3)
+    for _ in range(3):
+        assert rl.allow("1.2.3.4", 1000.0) is True
+    assert rl.allow("1.2.3.4", 1000.5) is False
+
+
+def test_rate_limiter_allows_again_after_window_expires():
+    rl = RateLimiter(max_per_minute=2)
+    assert rl.allow("1.2.3.4", 1000.0) is True
+    assert rl.allow("1.2.3.4", 1000.1) is True
+    assert rl.allow("1.2.3.4", 1000.2) is False
+    # 61 seconds later — both earlier hits have expired from the 60s window
+    assert rl.allow("1.2.3.4", 1061.0) is True
+
+
+def test_rate_limiter_tracks_ips_independently():
+    rl = RateLimiter(max_per_minute=2)
+    assert rl.allow("1.1.1.1", 1000.0) is True
+    assert rl.allow("1.1.1.1", 1000.0) is True
+    assert rl.allow("1.1.1.1", 1000.0) is False
+    # Different IP should not be affected
+    assert rl.allow("2.2.2.2", 1000.0) is True
+
+
+_OPAQUE_EXTRA = {"filename": "", "lineno": 0, "colno": 0}
+
+
+@pytest.mark.parametrize(
+    "message", ["Script error.", "Script error", "Error: Script error.", "  SCRIPT ERROR.  "]
+)
+def test_is_opaque_script_error_true(message):
+    assert is_opaque_script_error(message, "window.onerror", _OPAQUE_EXTRA) is True
+
+
+@pytest.mark.parametrize(
+    "message", [None, "", "TypeError: Script error.", "Script error in foo", "Load failed"]
+)
+def test_is_opaque_script_error_false_for_other_messages(message):
+    assert is_opaque_script_error(message, "window.onerror", _OPAQUE_EXTRA) is False
+
+
+@pytest.mark.parametrize(
+    "source,extra",
+    [
+        # A real `throw new Error("Script error.")` from our code keeps its file/line.
+        ("window.onerror", {"filename": "https://gen.nomadkaraoke.com/_next/static/chunks/x.js", "lineno": 6}),
+        ("window.onerror", {"filename": "", "lineno": 12}),
+        ("window.onerror", None),
+        ("unhandledrejection", _OPAQUE_EXTRA),
+        ("error-boundary", None),
+    ],
+)
+def test_is_opaque_script_error_false_when_error_is_located(source, extra):
+    assert is_opaque_script_error("Error: Script error.", source, extra) is False
+
+
+# ---------------------------------------------------------------------------
+# Safari/Firefox stacks don't start with the message
+# ---------------------------------------------------------------------------
+
+def _report(message, stack, release="9d6aa3df"):
+    return FrontendErrorReport(
+        message=message, stack=stack, url="https://gen.nomadkaraoke.com/",
+        user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) Safari/604.1",
+        release=release, user_email=None, viewport=None, locale="en", extra=None,
+    )
+
+
+SAFARI_STACK = "@https://gen.nomadkaraoke.com/_next/static/chunks/turbopack-7c45166c9b701384.js:1:5749"
+
+
+def test_safari_stack_without_message_gets_message_prepended():
+    """2026-10-18: a Safari pattern was named "@https://gen.nomadkaraoke.com"
+    because its stack has no "Name: message" header, so every Safari error
+    thrown from that bundle frame collapsed into one meaningless pattern."""
+    data = build_pattern_data(_report("TypeError: undefined is not an object", SAFARI_STACK))
+    assert data.normalized_message.startswith("TypeError: undefined is not an object")
+
+
+def test_safari_errors_from_same_frame_get_distinct_patterns():
+    a = build_pattern_data(_report("TypeError: undefined is not an object", SAFARI_STACK))
+    b = build_pattern_data(_report("RangeError: Maximum call stack size exceeded", SAFARI_STACK))
+    assert a.pattern_id != b.pattern_id
+
+
+def test_chrome_stack_hash_unchanged():
+    """Chrome stacks already start with the message: same hash as before."""
+    from backend.services.error_monitor.normalizer import compute_pattern_hash, normalize_message
+
+    stack = "TypeError: x is null\n    at foo (https://gen.nomadkaraoke.com/a.js:1:2)"
+    data = build_pattern_data(_report("TypeError: x is null", stack))
+    assert data.pattern_id == compute_pattern_hash("frontend", normalize_message(stack))
+
+
+# ---------------------------------------------------------------------------
+# Chunk-load errors: alert only on a per-build burst
+# ---------------------------------------------------------------------------
+
+from backend.services.error_monitor.frontend_ingestion import (  # noqa: E402
+    CHUNK_LOAD_ALERT_PER_HOUR,
+    is_chunk_load_error,
+)
+
+
+@pytest.mark.parametrize("message", [
+    "Error: Failed to load chunk /_next/static/chunks/b87534e20efd1895.js from module 64893",
+    "ChunkLoadError: Loading chunk 123 failed.",
+    "Error: Loading chunk app-pages failed",
+    "TypeError: Failed to fetch dynamically imported module: https://x/y.js",
+    "TypeError: Importing a module script failed.",
+])
+def test_is_chunk_load_error_true(message):
+    assert is_chunk_load_error(message) is True
+
+
+@pytest.mark.parametrize("message", [
+    "TypeError: Cannot read properties of null",
+    "Error: chunk size too large for upload",
+    "",
+    None,
+])
+def test_is_chunk_load_error_false(message):
+    assert is_chunk_load_error(message) is False
+
+
+def test_chunk_errors_collapse_into_one_pattern_per_build():
+    a = build_pattern_data(_report(
+        "Error: Failed to load chunk /_next/static/chunks/b87534e20efd1895.js from module 64893",
+        "Error: Failed to load chunk …\n    at https://gen.nomadkaraoke.com/_next/static/chunks/turbopack-1.js:1:5744",
+    ))
+    b = build_pattern_data(_report(
+        "Error: Failed to load chunk /_next/static/chunks/8226dd5ce61ba9e5.js from module 1234", SAFARI_STACK,
+    ))
+    other_build = build_pattern_data(_report(
+        "Error: Failed to load chunk /_next/static/chunks/8226dd5ce61ba9e5.js from module 1234",
+        SAFARI_STACK, release="0000abcd",
+    ))
+    assert a.pattern_id == b.pattern_id
+    assert a.pattern_id != other_build.pattern_id
+    assert "9d6aa3df" in a.normalized_message
+    # The sample keeps the real error for whoever investigates.
+    assert "8226dd5ce61ba9e5.js" in b.sample_message
+
+
+def test_chunk_errors_are_gated_by_hourly_threshold():
+    data = build_pattern_data(_report("ChunkLoadError: Loading chunk 9 failed.", None))
+    assert data.alert_min_hourly_count == CHUNK_LOAD_ALERT_PER_HOUR == 10
+
+
+def test_ordinary_errors_are_not_gated():
+    data = build_pattern_data(_report("TypeError: x is null", "TypeError: x is null\n  at f (a.js:1:1)"))
+    assert data.alert_min_hourly_count is None

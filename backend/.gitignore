@@ -1,0 +1,39 @@
+# Ignore Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment files
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.log
+temp/
+tmp/
+
+# Google Cloud
+.gcloud/
+*.json
+# Allow i18n translation files
+!translations/*.json
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+

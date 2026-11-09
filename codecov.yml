@@ -1,0 +1,36 @@
+# Codecov Configuration
+# Docs: https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  # Coverage value precision (2 decimal places)
+  precision: 2
+  round: down
+  # Green range starts at 70% (our target)
+  range: "70...100"
+  
+  status:
+    # Project-level coverage status check
+    project:
+      default:
+        target: 70%        # Pass if coverage >= 70%
+        threshold: 2%      # Allow 2% drop without failing
+        if_ci_failed: error
+    
+    # Patch coverage (new/changed lines only)
+    patch:
+      default:
+        target: 70%        # New code should also meet 70%
+        threshold: 5%      # More lenient for patches
+        only_pulls: true   # Only run on PRs, not on main branch pushes
+
+# Disable PR comments entirely since we're satisfied with 70%+ coverage
+# Status checks will still appear on the PR
+comment: false
+
+# Alternative: Uncomment below to only comment when coverage changes
+# comment:
+#   layout: "diff, flags, files"
+#   behavior: default
+#   require_changes: true   # Only comment if coverage actually changes
+#   require_base: true      # Require base report to exist
+

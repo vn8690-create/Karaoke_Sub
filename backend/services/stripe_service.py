@@ -1,0 +1,674 @@
+"""
+Stripe service for payment processing.
+
+Handles:
+- Creating checkout sessions for credit purchases
+- Processing webhook events
+- Managing customer records
+"""
+import json
+import logging
+import os
+from typing import Optional, Dict, Any, Tuple
+
+import stripe
+
+from backend.config import get_settings
+from backend.services.fake_workers import fake_workers_enabled
+
+
+logger = logging.getLogger(__name__)
+
+# Stripe's SignatureVerificationError message when the header isn't "t=...,v1=..." at all.
+UNPARSEABLE_SIGNATURE_HEADER = "Unable to extract timestamp and signatures from header"
+
+
+# Credit packages available for purchase
+CREDIT_PACKAGES = {
+    "1_credit": {
+        "credits": 1,
+        "store_product_id": "nomad_credits_1",  # App Store / Play product id
+        "price_cents": 1000,  # $10.00
+        "name": "1 Karaoke Credit",
+        "description": "Create 1 professional karaoke video",
+    },
+    "3_credits": {
+        "credits": 3,
+        "store_product_id": "nomad_credits_3",  # App Store / Play product id
+        "price_cents": 2400,  # $24.00 (20% discount)
+        "name": "3 Karaoke Credits",
+        "description": "Create 3 professional karaoke videos (Save 20%)",
+    },
+    "5_credits": {
+        "credits": 5,
+        "store_product_id": "nomad_credits_5",  # App Store / Play product id
+        "price_cents": 3500,  # $35.00 (30% discount)
+        "name": "5 Karaoke Credits",
+        "description": "Create 5 professional karaoke videos (Save 30%)",
+    },
+    "10_credits": {
+        "credits": 10,
+        "store_product_id": "nomad_credits_10",  # App Store / Play product id
+        "price_cents": 6000,  # $60.00 (40% discount)
+        "name": "10 Karaoke Credits",
+        "description": "Create 10 professional karaoke videos (Save 40%)",
+    },
+}
+
+# Made-for-you service package (not a credit package - creates a job directly)
+# Optional "tip the creator" add-on offered on gen's Stripe Checkout pages as an
+# opt-in optional item (the customer taps "Add" and picks the amount). One Price at
+# $1/unit, found or created by lookup_key, so the tip is TIP_DEFAULT_UNITS dollars
+# by default and adjustable from $1 to $TIP_MAX_UNITS. Tips buy nothing: credits
+# come from session metadata and are unaffected.
+TIP_PRICE_LOOKUP_KEY = "gen_checkout_tip_usd_1"
+TIP_UNIT_CENTS = 100
+TIP_DEFAULT_UNITS = 5
+TIP_MAX_UNITS = 100
+
+MADE_FOR_YOU_PACKAGE = {
+    "price_cents": 5000,  # $50.00
+    "name": "Made For You Karaoke Video",
+    "description": "Professional 4K karaoke video with perfectly synced lyrics, delivered to your email within 24 hours",
+    "images": ["https://gen.nomadkaraoke.com/nomad-logo.png"],
+}
+
+
+class StripeService:
+    """Service for Stripe payment processing."""
+
+    def __init__(self):
+        """Initialize Stripe with API key."""
+        self.settings = get_settings()
+        self.secret_key = os.getenv("STRIPE_SECRET_KEY")
+        self.webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+        self.frontend_url = os.getenv("FRONTEND_URL", "https://gen.nomadkaraoke.com")
+        # After consolidation, buy URL is the same as frontend URL
+        self.buy_url = os.getenv("BUY_URL", self.frontend_url)
+        # Payment method configuration ID from Stripe Dashboard
+        # Enables Google Pay, Apple Pay, Link, and other wallet methods
+        # Get this from: Dashboard > Settings > Payment methods > [Your Config] > Copy ID
+        self.payment_method_config = os.getenv("STRIPE_PAYMENT_METHOD_CONFIG")
+        self._tip_price_id: Optional[str] = None  # cached by get_tip_price_id()
+
+        if self.secret_key:
+            stripe.api_key = self.secret_key
+            logger.info("Stripe initialized with API key")
+        else:
+            logger.warning("STRIPE_SECRET_KEY not set - payments disabled")
+
+        if self.payment_method_config:
+            logger.info(f"Using payment method config: {self.payment_method_config}")
+        else:
+            logger.info("No STRIPE_PAYMENT_METHOD_CONFIG set - using Stripe defaults")
+
+    def is_configured(self) -> bool:
+        """Check if Stripe is properly configured."""
+        return bool(self.secret_key)
+
+    def get_credit_packages(self) -> Dict[str, Dict[str, Any]]:
+        """Get available credit packages."""
+        return CREDIT_PACKAGES
+
+    def can_checkout(self) -> bool:
+        """Checkout sessions can be created: real Stripe, or the local stack's fake checkout."""
+        return self.is_configured() or fake_workers_enabled()
+
+    def _create_checkout(self, session_params: Dict[str, Any]):
+        """Create the Stripe Checkout session, or a local fake one on the local stack."""
+        if not self.is_configured() and fake_workers_enabled():
+            from backend.services.fake_workers.checkout import create_fake_checkout
+
+            return create_fake_checkout(session_params)
+        return stripe.checkout.Session.create(**session_params)
+
+    def create_checkout_session(
+        self,
+        package_id: str,
+        user_email: str,
+        success_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
+        coupon_id: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], str]:
+        """
+        Create a Stripe Checkout session for purchasing credits.
+
+        Args:
+            package_id: ID of the credit package to purchase
+            user_email: Email of the purchasing user
+            success_url: URL to redirect to on success (optional)
+            cancel_url: URL to redirect to on cancel (optional)
+
+        Returns:
+            (success, checkout_url, message)
+        """
+        if not self.can_checkout():
+            return False, None, "Payment processing is not configured"
+
+        package = CREDIT_PACKAGES.get(package_id)
+        if not package:
+            return False, None, f"Invalid package: {package_id}"
+
+        try:
+            # Default URLs
+            if not success_url:
+                success_url = f"{self.frontend_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
+            if not cancel_url:
+                cancel_url = f"{self.buy_url}?cancelled=true"
+
+            # Build checkout session params
+            session_params = {
+                # Omit payment_method_types to auto-enable Apple Pay, Google Pay, Link, etc.
+                'line_items': [{
+                    'price_data': {
+                        'currency': 'usd',
+                        'product_data': {
+                            'name': package['name'],
+                            'description': package['description'],
+                            'images': ['https://gen.nomadkaraoke.com/nomad-logo.png'],
+                        },
+                        'unit_amount': package['price_cents'],
+                    },
+                    'quantity': 1,
+                }],
+                'mode': 'payment',
+                'success_url': success_url,
+                'cancel_url': cancel_url,
+                'customer_email': user_email,
+                'metadata': {
+                    'package_id': package_id,
+                    'credits': str(package['credits']),
+                    'user_email': user_email,
+                },
+                # Allow promotion codes
+                'allow_promotion_codes': True,
+            }
+
+            self._add_tip_option(session_params)
+
+            # If a referral coupon is applied, use discounts instead of allow_promotion_codes
+            if coupon_id:
+                session_params.pop('allow_promotion_codes', None)
+                session_params['discounts'] = [{'coupon': coupon_id}]
+
+            # Add payment method configuration if set (enables Google Pay, Link, etc.)
+            if self.payment_method_config:
+                session_params['payment_method_configuration'] = self.payment_method_config
+
+            # Create checkout session
+            session = self._create_checkout(session_params)
+
+            logger.info(f"Created checkout session {session.id} for {user_email}, package {package_id}")
+            return True, session.url, "Checkout session created"
+
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe error creating checkout session: {e}")
+            return False, None, f"Payment error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error creating checkout session: {e}")
+            return False, None, "Failed to create checkout session"
+
+    def create_made_for_you_checkout_session(
+        self,
+        customer_email: str,
+        artist: str,
+        title: str,
+        source_type: str = "search",
+        youtube_url: Optional[str] = None,
+        notes: Optional[str] = None,
+        success_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
+        locale: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str], str]:
+        """
+        Create a Stripe Checkout session for a made-for-you order.
+
+        This is for the full-service karaoke video creation where Nomad Karaoke
+        handles all the work (lyrics review, instrumental selection, etc.).
+
+        Args:
+            customer_email: Customer's email for delivery
+            artist: Song artist
+            title: Song title
+            source_type: Audio source type (search, youtube, upload)
+            youtube_url: YouTube URL if source_type is youtube
+            notes: Any special requests from customer
+            success_url: URL to redirect to on success (optional)
+            cancel_url: URL to redirect to on cancel (optional)
+
+        Returns:
+            (success, checkout_url, message)
+        """
+        if not self.can_checkout():
+            return False, None, "Payment processing is not configured"
+
+        try:
+            # Default URLs - redirect to gen app success page
+            if not success_url:
+                success_url = f"{self.frontend_url}/order/success?session_id={{CHECKOUT_SESSION_ID}}"
+            if not cancel_url:
+                cancel_url = "https://nomadkaraoke.com/#do-it-for-me"
+
+            # Build metadata for job creation after payment
+            metadata = {
+                'order_type': 'made_for_you',
+                'customer_email': customer_email,
+                'artist': artist,
+                'title': title,
+                'source_type': source_type,
+            }
+            if youtube_url:
+                metadata['youtube_url'] = youtube_url
+            if notes:
+                # Truncate notes to fit Stripe's 500 char limit per metadata value
+                metadata['notes'] = notes[:500] if len(notes) > 500 else notes
+            if locale:
+                # UI language the customer ordered in — surfaced admin-side on the job
+                metadata['locale'] = locale
+
+            # Build checkout session params
+            session_params = {
+                # Omit payment_method_types to auto-enable Apple Pay, Google Pay, Link, etc.
+                'line_items': [{
+                    'price_data': {
+                        'currency': 'usd',
+                        'product_data': {
+                            'name': f"Karaoke Video: {artist} - {title}",
+                            'description': MADE_FOR_YOU_PACKAGE['description'],
+                            'images': MADE_FOR_YOU_PACKAGE['images'],
+                        },
+                        'unit_amount': MADE_FOR_YOU_PACKAGE['price_cents'],
+                    },
+                    'quantity': 1,
+                }],
+                'mode': 'payment',
+                'success_url': success_url,
+                'cancel_url': cancel_url,
+                'customer_email': customer_email,
+                'metadata': metadata,
+                'allow_promotion_codes': True,
+            }
+            self._add_tip_option(session_params)
+
+            # Add payment method configuration if set (enables Google Pay, Link, etc.)
+            if self.payment_method_config:
+                session_params['payment_method_configuration'] = self.payment_method_config
+
+            # Create checkout session
+            session = self._create_checkout(session_params)
+
+            logger.info(
+                f"Created made-for-you checkout session {session.id} for {customer_email}, "
+                f"song: {artist} - {title}"
+            )
+            return True, session.url, "Checkout session created"
+
+        except stripe.error.StripeError as e:
+            logger.error(f"Stripe error creating made-for-you checkout session: {e}")
+            return False, None, f"Payment error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error creating made-for-you checkout session: {e}")
+            return False, None, "Failed to create checkout session"
+
+    def verify_webhook_signature(self, payload: bytes, signature: str) -> Tuple[bool, Optional[Dict], str]:
+        """
+        Verify a Stripe webhook signature.
+
+        Args:
+            payload: Raw request body
+            signature: Stripe-Signature header value
+
+        Returns:
+            (valid, event_data, message)
+        """
+        if not self.webhook_secret:
+            logger.error("STRIPE_WEBHOOK_SECRET not configured")
+            return False, None, "Webhook secret not configured"
+
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, signature, self.webhook_secret
+            )
+            # Convert Stripe Event object to plain dict — Stripe SDK v14+
+            # returns StripeObject instances that don't support .get()
+            event_dict = json.loads(str(event))
+            return True, event_dict, "Webhook verified"
+        except stripe.error.SignatureVerificationError as e:
+            if UNPARSEABLE_SIGNATURE_HEADER in str(e):
+                # Scanners/link-preview bots POST garbage headers; Stripe never sends one.
+                logger.warning(f"Invalid webhook signature: {e}")
+            else:
+                # A well-formed header that doesn't match means a wrong webhook secret or a
+                # tampered payload: every real delivery would fail, so keep it page-worthy.
+                logger.error(f"Invalid webhook signature: {e}")
+            return False, None, "Invalid signature"
+        except Exception as e:
+            logger.error(f"Error verifying webhook: {e}")
+            return False, None, str(e)
+
+    @staticmethod
+    def is_gen_checkout(session: Dict) -> bool:
+        """True if this checkout was created by gen (credit purchase or made-for-you).
+
+        Gen always sets metadata (user_email/credits for credits, order_type for
+        made-for-you). A session without it came from elsewhere on the Stripe
+        account, e.g. a Stripe Payment Link (``session.payment_link`` set): it's a
+        real payment to record, not a credit purchase to fulfil.
+        """
+        metadata = session.get('metadata') or {}
+        return bool(
+            metadata.get('order_type')
+            or metadata.get('user_email')
+            or metadata.get('credits')
+        )
+
+    def handle_checkout_completed(self, session: Dict) -> Tuple[bool, Optional[str], int, str]:
+        """
+        Handle a completed checkout session.
+
+        Args:
+            session: Stripe checkout session object
+
+        Returns:
+            (success, user_email, credits_to_add, message)
+        """
+        try:
+            metadata = session.get('metadata', {})
+            user_email = metadata.get('user_email') or session.get('customer_email')
+            try:
+                credits = int(metadata.get('credits', 0))
+            except (ValueError, TypeError):
+                logger.error(f"Invalid credits metadata in session {session.get('id')}: {metadata.get('credits')}")
+                return False, user_email, 0, "Invalid credit amount in session metadata"
+            package_id = metadata.get('package_id')
+
+            if not user_email:
+                logger.error(f"No user email in checkout session {session.get('id')}")
+                return False, None, 0, "No user email found"
+
+            if credits <= 0:
+                logger.error(f"Invalid credits in checkout session {session.get('id')}")
+                return False, user_email, 0, "Invalid credit amount"
+
+            logger.info(
+                f"Checkout completed: {user_email} purchased {credits} credits "
+                f"(package: {package_id}, session: {session.get('id')})"
+            )
+
+            return True, user_email, credits, f"Successfully purchased {credits} credits"
+
+        except Exception as e:
+            logger.error(f"Error handling checkout completed: {e}")
+            return False, None, 0, str(e)
+
+    def get_session(self, session_id: str) -> Optional[Dict]:
+        """
+        Get a checkout session by ID.
+
+        Args:
+            session_id: Stripe checkout session ID
+
+        Returns:
+            Session data or None
+        """
+        if not self.is_configured():
+            return None
+
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+            return dict(session)
+        except Exception as e:
+            logger.error(f"Error retrieving session {session_id}: {e}")
+            return None
+
+    def get_tip_price_id(self) -> Optional[str]:
+        """Stripe Price ID for the $1-per-unit checkout tip (found or created by lookup_key).
+
+        Returns None (no tip offered) if tips are disabled or Stripe errors, so a
+        tip problem can never block a purchase.
+        """
+        if not self.is_configured() or not get_settings().checkout_tip_enabled:
+            return None
+        if getattr(self, '_tip_price_id', None):
+            return self._tip_price_id
+        try:
+            existing = stripe.Price.list(lookup_keys=[TIP_PRICE_LOOKUP_KEY], active=True, limit=1)
+            if existing.data:
+                self._tip_price_id = existing.data[0].id
+            else:
+                price = stripe.Price.create(
+                    currency="usd",
+                    unit_amount=TIP_UNIT_CENTS,
+                    lookup_key=TIP_PRICE_LOOKUP_KEY,
+                    product_data={"name": "Tip the creator (optional)"},
+                    metadata={"purpose": "checkout_tip"},
+                )
+                self._tip_price_id = price.id
+                logger.info(f"Created Stripe tip price {price.id}")
+        except stripe.error.StripeError as e:
+            logger.warning(f"Checkout tip unavailable: {e}")
+            return None
+        return self._tip_price_id
+
+    def _add_tip_option(self, session_params: Dict[str, Any]) -> None:
+        """Offer the opt-in tip as a Checkout optional item (never pre-added to the cart)."""
+        price_id = self.get_tip_price_id()
+        if not price_id:
+            return
+        session_params['optional_items'] = [{
+            'price': price_id,
+            'quantity': TIP_DEFAULT_UNITS,
+            'adjustable_quantity': {'enabled': True, 'minimum': 1, 'maximum': TIP_MAX_UNITS},
+        }]
+
+    @staticmethod
+    def tip_cents_from_session(session: Dict[str, Any]) -> int:
+        """Total tip in a Checkout Session expanded with ``line_items`` (0 if none/unknown)."""
+        items = ((session.get('line_items') or {}).get('data')) or []
+        total = 0
+        for item in items:
+            price = item.get('price') or {}
+            if price.get('lookup_key') == TIP_PRICE_LOOKUP_KEY:
+                total += item.get('amount_total') or 0
+        return total
+
+    def get_tip_cents(self, session_id: str) -> Optional[int]:
+        """Tip amount for a completed session, fetched from Stripe.
+
+        Returns None (unknown) when Stripe can't be read, so callers can fall back
+        to a safe bound instead of silently treating the tip as zero.
+        """
+        if not session_id or not self.is_configured():
+            return None
+        try:
+            session = stripe.checkout.Session.retrieve(session_id, expand=["line_items"])
+            return self.tip_cents_from_session(dict(session) if not isinstance(session, dict) else session)
+        except Exception as e:
+            logger.warning(f"Could not read tip for session {session_id}: {e}")
+            return None
+
+    def referral_base_cents(self, session: Dict[str, Any]) -> int:
+        """Amount a referral earning is calculated on: the purchase without any tip.
+
+        If the tip can't be read from Stripe, cap at the package's list price
+        (a tip only ever adds on top of it), so a tip never inflates the earning.
+        """
+        amount_total = session.get('amount_total') or 0
+        tip = self.get_tip_cents(session.get('id'))
+        if tip is not None:
+            return max(0, amount_total - tip)
+        package = CREDIT_PACKAGES.get((session.get('metadata') or {}).get('package_id'), {})
+        return min(amount_total, package.get('price_cents', amount_total))
+
+    def get_or_create_referral_coupon(self, discount_percent: int) -> Optional[str]:
+        """Get or create a Stripe coupon for a referral discount percentage."""
+        if not self.is_configured():
+            return None
+        coupon_id = f"referral-{discount_percent}pct"
+        try:
+            stripe.Coupon.retrieve(coupon_id)
+            return coupon_id
+        except stripe.error.InvalidRequestError:
+            try:
+                stripe.Coupon.create(
+                    id=coupon_id,
+                    percent_off=discount_percent,
+                    duration="once",
+                    name=f"Referral {discount_percent}% off",
+                )
+                logger.info(f"Created Stripe coupon: {coupon_id}")
+                return coupon_id
+            except stripe.error.StripeError as e:
+                logger.error(f"Failed to create coupon {coupon_id}: {e}")
+                return None
+
+    def get_or_create_promo_coupon(self, discount_percent: int) -> Optional[str]:
+        """Stripe coupon for the conversion-email offer (distinct id so redemptions are countable)."""
+        if not self.is_configured():
+            return None
+        coupon_id = f"conversion-offer-{discount_percent}pct"
+        try:
+            stripe.Coupon.retrieve(coupon_id)
+            return coupon_id
+        except stripe.error.InvalidRequestError:
+            try:
+                stripe.Coupon.create(
+                    id=coupon_id,
+                    percent_off=discount_percent,
+                    duration="once",
+                    name=f"Welcome offer {discount_percent}% off",
+                )
+                logger.info(f"Created Stripe coupon: {coupon_id}")
+                return coupon_id
+            except stripe.error.StripeError as e:
+                logger.error(f"Failed to create coupon {coupon_id}: {e}")
+                return None
+
+    def create_connect_account(self, email: str) -> Tuple[Optional[str], Optional[str]]:
+        """Create a Stripe Connect Express account. Returns (account_id, onboarding_url)."""
+        if not self.is_configured():
+            return None, None
+        try:
+            account = stripe.Account.create(
+                type="express",
+                email=email,
+                capabilities={"transfers": {"requested": True}},
+                metadata={"source": "nomad_karaoke_referrals"},
+            )
+            account_link = stripe.AccountLink.create(
+                account=account.id,
+                refresh_url=f"{self.frontend_url}/app/referrals?connect=refresh",
+                return_url=f"{self.frontend_url}/app/referrals?connect=complete",
+                type="account_onboarding",
+            )
+            logger.info(f"Created Connect account {account.id} for {email}")
+            return account.id, account_link.url
+        except stripe.error.StripeError as e:
+            logger.error(f"Failed to create Connect account for {email}: {e}")
+            return None, None
+
+    def get_connect_account_status(self, account_id: str) -> Optional[dict]:
+        """Retrieve Stripe Connect account status. Returns dict with account details."""
+        if not self.is_configured():
+            return None
+        try:
+            account = stripe.Account.retrieve(account_id)
+            return {
+                "account_id": account.id,
+                "charges_enabled": account.charges_enabled,
+                "payouts_enabled": account.payouts_enabled,
+                "details_submitted": account.details_submitted,
+                "email": account.email,
+            }
+        except stripe.error.StripeError as e:
+            logger.error(f"Failed to retrieve Connect account {account_id}: {e}")
+            return None
+
+    def create_connect_login_link(self, account_id: str) -> Optional[str]:
+        """Create a login link to the Stripe Express dashboard. Returns URL."""
+        if not self.is_configured():
+            return None
+        try:
+            link = stripe.Account.create_login_link(account_id)
+            return link.url
+        except stripe.error.StripeError as e:
+            logger.error(f"Failed to create login link for {account_id}: {e}")
+            return None
+
+    def create_connect_update_link(self, account_id: str) -> Optional[str]:
+        """Create an account link for updating Connect account info. Returns URL."""
+        if not self.is_configured():
+            return None
+        try:
+            account_link = stripe.AccountLink.create(
+                account=account_id,
+                refresh_url=f"{self.frontend_url}/app/referrals?connect=refresh",
+                return_url=f"{self.frontend_url}/app/referrals?connect=complete",
+                type="account_onboarding",
+            )
+            return account_link.url
+        except stripe.error.StripeError as e:
+            logger.error(f"Failed to create update link for {account_id}: {e}")
+            return None
+
+    def create_transfer(self, amount_cents: int, destination_account_id: str, description: str = "Nomad Karaoke referral payout") -> Optional[str]:
+        """Create a transfer to a Connect account. Returns transfer ID."""
+        if not self.is_configured():
+            return None
+        try:
+            transfer = stripe.Transfer.create(
+                amount=amount_cents,
+                currency="usd",
+                destination=destination_account_id,
+                description=description,
+            )
+            logger.info(f"Created transfer {transfer.id}: ${amount_cents / 100:.2f} to {destination_account_id}")
+            return transfer.id
+        except stripe.error.StripeError as e:
+            logger.error(f"Failed to create transfer to {destination_account_id}: {e}")
+            return None
+
+    def create_customer(self, email: str, name: Optional[str] = None) -> Optional[str]:
+        """
+        Create or get a Stripe customer for a user.
+
+        Args:
+            email: User's email
+            name: User's display name (optional)
+
+        Returns:
+            Stripe customer ID or None
+        """
+        if not self.is_configured():
+            return None
+
+        try:
+            # Check if customer already exists
+            customers = stripe.Customer.list(email=email, limit=1)
+            if customers.data:
+                return customers.data[0].id
+
+            # Create new customer
+            customer = stripe.Customer.create(
+                email=email,
+                name=name,
+                metadata={'source': 'nomad_karaoke'},
+            )
+            logger.info(f"Created Stripe customer {customer.id} for {email}")
+            return customer.id
+
+        except Exception as e:
+            logger.error(f"Error creating Stripe customer: {e}")
+            return None
+
+
+# Global instance
+_stripe_service = None
+
+
+def get_stripe_service() -> StripeService:
+    """Get the global Stripe service instance."""
+    global _stripe_service
+    if _stripe_service is None:
+        _stripe_service = StripeService()
+    return _stripe_service

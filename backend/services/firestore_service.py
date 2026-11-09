@@ -1,0 +1,1256 @@
+"""
+Firestore database operations for job management.
+"""
+import logging
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from google.api_core import exceptions as core_exceptions
+from google.api_core import retry as api_retry
+from google.cloud import firestore
+from google.cloud.firestore_v1 import FieldFilter
+
+from backend.config import settings
+from backend.models.job import Job, JobStatus, TimelineEvent
+from backend.models.worker_log import WorkerLogEntry
+from backend.services.log_write_offload import submit_or_run
+from backend.models.review_session import ReviewSession
+from backend.models.audio_edit_session import AudioEditSession
+
+
+logger = logging.getLogger(__name__)
+
+# Job-list queries back user-facing endpoints (GET /api/jobs). The client's
+# default RunQuery retry/timeout is 300s, so a stalled stream used to hold a
+# threadpool thread for 5 minutes before failing ("Timeout of 300.0s exceeded").
+# Bound them so they fail fast; the frontend just polls again.
+LIST_QUERY_TIMEOUT_SECONDS = 30.0
+LIST_QUERY_RETRY = api_retry.Retry(
+    initial=0.1,
+    maximum=5.0,
+    multiplier=1.3,
+    predicate=api_retry.if_exception_type(
+        core_exceptions.DeadlineExceeded,
+        core_exceptions.InternalServerError,
+        core_exceptions.ServiceUnavailable,
+    ),
+    timeout=LIST_QUERY_TIMEOUT_SECONDS,
+)
+
+
+def _bounded_stream(query):
+    """query.stream() with the job-list retry/timeout bounds."""
+    return query.stream(retry=LIST_QUERY_RETRY, timeout=LIST_QUERY_TIMEOUT_SECONDS)
+
+
+class FirestoreService:
+    """Service for Firestore database operations."""
+    
+    def __init__(self):
+        """Initialize Firestore client."""
+        self.db = firestore.Client(project=settings.google_cloud_project)
+        self.collection = settings.firestore_collection
+        self.tokens_collection = "auth_tokens"  # Collection for access tokens
+        
+    def create_job(self, job: Job) -> None:
+        """Create a new job in Firestore."""
+        try:
+            doc_ref = self.db.collection(self.collection).document(job.job_id)
+            doc_ref.set(job.model_dump(mode='json'))
+            logger.info(f"Created job {job.job_id} in Firestore")
+        except Exception as e:
+            logger.error(f"Error creating job {job.job_id}: {e}")
+            raise
+    
+    def get_job(self, job_id: str) -> Optional[Job]:
+        """Get a job by ID."""
+        try:
+            doc_ref = self.db.collection(self.collection).document(job_id)
+            doc = doc_ref.get()
+            
+            logger.debug(f"Fetching job {job_id} from collection {self.collection}")
+            logger.debug(f"Document exists: {doc.exists}")
+            
+            if not doc.exists:
+                return None
+            
+            data = doc.to_dict()
+            logger.debug(f"Document data keys: {list(data.keys()) if data else 'None'}")
+            logger.debug(f"Document data: {data}")
+            
+            return Job(**data)
+        except Exception as e:
+            logger.error(f"Error getting job {job_id}: {e}")
+            raise
+    
+    @staticmethod
+    def _is_doc_size_error(exc: Exception) -> bool:
+        """True when a Firestore write failed the 1MB per-document size limit."""
+        return "maximum allowed size" in str(exc).lower()
+
+    def _update_with_size_recovery(
+        self, doc_ref, updates: Dict[str, Any], job_id: str
+    ) -> None:
+        """
+        Apply ``doc_ref.update(updates)``, self-healing past the 1MB doc limit.
+
+        Old job documents can accumulate a large embedded ``worker_logs`` array
+        (the legacy logging path, superseded by the ``jobs/{id}/logs``
+        subcollection). Once that array pushes a document to ~1MB, EVERY
+        subsequent write — including a customer submitting lyrics corrections —
+        fails with Firestore's "exceeds the maximum allowed size" 400. The
+        embedded array is deprecated dead weight, so drop it and retry once.
+        """
+        try:
+            doc_ref.update(updates)
+        except Exception as e:
+            # Don't recurse if the caller is itself writing worker_logs, and
+            # only recover from the specific size-limit failure.
+            if 'worker_logs' in updates or not self._is_doc_size_error(e):
+                raise
+            logger.warning(
+                f"Job {job_id}: Firestore write hit the 1MB document limit; "
+                f"clearing the legacy embedded worker_logs array and retrying ({e})"
+            )
+            # Deleting a field only shrinks the document, so this write is safe.
+            doc_ref.update({'worker_logs': firestore.DELETE_FIELD})
+            doc_ref.update(updates)
+            logger.info(
+                f"Job {job_id}: cleared legacy worker_logs; write succeeded on retry"
+            )
+
+    def update_job(self, job_id: str, updates: Dict[str, Any]) -> None:
+        """Update a job with partial data."""
+        try:
+            doc_ref = self.db.collection(self.collection).document(job_id)
+
+            # Add updated_at timestamp
+            updates['updated_at'] = datetime.utcnow()
+
+            self._update_with_size_recovery(doc_ref, updates, job_id)
+            logger.info(f"Updated job {job_id} in Firestore")
+        except Exception as e:
+            logger.error(f"Error updating job {job_id}: {e}")
+            raise
+    
+    def claim_job_state_flag(self, job_id: str, key: str) -> bool:
+        """Atomically test-and-clear ``state_data.<key>``.
+
+        Returns True for exactly one caller while the flag is truthy (it is set
+        to False in the same transaction), so two workers racing to act on the
+        same flag can't both proceed.
+        """
+        doc_ref = self.db.collection(self.collection).document(job_id)
+
+        @firestore.transactional
+        def _claim(transaction, ref) -> bool:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return False
+            if not ((snapshot.to_dict() or {}).get("state_data") or {}).get(key):
+                return False
+            transaction.update(ref, {f"state_data.{key}": False, "updated_at": datetime.utcnow()})
+            return True
+
+        return _claim(self.db.transaction(), doc_ref)
+
+    def try_set_job_state_flag(self, job_id: str, key: str) -> bool:
+        """Atomically set ``state_data.<key>`` to True if it isn't already truthy.
+
+        The inverse of ``claim_job_state_flag``: returns True for exactly one of
+        several concurrent callers (a guard flag such as visibility_change_in_progress).
+        """
+        doc_ref = self.db.collection(self.collection).document(job_id)
+
+        @firestore.transactional
+        def _set(transaction, ref) -> bool:
+            snapshot = ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return False
+            if ((snapshot.to_dict() or {}).get("state_data") or {}).get(key):
+                return False
+            transaction.update(ref, {f"state_data.{key}": True, "updated_at": datetime.utcnow()})
+            return True
+
+        return _set(self.db.transaction(), doc_ref)
+
+    def update_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        progress: Optional[int] = None,
+        message: Optional[str] = None,
+        timeline_metadata: Optional[Dict[str, Any]] = None,
+        **additional_fields
+    ) -> None:
+        """Update job status and add timeline event."""
+        try:
+            doc_ref = self.db.collection(self.collection).document(job_id)
+
+            # Create timeline event
+            timeline_event = TimelineEvent(
+                status=status.value,
+                # Timezone-aware UTC so the serialized ISO string carries a
+                # "+00:00" offset (see job_manager.create_job for rationale).
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                progress=progress,
+                message=message,
+                metadata=timeline_metadata,
+            )
+            
+            # Prepare updates
+            updates = {
+                'status': status.value,
+                'updated_at': datetime.utcnow(),
+                'timeline': firestore.ArrayUnion([timeline_event.model_dump(mode='json')])
+            }
+            
+            if progress is not None:
+                updates['progress'] = progress
+            
+            # Add any additional fields
+            updates.update(additional_fields)
+
+            self._update_with_size_recovery(doc_ref, updates, job_id)
+            logger.info(f"Updated job {job_id} status to {status.value}")
+        except Exception as e:
+            logger.error(f"Error updating job status {job_id}: {e}")
+            raise
+
+        # Incident-hardening D1: near-real-time alert on ANY transition to FAILED.
+        # The spike-based error monitor is blind to a novel low-volume failure
+        # (rolling_avg==0 → never a spike), so a brand-new error on a couple of
+        # jobs can go unnoticed. This is the universal net. Best-effort: it must
+        # never turn a successful status write into a failure, hence the guard.
+        if status == JobStatus.FAILED:
+            try:
+                from backend.services.ops_alerts import notify_job_failed
+
+                notify_job_failed(
+                    db=self.db,
+                    collection=self.collection,
+                    job_id=job_id,
+                    message=message,
+                    additional_fields=additional_fields,
+                )
+            except Exception as alert_exc:  # noqa: BLE001
+                logger.warning(f"Failure alert for job {job_id} did not send: {alert_exc}")
+    
+    def list_jobs(
+        self,
+        status: Optional[JobStatus] = None,
+        environment: Optional[str] = None,
+        client_id: Optional[str] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        user_email: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Job]:
+        """
+        List jobs with optional filters.
+
+        Args:
+            status: Filter by job status
+            environment: Filter by request_metadata.environment (test/production/development)
+            client_id: Filter by request_metadata.client_id
+            created_after: Filter jobs created after this datetime
+            created_before: Filter jobs created before this datetime
+            user_email: Filter by user_email (owner of the job)
+            tenant_id: Filter by tenant_id (white-label portal scoping)
+            limit: Maximum number of jobs to return
+
+        Returns:
+            List of Job objects matching filters, ordered by created_at descending
+        """
+        try:
+            query = self.db.collection(self.collection)
+
+            if status:
+                query = query.where(filter=FieldFilter('status', '==', status.value))
+
+            # Filter by request_metadata fields using dot notation
+            if environment:
+                query = query.where(filter=FieldFilter('request_metadata.environment', '==', environment))
+
+            if client_id:
+                query = query.where(filter=FieldFilter('request_metadata.client_id', '==', client_id))
+
+            # Filter by user_email (job owner)
+            if user_email:
+                query = query.where(filter=FieldFilter('user_email', '==', user_email.lower()))
+
+            # Filter by tenant_id (white-label portal scoping)
+            # Always filter: "" for consumer jobs, "vocalstar"/etc for tenant jobs
+            if tenant_id is not None:
+                query = query.where(filter=FieldFilter('tenant_id', '==', tenant_id))
+
+            # Date range filters
+            if created_after:
+                query = query.where(filter=FieldFilter('created_at', '>=', created_after))
+
+            if created_before:
+                query = query.where(filter=FieldFilter('created_at', '<=', created_before))
+
+            query = query.order_by('created_at', direction=firestore.Query.DESCENDING).limit(limit)
+
+            docs = _bounded_stream(query)
+            jobs = [Job(**doc.to_dict()) for doc in docs]
+
+            return jobs
+        except Exception as e:
+            logger.error(f"Error listing jobs: {e}")
+            raise
+
+    def list_jobs_by_batch_id(self, batch_id: str, limit: int = 200) -> List[Job]:
+        """List all jobs belonging to a Bulk Mode batch (state_data.batch_id == batch_id).
+
+        Single-field equality, so no composite index is required.
+        """
+        try:
+            query = (
+                self.db.collection(self.collection)
+                .where(filter=FieldFilter('state_data.batch_id', '==', batch_id))
+                .limit(limit)
+            )
+            return [Job(**doc.to_dict()) for doc in _bounded_stream(query)]
+        except Exception as e:
+            logger.error(f"Error listing jobs for batch {batch_id}: {e}")
+            raise
+
+    # Fields needed by the dashboard summary view
+    SUMMARY_FIELD_PATHS = [
+        'job_id', 'status', 'progress', 'created_at', 'updated_at', 'artist', 'title',
+        'error_message', 'error_details.code', 'error_details.stage',
+        'error_details.stall_minutes', 'error_details.keep_trying', 'non_interactive', 'outputs_deleted_at', 'user_email', 'is_private',
+        'renders_purged_at', 'stems_purged_at', 'finalise_only', 'prep_only',
+        'state_data.regenerate', 'state_data.stems_restore', 'state_data.instrumental_selection',
+        'made_for_you', 'customer_email', 'locale', 'credit_refunded',
+        'url', 'filename', 'existing_instrumental_gcs_path',
+        'audio_search_artist', 'audio_search_title',
+        'audio_source_type', 'source_name', 'source_id', 'target_file', 'download_url',
+        'state_data.brand_code', 'state_data.youtube_url', 'state_data.dropbox_link',
+        'state_data.audio_progress', 'state_data.lyrics_progress',
+        'state_data.audio_complete', 'state_data.lyrics_complete',
+        'state_data.backing_vocals_analysis', 'state_data.visibility_change_in_progress',
+        'state_data.render_pending_capacity',
+        'state_data.cloud_run_retry_pending',
+        'state_data.credits_charged',
+        'state_data.payment_bypassed',
+        'state_data.pending_additional_credits',
+        # Inputs for resolving a missing credits_charged (job_credits); the list
+        # route strips tenant_id/creation_params from the response again.
+        'tenant_id', 'creation_params.is_admin',
+        'state_data.duration_actual_seconds',
+        'state_data.duration_confirm_reason',
+        'state_data.batch_id',
+        'state_data.bulk_auto_selected',
+        'state_data.awaiting_upload',
+        'file_urls.finals', 'file_urls.videos', 'file_urls.packages',
+        'processing_metadata',
+    ]
+
+    def list_jobs_summary(
+        self,
+        status: Optional[JobStatus] = None,
+        exclude_statuses: Optional[List[str]] = None,
+        environment: Optional[str] = None,
+        client_id: Optional[str] = None,
+        created_after: Optional[datetime] = None,
+        created_before: Optional[datetime] = None,
+        user_email: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        List jobs with Firestore field projection for reduced payload.
+
+        Uses ``query.select()`` so Firestore only reads the requested fields,
+        drastically cutting bandwidth and deserialization cost.
+
+        Returns raw dicts (not Job models) because projected documents would
+        fail Pydantic validation for missing required fields.
+        """
+        try:
+            query = self.db.collection(self.collection)
+
+            if status:
+                query = query.where(filter=FieldFilter('status', '==', status.value))
+
+            # NOTE: exclude_statuses is filtered in Python after the query
+            # because Firestore's not-in filter combined with order_by(created_at)
+            # requires a composite index. Since documents are tiny after select(),
+            # Python filtering is fast and avoids the index requirement.
+
+            if environment:
+                query = query.where(filter=FieldFilter('request_metadata.environment', '==', environment))
+
+            if client_id:
+                query = query.where(filter=FieldFilter('request_metadata.client_id', '==', client_id))
+
+            if user_email:
+                query = query.where(filter=FieldFilter('user_email', '==', user_email.lower()))
+
+            # Always filter: "" for consumer jobs, "vocalstar"/etc for tenant jobs
+            if tenant_id is not None:
+                query = query.where(filter=FieldFilter('tenant_id', '==', tenant_id))
+
+            if created_after:
+                query = query.where(filter=FieldFilter('created_at', '>=', created_after))
+
+            if created_before:
+                query = query.where(filter=FieldFilter('created_at', '<=', created_before))
+
+            query = query.order_by('created_at', direction=firestore.Query.DESCENDING).limit(limit)
+            query = query.select(self.SUMMARY_FIELD_PATHS)
+
+            docs = _bounded_stream(query)
+            results = [doc.to_dict() for doc in docs]
+
+            # Apply exclude_statuses filter in Python (see note above)
+            if exclude_statuses:
+                results = [r for r in results if r.get('status') not in exclude_statuses]
+
+            return results
+        except Exception as e:
+            logger.error(f"Error listing jobs summary: {e}")
+            raise
+
+    def delete_jobs_by_filter(
+        self,
+        environment: Optional[str] = None,
+        client_id: Optional[str] = None,
+        status: Optional[JobStatus] = None,
+        created_before: Optional[datetime] = None,
+    ) -> int:
+        """
+        Delete multiple jobs matching filter criteria.
+        
+        CAUTION: This is a destructive operation. Use carefully.
+        
+        Args:
+            environment: Delete jobs with this environment (e.g., "test")
+            client_id: Delete jobs from this client
+            status: Delete jobs with this status
+            created_before: Delete jobs created before this datetime
+            
+        Returns:
+            Number of jobs deleted
+        """
+        try:
+            query = self.db.collection(self.collection)
+            
+            if environment:
+                query = query.where(filter=FieldFilter('request_metadata.environment', '==', environment))
+            
+            if client_id:
+                query = query.where(filter=FieldFilter('request_metadata.client_id', '==', client_id))
+            
+            if status:
+                query = query.where(filter=FieldFilter('status', '==', status.value))
+            
+            if created_before:
+                query = query.where(filter=FieldFilter('created_at', '<=', created_before))
+            
+            # Get matching documents
+            docs = list(query.stream())
+            deleted_count = 0
+            
+            # Delete in batches
+            batch = self.db.batch()
+            batch_count = 0
+            
+            for doc in docs:
+                batch.delete(doc.reference)
+                batch_count += 1
+                deleted_count += 1
+                
+                # Firestore batch limit is 500
+                if batch_count >= 500:
+                    batch.commit()
+                    batch = self.db.batch()
+                    batch_count = 0
+            
+            # Commit any remaining deletes
+            if batch_count > 0:
+                batch.commit()
+            
+            logger.info(f"Deleted {deleted_count} jobs matching filter criteria")
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error deleting jobs by filter: {e}")
+            raise
+    
+    def delete_job(self, job_id: str) -> None:
+        """Delete a job from Firestore."""
+        try:
+            doc_ref = self.db.collection(self.collection).document(job_id)
+            doc_ref.delete()
+            logger.info(f"Deleted job {job_id} from Firestore")
+        except Exception as e:
+            logger.error(f"Error deleting job {job_id}: {e}")
+            raise
+    
+    def append_worker_log(self, job_id: str, log_entry: Dict[str, Any]) -> None:
+        """
+        Append a log entry to the job's log stream.
+
+        DEPRECATED embedded-array behaviour: with USE_LOG_SUBCOLLECTION=false
+        this appends to the ``worker_logs`` array via ArrayUnion (atomic, but
+        subject to the 1MB per-document limit). With the flag on (default) the
+        entry is routed to the ``jobs/{id}/logs`` subcollection instead, so the
+        legacy dict-based callers (job_logging.JobLogger, FirestoreJobLogHandler)
+        stop bloating the embedded array toward that limit.
+
+        Args:
+            job_id: Job ID
+            log_entry: Log entry dict with timestamp, level, worker, message
+        """
+        # Route legacy dict-based callers to the subcollection when enabled so
+        # they no longer grow the embedded worker_logs array (which, once near
+        # 1MB, blocks all writes to the job document — including review submits).
+        if settings.use_log_subcollection:
+            entry = WorkerLogEntry.create(
+                job_id=job_id,
+                worker=log_entry.get('worker', 'unknown'),
+                level=log_entry.get('level', 'INFO'),
+                message=log_entry.get('message', ''),
+            )
+            self.append_log_to_subcollection(job_id, entry)
+            return
+        try:
+            doc_ref = self.db.collection(self.collection).document(job_id)
+            doc_ref.update({
+                'worker_logs': firestore.ArrayUnion([log_entry]),
+                'updated_at': datetime.utcnow()
+            })
+            # Don't log every append - too spammy
+        except Exception as e:
+            # Log but don't raise - logging shouldn't break workers
+            logger.debug(f"Error appending worker log for job {job_id}: {e}")
+
+    # ============================================
+    # Worker Log Subcollection Methods
+    # ============================================
+    # These methods store logs in a subcollection (jobs/{job_id}/logs)
+    # instead of an embedded array to avoid the 1MB document size limit.
+
+    def append_log_to_subcollection(self, job_id: str, log_entry: WorkerLogEntry) -> None:
+        """
+        Append a log entry to the logs subcollection.
+
+        Stores logs at: jobs/{job_id}/logs/{log_id}
+
+        This approach avoids the 1MB document size limit by storing each
+        log entry as a separate document in a subcollection.
+
+        Args:
+            job_id: Job ID
+            log_entry: WorkerLogEntry instance
+        """
+        try:
+            # Ensure job_id is set on the log entry
+            log_entry.job_id = job_id
+
+            # Get subcollection reference
+            logs_ref = self.db.collection(self.collection).document(job_id).collection("logs")
+
+            # Add document with auto-generated ID or use log_entry.id.
+            # On the API event loop this hands off to a background thread
+            # (a sync Firestore write there freezes every request on the instance).
+            doc_ref = logs_ref.document(log_entry.id)
+            data = log_entry.to_dict()
+
+            def _write():
+                try:
+                    doc_ref.set(data)
+                except Exception as e:
+                    logger.debug(f"Error appending log to subcollection for job {job_id}: {e}")
+
+            submit_or_run(_write)
+
+            # Don't log every append - too spammy
+        except Exception as e:
+            # Log but don't raise - logging shouldn't break workers
+            logger.debug(f"Error appending log to subcollection for job {job_id}: {e}")
+
+    def get_logs_from_subcollection(
+        self,
+        job_id: str,
+        limit: int = 500,
+        since_timestamp: Optional[datetime] = None,
+        worker: Optional[str] = None,
+        offset: int = 0
+    ) -> List[WorkerLogEntry]:
+        """
+        Get log entries from the logs subcollection.
+
+        Args:
+            job_id: Job ID
+            limit: Maximum number of logs to return (default 500)
+            since_timestamp: Return only logs after this timestamp
+            worker: Filter by worker name (optional)
+            offset: Number of logs to skip (for pagination)
+
+        Returns:
+            List of WorkerLogEntry instances, ordered by timestamp ascending
+        """
+        try:
+            # Get subcollection reference
+            logs_ref = self.db.collection(self.collection).document(job_id).collection("logs")
+
+            # Build query
+            query = logs_ref.order_by("timestamp", direction=firestore.Query.ASCENDING)
+
+            if since_timestamp:
+                query = query.where(filter=FieldFilter("timestamp", ">", since_timestamp))
+
+            if worker:
+                query = query.where(filter=FieldFilter("worker", "==", worker))
+
+            # Apply offset and limit
+            if offset > 0:
+                query = query.offset(offset)
+
+            query = query.limit(limit)
+
+            # Execute query
+            docs = query.stream()
+            logs = [WorkerLogEntry.from_dict(doc.to_dict()) for doc in docs]
+
+            return logs
+
+        except Exception as e:
+            logger.error(f"Error getting logs from subcollection for job {job_id}: {e}")
+            return []
+
+    def get_logs_count_from_subcollection(self, job_id: str) -> int:
+        """
+        Get the total count of log entries in the subcollection.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            Total count of log entries
+        """
+        try:
+            # Get subcollection reference
+            logs_ref = self.db.collection(self.collection).document(job_id).collection("logs")
+
+            # Use aggregation query for efficient counting
+            count_query = logs_ref.count()
+            result = count_query.get()
+
+            # Result is a list of AggregationResult, we want the first one's count
+            if result and len(result) > 0:
+                return result[0][0].value
+            return 0
+
+        except Exception as e:
+            logger.error(f"Error counting logs for job {job_id}: {e}")
+            return 0
+
+    def delete_logs_subcollection(self, job_id: str, batch_size: int = 500) -> int:
+        """
+        Delete all log entries in the logs subcollection.
+
+        This is used when deleting a job to clean up its logs.
+
+        Args:
+            job_id: Job ID
+            batch_size: Number of documents to delete per batch
+
+        Returns:
+            Number of logs deleted
+        """
+        try:
+            logs_ref = self.db.collection(self.collection).document(job_id).collection("logs")
+            deleted_count = 0
+
+            while True:
+                # Get a batch of documents
+                docs = logs_ref.limit(batch_size).stream()
+                deleted_in_batch = 0
+
+                # Delete in a batch
+                batch = self.db.batch()
+                for doc in docs:
+                    batch.delete(doc.reference)
+                    deleted_in_batch += 1
+
+                if deleted_in_batch == 0:
+                    break
+
+                batch.commit()
+                deleted_count += deleted_in_batch
+
+                # If we deleted less than batch_size, we're done
+                if deleted_in_batch < batch_size:
+                    break
+
+            if deleted_count > 0:
+                logger.info(f"Deleted {deleted_count} logs for job {job_id}")
+
+            return deleted_count
+
+        except Exception as e:
+            logger.error(f"Error deleting logs subcollection for job {job_id}: {e}")
+            return 0
+    
+    # ============================================
+    # Token Management Methods
+    # ============================================
+    
+    def create_token(self, token: str, token_data: Dict[str, Any]) -> None:
+        """Create a new access token in Firestore."""
+        try:
+            doc_ref = self.db.collection(self.tokens_collection).document(token)
+            doc_ref.set(token_data)
+            logger.info(f"Created token in Firestore")
+        except Exception as e:
+            logger.error(f"Error creating token: {e}")
+            raise
+    
+    def get_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Get token data by token string."""
+        try:
+            doc_ref = self.db.collection(self.tokens_collection).document(token)
+            doc = doc_ref.get()
+            
+            if not doc.exists:
+                return None
+            
+            return doc.to_dict()
+        except Exception as e:
+            logger.error(f"Error getting token: {e}")
+            return None
+    
+    def update_token(self, token: str, updates: Dict[str, Any]) -> None:
+        """Update token data."""
+        try:
+            doc_ref = self.db.collection(self.tokens_collection).document(token)
+            doc_ref.update(updates)
+            logger.info(f"Updated token in Firestore")
+        except Exception as e:
+            logger.error(f"Error updating token: {e}")
+            raise
+    
+    def increment_token_usage(self, token: str, job_id: str) -> None:
+        """Increment token usage count and add job to history."""
+        try:
+            doc_ref = self.db.collection(self.tokens_collection).document(token)
+            
+            # Use Firestore transaction to ensure atomic increment
+            @firestore.transactional
+            def update_in_transaction(transaction, doc_ref):
+                snapshot = doc_ref.get(transaction=transaction)
+                if not snapshot.exists:
+                    raise ValueError("Token not found")
+                
+                data = snapshot.to_dict()
+                current_usage = data.get("usage_count", 0)
+                jobs = data.get("jobs", [])
+                
+                # Increment usage
+                transaction.update(doc_ref, {
+                    "usage_count": current_usage + 1,
+                    "last_used": datetime.utcnow(),
+                    "jobs": firestore.ArrayUnion([{
+                        "job_id": job_id,
+                        "created_at": datetime.utcnow()
+                    }])
+                })
+            
+            transaction = self.db.transaction()
+            update_in_transaction(transaction, doc_ref)
+            
+            logger.info(f"Incremented token usage for job {job_id}")
+        except Exception as e:
+            logger.error(f"Error incrementing token usage: {e}")
+            raise
+    
+    def list_tokens(self) -> List[Dict[str, Any]]:
+        """List all tokens (admin only)."""
+        try:
+            docs = self.db.collection(self.tokens_collection).stream()
+            tokens = [doc.to_dict() for doc in docs]
+            logger.info(f"Retrieved {len(tokens)} tokens from Firestore")
+            return tokens
+        except Exception as e:
+            logger.error(f"Error listing tokens: {e}")
+            return []
+
+    # ============================================
+    # Search Session Methods
+    # ============================================
+
+    def create_search_session(self, session_data: dict) -> str:
+        """Store a search session for the guided job creation flow.
+
+        Sessions are short-lived (TTL enforced via Firestore TTL policy) and
+        represent a completed audio search that hasn't yet been converted into
+        a job.  The document is consumed (deleted) when create-from-search runs.
+
+        Args:
+            session_data: Dict with session_id, user_email, tenant_id, artist,
+                          title, results, remote_search_id, ttl_expiry.
+
+        Returns:
+            session_id from session_data.
+        """
+        try:
+            session_id = session_data['session_id']
+            doc_ref = self.db.collection('search_sessions').document(session_id)
+            doc_ref.set(session_data)
+            logger.info(f"Created search session {session_id}")
+            return session_id
+        except Exception as e:
+            logger.error(f"Error creating search session: {e}")
+            raise
+
+    def get_search_session(self, session_id: str) -> Optional[dict]:
+        """Retrieve a search session by ID.
+
+        Returns None only if the document does not exist.
+        Raises on Firestore errors so callers can distinguish a missing session
+        from a transient datastore failure.
+
+        TTL-expired documents may still appear briefly; callers should check
+        ttl_expiry and treat expired sessions as missing.
+
+        Args:
+            session_id: UUID string identifying the session.
+
+        Returns:
+            Session dict or None.
+        """
+        doc_ref = self.db.collection('search_sessions').document(session_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return None
+        return doc.to_dict()
+
+    def consume_search_session(self, session_id: str) -> Optional[dict]:
+        """Atomically read and delete a search session.
+
+        Uses a Firestore transaction to prevent two concurrent job-creation
+        requests from both reading the same session and creating duplicate jobs.
+
+        Returns the session dict if it existed, None if it did not exist.
+        Raises on Firestore errors.
+
+        Args:
+            session_id: UUID string identifying the session.
+
+        Returns:
+            Session dict or None.
+        """
+        doc_ref = self.db.collection('search_sessions').document(session_id)
+
+        @firestore.transactional
+        def _read_and_delete(transaction, ref):
+            doc = ref.get(transaction=transaction)
+            if not doc.exists:
+                return None
+            session_data = doc.to_dict()
+            transaction.delete(ref)
+            return session_data
+
+        transaction = self.db.transaction()
+        return _read_and_delete(transaction, doc_ref)
+
+    # ============================================
+    # Review Session Subcollection Methods
+    # ============================================
+    # These methods store review session snapshots in a subcollection
+    # (jobs/{job_id}/review_sessions) for lyrics review backup/restore.
+
+    def save_review_session(self, job_id: str, session: ReviewSession) -> str:
+        """
+        Save a review session to the subcollection.
+
+        Stores at: jobs/{job_id}/review_sessions/{session_id}
+
+        Args:
+            job_id: Job ID
+            session: ReviewSession instance
+
+        Returns:
+            session_id
+        """
+        try:
+            session.job_id = job_id
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("review_sessions")
+            doc_ref = sessions_ref.document(session.session_id)
+            doc_ref.set(session.to_dict())
+            logger.info(f"Saved review session {session.session_id} for job {job_id}")
+            return session.session_id
+        except Exception as e:
+            logger.error(f"Error saving review session for job {job_id}: {e}")
+            raise
+
+    def list_review_sessions(self, job_id: str) -> List[ReviewSession]:
+        """
+        List all review sessions for a job, ordered by updated_at descending.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            List of ReviewSession instances (metadata only, no correction_data)
+        """
+        try:
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("review_sessions")
+            query = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING)
+            docs = query.stream()
+            return [ReviewSession.from_dict(doc.to_dict()) for doc in docs]
+        except Exception as e:
+            logger.error(f"Error listing review sessions for job {job_id}: {e}")
+            return []
+
+    def get_review_session(self, job_id: str, session_id: str) -> Optional[ReviewSession]:
+        """
+        Get a single review session by ID.
+
+        Args:
+            job_id: Job ID
+            session_id: Session ID
+
+        Returns:
+            ReviewSession or None
+        """
+        try:
+            doc_ref = (
+                self.db.collection(self.collection)
+                .document(job_id)
+                .collection("review_sessions")
+                .document(session_id)
+            )
+            doc = doc_ref.get()
+            if not doc.exists:
+                return None
+            return ReviewSession.from_dict(doc.to_dict())
+        except Exception as e:
+            logger.error(f"Error getting review session {session_id} for job {job_id}: {e}")
+            raise
+
+    def delete_review_session(self, job_id: str, session_id: str) -> None:
+        """
+        Delete a review session.
+
+        Args:
+            job_id: Job ID
+            session_id: Session ID
+        """
+        try:
+            doc_ref = (
+                self.db.collection(self.collection)
+                .document(job_id)
+                .collection("review_sessions")
+                .document(session_id)
+            )
+            doc_ref.delete()
+            logger.info(f"Deleted review session {session_id} for job {job_id}")
+        except Exception as e:
+            logger.error(f"Error deleting review session {session_id} for job {job_id}: {e}")
+            raise
+
+    def delete_review_sessions_subcollection(self, job_id: str, batch_size: int = 500) -> int:
+        """
+        Delete all review sessions for a job (used when deleting a job).
+
+        Args:
+            job_id: Job ID
+            batch_size: Number of documents to delete per batch
+
+        Returns:
+            Number of sessions deleted
+        """
+        try:
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("review_sessions")
+            deleted_count = 0
+
+            while True:
+                docs = sessions_ref.limit(batch_size).stream()
+                deleted_in_batch = 0
+
+                batch = self.db.batch()
+                for doc in docs:
+                    batch.delete(doc.reference)
+                    deleted_in_batch += 1
+
+                if deleted_in_batch == 0:
+                    break
+
+                batch.commit()
+                deleted_count += deleted_in_batch
+
+                if deleted_in_batch < batch_size:
+                    break
+
+            if deleted_count > 0:
+                logger.info(f"Deleted {deleted_count} review sessions for job {job_id}")
+
+            return deleted_count
+
+        except Exception as e:
+            logger.error(f"Error deleting review sessions subcollection for job {job_id}: {e}")
+            return 0
+
+    def get_latest_review_session_hash(self, job_id: str) -> Optional[str]:
+        """
+        Get the data_hash of the most recent review session for deduplication.
+
+        Args:
+            job_id: Job ID
+
+        Returns:
+            data_hash string or None if no sessions exist
+        """
+        try:
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("review_sessions")
+            query = (
+                sessions_ref
+                .order_by("updated_at", direction=firestore.Query.DESCENDING)
+                .limit(1)
+                .select(["data_hash"])
+            )
+            docs = list(query.stream())
+            if docs:
+                return docs[0].to_dict().get("data_hash", "")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting latest review session hash for job {job_id}: {e}")
+            return None
+
+    def search_review_sessions(
+        self,
+        query_text: str = "",
+        job_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search review sessions across all jobs using collection group query.
+
+        Args:
+            query_text: Search text (prefix-matched against artist_lower or title_lower)
+            job_id: If provided, search only within this job
+            limit: Maximum results
+
+        Returns:
+            List of session dicts with job context
+        """
+        try:
+            if job_id:
+                # Search within a specific job
+                sessions_ref = self.db.collection(self.collection).document(job_id).collection("review_sessions")
+                query = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit)
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+
+            # Collection group query across all jobs
+            sessions_ref = self.db.collection_group("review_sessions")
+
+            if query_text:
+                # Over-fetch since we filter in Python (Firestore doesn't support LIKE/contains)
+                fetch_limit = max(limit * 25, 500)
+                query = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(fetch_limit)
+                docs = query.stream()
+                results = [doc.to_dict() for doc in docs]
+
+                q_lower = query_text.lower()
+                results = [
+                    r for r in results
+                    if q_lower in (r.get("artist") or "").lower()
+                    or q_lower in (r.get("title") or "").lower()
+                    or q_lower in (r.get("job_id") or "").lower()
+                ]
+                return results[:limit]
+            else:
+                query = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING).limit(limit)
+                docs = query.stream()
+                return [doc.to_dict() for doc in docs]
+
+        except Exception as e:
+            logger.error(f"Error searching review sessions: {e}")
+            return []
+
+    # ---- Audio Edit Sessions ----
+
+    def save_audio_edit_session(self, job_id: str, session: AudioEditSession) -> str:
+        """Save an audio edit session to the subcollection."""
+        try:
+            session.job_id = job_id
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("audio_edit_sessions")
+            doc_ref = sessions_ref.document(session.session_id)
+            doc_ref.set(session.to_dict())
+            logger.info(f"Saved audio edit session {session.session_id} for job {job_id}")
+            return session.session_id
+        except Exception as e:
+            logger.error(f"Error saving audio edit session for job {job_id}: {e}")
+            raise
+
+    def list_audio_edit_sessions(self, job_id: str) -> List[AudioEditSession]:
+        """List all audio edit sessions for a job, ordered by updated_at descending."""
+        try:
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("audio_edit_sessions")
+            query = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING)
+            docs = query.stream()
+            return [AudioEditSession.from_dict(doc.to_dict()) for doc in docs]
+        except Exception as e:
+            logger.error(f"Error listing audio edit sessions for job {job_id}: {e}")
+            return []
+
+    def get_audio_edit_session(self, job_id: str, session_id: str) -> Optional[AudioEditSession]:
+        """Get a single audio edit session by ID."""
+        try:
+            doc_ref = (
+                self.db.collection(self.collection)
+                .document(job_id)
+                .collection("audio_edit_sessions")
+                .document(session_id)
+            )
+            doc = doc_ref.get()
+            if not doc.exists:
+                return None
+            return AudioEditSession.from_dict(doc.to_dict())
+        except Exception as e:
+            logger.error(f"Error getting audio edit session {session_id} for job {job_id}: {e}")
+            raise
+
+    def delete_audio_edit_session(self, job_id: str, session_id: str) -> None:
+        """Delete a single audio edit session."""
+        try:
+            doc_ref = (
+                self.db.collection(self.collection)
+                .document(job_id)
+                .collection("audio_edit_sessions")
+                .document(session_id)
+            )
+            doc_ref.delete()
+            logger.info(f"Deleted audio edit session {session_id} for job {job_id}")
+        except Exception as e:
+            logger.error(f"Error deleting audio edit session {session_id} for job {job_id}: {e}")
+            raise
+
+    def delete_audio_edit_sessions_subcollection(self, job_id: str, batch_size: int = 500) -> int:
+        """Delete all audio edit sessions for a job (used when deleting a job)."""
+        try:
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("audio_edit_sessions")
+            deleted_count = 0
+
+            while True:
+                docs = sessions_ref.limit(batch_size).stream()
+                deleted_in_batch = 0
+
+                batch = self.db.batch()
+                for doc in docs:
+                    batch.delete(doc.reference)
+                    deleted_in_batch += 1
+
+                if deleted_in_batch == 0:
+                    break
+
+                batch.commit()
+                deleted_count += deleted_in_batch
+
+                if deleted_in_batch < batch_size:
+                    break
+
+            if deleted_count > 0:
+                logger.info(f"Deleted {deleted_count} audio edit sessions for job {job_id}")
+
+            return deleted_count
+
+        except Exception as e:
+            logger.error(f"Error deleting audio edit sessions subcollection for job {job_id}: {e}")
+            return 0
+
+    def get_latest_audio_edit_session_hash(self, job_id: str) -> Optional[str]:
+        """Get the data_hash of the most recent audio edit session for deduplication."""
+        try:
+            sessions_ref = self.db.collection(self.collection).document(job_id).collection("audio_edit_sessions")
+            query = (
+                sessions_ref
+                .order_by("updated_at", direction=firestore.Query.DESCENDING)
+                .limit(1)
+                .select(["data_hash"])
+            )
+            docs = list(query.stream())
+            if docs:
+                return docs[0].to_dict().get("data_hash", "")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting latest audio edit session hash for job {job_id}: {e}")
+            return None
+
+    def delete_search_session(self, session_id: str) -> None:
+        """Delete a search session after it has been consumed by job creation.
+
+        Errors are logged but not re-raised — a missing or already-deleted
+        session is a no-op.
+
+        Args:
+            session_id: UUID string identifying the session.
+        """
+        try:
+            doc_ref = self.db.collection('search_sessions').document(session_id)
+            doc_ref.delete()
+            logger.debug(f"Deleted search session {session_id}")
+        except Exception as e:
+            logger.error(f"Error deleting search session {session_id}: {e}")
+
+
+# Singleton client instance
+_firestore_client: Optional[firestore.Client] = None
+
+
+def get_firestore_client() -> firestore.Client:
+    """
+    Get a shared Firestore client instance.
+
+    This returns a raw Firestore client (not the FirestoreService) for use
+    in services that need direct Firestore access without the job-specific
+    abstractions provided by FirestoreService.
+
+    Returns:
+        Firestore client instance
+    """
+    global _firestore_client
+    if _firestore_client is None:
+        _firestore_client = firestore.Client(project=settings.google_cloud_project)
+    return _firestore_client
+
+
+_log_service: Optional["FirestoreService"] = None
+
+
+def _get_log_service() -> "FirestoreService":
+    """Return a cached FirestoreService instance for log_to_job."""
+    global _log_service
+    if _log_service is None:
+        _log_service = FirestoreService()
+    return _log_service
+
+
+def log_to_job(job_id: str, worker: str, level: str, message: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Write a log entry to a job's Firestore log subcollection.
+
+    This is a convenience function for API endpoints that need to log
+    to a job's log history (workers already have JobLogAdapter for this).
+
+    Args:
+        job_id: Job ID to log to
+        worker: Worker/source name (e.g., "api", "edit", "admin")
+        level: Log level (INFO, WARNING, ERROR)
+        message: Log message
+        metadata: Optional structured metadata dict
+    """
+    try:
+        entry = WorkerLogEntry.create(job_id, worker, level, message, metadata)
+        _get_log_service().append_log_to_subcollection(job_id, entry)
+    except Exception as e:
+        logger.debug(f"Failed to write job log for {job_id}: {e}")
+

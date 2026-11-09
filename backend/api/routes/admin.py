@@ -1,0 +1,4587 @@
+"""
+Admin API routes for dashboard statistics and management.
+
+Handles:
+- Dashboard overview statistics
+- System-wide metrics
+- Admin-only operations
+- Audio search cache management
+"""
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from typing import Tuple, List, Literal, Optional, Any, Dict
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from backend.api.dependencies import require_admin
+from backend.i18n import t, get_locale_from_request
+from backend.services.auth_service import UserType, AuthResult
+from backend.services.user_service import get_user_service, UserService, USERS_COLLECTION
+from backend.services.job_manager import JobManager
+from backend.services.tempo_label import strip_tempo_suffix
+from backend.services.flacfetch_client import get_flacfetch_client, FlacfetchServiceError
+from backend.services.storage_service import StorageService
+from backend.services.audio_search_service import get_audio_search_service, NoResultsError, AudioSearchError
+from backend.models.job import JobStatus
+from backend.services.firestore_service import log_to_job
+from backend.utils.test_data import is_test_email
+from backend.services.ip_geolocation_service import get_ip_geolocation_service
+from karaoke_gen.utils import sanitize_filename
+
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# =============================================================================
+# Response Models
+# =============================================================================
+
+class JobsByStatusResponse(BaseModel):
+    """Breakdown of jobs by status."""
+    pending: int = 0
+    processing: int = 0
+    awaiting_review: int = 0
+    awaiting_instrumental: int = 0
+    complete: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+
+class AdminStatsOverview(BaseModel):
+    """Overview statistics for admin dashboard."""
+    total_users: int
+    active_users_7d: int
+    active_users_30d: int
+    total_jobs: int
+    jobs_last_7d: int
+    jobs_last_30d: int
+    jobs_by_status: JobsByStatusResponse
+    total_credits_issued_30d: int
+
+
+class FileInfo(BaseModel):
+    """Information about a single file with signed download URL."""
+    name: str
+    path: str  # GCS path (gs://bucket/...)
+    download_url: str  # Signed URL for download
+    category: str  # e.g., "stems", "lyrics", "finals"
+    file_key: str  # e.g., "instrumental_clean", "lrc"
+
+
+class JobFilesResponse(BaseModel):
+    """Response containing all files for a job with signed download URLs."""
+    job_id: str
+    artist: Optional[str]
+    title: Optional[str]
+    files: List[FileInfo]
+    total_files: int
+
+
+class JobUpdateRequest(BaseModel):
+    """Request model for updating job fields."""
+    # Editable text fields
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    user_email: Optional[str] = None
+    theme_id: Optional[str] = None
+    brand_prefix: Optional[str] = None
+    discord_webhook_url: Optional[str] = None
+    youtube_description: Optional[str] = None
+    youtube_description_template: Optional[str] = None
+    customer_email: Optional[str] = None
+    customer_notes: Optional[str] = None
+    # Review autonomy: "auto" (skip review when confident) | "always_review"
+    review_mode: Optional[str] = None
+    # Backing-vocals preference: "auto" | "clean" | "review"
+    backing_preference: Optional[str] = None
+    # Translated lyrics language code ("" turns it off)
+    translation_language: Optional[str] = None
+
+    # Editable boolean fields
+    enable_cdg: Optional[bool] = None
+    enable_txt: Optional[bool] = None
+    enable_youtube_upload: Optional[bool] = None
+    non_interactive: Optional[bool] = None
+    prep_only: Optional[bool] = None
+    is_private: Optional[bool] = None
+
+
+class JobUpdateResponse(BaseModel):
+    """Response from job update endpoint."""
+    status: str
+    job_id: str
+    updated_fields: List[str]
+    message: str
+
+
+# Fields that are allowed to be updated via PATCH endpoint
+EDITABLE_JOB_FIELDS = {
+    "artist",
+    "title",
+    "user_email",
+    "theme_id",
+    "brand_prefix",
+    "discord_webhook_url",
+    "youtube_description",
+    "youtube_description_template",
+    "customer_email",
+    "customer_notes",
+    "enable_cdg",
+    "enable_txt",
+    "enable_youtube_upload",
+    "non_interactive",
+    "prep_only",
+    "is_private",
+    "review_mode",
+    "backing_preference",
+    "translation_language",
+    # Exempts a job from the stale-review auto-expiry (48h cancel+refund) —
+    # the stale_review_processor skips made_for_you jobs. Used for admin-driven
+    # batches (e.g. KaraokeHunt outreach) that must wait at review indefinitely.
+    "made_for_you",
+}
+
+
+def _tempo_label_reset_updates(job) -> dict:
+    """Updates that undo an audio-editor tempo label (for resets that restore normal-speed audio)."""
+    if getattr(job, "tempo_factor", None) is None:
+        return {}
+    return {"title": strip_tempo_suffix(job.title), "tempo_factor": None}
+
+
+# =============================================================================
+# Admin Stats Endpoints
+# =============================================================================
+
+@router.get("/stats/overview", response_model=AdminStatsOverview)
+async def get_admin_stats_overview(
+    exclude_test: bool = True,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Get overview statistics for admin dashboard.
+
+    Args:
+        exclude_test: If True (default), exclude test data (users with @inbox.testmail.app emails
+                     and jobs created by test users) from all counts.
+
+    Includes:
+    - User counts (total, active in 7d, active in 30d)
+    - Job counts (total, by status, recent)
+    - Credit statistics
+    - Beta program stats
+    """
+    # The Firestore streaming below is synchronous; run it in a worker thread so
+    # it can't block the event loop and stall every other request on this instance.
+    return await asyncio.to_thread(_compute_admin_stats_overview, user_service.db, exclude_test)
+
+
+# Field masks for the overview stats streams. Job documents carry large payloads
+# (state_data, timeline, corrections — ~100MB across the collection), so streaming
+# full documents just to count statuses takes ~15-20s; with these masks it's ~1s.
+_OVERVIEW_USER_FIELDS = ["email", "last_login_at", "credit_transactions"]
+_OVERVIEW_JOB_FIELDS = ["user_email", "created_at", "status"]
+
+
+def _compute_admin_stats_overview(db, exclude_test: bool) -> AdminStatsOverview:
+    """Synchronous stats computation — called via asyncio.to_thread from the route."""
+    from google.cloud.firestore_v1 import FieldFilter
+    from google.cloud.firestore_v1 import aggregation
+
+    now = datetime.utcnow()
+    seven_days_ago = now - timedelta(days=7)
+    thirty_days_ago = now - timedelta(days=30)
+
+    users_collection = db.collection(USERS_COLLECTION)
+    jobs_collection = db.collection("jobs")
+
+    # Jobs by status category mapping
+    processing_statuses = [
+        "downloading", "downloading_audio", "searching_audio", "awaiting_audio_selection",
+        "separating_stage1", "separating_stage2", "transcribing", "correcting",
+        "generating_screens", "applying_padding", "rendering_video",
+        "instrumental_selected", "generating_video", "encoding", "packaging",
+        "uploading", "notifying"
+    ]
+
+    # Limits for streaming queries - these are safety limits to prevent memory issues
+    # If hit, stats may be incomplete so we log a warning
+    USERS_STREAM_LIMIT = 2000
+    JOBS_STREAM_LIMIT = 10000
+
+    if exclude_test:
+        # When excluding test data, we must stream and filter in Python
+        # because Firestore doesn't support "not ends with" queries.
+        # The two streams are independent, so run them concurrently.
+
+        def _stream_users():
+            users, fetched = [], 0
+            for doc in users_collection.select(_OVERVIEW_USER_FIELDS).limit(USERS_STREAM_LIMIT).stream():
+                fetched += 1
+                user_data = doc.to_dict()
+                if not is_test_email(user_data.get("email", "")):
+                    users.append(user_data)
+            return users, fetched
+
+        def _stream_jobs():
+            jobs, fetched = [], 0
+            for doc in jobs_collection.select(_OVERVIEW_JOB_FIELDS).limit(JOBS_STREAM_LIMIT).stream():
+                fetched += 1
+                job_data = doc.to_dict()
+                if not is_test_email(job_data.get("user_email", "")):
+                    jobs.append(job_data)
+            return jobs, fetched
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            users_future = executor.submit(_stream_users)
+            jobs_future = executor.submit(_stream_jobs)
+            all_users, users_fetched = users_future.result()
+            all_jobs, jobs_fetched = jobs_future.result()
+
+        if users_fetched >= USERS_STREAM_LIMIT:
+            logger.warning(f"Users stream hit limit ({USERS_STREAM_LIMIT}), stats may be incomplete")
+        if jobs_fetched >= JOBS_STREAM_LIMIT:
+            logger.warning(f"Jobs stream hit limit ({JOBS_STREAM_LIMIT}), stats may be incomplete")
+
+        # Calculate user stats from filtered list
+        total_users = len(all_users)
+        active_users_7d = sum(
+            1 for u in all_users
+            if u.get("last_login_at") and _normalize_datetime(u["last_login_at"]) >= seven_days_ago
+        )
+        active_users_30d = sum(
+            1 for u in all_users
+            if u.get("last_login_at") and _normalize_datetime(u["last_login_at"]) >= thirty_days_ago
+        )
+        # Calculate credits from filtered users
+        total_credits_issued_30d = 0
+        for user_data in all_users:
+            transactions = user_data.get("credit_transactions", [])
+            for txn in transactions:
+                txn_date = _normalize_datetime(txn.get("created_at"))
+                if txn_date and txn_date >= thirty_days_ago:
+                    amount = txn.get("amount", 0)
+                    if amount > 0:
+                        total_credits_issued_30d += amount
+
+        # Calculate job stats from filtered list
+        total_jobs = len(all_jobs)
+        jobs_last_7d = sum(
+            1 for j in all_jobs
+            if j.get("created_at") and _normalize_datetime(j["created_at"]) >= seven_days_ago
+        )
+        jobs_last_30d = sum(
+            1 for j in all_jobs
+            if j.get("created_at") and _normalize_datetime(j["created_at"]) >= thirty_days_ago
+        )
+
+        # Jobs by status
+        jobs_by_status = JobsByStatusResponse(
+            pending=sum(1 for j in all_jobs if j.get("status") == "pending"),
+            processing=sum(1 for j in all_jobs if j.get("status") in processing_statuses),
+            awaiting_review=sum(1 for j in all_jobs if j.get("status") in ["awaiting_review", "in_review"]),
+            awaiting_instrumental=sum(1 for j in all_jobs if j.get("status") == "awaiting_instrumental_selection"),
+            complete=sum(1 for j in all_jobs if j.get("status") in ["complete", "prep_complete"]),
+            failed=sum(1 for j in all_jobs if j.get("status") == "failed"),
+            cancelled=sum(1 for j in all_jobs if j.get("status") == "cancelled"),
+        )
+    else:
+        # When including test data, use efficient aggregation queries
+        def get_count(query) -> int:
+            try:
+                agg_query = aggregation.AggregationQuery(query)
+                agg_query.count(alias="count")
+                results = agg_query.get()
+                return results[0][0].value if results else 0
+            except Exception as e:
+                logger.warning(f"Aggregation query failed: {e}")
+                return 0
+
+        # User statistics
+        total_users = get_count(users_collection)
+        active_users_7d = get_count(
+            users_collection.where(filter=FieldFilter("last_login_at", ">=", seven_days_ago))
+        )
+        active_users_30d = get_count(
+            users_collection.where(filter=FieldFilter("last_login_at", ">=", thirty_days_ago))
+        )
+        # Job statistics
+        total_jobs = get_count(jobs_collection)
+        jobs_last_7d = get_count(
+            jobs_collection.where(filter=FieldFilter("created_at", ">=", seven_days_ago))
+        )
+        jobs_last_30d = get_count(
+            jobs_collection.where(filter=FieldFilter("created_at", ">=", thirty_days_ago))
+        )
+
+        # Jobs by status
+        jobs_by_status = JobsByStatusResponse(
+            pending=get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "pending"))
+            ),
+            processing=sum(
+                get_count(jobs_collection.where(filter=FieldFilter("status", "==", status)))
+                for status in processing_statuses
+            ),
+            awaiting_review=get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "awaiting_review"))
+            ) + get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "in_review"))
+            ),
+            awaiting_instrumental=get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "awaiting_instrumental_selection"))
+            ),
+            complete=get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "complete"))
+            ) + get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "prep_complete"))
+            ),
+            failed=get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "failed"))
+            ),
+            cancelled=get_count(
+                jobs_collection.where(filter=FieldFilter("status", "==", "cancelled"))
+            ),
+        )
+
+        # Credit statistics - sum credits added in last 30 days
+        total_credits_issued_30d = 0
+        try:
+            users_fetched = 0
+            for user_doc in users_collection.select(["credit_transactions"]).limit(USERS_STREAM_LIMIT).stream():
+                users_fetched += 1
+                user_data = user_doc.to_dict()
+                transactions = user_data.get("credit_transactions", [])
+                for txn in transactions:
+                    txn_date = _normalize_datetime(txn.get("created_at"))
+                    if txn_date and txn_date >= thirty_days_ago:
+                        amount = txn.get("amount", 0)
+                        if amount > 0:
+                            total_credits_issued_30d += amount
+            if users_fetched >= USERS_STREAM_LIMIT:
+                logger.warning(f"Credit calculation hit user limit ({USERS_STREAM_LIMIT}), total may be incomplete")
+        except Exception as e:
+            logger.warning(f"Error calculating credits: {e}")
+
+    return AdminStatsOverview(
+        total_users=total_users,
+        active_users_7d=active_users_7d,
+        active_users_30d=active_users_30d,
+        total_jobs=total_jobs,
+        jobs_last_7d=jobs_last_7d,
+        jobs_last_30d=jobs_last_30d,
+        jobs_by_status=jobs_by_status,
+        total_credits_issued_30d=total_credits_issued_30d,
+    )
+
+
+def _normalize_datetime(dt_value) -> Optional[datetime]:
+    """Normalize datetime values from Firestore (can be datetime or ISO string)."""
+    if dt_value is None:
+        return None
+    if isinstance(dt_value, datetime):
+        return dt_value.replace(tzinfo=None)
+    if isinstance(dt_value, str):
+        try:
+            parsed = datetime.fromisoformat(dt_value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None)
+        except Exception:
+            return None
+    return None
+
+
+# =============================================================================
+# Audio Search Management Models
+# =============================================================================
+
+class AudioSearchResultSummary(BaseModel):
+    """Summary of a single audio search result."""
+    index: int
+    provider: str
+    artist: str
+    title: str
+    is_lossless: bool
+    quality: Optional[str] = None
+    seeders: Optional[int] = None
+
+
+class AudioSearchJobSummary(BaseModel):
+    """Summary of a job with audio search results."""
+    job_id: str
+    status: str
+    user_email: Optional[str] = None
+    audio_search_artist: Optional[str] = None
+    audio_search_title: Optional[str] = None
+    created_at: Optional[datetime] = None
+    results_count: int
+    results_summary: List[AudioSearchResultSummary]
+    has_lossless: bool
+    providers: List[str]
+
+
+class AudioSearchListResponse(BaseModel):
+    """Response for listing audio search jobs."""
+    jobs: List[AudioSearchJobSummary]
+    total: int
+
+
+class ClearSearchCacheResponse(BaseModel):
+    """Response for clearing search cache."""
+    status: str
+    job_id: str
+    message: str
+    previous_status: str
+    new_status: str
+    results_cleared: int
+    flacfetch_cache_cleared: bool = False
+    flacfetch_error: Optional[str] = None
+
+
+class ClearAllCacheResponse(BaseModel):
+    """Response for clearing all flacfetch cache."""
+    status: str
+    message: str
+    deleted_count: int
+
+
+class CacheStatsResponse(BaseModel):
+    """Response for cache statistics."""
+    count: int
+    total_size_bytes: int
+    oldest_entry: Optional[str] = None
+    newest_entry: Optional[str] = None
+    configured: bool
+
+
+# =============================================================================
+# Audio Search Management Endpoints
+# =============================================================================
+
+@router.get("/audio-searches", response_model=AudioSearchListResponse)
+def list_audio_searches(
+    limit: int = 50,
+    status_filter: Optional[str] = None,
+    exclude_test: bool = True,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    List jobs with audio search results.
+
+    Returns jobs that have cached audio search results, useful for:
+    - Monitoring search activity
+    - Identifying stale cached results
+    - Clearing cache for specific jobs
+
+    Args:
+        limit: Maximum number of jobs to return (default 50)
+        status_filter: Optional filter by job status (e.g., 'awaiting_audio_selection')
+        exclude_test: If True (default), exclude jobs from test users
+    """
+    from google.cloud.firestore_v1 import FieldFilter
+
+    db = user_service.db
+    jobs_collection = db.collection("jobs")
+
+    # Query jobs - we'll filter for those with audio_search_results in Python
+    # since Firestore can't query for existence of nested fields efficiently
+    query = jobs_collection.order_by("created_at", direction="DESCENDING").limit(500)
+
+    if status_filter:
+        query = jobs_collection.where(
+            filter=FieldFilter("status", "==", status_filter)
+        ).order_by("created_at", direction="DESCENDING").limit(500)
+
+    jobs_with_searches = []
+
+    for doc in query.stream():
+        data = doc.to_dict()
+
+        # Filter out test users if exclude_test is True
+        if exclude_test and is_test_email(data.get("user_email", "")):
+            continue
+
+        state_data = data.get("state_data", {})
+        audio_results = state_data.get("audio_search_results", [])
+
+        if not audio_results:
+            continue
+
+        # Compute has_lossless and providers from ALL results (not just first 10)
+        has_lossless = any(r.get("is_lossless", False) for r in audio_results)
+        providers = {r.get("provider", "Unknown") for r in audio_results}
+
+        # Build summary from first 10 results only
+        results_summary = []
+        for r in audio_results[:10]:
+            results_summary.append(AudioSearchResultSummary(
+                index=r.get("index", 0),
+                provider=r.get("provider", "Unknown"),
+                artist=r.get("artist", ""),
+                title=r.get("title", ""),
+                is_lossless=r.get("is_lossless", False),
+                quality=r.get("quality"),
+                seeders=r.get("seeders"),
+            ))
+
+        jobs_with_searches.append(AudioSearchJobSummary(
+            job_id=doc.id,
+            status=data.get("status", "unknown"),
+            user_email=data.get("user_email"),
+            audio_search_artist=data.get("audio_search_artist"),
+            audio_search_title=data.get("audio_search_title"),
+            created_at=data.get("created_at"),
+            results_count=len(audio_results),
+            results_summary=results_summary,
+            has_lossless=has_lossless,
+            providers=sorted(providers),
+        ))
+
+        if len(jobs_with_searches) >= limit:
+            break
+
+    return AudioSearchListResponse(
+        jobs=jobs_with_searches,
+        total=len(jobs_with_searches),
+    )
+
+
+@router.post("/audio-searches/{job_id}/clear-cache", response_model=ClearSearchCacheResponse)
+async def clear_audio_search_cache(
+    job_id: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Clear the cached audio search results for a job.
+
+    This will:
+    1. Remove the cached search results from job.state_data
+    2. Reset the job status to 'pending' so a new search can be performed
+    3. Clear the flacfetch GCS cache for this artist/title (if available)
+
+    Use this when:
+    - Cached results are stale (e.g., flacfetch was updated)
+    - User wants to search again with different terms
+    - Results appear incomplete or incorrect
+    """
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Get current state
+    state_data = job.state_data or {}
+    audio_results = state_data.get("audio_search_results", [])
+    results_count = len(audio_results)
+    previous_status = job.status
+
+    if not audio_results:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job {job_id} has no cached audio search results"
+        )
+
+    # Validate job status - only allow cache clear for appropriate states
+    # Don't allow clearing cache for jobs that are actively processing or complete
+    forbidden_statuses = {
+        "downloading", "downloading_audio", "searching_audio",
+        "separating_stage1", "separating_stage2", "transcribing", "correcting",
+        "generating_screens", "applying_padding", "rendering_video",
+        "generating_video", "encoding", "packaging", "uploading",
+        "complete", "prep_complete",
+    }
+    if previous_status in forbidden_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot clear cache for job in '{previous_status}' state. "
+            f"Only jobs in pending, awaiting_audio_selection, failed, or cancelled states can have cache cleared."
+        )
+
+    # Clear the cache by removing the keys
+    db = user_service.db
+    job_ref = db.collection("jobs").document(job_id)
+
+    from google.cloud.firestore_v1 import DELETE_FIELD
+
+    # Update job: clear cache and reset status
+    job_ref.update({
+        "state_data.audio_search_results": DELETE_FIELD,
+        "state_data.audio_search_count": DELETE_FIELD,
+        "state_data.remote_search_id": DELETE_FIELD,
+        "status": "pending",
+        "progress": 0,
+        "message": "Audio search cache cleared by admin. Ready for new search.",
+        "updated_at": datetime.utcnow(),
+    })
+
+    # Also clear flacfetch's GCS cache if we have artist/title
+    flacfetch_cache_cleared = False
+    flacfetch_error = None
+    artist = job.audio_search_artist
+    title = job.audio_search_title
+
+    if artist and title:
+        flacfetch_client = get_flacfetch_client()
+        if flacfetch_client:
+            try:
+                flacfetch_cache_cleared = await flacfetch_client.clear_search_cache(artist, title)
+                logger.info(
+                    f"Cleared flacfetch cache for '{artist}' - '{title}': "
+                    f"{'deleted' if flacfetch_cache_cleared else 'no entry found'}"
+                )
+            except FlacfetchServiceError as e:
+                flacfetch_error = str(e)
+                logger.warning(f"Failed to clear flacfetch cache: {e}")
+        else:
+            flacfetch_error = "flacfetch client not configured"
+            logger.debug("Skipping flacfetch cache clear - client not configured")
+    else:
+        flacfetch_error = "missing artist or title"
+        logger.debug(f"Skipping flacfetch cache clear - missing artist ({artist}) or title ({title})")
+
+    logger.info(
+        f"Admin {auth_data.user_email} cleared audio search cache for job {job_id}. "
+        f"Cleared {results_count} results. Status changed from {previous_status} to pending. "
+        f"Flacfetch cache cleared: {flacfetch_cache_cleared}"
+    )
+
+    message = f"Cleared {results_count} cached search results. Job reset to pending."
+    if flacfetch_cache_cleared:
+        message += " Flacfetch cache also cleared."
+    elif flacfetch_error:
+        message += f" Note: flacfetch cache not cleared ({flacfetch_error})."
+
+    return ClearSearchCacheResponse(
+        status="success",
+        job_id=job_id,
+        message=message,
+        previous_status=previous_status,
+        new_status="pending",
+        results_cleared=results_count,
+        flacfetch_cache_cleared=flacfetch_cache_cleared,
+        flacfetch_error=flacfetch_error,
+    )
+
+
+@router.post("/jobs/{job_id}/reset-worker-state")
+def reset_worker_state(
+    job_id: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Reset stale worker progress state for a job.
+
+    This clears the video_progress, render_progress, and screens_progress
+    from state_data, allowing workers to be re-triggered.
+
+    Use this when a job is stuck because worker progress shows 'running'
+    from a previous failed attempt.
+    """
+    from backend.services.job_manager import JobManager
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Reset worker progress states
+    job_manager.update_state_data(job_id, 'video_progress', {'stage': 'pending'})
+    job_manager.update_state_data(job_id, 'render_progress', {'stage': 'pending'})
+    job_manager.update_state_data(job_id, 'screens_progress', {'stage': 'pending'})
+
+    logger.info(f"Admin {auth_data.user_email} reset worker state for job {job_id}")
+
+    return {
+        "status": "success",
+        "job_id": job_id,
+        "message": "Worker progress states reset to pending"
+    }
+
+
+@router.delete("/cache", response_model=ClearAllCacheResponse)
+async def clear_all_flacfetch_cache(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Clear the entire flacfetch search cache.
+
+    This will delete all cached search results from flacfetch's GCS cache.
+    Use with caution - this will cause all subsequent searches to hit
+    the trackers fresh.
+
+    Note: This does NOT clear Firestore job.state_data caches, only the
+    flacfetch-side GCS cache.
+    """
+    flacfetch_client = get_flacfetch_client()
+    if not flacfetch_client:
+        raise HTTPException(
+            status_code=503,
+            detail="flacfetch client not configured"
+        )
+
+    try:
+        deleted_count = await flacfetch_client.clear_all_cache()
+        logger.info(
+            f"Admin {auth_data.user_email} cleared all flacfetch cache. "
+            f"Deleted {deleted_count} entries."
+        )
+        return ClearAllCacheResponse(
+            status="success",
+            message=f"Cleared {deleted_count} cache entries from flacfetch.",
+            deleted_count=deleted_count,
+        )
+    except FlacfetchServiceError as e:
+        logger.error(f"Failed to clear all flacfetch cache: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to clear flacfetch cache: {e}"
+        )
+
+
+@router.get("/cache/stats", response_model=CacheStatsResponse)
+async def get_flacfetch_cache_stats(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Get statistics about the flacfetch search cache.
+
+    Returns information about:
+    - Number of cached entries
+    - Total size in bytes
+    - Oldest and newest cache entries
+    - Whether cache is configured
+    """
+    flacfetch_client = get_flacfetch_client()
+    if not flacfetch_client:
+        raise HTTPException(
+            status_code=503,
+            detail="flacfetch client not configured"
+        )
+
+    try:
+        stats = await flacfetch_client.get_cache_stats()
+        return CacheStatsResponse(
+            count=stats.get("count", 0),
+            total_size_bytes=stats.get("total_size_bytes", 0),
+            oldest_entry=stats.get("oldest_entry"),
+            newest_entry=stats.get("newest_entry"),
+            configured=stats.get("configured", True),
+        )
+    except FlacfetchServiceError as e:
+        logger.error(f"Failed to get flacfetch cache stats: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to get cache stats: {e}"
+        )
+
+
+# =============================================================================
+# Job Completion Message Endpoints (for admin copy/send functionality)
+# =============================================================================
+
+class CompletionMessageResponse(BaseModel):
+    """Response containing the rendered completion message."""
+    job_id: str
+    message: str
+    subject: str
+    youtube_url: Optional[str] = None
+    dropbox_url: Optional[str] = None
+
+
+class SendCompletionEmailRequest(BaseModel):
+    """Request to send a completion email."""
+    to_email: str
+    cc_admin: bool = True
+    # Send even though a job meant for Dropbox delivery has no Dropbox link
+    # (the Dropbox section is then left out of the email, never a placeholder).
+    allow_missing_dropbox_link: bool = False
+
+
+class SendCompletionEmailResponse(BaseModel):
+    """Response from sending a completion email."""
+    success: bool
+    job_id: str
+    to_email: str
+    message: str
+
+
+# =============================================================================
+# Job Files Endpoint
+# =============================================================================
+
+def _extract_files_recursive(
+    file_urls: Dict[str, Any],
+    storage: StorageService,
+    category: str = "",
+    expiration_minutes: int = 120,
+) -> List[FileInfo]:
+    """
+    Recursively extract files from nested file_urls structure.
+
+    Only includes entries that are GCS paths (gs://...).
+    Skips non-GCS entries like YouTube URLs.
+
+    Args:
+        file_urls: Dictionary of file URLs (may be nested)
+        storage: StorageService instance for generating signed URLs
+        category: Current category name (for nested calls)
+        expiration_minutes: How long signed URLs should be valid
+
+    Returns:
+        List of FileInfo objects with signed download URLs
+    """
+    files = []
+
+    for key, value in file_urls.items():
+        if isinstance(value, dict):
+            # Nested structure - recurse with key as category
+            nested_files = _extract_files_recursive(
+                value,
+                storage,
+                category=key if not category else f"{category}.{key}",
+                expiration_minutes=expiration_minutes,
+            )
+            files.extend(nested_files)
+        elif isinstance(value, str):
+            # Check if it's a GCS path (gs:// URI or relative path starting with "jobs/")
+            # Skip non-GCS values like YouTube URLs, video IDs, etc.
+            blob_path = None
+            if value.startswith("gs://"):
+                # Full GCS URI - extract blob path after bucket name
+                # Format: gs://bucket-name/path/to/file
+                parts = value.replace("gs://", "").split("/", 1)
+                if len(parts) > 1:
+                    blob_path = parts[1]
+            elif value.startswith("jobs/"):
+                # Relative path within bucket - use directly
+                blob_path = value
+
+            if blob_path:
+                try:
+                    signed_url = storage.generate_signed_url(blob_path, expiration_minutes=expiration_minutes)
+                    # Extract filename from path
+                    name = blob_path.split("/")[-1] if "/" in blob_path else blob_path
+                    files.append(FileInfo(
+                        name=name,
+                        path=value,
+                        download_url=signed_url,
+                        category=category,
+                        file_key=key,
+                    ))
+                except Exception as e:
+                    # Log but don't fail - file might not exist
+                    logger.warning(f"Failed to generate signed URL for {value}: {e}")
+
+    return files
+
+
+@router.get("/jobs/{job_id}/files", response_model=JobFilesResponse)
+def get_job_files(
+    job_id: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Get all files for a job with signed download URLs.
+
+    Returns a list of all files associated with the job, including:
+    - Input audio file
+    - Stem separation results (vocals, instrumentals, etc.)
+    - Lyrics files (LRC, ASS, corrections JSON)
+    - Screen files (title, end screens)
+    - Video files (with/without vocals)
+    - Final output files (various formats)
+    - Package files (CDG, TXT zips)
+
+    Each file includes a signed URL that's valid for 2 hours.
+    Non-GCS entries (like YouTube URLs) are excluded.
+
+    Requires admin authentication.
+    """
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Extract all files with signed URLs
+    try:
+        storage = StorageService()
+        file_urls = job.file_urls or {}
+        files = _extract_files_recursive(file_urls, storage)
+    except Exception as e:
+        # Log but don't fail - return empty list if file extraction fails
+        logger.error(f"Failed to extract files for job {job_id}: {e}")
+        files = []
+
+    return JobFilesResponse(
+        job_id=job.job_id,
+        artist=job.artist,
+        title=job.title,
+        files=files,
+        total_files=len(files),
+    )
+
+
+@router.patch("/jobs/{job_id}", response_model=JobUpdateResponse)
+async def update_job(
+    job_id: str,
+    request: Dict[str, Any],
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Update editable fields of a job (admin only).
+
+    This endpoint allows admins to update certain job fields without
+    affecting the job's processing state. It's useful for:
+    - Correcting artist/title typos
+    - Changing user assignment
+    - Updating delivery settings (email, theme, etc.)
+
+    Editable fields:
+    - artist, title: Track metadata
+    - user_email: Job owner
+    - theme_id: Visual theme
+    - enable_cdg, enable_txt, enable_youtube_upload: Output options
+    - customer_email, customer_notes: Made-for-you order info
+    - brand_prefix: Brand code prefix
+    - non_interactive, prep_only: Workflow options
+    - is_private: Private (non-published) track mode
+    - discord_webhook_url: Notification URL
+    - youtube_description, youtube_description_template: YouTube settings
+
+    Non-editable fields (will return 400 error):
+    - job_id, status, progress: System-managed
+    - created_at, updated_at: Timestamps
+    - state_data, file_urls, timeline: Processing state
+    - worker_logs, worker_ids: Audit/tracking data
+
+    For status changes, use the reset endpoint instead.
+    """
+    admin_email = auth_data.user_email or "unknown"
+
+    # Check for non-editable fields in request
+    non_editable_fields = set(request.keys()) - EDITABLE_JOB_FIELDS
+    if non_editable_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The following fields are not editable: {', '.join(sorted(non_editable_fields))}. "
+            f"Editable fields are: {', '.join(sorted(EDITABLE_JOB_FIELDS))}"
+        )
+
+    # Filter to only include provided fields (non-None values)
+    updates = {k: v for k, v in request.items() if v is not None}
+
+    if not updates:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid fields provided for update. "
+            f"Editable fields are: {', '.join(sorted(EDITABLE_JOB_FIELDS))}"
+        )
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Reassigning a job to an email with no account would orphan it (the user
+    # couldn't log in to see it, and impersonation would 404) — so normalize the
+    # email and auto-create the account if needed.
+    user_created_email = None
+    if isinstance(updates.get("user_email"), str):
+        normalized_email = updates["user_email"].strip().lower()
+        if not normalized_email or "@" not in normalized_email:
+            raise HTTPException(
+                status_code=400,
+                detail="user_email must be a valid email address"
+            )
+        updates["user_email"] = normalized_email
+        user_service = get_user_service()
+        if not user_service.get_user(normalized_email):
+            user_service.get_or_create_user(normalized_email)
+            user_created_email = normalized_email
+            logger.info(
+                f"Admin {admin_email} reassigned job {job_id} to {normalized_email} — "
+                f"no account existed, created one"
+            )
+
+    # A non-bool would silently break the stale-review exemption check.
+    if "made_for_you" in updates and not isinstance(updates["made_for_you"], bool):
+        raise HTTPException(
+            status_code=400,
+            detail="made_for_you must be a boolean",
+        )
+
+    # The executor treats any value other than "auto" as an enforcement blocker,
+    # so a typo (e.g. "always-review") would silently force human review.
+    if "review_mode" in updates and updates["review_mode"] not in ("auto", "always_review"):
+        raise HTTPException(
+            status_code=400,
+            detail='review_mode must be "auto" or "always_review"',
+        )
+
+    # Translated lyrics: "" / null turns it off; otherwise a supported language code
+    if "translation_language" in updates:
+        from backend.services.lyrics_translation import normalize_language
+
+        raw = updates["translation_language"]
+        code = normalize_language(raw) if raw else None
+        if raw and code is None:
+            raise HTTPException(status_code=400, detail=f"Unsupported translation_language: {raw}")
+        updates["translation_language"] = code
+
+    # backing_preference likewise gates the instrumental decision — reject typos.
+    if "backing_preference" in updates and updates["backing_preference"] not in (
+        "auto", "clean", "review",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail='backing_preference must be "auto", "clean", or "review"',
+        )
+
+    # Check if we're toggling is_private from False to True on a completed job
+    # If so, auto-delete existing outputs (YouTube, Dropbox, GDrive)
+    toggling_to_private = (
+        "is_private" in updates
+        and updates["is_private"] is True
+        and not getattr(job, 'is_private', False)
+    )
+
+    # Perform the update (update_job returns None; exceptions indicate failure)
+    try:
+        job_manager.update_job(job_id, updates)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update job. Please try again."
+        ) from e
+
+    # Auto-delete outputs when toggling to private on a job with existing outputs
+    auto_deleted = False
+    if toggling_to_private and job.status in TERMINAL_STATES and not job.outputs_deleted_at:
+        state_data = job.state_data or {}
+        has_outputs = (
+            state_data.get('youtube_url')
+            or state_data.get('dropbox_link')
+            or state_data.get('gdrive_files')
+        )
+        if has_outputs:
+            try:
+                logger.info(
+                    f"Auto-deleting outputs for job {job_id} (toggled to private by {admin_email})"
+                )
+                # Call the delete-outputs endpoint directly (same module)
+                await asyncio.to_thread(delete_job_outputs, job_id, auth_data)
+                auto_deleted = True
+            except HTTPException:
+                # delete_job_outputs raises HTTPException on validation failures,
+                # but we've already validated terminal state + not-already-deleted
+                logger.warning(f"Auto-delete outputs skipped for job {job_id} (validation)")
+            except Exception as e:
+                logger.warning(f"Auto-delete outputs failed for job {job_id}: {e}")
+
+    # Log the admin action
+    logger.info(
+        f"Admin {admin_email} updated job {job_id}. "
+        f"Updated fields: {list(updates.keys())}"
+        f"{' (outputs auto-deleted)' if auto_deleted else ''}"
+    )
+
+    message = f"Successfully updated {len(updates)} field(s)"
+    if user_created_email:
+        message += f". Created new user account for {user_created_email}."
+    if auto_deleted:
+        message += ". Existing outputs were auto-deleted (job set to private)."
+
+    return JobUpdateResponse(
+        status="success",
+        job_id=job_id,
+        updated_fields=list(updates.keys()),
+        message=message,
+    )
+
+
+# =============================================================================
+# Job Reset Endpoint
+# =============================================================================
+
+class JobResetRequest(BaseModel):
+    """Request model for resetting a job to a specific state."""
+    target_state: str
+
+
+class JobResetResponse(BaseModel):
+    """Response from job reset endpoint."""
+    status: str
+    job_id: str
+    previous_status: str
+    new_status: str
+    message: str
+    cleared_data: List[str]
+    worker_triggered: Optional[bool] = None  # Was worker auto-triggered? (only for instrumental_selected)
+    worker_trigger_error: Optional[str] = None  # Error message if trigger failed
+
+
+class TriggerWorkerRequest(BaseModel):
+    """Request to trigger a worker for a job."""
+    worker_type: str = "video"  # Currently only video supported
+
+
+class TriggerWorkerResponse(BaseModel):
+    """Response from trigger worker endpoint."""
+    status: str
+    job_id: str
+    worker_type: str
+    triggered: bool
+    message: str
+    error: Optional[str] = None
+
+
+# States that are allowed as reset targets
+ALLOWED_RESET_STATES = {
+    "pending",
+    "awaiting_audio_selection",
+    "awaiting_audio_edit",  # Re-enter audio editing phase
+    "awaiting_review",  # Combined review (lyrics + instrumental selection)
+    # Note: awaiting_instrumental_selection removed - deprecated by combined review flow (Jan 2026)
+    "instrumental_selected",  # Re-run video generation with same settings
+}
+
+# State data keys to clear for each reset target
+# Keys not in this mapping are preserved
+# Note: encoding_progress is included in all states because workers check {worker}_progress.stage
+# to determine if they should skip (idempotency). Stale 'complete' markers cause workers to skip.
+STATE_DATA_CLEAR_KEYS = {
+    "pending": [
+        "audio_search_results",
+        "audio_search_count",
+        "remote_search_id",
+        "audio_selection",
+        "review_complete",
+        "corrected_lyrics",
+        "instrumental_selection",
+        "video_progress",
+        "render_progress",
+        "screens_progress",
+        "encoding_progress",
+        # Parallel processing flags - must clear to allow workers to run again
+        "audio_complete",
+        "lyrics_complete",
+    ],
+    "awaiting_audio_selection": [
+        "audio_selection",
+        "review_complete",
+        "corrected_lyrics",
+        "instrumental_selection",
+        "video_progress",
+        "render_progress",
+        "screens_progress",
+        "encoding_progress",
+    ],
+    "awaiting_audio_edit": [
+        # Clear edit state so user starts fresh
+        "audio_edit_stack",
+        "audio_edit_redo_stack",
+        "audio_edit_uploads",
+        # Clear downstream processing flags
+        "audio_complete",
+        "lyrics_complete",
+        "review_complete",
+        "corrected_lyrics",
+        "instrumental_selection",
+        "video_progress",
+        "render_progress",
+        "screens_progress",
+        "encoding_progress",
+    ],
+    "awaiting_review": [
+        # Combined review - user reviews lyrics AND selects instrumental in one step
+        "review_complete",
+        "corrected_lyrics",
+        "instrumental_selection",
+        "video_progress",
+        "render_progress",
+        "screens_progress",
+        "encoding_progress",
+    ],
+    # Note: awaiting_instrumental_selection removed - deprecated by combined review flow (Jan 2026)
+    "instrumental_selected": [
+        # Clear video/encoding/distribution state to allow re-processing
+        # Preserves: instrumental_selection, lyrics_metadata, review data
+        "video_progress",
+        "render_progress",
+        "screens_progress",
+        "encoding_progress",
+        "distribution",
+        "brand_code",
+        "youtube_url",
+        "youtube_video_id",
+        "dropbox_link",
+        "gdrive_files",
+    ],
+}
+
+
+@router.post("/jobs/{job_id}/reset", response_model=JobResetResponse)
+async def reset_job(
+    job_id: str,
+    request: JobResetRequest,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Reset a job to a specific state for re-processing (admin only).
+
+    This endpoint allows admins to reset a job back to specific workflow
+    checkpoints to re-do parts of the processing. This is useful for:
+    - Re-running audio search after flacfetch updates
+    - Re-reviewing lyrics after corrections
+    - Re-selecting instrumental after hearing the result
+    - Restarting a failed job from the beginning
+
+    Allowed target states:
+    - pending: Restart from the beginning (clears all processing data)
+    - awaiting_audio_selection: Re-select audio source
+    - awaiting_review: Re-review lyrics (preserves audio stems)
+    - awaiting_instrumental_selection: Re-select instrumental (preserves review)
+
+    State data is cleared based on the target state to ensure a clean
+    re-processing from that point forward.
+    """
+    admin_email = auth_data.user_email or "unknown"
+    target_state = request.target_state.lower()
+
+    # Validate target state
+    if target_state not in ALLOWED_RESET_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid target state '{target_state}'. "
+            f"Allowed states are: {', '.join(sorted(ALLOWED_RESET_STATES))}"
+        )
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    previous_status = job.status
+
+    # Build update payload
+    updates = {
+        "status": target_state,
+        "progress": 0,
+        "message": f"Job reset to {target_state} by admin",
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    # Clear state data keys based on target state
+    keys_to_clear = STATE_DATA_CLEAR_KEYS.get(target_state, [])
+    cleared_keys = []
+    current_state_data = job.state_data or {}
+
+    for key in keys_to_clear:
+        if key in current_state_data:
+            cleared_keys.append(key)
+
+    # Add timeline event
+    timeline_event = {
+        "status": target_state,
+        "timestamp": datetime.utcnow().isoformat(),
+        "message": f"Admin reset from {previous_status} to {target_state}",
+    }
+
+    # Perform the update with state_data clearing
+    # Note: update_job() raises exceptions on failure, returns None on success
+    job_manager.update_job(job_id, updates)
+
+    # Clear the state data keys and error state using direct Firestore update
+    from google.cloud.firestore_v1 import DELETE_FIELD, ArrayUnion, Increment
+
+    job_ref = user_service.db.collection("jobs").document(job_id)
+
+    # Build the update payload
+    clear_updates = {}
+
+    # Clear state_data keys
+    if cleared_keys:
+        for key in cleared_keys:
+            clear_updates[f"state_data.{key}"] = DELETE_FIELD
+
+    # Always clear error state on reset (confusing to have old errors after reset)
+    clear_updates["error_message"] = DELETE_FIELD
+    clear_updates["error_details"] = DELETE_FIELD
+
+    # Advance the supersession fence: a reset is a "stop what you're doing" event.
+    # Any render/video worker still in flight (e.g. the operator hit "Review"
+    # mid-render) will observe the bumped generation and discard its stale result
+    # instead of overwriting fresh outputs or failing this reset. See
+    # backend/workers/supersede.py. Atomic with the clears above so an in-flight
+    # worker can never observe a half-applied reset.
+    clear_updates["state_data.worker_generation"] = Increment(1)
+    # A reset starts a new run: drop any failed admin re-render's marker.
+    from backend.services.admin_rerender_service import clear_admin_rerender_update
+    clear_updates.update(clear_admin_rerender_update(job))
+
+    # Add timeline event
+    clear_updates["timeline"] = ArrayUnion([timeline_event])
+
+    # Special handling for awaiting_audio_edit: restore original input audio
+    # The submit endpoint copies edited audio to input_media_gcs_path,
+    # so we must restore the original path so the user starts fresh.
+    if target_state == "awaiting_audio_edit":
+        original_path = current_state_data.get("original_input_media_gcs_path")
+        if original_path:
+            clear_updates["input_media_gcs_path"] = original_path
+            logger.info(
+                f"Admin reset job {job_id}: Restoring input_media_gcs_path "
+                f"to original: {original_path}"
+            )
+        # The original audio is back at its normal speed, so drop any tempo label.
+        clear_updates.update(_tempo_label_reset_updates(job))
+
+    # Execute the update
+    job_ref.update(clear_updates)
+
+    # Debug logging to verify keys were actually cleared
+    logger.info(
+        f"Admin {admin_email} reset job {job_id} from {previous_status} to {target_state}. "
+        f"Attempted to clear state_data keys: {cleared_keys}"
+    )
+
+    # Verify the keys were actually deleted (debug check)
+    job_after = job_manager.get_job(job_id)
+    if job_after and cleared_keys:
+        remaining_keys = [k for k in cleared_keys if k in (job_after.state_data or {})]
+        if remaining_keys:
+            logger.error(
+                f"Admin reset job {job_id}: Some keys were NOT cleared: {remaining_keys}. "
+                f"Current state_data keys: {list((job_after.state_data or {}).keys())}"
+            )
+        else:
+            logger.debug(f"Admin reset job {job_id}: Verified all keys were cleared successfully")
+
+    # Trigger video worker for states that should auto-continue
+    # instrumental_selected: Re-run video generation with same instrumental selection
+    worker_triggered: Optional[bool] = None
+    worker_trigger_error: Optional[str] = None
+    if target_state == "instrumental_selected":
+        try:
+            from backend.services.worker_service import get_worker_service
+            worker_service = get_worker_service()
+            worker_triggered = await worker_service.trigger_video_worker(job_id)
+            if worker_triggered:
+                logger.info(f"Admin reset: Triggered video worker for job {job_id}")
+            else:
+                worker_trigger_error = "Worker trigger returned False - check worker service logs"
+                logger.warning(f"Admin reset: Failed to trigger video worker for job {job_id}")
+        except Exception as e:
+            worker_triggered = False
+            worker_trigger_error = str(e)
+            logger.error(f"Admin reset: Exception triggering video worker for job {job_id}: {e}", exc_info=True)
+
+    message = f"Job reset from {previous_status} to {target_state}"
+    if worker_triggered:
+        message += " (video worker triggered)"
+    elif target_state == "instrumental_selected" and not worker_triggered:
+        message += " (WARNING: video worker NOT triggered - use manual trigger)"
+
+    return JobResetResponse(
+        status="success",
+        job_id=job_id,
+        previous_status=previous_status,
+        new_status=target_state,
+        message=message,
+        cleared_data=cleared_keys,
+        worker_triggered=worker_triggered,
+        worker_trigger_error=worker_trigger_error,
+    )
+
+
+# =============================================================================
+# Trigger Worker Endpoint
+# =============================================================================
+
+@router.post("/jobs/{job_id}/trigger-worker", response_model=TriggerWorkerResponse)
+async def trigger_worker(
+    job_id: str,
+    request: TriggerWorkerRequest,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Manually trigger a worker for a job (admin only).
+
+    Use this when:
+    - Auto-trigger fails after a reset to instrumental_selected
+    - Need to re-run processing without resetting state
+    - Debugging worker trigger issues
+
+    Currently supports:
+    - video: Triggers the video generation worker
+
+    The job should be in an appropriate state for the worker type:
+    - video: Job should be in 'instrumental_selected' status
+
+    Args:
+        job_id: Job ID to trigger worker for
+        request: Contains worker_type (default: "video")
+
+    Returns:
+        Trigger result with success/failure and error details
+    """
+    admin_email = auth_data.user_email or "unknown"
+    worker_type = request.worker_type.lower()
+
+    # Validate worker type
+    if worker_type not in ["video"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported worker type '{worker_type}'. Supported: video"
+        )
+
+    # Get job to validate it exists
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Warn if job is not in the expected state (but don't block)
+    expected_status = "instrumental_selected"
+    if job.status != expected_status:
+        logger.warning(
+            f"Admin {admin_email} triggering {worker_type} worker for job {job_id} "
+            f"in unexpected status '{job.status}' (expected '{expected_status}')"
+        )
+
+    # Trigger the worker
+    triggered = False
+    error_msg = None
+
+    try:
+        from backend.services.worker_service import get_worker_service
+        worker_service = get_worker_service()
+
+        if worker_type == "video":
+            triggered = await worker_service.trigger_video_worker(job_id)
+
+        if triggered:
+            logger.info(
+                f"Admin {admin_email} manually triggered {worker_type} worker for job {job_id}"
+            )
+            message = f"Successfully triggered {worker_type} worker"
+        else:
+            error_msg = "Worker service returned False - check service logs"
+            logger.warning(
+                f"Admin {admin_email} failed to trigger {worker_type} worker for job {job_id}: "
+                f"service returned False"
+            )
+            message = f"Failed to trigger {worker_type} worker"
+
+    except Exception as e:
+        triggered = False
+        error_msg = str(e)
+        logger.error(
+            f"Admin {admin_email} exception triggering {worker_type} worker for job {job_id}: {e}",
+            exc_info=True
+        )
+        message = f"Error triggering {worker_type} worker"
+
+    return TriggerWorkerResponse(
+        status="success" if triggered else "error",
+        job_id=job_id,
+        worker_type=worker_type,
+        triggered=triggered,
+        message=message,
+        error=error_msg,
+    )
+
+
+# =============================================================================
+# Prepare Review Audio Endpoint
+# =============================================================================
+
+class PrepareReviewAudioResponse(BaseModel):
+    """Response from prepare-review-audio endpoint."""
+    status: str
+    job_id: str
+    transcoded_files: List[str]
+    message: str
+
+
+@router.post("/jobs/{job_id}/prepare-review-audio", response_model=PrepareReviewAudioResponse)
+async def prepare_review_audio(
+    job_id: str,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Transcode review audio to OGG Opus for a job (admin only).
+
+    Use this to backfill transcoded audio for existing jobs that were
+    created before eager transcoding was deployed. Transcodes the main
+    input audio and all stem files to OGG Opus 128kbps.
+
+    Idempotent: skips files that are already transcoded.
+    """
+    admin_email = auth_data.user_email or "unknown"
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    try:
+        import asyncio
+        from backend.services.audio_transcoding_service import AudioTranscodingService
+        transcoding = AudioTranscodingService()
+        transcoded = await asyncio.to_thread(transcoding.prepare_review_audio_for_job, job)
+
+        logger.info(
+            f"Admin {admin_email} prepared review audio for job {job_id}: "
+            f"{len(transcoded)} files transcoded"
+        )
+
+        return PrepareReviewAudioResponse(
+            status="success",
+            job_id=job_id,
+            transcoded_files=transcoded,
+            message=f"Transcoded {len(transcoded)} files to OGG Opus",
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Admin {admin_email} failed to prepare review audio for job {job_id}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to prepare review audio: {str(e)}",
+        )
+
+
+# =============================================================================
+# Clear Worker State Endpoint
+# =============================================================================
+
+class ClearWorkersResponse(BaseModel):
+    """Response from clear workers endpoint."""
+    status: str
+    job_id: str
+    message: str
+    cleared_keys: List[str]
+
+
+# All worker progress keys that can be cleared
+ALL_WORKER_PROGRESS_KEYS = [
+    "audio_progress",
+    "lyrics_progress",
+    "render_progress",
+    "screens_progress",
+    "video_progress",
+    "encoding_progress",
+]
+
+
+@router.post("/jobs/{job_id}/clear-workers", response_model=ClearWorkersResponse)
+def clear_worker_state(
+    job_id: str,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Clear all worker completion markers to allow re-execution (admin only).
+
+    This is an escape hatch for edge cases where you need workers to run again
+    without doing a full status reset. It clears all *_progress keys from state_data.
+
+    Use cases:
+    - Worker was interrupted and left stale "running" progress
+    - Worker completed but needs to run again (e.g., after code fix)
+    - Debugging worker idempotency issues
+
+    Note: This does NOT change the job status. If the job is in a terminal state
+    (complete, failed, cancelled), workers may not be triggered automatically.
+    Use the reset endpoint to also change status if needed.
+    """
+    from google.cloud.firestore_v1 import DELETE_FIELD
+
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Check which keys actually exist in state_data
+    state_data = job.state_data or {}
+    keys_to_clear = [k for k in ALL_WORKER_PROGRESS_KEYS if k in state_data]
+
+    if not keys_to_clear:
+        return ClearWorkersResponse(
+            status="success",
+            job_id=job_id,
+            message="No worker progress keys found in state_data",
+            cleared_keys=[],
+        )
+
+    # Clear the worker progress keys
+    db = JobManager().firestore.db
+    job_ref = db.collection("jobs").document(job_id)
+    update_payload = {f"state_data.{key}": DELETE_FIELD for key in keys_to_clear}
+    job_ref.update(update_payload)
+
+    logger.info(
+        f"Admin {admin_email} cleared worker state for job {job_id}. "
+        f"Cleared keys: {keys_to_clear}"
+    )
+
+    return ClearWorkersResponse(
+        status="success",
+        job_id=job_id,
+        message=f"Cleared {len(keys_to_clear)} worker progress key(s)",
+        cleared_keys=keys_to_clear,
+    )
+
+
+# =============================================================================
+# Delete Job Outputs Endpoint
+# =============================================================================
+
+class DeleteOutputsResponse(BaseModel):
+    """Response from delete job outputs endpoint."""
+    status: str
+    job_id: str
+    message: str
+    deleted_services: Dict[str, Any]  # youtube, dropbox, gdrive results
+    cleared_state_data: List[str]
+    outputs_deleted_at: str
+
+
+# State data keys to clear when deleting outputs
+OUTPUT_STATE_DATA_KEYS = [
+    "youtube_url",
+    "youtube_video_id",
+    "dropbox_link",
+    "brand_code",
+    "gdrive_files",
+]
+
+
+# Terminal states that allow output deletion
+TERMINAL_STATES = {"complete", "prep_complete", "failed", "cancelled"}
+
+
+@router.post("/jobs/{job_id}/delete-outputs", response_model=DeleteOutputsResponse)
+def delete_job_outputs(
+    job_id: str,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Delete all distributed outputs for a job (admin only).
+
+    This endpoint deletes:
+    1. YouTube video (if uploaded)
+    2. Dropbox folder (if uploaded)
+    3. Google Drive files (if uploaded)
+    4. Recycles brand code for reuse (if Dropbox + GDrive cleanup succeeded)
+
+    The job record is preserved with outputs_deleted_at timestamp set.
+    State data related to distribution is cleared.
+
+    Use case: Delete outputs for quality issues, then reset job to
+    awaiting_review or awaiting_instrumental_selection to re-process.
+
+    Args:
+        job_id: Job ID to delete outputs for
+
+    Returns:
+        Deletion results for each service
+    """
+    from google.cloud.firestore_v1 import DELETE_FIELD, ArrayUnion
+
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Verify job is in a terminal state
+    if job.status not in TERMINAL_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only delete outputs from jobs in terminal states. "
+            f"Current status: {job.status}. Allowed: {', '.join(sorted(TERMINAL_STATES))}"
+        )
+
+    # Check if outputs already deleted
+    if job.outputs_deleted_at:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Outputs were already deleted at {job.outputs_deleted_at}"
+        )
+
+    state_data = job.state_data or {}
+    from backend.services.published_outputs_cleanup import (
+        delete_dropbox_folder,
+        delete_gdrive_files,
+        delete_youtube_video,
+        snapshot_published_outputs,
+    )
+
+    # Snapshot current outputs before cleanup (preserved in timeline metadata)
+    deleted_outputs = snapshot_published_outputs(state_data)
+
+    log_to_job(job_id, "admin", "INFO", f"Output deletion initiated by {admin_email}", {"deleted_outputs": deleted_outputs})
+
+    # Shared helpers (same as Edit / admin re-render): the Dropbox folder name is
+    # sanitised exactly like the uploader names it.
+    brand_code = state_data.get('brand_code')
+    results = {
+        "youtube": delete_youtube_video(job_id, state_data.get('youtube_url')),
+        "dropbox": delete_dropbox_folder(
+            job_id, getattr(job, 'dropbox_path', None), brand_code, job.artist, job.title
+        ),
+        # Mirror cleanup happens below for any brand_code, Drive files or not.
+        "gdrive": delete_gdrive_files(job_id, state_data.get('gdrive_files'), brand_code, cleanup_mirror=False),
+    }
+
+    # Remove the Nomad 720p master(s) from the GCS fast-sync mirror too (prefix-keyed
+    # by brand_code, covers renames). Non-fatal, Nomad-only, no-op otherwise.
+    if brand_code:
+        from backend.services.nomad_master_mirror import cleanup_nomad_masters
+        cleanup_nomad_masters(brand_code)
+
+    # Clean up GCS finals folder - prevents stale files from being picked up during re-encoding
+    try:
+        from backend.services.storage_service import StorageService
+        storage = StorageService()
+        finals_prefix = f"jobs/{job_id}/finals/"
+        deleted_count = storage.delete_folder(finals_prefix)
+        if deleted_count > 0:
+            logger.info(f"Deleted {deleted_count} files from GCS finals folder for job {job_id}")
+        results["gcs_finals"] = {
+            "status": "success",
+            "deleted_count": deleted_count,
+            "path": finals_prefix,
+        }
+    except Exception as e:
+        logger.error(f"Error deleting GCS finals folder for job {job_id}: {e}", exc_info=True)
+        results["gcs_finals"] = {"status": "error", "error": str(e)}
+
+    # Recycle brand code if Dropbox and GDrive cleanup both succeeded
+    dropbox_success = results["dropbox"]["status"] in ("success", "skipped")
+    gdrive_success = results["gdrive"]["status"] in ("success", "skipped")
+    from backend.services.brand_code_service import is_preserved_brand_code
+    if brand_code and dropbox_success and gdrive_success and not is_preserved_brand_code(job, brand_code):
+        try:
+            from backend.services.brand_code_service import BrandCodeService, get_brand_code_service
+            prefix, number = BrandCodeService.parse_brand_code(brand_code)
+            get_brand_code_service().recycle_brand_code(prefix, number)
+            results["brand_code"] = {"status": "recycled", "code": brand_code}
+            logger.info(f"Recycled brand code {brand_code} during delete-outputs for job {job_id}")
+        except (ValueError, Exception) as e:
+            logger.warning(f"Failed to recycle brand code {brand_code}: {e}")
+            results["brand_code"] = {"status": "failed", "error": str(e)}
+    elif brand_code and is_preserved_brand_code(job, brand_code):
+        results["brand_code"] = {"status": "skipped", "reason": "Tenant-supplied code (not allocated)"}
+    elif brand_code:
+        logger.warning(f"Brand code {brand_code} NOT recycled: cleanup incomplete (dropbox={results['dropbox']['status']}, gdrive={results['gdrive']['status']})")
+        results["brand_code"] = {"status": "skipped", "reason": "Dropbox/GDrive cleanup incomplete"}
+
+    # Update job record
+    deletion_timestamp = datetime.now(timezone.utc)
+    user_service = get_user_service()
+    db = user_service.db
+    job_ref = db.collection("jobs").document(job_id)
+
+    update_payload = {
+        "outputs_deleted_at": deletion_timestamp,
+        "outputs_deleted_by": admin_email,
+        "updated_at": deletion_timestamp,
+    }
+
+    # Clear distribution-related state_data keys
+    cleared_keys = []
+    for key in OUTPUT_STATE_DATA_KEYS:
+        if key in state_data:
+            update_payload[f"state_data.{key}"] = DELETE_FIELD
+            cleared_keys.append(key)
+    # Outputs are gone; a failed admin re-render's marker no longer applies.
+    from backend.services.admin_rerender_service import clear_admin_rerender_update
+    update_payload.update(clear_admin_rerender_update(job))
+
+    # Add timeline event with structured metadata
+    timeline_event = {
+        "status": job.status,  # Keep current status
+        "timestamp": deletion_timestamp.isoformat(),
+        "message": f"Outputs deleted by admin ({admin_email})",
+        "metadata": {
+            "action": "outputs_deleted",
+            "deleted_by": admin_email,
+            "deleted_outputs": deleted_outputs,
+            "cleanup_results": results,
+        },
+    }
+    update_payload["timeline"] = ArrayUnion([timeline_event])
+
+    job_ref.update(update_payload)
+
+    # Determine overall status based on per-service results
+    error_services = [s for s, r in results.items() if r["status"] == "error"]
+    failed_services = [s for s, r in results.items() if r["status"] == "failed"]
+    success_services = [s for s, r in results.items() if r["status"] == "success"]
+
+    if error_services:
+        overall_status = "partial_success" if success_services else "error"
+        error_details = "; ".join(
+            f"{s}: {results[s].get('error', 'unknown error')}" for s in error_services
+        )
+        message = f"Some services failed: {error_details}"
+    elif failed_services:
+        overall_status = "partial_success" if success_services else "failed"
+        message = f"Some deletions failed: {', '.join(failed_services)}"
+    else:
+        overall_status = "success"
+        message = "Outputs deleted successfully"
+
+    brand_code_status = results.get('brand_code', {}).get('status', 'n/a')
+    logger.info(
+        f"Admin {admin_email} deleted outputs for job {job_id}. "
+        f"YouTube: {results['youtube']['status']}, "
+        f"Dropbox: {results['dropbox']['status']}, "
+        f"GDrive: {results['gdrive']['status']}, "
+        f"GCS Finals: {results['gcs_finals']['status']}, "
+        f"Brand Code: {brand_code_status}. "
+        f"Cleared state_data keys: {cleared_keys}"
+    )
+    log_to_job(job_id, "admin", "INFO", f"Outputs deleted by {admin_email}: {overall_status}", {
+        "cleanup_results": results,
+        "cleared_keys": cleared_keys,
+    })
+
+    return DeleteOutputsResponse(
+        status=overall_status,
+        job_id=job_id,
+        message=message,
+        deleted_services=results,
+        cleared_state_data=cleared_keys,
+        outputs_deleted_at=deletion_timestamp.isoformat(),
+    )
+
+
+class OrphanedOutputsCleanupRequest(BaseModel):
+    """Explicit targets for cleaning up distributed outputs whose owning job doc no
+    longer exists (e.g. a job deleted before its outputs were cleaned up)."""
+    youtube_video_id: Optional[str] = None
+    dropbox_folder_path: Optional[str] = None
+    gdrive_file_ids: List[str] = []
+    mirror_filename_prefix: Optional[str] = None  # e.g. "NOMAD-1583 - Mazzy Star"
+
+
+@router.post("/orphaned-outputs/cleanup")
+def cleanup_orphaned_outputs(
+    req: OrphanedOutputsCleanupRequest,
+    auth_data: AuthResult = Depends(require_admin),
+) -> dict:
+    """
+    Delete distributed outputs that no longer have an owning job doc (admin only).
+
+    The per-job cleanup endpoints (delete-outputs, cleanup-distribution) all require
+    the job document to resolve file IDs and paths. When a job was deleted while its
+    outputs were still published (the pre-fix DELETE /api/jobs/{id} behavior), those
+    outputs are orphaned and must be targeted explicitly:
+
+    - youtube_video_id: YouTube video to delete (bare video ID)
+    - dropbox_folder_path: full Dropbox folder path to delete
+    - gdrive_file_ids: Google Drive file IDs to delete (from upload logs)
+    - mirror_filename_prefix: "NOMAD-#### - Artist..." prefix for kjbox GCS mirror
+      objects (masters + vocals guides); must include artist text so it can't match
+      another track sharing a recycled brand code
+
+    Returns per-service results; each requested service reports success/failed/error.
+    """
+    admin_email = auth_data.user_email or "unknown"
+    if not any([req.youtube_video_id, req.dropbox_folder_path, req.gdrive_file_ids, req.mirror_filename_prefix]):
+        raise HTTPException(status_code=400, detail="No cleanup targets specified")
+
+    if req.mirror_filename_prefix:
+        from backend.services.nomad_master_mirror import is_safe_track_filename_prefix
+
+        if not is_safe_track_filename_prefix(req.mirror_filename_prefix):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsafe mirror_filename_prefix {req.mirror_filename_prefix!r}: must be "
+                    f"'NOMAD-#### - Artist...' (brand code plus artist text) so it cannot "
+                    f"match another track sharing a recycled brand code"
+                ),
+            )
+
+    logger.info(
+        f"Admin {admin_email} cleaning up orphaned outputs: "
+        f"youtube={req.youtube_video_id}, dropbox={req.dropbox_folder_path}, "
+        f"gdrive={req.gdrive_file_ids}, mirror_prefix={req.mirror_filename_prefix}"
+    )
+    results: Dict[str, Any] = {}
+
+    if req.youtube_video_id:
+        try:
+            from karaoke_gen.karaoke_finalise.karaoke_finalise import KaraokeFinalise
+            from backend.services.youtube_service import get_youtube_service
+
+            youtube_service = get_youtube_service()
+            if youtube_service.is_configured:
+                finalise = KaraokeFinalise(
+                    dry_run=False,
+                    non_interactive=True,
+                    user_youtube_credentials=youtube_service.get_credentials_dict(),
+                )
+                success = finalise.delete_youtube_video(req.youtube_video_id)
+                results["youtube"] = {
+                    "status": "success" if success else "failed",
+                    "video_id": req.youtube_video_id,
+                }
+            else:
+                results["youtube"] = {"status": "failed", "reason": "YouTube credentials not configured"}
+        except Exception as e:
+            logger.error(f"Error deleting orphaned YouTube video {req.youtube_video_id}: {e}", exc_info=True)
+            results["youtube"] = {"status": "error", "error": str(e)}
+
+    if req.dropbox_folder_path:
+        try:
+            from backend.services.dropbox_service import get_dropbox_service
+
+            dropbox = get_dropbox_service()
+            if dropbox.is_configured:
+                success = dropbox.delete_folder(req.dropbox_folder_path)
+                results["dropbox"] = {
+                    "status": "success" if success else "failed",
+                    "path": req.dropbox_folder_path,
+                }
+            else:
+                results["dropbox"] = {"status": "failed", "reason": "Dropbox credentials not configured"}
+        except Exception as e:
+            logger.error(f"Error deleting orphaned Dropbox folder {req.dropbox_folder_path}: {e}", exc_info=True)
+            results["dropbox"] = {"status": "error", "error": str(e)}
+
+    if req.gdrive_file_ids:
+        try:
+            from backend.services.gdrive_service import get_gdrive_service
+
+            gdrive = get_gdrive_service()
+            if gdrive.is_configured:
+                delete_results = gdrive.delete_files(req.gdrive_file_ids)
+                all_success = all(delete_results.values())
+                results["gdrive"] = {
+                    "status": "success" if all_success else "partial",
+                    "files": delete_results,
+                }
+            else:
+                results["gdrive"] = {"status": "failed", "reason": "Google Drive credentials not configured"}
+        except Exception as e:
+            logger.error(f"Error deleting orphaned GDrive files {req.gdrive_file_ids}: {e}", exc_info=True)
+            results["gdrive"] = {"status": "error", "error": str(e)}
+
+    if req.mirror_filename_prefix:
+        try:
+            from backend.services.nomad_master_mirror import NomadMasterMirror
+
+            counts = NomadMasterMirror().delete_track_objects_by_filename_prefix(req.mirror_filename_prefix)
+            results["mirror"] = {"status": "success", **counts}
+        except Exception as e:
+            logger.error(f"Error deleting orphaned mirror objects for {req.mirror_filename_prefix}: {e}", exc_info=True)
+            results["mirror"] = {"status": "error", "error": str(e)}
+
+    logger.info(f"Orphaned-outputs cleanup by {admin_email} complete: {results}")
+    return {"status": "complete", "results": results}
+
+
+@router.get("/jobs/{job_id}/completion-message", response_model=CompletionMessageResponse)
+def get_job_completion_message(
+    job_id: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Get the rendered completion message for a job.
+
+    Returns the plain text message that would be sent to the user,
+    rendered using the job completion template with the job's details.
+
+    This is useful for:
+    - Copying the message to clipboard (e.g., for Fiverr)
+    - Previewing the email before sending
+
+    Requires admin authentication.
+    """
+    from backend.services.job_notification_service import get_job_notification_service
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Get youtube, dropbox URLs, and brand_code from state_data (may be None)
+    state_data = job.state_data or {}
+    youtube_url = state_data.get('youtube_url')
+    dropbox_url = state_data.get('dropbox_link')
+    brand_code = state_data.get('brand_code')
+
+    # Render the completion message
+    notification_service = get_job_notification_service()
+    message = notification_service.get_completion_message(
+        job_id=job.job_id,
+        user_name=None,  # Use default "there"
+        artist=job.artist,
+        title=job.title,
+        youtube_url=youtube_url,
+        dropbox_url=dropbox_url,
+        is_private=getattr(job, 'is_private', False),
+    )
+
+    # Build subject: "NOMAD-1178: Artist - Title (Your karaoke video is ready!)"
+    # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+    # that cause email header encoding issues (MIME headers use latin-1)
+    safe_artist = sanitize_filename(job.artist) if job.artist else None
+    safe_title = sanitize_filename(job.title) if job.title else None
+    if brand_code and safe_artist and safe_title:
+        subject = f"{brand_code}: {safe_artist} - {safe_title} (Your karaoke video is ready!)"
+    elif safe_artist and safe_title:
+        subject = f"{safe_artist} - {safe_title} (Your karaoke video is ready!)"
+    else:
+        subject = "Your karaoke video is ready!"
+
+    return CompletionMessageResponse(
+        job_id=job_id,
+        message=message,
+        subject=subject,
+        youtube_url=youtube_url,
+        dropbox_url=dropbox_url,
+    )
+
+
+@router.post("/jobs/{job_id}/send-completion-email", response_model=SendCompletionEmailResponse)
+def send_job_completion_email(
+    job_id: str,
+    request: SendCompletionEmailRequest,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Send a completion email for a job to a specified email address.
+
+    This allows admins to manually send (or re-send) completion emails,
+    useful for:
+    - Sending to customers who didn't have an email on file
+    - Re-sending if the original email was lost
+    - Sending to alternate email addresses
+
+    Requires admin authentication.
+    """
+    from backend.services.job_notification_service import get_job_notification_service
+    from backend.services.email_service import get_email_service
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Get youtube, dropbox URLs, and brand_code from state_data (may be None)
+    state_data = job.state_data or {}
+    youtube_url = state_data.get('youtube_url')
+    dropbox_url = state_data.get('dropbox_link')
+    brand_code = state_data.get('brand_code')
+
+    # Refuse to send a delivery email with no files link unless explicitly overridden.
+    from backend.services.delivery_guard import completion_email_hold_reason
+    hold = completion_email_hold_reason(job)
+    if hold and not request.allow_missing_dropbox_link:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job {job_id} was meant to deliver to Dropbox but has no Dropbox link "
+                f"({hold['reason']}). Fix the Dropbox upload and set state_data.dropbox_link "
+                "first, or resend with allow_missing_dropbox_link=true to send without it."
+            ),
+        )
+
+    # Render the completion message
+    notification_service = get_job_notification_service()
+    message = notification_service.get_completion_message(
+        job_id=job.job_id,
+        user_name=None,  # Use default "there"
+        artist=job.artist,
+        title=job.title,
+        youtube_url=youtube_url,
+        dropbox_url=dropbox_url,
+        is_private=getattr(job, 'is_private', False),
+    )
+
+    # Send the email
+    email_service = get_email_service()
+    success = email_service.send_job_completion(
+        to_email=request.to_email,
+        message_content=message,
+        artist=job.artist,
+        title=job.title,
+        brand_code=brand_code,
+        cc_admin=request.cc_admin,
+    )
+
+    if success:
+        logger.info(f"Admin sent completion email for job {job_id} to {request.to_email}")
+        if state_data.get('completion_email_held'):
+            try:
+                from google.cloud.firestore_v1 import DELETE_FIELD
+                job_manager.update_job(job_id, {'state_data.completion_email_held': DELETE_FIELD})
+            except Exception as e:
+                logger.warning(f"Failed to clear completion_email_held for job {job_id}: {e}")
+        return SendCompletionEmailResponse(
+            success=True,
+            job_id=job_id,
+            to_email=request.to_email,
+            message=f"Completion email sent to {request.to_email}",
+        )
+    else:
+        logger.error(f"Failed to send completion email for job {job_id}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to send email. Check email service configuration."
+        )
+
+
+class MintLoginLinkRequest(BaseModel):
+    """Request to mint a one-click login link for a user."""
+    expiry_hours: int = Field(168, ge=1, le=168)
+    # e.g. "job_review:<job_id>" — verify maps known purposes to a redirect
+    purpose: Optional[str] = None
+
+
+@router.post("/users/{email}/login-link")
+def mint_user_login_link(
+    email: str,
+    request: MintLoginLinkRequest,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Mint a one-click login link for a user (admin only). Sends NOTHING — returns
+    the URL for embedding in manually-reviewed outreach emails. The link logs the
+    user in and, when purpose is "job_review:<job_id>", lands them directly on
+    that job's lyrics review page. Expiry up to 168h (7 days).
+    """
+    import os as _os
+    token = user_service.create_admin_login_token(
+        email=email.strip().lower(),
+        expiry_hours=request.expiry_hours,
+        purpose=request.purpose,
+    )
+    frontend_url = _os.getenv("FRONTEND_URL", "https://gen.nomadkaraoke.com")
+    return {
+        "email": token.email,
+        "url": f"{frontend_url}/auth/verify?token={token.token}",
+        "expires_at": token.expires_at.isoformat(),
+        "purpose": request.purpose,
+    }
+
+
+# =============================================================================
+# User Impersonation
+# =============================================================================
+
+class ImpersonateUserResponse(BaseModel):
+    """Response from impersonate user endpoint."""
+    session_token: str
+    user_email: str
+    message: str
+
+
+@router.post("/users/{email}/impersonate", response_model=ImpersonateUserResponse)
+def impersonate_user(
+    email: str,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Create a session token to impersonate a user (admin only).
+
+    This allows admins to view the application exactly as a specific user would see it.
+    The admin's original session remains valid and can be restored client-side.
+
+    Security:
+    - Only admins can impersonate
+    - Creates a real session (auditable in Firestore)
+    - Impersonation is logged for security audit
+
+    Args:
+        email: Email of the user to impersonate
+
+    Returns:
+        session_token: A valid session token for the target user
+        user_email: The impersonated user's email
+        message: Success message
+    """
+    admin_email = auth_data.user_email or "unknown"
+    target_email = email.lower()
+
+    # Cannot impersonate yourself
+    if target_email == admin_email.lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot impersonate yourself"
+        )
+
+    # Verify target user exists
+    target_user = user_service.get_user(target_email)
+    if not target_user:
+        raise HTTPException(
+            status_code=404,
+            detail=f"User {target_email} not found"
+        )
+
+    # Create a real session for the target user
+    session = user_service.create_session(
+        user_email=target_email,
+        ip_address=None,  # Not tracking IP for impersonation
+        user_agent=f"Impersonation by {admin_email}",
+    )
+
+    # Log impersonation for audit trail
+    logger.info(
+        f"IMPERSONATION: Admin {admin_email} started impersonating user {target_email}. "
+        f"Session token prefix: {session.token[:12]}..."
+    )
+
+    return ImpersonateUserResponse(
+        session_token=session.token,
+        user_email=target_email,
+        message=f"Now impersonating {target_email}",
+    )
+
+
+# =============================================================================
+# Regenerate Screens Endpoint
+# =============================================================================
+
+class RegenerateScreensResponse(BaseModel):
+    """Response from regenerate screens endpoint."""
+    status: str
+    job_id: str
+    message: str
+    previous_screens_deleted: bool
+    worker_triggered: bool
+    error: Optional[str] = None
+
+
+# States where regenerate screens is allowed
+REGENERATE_SCREENS_ALLOWED_STATES = {
+    "complete",
+    "failed",
+    "awaiting_review",
+    "in_review",  # User opened the review UI but hasn't submitted yet
+    "awaiting_instrumental_selection",
+    "instrumental_selected",
+    "prep_complete",
+}
+
+
+@router.post("/jobs/{job_id}/regenerate-screens", response_model=RegenerateScreensResponse)
+async def regenerate_screens(
+    job_id: str,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Regenerate title and end screens with current artist/title metadata (admin only).
+
+    Use this when you've edited the artist or title fields and need the
+    title/end screens to reflect the new metadata.
+
+    This endpoint:
+    1. Validates the job is in an appropriate state
+    2. Deletes existing screen files from GCS
+    3. Triggers the screens worker to regenerate with current metadata
+    4. Returns immediately (does not wait for completion)
+
+    Monitor progress via the job detail page or logs.
+
+    Allowed states: complete, failed, awaiting_review, awaiting_instrumental_selection,
+    instrumental_selected, prep_complete
+    """
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Validate job state
+    if job.status not in REGENERATE_SCREENS_ALLOWED_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot regenerate screens for job in '{job.status}' state. "
+            f"Allowed states: {', '.join(sorted(REGENERATE_SCREENS_ALLOWED_STATES))}"
+        )
+
+    # Validate job has artist and title
+    if not job.artist or not job.title:
+        raise HTTPException(
+            status_code=400,
+            detail="Job must have artist and title set to regenerate screens"
+        )
+
+    # Check that audio and lyrics processing completed at some point
+    state_data = job.state_data or {}
+    audio_progress = state_data.get('audio_progress', {})
+    lyrics_progress = state_data.get('lyrics_progress', {})
+
+    if audio_progress.get('stage') != 'audio_complete':
+        raise HTTPException(
+            status_code=400,
+            detail="Audio processing must be complete before regenerating screens"
+        )
+
+    if lyrics_progress.get('stage') != 'lyrics_complete':
+        raise HTTPException(
+            status_code=400,
+            detail="Lyrics processing must be complete before regenerating screens"
+        )
+
+    # Delete existing screen files from GCS
+    storage = StorageService()
+    screens_deleted = False
+    try:
+        # Delete screen video and image files
+        screen_paths = [
+            f"jobs/{job_id}/screens/title.mov",
+            f"jobs/{job_id}/screens/title.jpg",
+            f"jobs/{job_id}/screens/title.png",
+            f"jobs/{job_id}/screens/end.mov",
+            f"jobs/{job_id}/screens/end.jpg",
+            f"jobs/{job_id}/screens/end.png",
+        ]
+        for path in screen_paths:
+            try:
+                storage.delete_file(path, ignore_missing=True)
+            except Exception:
+                pass  # File may not exist
+        screens_deleted = True
+        logger.info(f"Admin {admin_email} deleted existing screens for job {job_id}")
+    except Exception as e:
+        logger.warning(f"Error deleting screens for job {job_id}: {e}")
+
+    # Clear screens_progress to allow worker to run
+    from google.cloud.firestore_v1 import DELETE_FIELD, ArrayUnion
+    db = job_manager.firestore.db
+    job_ref = db.collection("jobs").document(job_id)
+
+    # Set status to lyrics_complete so screens worker can transition to generating_screens.
+    # Store original status so the worker can restore it after regen instead of going to awaiting_review.
+    original_status = job.status
+    job_ref.update({
+        "status": JobStatus.LYRICS_COMPLETE.value,
+        "state_data.screens_progress": DELETE_FIELD,
+        "state_data.audio_complete": True,
+        "state_data.lyrics_complete": True,
+        "state_data.regen_restore_status": original_status,
+        "timeline": ArrayUnion([{
+            "status": original_status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": f"Admin {admin_email} triggered screen regeneration (will restore to {original_status})"
+        }])
+    })
+
+    # Trigger screens worker
+    worker_triggered = False
+    error_msg = None
+    try:
+        from backend.services.worker_service import get_worker_service
+        worker_service = get_worker_service()
+        worker_triggered = await worker_service.trigger_screens_worker(job_id)
+        if worker_triggered:
+            logger.info(f"Admin {admin_email} triggered screens regeneration for job {job_id}")
+        else:
+            error_msg = "Worker service returned False - check service logs"
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error triggering screens worker for job {job_id}: {e}", exc_info=True)
+
+    return RegenerateScreensResponse(
+        status="success" if worker_triggered else "error",
+        job_id=job_id,
+        message="Screens regeneration started" if worker_triggered else "Failed to trigger screens worker",
+        previous_screens_deleted=screens_deleted,
+        worker_triggered=worker_triggered,
+        error=error_msg,
+    )
+
+
+# =============================================================================
+# Admin Regenerate (storage retention) Endpoint
+# =============================================================================
+
+class AdminRegenerateRequest(BaseModel):
+    """Request body for POST /api/admin/jobs/{job_id}/regenerate."""
+    notify_customer: bool = Field(
+        False, description="Email/push the customer when the regenerate completes",
+    )
+
+
+@router.post("/jobs/{job_id}/regenerate")
+async def admin_regenerate_job(
+    job_id: str,
+    body: Optional[AdminRegenerateRequest] = None,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Rebuild a completed job's GCS outputs (storage retention), admin only.
+
+    Re-separates stems first if they were purged, then regenerates screens,
+    the lyrics video, every final and the packages in GCS. Unlike
+    ``/rerender`` nothing is deleted or re-published (YouTube/Dropbox/GDrive
+    untouched, same brand code). No rate limit.
+    """
+    from backend.services.regenerate_service import RegenerateService
+    from backend.services.theme_rerender_service import RerenderError
+
+    body = body or AdminRegenerateRequest()
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    try:
+        result = await RegenerateService(job_manager).start(
+            job, requested_by=admin_email, source="admin", notify_customer=body.notify_customer,
+        )
+    except RerenderError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    return {
+        "status": "processing",
+        "job_id": job_id,
+        "needs_stems": result["needs_stems"],
+        "notify_customer": body.notify_customer,
+        "message": "Regenerate started (GCS only; nothing re-published).",
+    }
+
+
+# =============================================================================
+# Admin Re-render Endpoint
+# =============================================================================
+
+class AdminRerenderRequest(BaseModel):
+    """Request body for POST /api/admin/jobs/{job_id}/rerender."""
+    notify_customer: bool = Field(
+        False,
+        description="Email/push the customer when the re-render completes (default: no notification)",
+    )
+
+
+class AdminRerenderResponse(BaseModel):
+    """Response from the admin re-render endpoint."""
+    status: str
+    job_id: str
+    message: str
+    brand_code: Optional[str] = None
+    notify_customer: bool
+    previous_outputs: Dict[str, Any]
+    cleanup_results: Dict[str, Any]
+    warnings: List[str] = []
+
+
+@router.post("/jobs/{job_id}/rerender", response_model=AdminRerenderResponse)
+async def admin_rerender_job(
+    job_id: str,
+    body: Optional[AdminRerenderRequest] = None,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Re-render a completed job end to end without review (admin only).
+
+    Regenerates title/end screens, the karaoke video, every encoded format and
+    the CDG/TXT packages from the job's existing reviewed lyrics and
+    instrumental selection, with the job's existing style snapshot. Published
+    outputs (YouTube video, Google Drive files, Dropbox folder) the re-render
+    will re-publish are deleted up front and re-published under the SAME brand
+    code when the pipeline finishes (the YouTube URL changes); outputs for
+    destinations no longer configured are left in place (see ``warnings``).
+    The customer (and Discord / community voters) are only notified on
+    completion when ``notify_customer`` is true.
+
+    Works for tenant and consumer, public and private jobs in ``complete``
+    status (or ``failed`` after a previous admin re-render).
+    """
+    from backend.services.admin_rerender_service import AdminRerenderService
+    from backend.services.theme_rerender_service import RerenderError
+
+    body = body or AdminRerenderRequest()
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    try:
+        result = await AdminRerenderService(job_manager).start(
+            job, requested_by=admin_email, notify_customer=body.notify_customer
+        )
+    except RerenderError as e:
+        logger.warning(f"Admin {admin_email} re-render of job {job_id} rejected ({e.status_code}): {e}")
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+    logger.info(
+        f"Admin {admin_email} started re-render of job {job_id} "
+        f"(notify_customer={body.notify_customer}, brand_code={result['brand_code']})"
+    )
+    return AdminRerenderResponse(
+        status="processing",
+        job_id=job_id,
+        message="Re-render started. Published outputs will be replaced when it completes.",
+        brand_code=result["brand_code"],
+        notify_customer=body.notify_customer,
+        previous_outputs=result["previous_outputs"],
+        cleanup_results=result["cleanup_results"],
+        warnings=result.get("warnings") or [],
+    )
+
+
+# =============================================================================
+# Restart Job Endpoint
+# =============================================================================
+
+class RestartJobRequest(BaseModel):
+    """Request model for restarting a job."""
+    preserve_audio_stems: bool = False  # If true, keep existing stems (faster)
+    delete_outputs: bool = True  # Delete existing output files from GCS
+
+
+class RestartJobResponse(BaseModel):
+    """Response from restart job endpoint."""
+    status: str
+    job_id: str
+    message: str
+    previous_status: str
+    new_status: str
+    cleared_data: List[str]
+    deleted_gcs_paths: List[str]
+    workers_triggered: List[str]
+    error: Optional[str] = None
+
+
+# States where restart is allowed
+RESTART_ALLOWED_STATES = {
+    "pending",
+    "complete",
+    "failed",
+    "awaiting_review",
+    "in_review",  # User opened review UI but hasn't completed
+    "awaiting_audio_selection",
+    "awaiting_instrumental_selection",
+    "instrumental_selected",
+    "prep_complete",
+}
+
+
+@router.post("/jobs/{job_id}/restart", response_model=RestartJobResponse)
+async def restart_job(
+    job_id: str,
+    request: RestartJobRequest,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Fully restart a job from the beginning (admin only).
+
+    Unlike reset (which just changes state), restart actually triggers
+    the appropriate workers to begin processing again.
+
+    Options:
+    - preserve_audio_stems: If True, keeps existing audio separation (faster restart).
+      Useful when you just need to regenerate screens with updated metadata.
+    - delete_outputs: If True (default), deletes existing output files from GCS.
+
+    When preserve_audio_stems=True:
+    - Keeps stems, lyrics, and transcription data
+    - Clears screens, video, encoding state
+    - Triggers screens worker immediately
+
+    When preserve_audio_stems=False:
+    - Clears all processing state
+    - For YouTube URL jobs: triggers download then audio/lyrics workers
+    - For audio search jobs: transitions to awaiting_audio_selection
+    - For file upload jobs: triggers audio/lyrics workers
+
+    Allowed states: pending, complete, failed, awaiting_review, awaiting_audio_selection,
+    awaiting_instrumental_selection, instrumental_selected, prep_complete
+    """
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Validate job state
+    if job.status not in RESTART_ALLOWED_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot restart job in '{job.status}' state. "
+            f"Allowed states: {', '.join(sorted(RESTART_ALLOWED_STATES))}"
+        )
+
+    previous_status = job.status
+    state_data = job.state_data or {}
+    cleared_keys = []
+    deleted_paths = []
+    workers_triggered = []
+    error_msg = None
+
+    # A restart starts a new run: drop any failed admin re-render's marker —
+    # folded into the restart's own atomic update below, so a restart that is
+    # rejected (e.g. 400 on preserve_audio_stems) keeps the marker.
+    from backend.services.admin_rerender_service import clear_admin_rerender_update
+    marker_clear = clear_admin_rerender_update(job)
+
+    from google.cloud.firestore_v1 import DELETE_FIELD, ArrayUnion
+    db = job_manager.firestore.db
+    job_ref = db.collection("jobs").document(job_id)
+
+    # Delete output files if requested
+    if request.delete_outputs:
+        storage = StorageService()
+        # Delete screens
+        for screen_file in ["title.mov", "title.jpg", "title.png", "end.mov", "end.jpg", "end.png"]:
+            try:
+                path = f"jobs/{job_id}/screens/{screen_file}"
+                if storage.delete_file(path, ignore_missing=True):
+                    deleted_paths.append(path)
+            except Exception:
+                pass
+        # Delete final outputs
+        for output_file in ["final_4k.mp4", "final_720p.mp4", "with_vocals.mkv", "preview.mp4"]:
+            try:
+                path = f"jobs/{job_id}/output/{output_file}"
+                if storage.delete_file(path, ignore_missing=True):
+                    deleted_paths.append(path)
+            except Exception:
+                pass
+
+    if request.preserve_audio_stems:
+        # Quick restart: keep stems/lyrics, just regenerate screens and video
+        # Validate that audio and lyrics completed
+        audio_progress = state_data.get('audio_progress', {})
+        lyrics_progress = state_data.get('lyrics_progress', {})
+
+        if audio_progress.get('stage') != 'audio_complete':
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot preserve audio stems - audio processing was not complete"
+            )
+        if lyrics_progress.get('stage') != 'lyrics_complete':
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot preserve audio stems - lyrics processing was not complete"
+            )
+
+        # Clear only screens/video/encoding state
+        keys_to_clear = [
+            "screens_progress",
+            "video_progress",
+            "render_progress",
+            "encoding_progress",
+            "review_complete",
+            "instrumental_selection",
+        ]
+
+        update_payload = {}
+        update_payload.update(marker_clear)
+        if marker_clear:
+            cleared_keys.append("admin_rerender")
+        for key in keys_to_clear:
+            if key in state_data:
+                update_payload[f"state_data.{key}"] = DELETE_FIELD
+                cleared_keys.append(key)
+
+        # Set coordination flags to trigger screens worker
+        update_payload["state_data.audio_complete"] = True
+        update_payload["state_data.lyrics_complete"] = True
+        update_payload["status"] = "downloading"  # Allows transition to generating_screens
+        update_payload["message"] = "Restarting with preserved audio stems"
+        update_payload["error_message"] = DELETE_FIELD
+        update_payload["error_details"] = DELETE_FIELD
+        update_payload["timeline"] = ArrayUnion([{
+            "status": "downloading",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": f"Admin {admin_email} restarted job (preserving audio stems)"
+        }])
+
+        job_ref.update(update_payload)
+        new_status = "downloading"
+
+        # Trigger screens worker
+        try:
+            from backend.services.worker_service import get_worker_service
+            worker_service = get_worker_service()
+            if await worker_service.trigger_screens_worker(job_id):
+                workers_triggered.append("screens")
+                logger.info(f"Admin {admin_email} triggered screens worker for restart of job {job_id}")
+            else:
+                error_msg = "Failed to trigger screens worker"
+        except Exception as e:
+            error_msg = f"Error triggering screens worker: {e}"
+            logger.error(f"Error triggering screens worker for job {job_id}: {e}", exc_info=True)
+
+    else:
+        # Full restart: clear everything and start from beginning
+        keys_to_clear = [
+            "audio_complete",
+            "lyrics_complete",
+            "audio_progress",
+            "lyrics_progress",
+            "screens_progress",
+            "video_progress",
+            "render_progress",
+            "encoding_progress",
+            "review_complete",
+            "corrected_lyrics",
+            "instrumental_selection",
+            "instrumental_options",
+            "lyrics_metadata",
+        ]
+
+        update_payload = {}
+        update_payload.update(marker_clear)
+        if marker_clear:
+            cleared_keys.append("admin_rerender")
+        for key in keys_to_clear:
+            if key in state_data:
+                update_payload[f"state_data.{key}"] = DELETE_FIELD
+                cleared_keys.append(key)
+
+        update_payload["error_message"] = DELETE_FIELD
+        update_payload["error_details"] = DELETE_FIELD
+
+        # Determine what workers to trigger based on job input type
+        has_youtube_url = bool(job.url)
+        has_uploaded_file = bool(job.input_media_gcs_path)
+        has_audio_search = bool(state_data.get('audio_search_results') or state_data.get('audio_selection'))
+
+        if has_youtube_url and not has_audio_search:
+            # YouTube URL job - need to re-download and process
+            # Clear the downloaded file to force re-download
+            update_payload["input_media_gcs_path"] = DELETE_FIELD
+            cleared_keys.append("input_media_gcs_path")
+            update_payload["status"] = "downloading"
+            update_payload["message"] = "Re-downloading audio from YouTube"
+            update_payload["timeline"] = ArrayUnion([{
+                "status": "downloading",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": f"Admin {admin_email} restarted job - downloading from YouTube"
+            }])
+            job_ref.update(update_payload)
+            new_status = "downloading"
+
+            # Download YouTube audio using YouTubeDownloadService, then trigger processing
+            try:
+                from backend.services.youtube_download_service import (
+                    get_youtube_download_service,
+                    YouTubeDownloadError,
+                )
+                from backend.services.worker_service import get_worker_service
+
+                youtube_service = get_youtube_download_service()
+                audio_gcs_path = await youtube_service.download(
+                    url=job.url,
+                    job_id=job_id,
+                    artist=job.artist,
+                    title=job.title,
+                )
+
+                # Update job with downloaded audio path
+                job_manager.update_job(job_id, {'input_media_gcs_path': audio_gcs_path})
+                workers_triggered.append("download")
+                logger.info(f"YouTube audio re-downloaded to GCS: {audio_gcs_path}")
+
+                # Now trigger audio and lyrics workers
+                worker_service = get_worker_service()
+                if await worker_service.trigger_audio_worker(job_id):
+                    workers_triggered.append("audio")
+                if await worker_service.trigger_lyrics_worker(job_id):
+                    workers_triggered.append("lyrics")
+
+                if "audio" not in workers_triggered and "lyrics" not in workers_triggered:
+                    error_msg = "Audio downloaded but failed to trigger processing workers"
+            except YouTubeDownloadError as e:
+                error_msg = f"YouTube download failed: {e}"
+                logger.error(f"YouTube download failed for job {job_id}: {e}")
+                # Update job to failed state
+                job_manager.mark_job_failed(job_id, f"YouTube download failed: {e}")
+                new_status = "failed"
+            except Exception as e:
+                error_msg = f"Error during YouTube restart: {e}"
+                logger.error(f"Error restarting YouTube job {job_id}: {e}", exc_info=True)
+
+        elif has_audio_search:
+            # Audio search job - go back to audio selection
+            # Clear audio search results to allow re-search
+            for key in ["audio_search_results", "audio_search_count", "remote_search_id", "audio_selection"]:
+                if key in state_data:
+                    update_payload[f"state_data.{key}"] = DELETE_FIELD
+                    cleared_keys.append(key)
+
+            update_payload["input_media_gcs_path"] = DELETE_FIELD
+            update_payload["status"] = "awaiting_audio_selection"
+            update_payload["message"] = "Ready for audio source selection"
+            update_payload["timeline"] = ArrayUnion([{
+                "status": "awaiting_audio_selection",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": f"Admin {admin_email} restarted job - select audio source"
+            }])
+            job_ref.update(update_payload)
+            new_status = "awaiting_audio_selection"
+            # No workers to trigger - waiting for admin to select audio
+
+        elif has_uploaded_file:
+            # File upload job - just trigger audio/lyrics workers
+            update_payload["status"] = "downloading"
+            update_payload["message"] = "Restarting audio and lyrics processing"
+            update_payload["timeline"] = ArrayUnion([{
+                "status": "downloading",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": f"Admin {admin_email} restarted job from beginning"
+            }])
+            job_ref.update(update_payload)
+            new_status = "downloading"
+
+            try:
+                from backend.services.worker_service import get_worker_service
+                worker_service = get_worker_service()
+                if await worker_service.trigger_audio_worker(job_id):
+                    workers_triggered.append("audio")
+                if await worker_service.trigger_lyrics_worker(job_id):
+                    workers_triggered.append("lyrics")
+                if not workers_triggered:
+                    error_msg = "Failed to trigger audio/lyrics workers"
+            except Exception as e:
+                error_msg = f"Error triggering workers: {e}"
+                logger.error(f"Error triggering workers for job {job_id}: {e}", exc_info=True)
+        else:
+            # Unknown job type - just set to pending
+            update_payload["status"] = "pending"
+            update_payload["message"] = "Job reset - manual intervention may be needed"
+            update_payload["timeline"] = ArrayUnion([{
+                "status": "pending",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": f"Admin {admin_email} restarted job (no automatic worker trigger)"
+            }])
+            job_ref.update(update_payload)
+            new_status = "pending"
+            error_msg = "Job type unclear - may need manual worker trigger"
+
+    logger.info(
+        f"Admin {admin_email} restarted job {job_id}: "
+        f"{previous_status} -> {new_status}, cleared: {cleared_keys}, workers: {workers_triggered}"
+    )
+
+    return RestartJobResponse(
+        status="success" if workers_triggered or new_status == "awaiting_audio_selection" else "partial",
+        job_id=job_id,
+        message=f"Job restarted from {previous_status} to {new_status}",
+        previous_status=previous_status,
+        new_status=new_status,
+        cleared_data=cleared_keys,
+        deleted_gcs_paths=deleted_paths,
+        workers_triggered=workers_triggered,
+        error=error_msg,
+    )
+
+
+# =============================================================================
+# Override Audio Source Endpoint
+# =============================================================================
+
+class OverrideAudioSourceRequest(BaseModel):
+    """Request model for overriding audio source."""
+    source_type: str  # "audio_search" - switch to audio search mode
+
+
+class OverrideAudioSourceResponse(BaseModel):
+    """Response from override audio source endpoint."""
+    status: str
+    job_id: str
+    message: str
+    previous_source: str  # "youtube", "audio_search", "file_upload"
+    new_source: str
+    cleared_data: List[str]
+    new_status: str
+    search_results_count: Optional[int] = None
+    error: Optional[str] = None
+
+
+# States where audio source override is allowed
+OVERRIDE_AUDIO_ALLOWED_STATES = {
+    "pending",
+    "complete",
+    "failed",
+    "awaiting_review",
+    "awaiting_audio_selection",
+    "instrumental_selected",
+    "prep_complete",
+}
+
+
+@router.post("/jobs/{job_id}/override-audio-source", response_model=OverrideAudioSourceResponse)
+def override_audio_source(
+    job_id: str,
+    request: OverrideAudioSourceRequest,
+    auth_data: AuthResult = Depends(require_admin),
+):
+    """
+    Override the audio source for a job (admin only).
+
+    Use this when a Made-For-You order was submitted with a YouTube URL
+    but you want to use audio search to find higher quality audio instead.
+
+    Currently supports switching to audio_search mode, which:
+    1. Clears existing audio-related state
+    2. Performs an audio search using the job's artist/title
+    3. Stores search results in state_data
+    4. Transitions job to awaiting_audio_selection with results ready
+    5. Admin can then select an audio source from the search results
+
+    Allowed states: pending, complete, failed, awaiting_review, awaiting_audio_selection,
+    instrumental_selected, prep_complete
+    """
+    admin_email = auth_data.user_email or "unknown"
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # Validate job state
+    if job.status not in OVERRIDE_AUDIO_ALLOWED_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot override audio source for job in '{job.status}' state. "
+            f"Allowed states: {', '.join(sorted(OVERRIDE_AUDIO_ALLOWED_STATES))}"
+        )
+
+    # Validate source type
+    if request.source_type != "audio_search":
+        raise HTTPException(
+            status_code=400,
+            detail="Only 'audio_search' source type is currently supported"
+        )
+
+    # Determine current source type
+    state_data = job.state_data or {}
+    if state_data.get('audio_selection') or state_data.get('audio_search_results'):
+        previous_source = "audio_search"
+    elif job.url:
+        previous_source = "youtube"
+    elif job.input_media_gcs_path:
+        previous_source = "file_upload"
+    else:
+        previous_source = "unknown"
+
+    previous_status = job.status
+    cleared_keys = []
+
+    from google.cloud.firestore_v1 import DELETE_FIELD, ArrayUnion
+    db = job_manager.firestore.db
+    job_ref = db.collection("jobs").document(job_id)
+
+    # Clear all audio-related state to start fresh with audio search
+    keys_to_clear = [
+        "audio_complete",
+        "lyrics_complete",
+        "audio_progress",
+        "lyrics_progress",
+        "screens_progress",
+        "video_progress",
+        "render_progress",
+        "encoding_progress",
+        "review_complete",
+        "corrected_lyrics",
+        "instrumental_selection",
+        "instrumental_options",
+        "lyrics_metadata",
+        "audio_search_results",
+        "audio_search_count",
+        "remote_search_id",
+        "audio_selection",
+        # A pending duration confirm / duration estimate belongs to the OLD source.
+        "duration_confirmed",
+        "duration_confirm_reason",
+        "pending_additional_credits",
+        "duration_estimate_seconds",
+        "duration_estimate_source",
+        "duration_actual_seconds",
+        # Re-arm the /select delta charge for the new source. credits_charged is
+        # KEPT, so /select charges only target - credits_charged (no double charge).
+        "select_charge_applied",
+    ]
+
+    update_payload = {}
+    for key in keys_to_clear:
+        if key in state_data:
+            update_payload[f"state_data.{key}"] = DELETE_FIELD
+            cleared_keys.append(key)
+
+    # Clear job-level audio fields
+    update_payload["url"] = DELETE_FIELD  # Clear YouTube URL
+    update_payload["input_media_gcs_path"] = DELETE_FIELD  # Clear downloaded file
+    update_payload["error_message"] = DELETE_FIELD
+    update_payload["error_details"] = DELETE_FIELD
+
+    # Fresh audio will be at normal speed: drop any tempo label from the title
+    update_payload.update(_tempo_label_reset_updates(job))
+
+    # Set audio search fields based on current artist/title
+    search_artist = job.artist
+    search_title = strip_tempo_suffix(job.title) if getattr(job, "tempo_factor", None) is not None else job.title
+    update_payload["audio_search_artist"] = search_artist
+    update_payload["audio_search_title"] = search_title
+
+    # First transition to searching_audio
+    update_payload["status"] = "searching_audio"
+    update_payload["message"] = f"Searching for: {search_artist} - {search_title}"
+    update_payload["progress"] = 5
+    update_payload["timeline"] = ArrayUnion([{
+        "status": "searching_audio",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message": f"Admin {admin_email} switched audio source from {previous_source} to audio_search"
+    }])
+
+    job_ref.update(update_payload)
+
+    # Perform the actual audio search
+    search_results_count = None
+    error_msg = None
+    try:
+        audio_search_service = get_audio_search_service()
+        search_results = audio_search_service.search(search_artist, search_title)
+        search_results_count = len(search_results)
+
+        # Store results in job state_data
+        results_dicts = [r.to_dict() for r in search_results]
+        state_data_update = {
+            'audio_search_results': results_dicts,
+            'audio_search_count': search_results_count,
+        }
+        if audio_search_service.last_remote_search_id:
+            state_data_update['remote_search_id'] = audio_search_service.last_remote_search_id
+
+        # Transition to awaiting_audio_selection with results
+        new_status = "awaiting_audio_selection"
+        # Dotted paths MERGE: replacing the whole map would wipe billing state
+        # (credits_charged / payment_bypassed) — the keys_to_clear list above is
+        # the intended reset.
+        job_ref.update({
+            **{f"state_data.{k}": v for k, v in state_data_update.items()},
+            "status": new_status,
+            "message": f"Found {search_results_count} audio sources - select one",
+            "progress": 10,
+        })
+
+        logger.info(
+            f"Admin {admin_email} overrode audio source for job {job_id}: "
+            f"{previous_source} -> audio_search, found {search_results_count} results"
+        )
+
+    except NoResultsError as e:
+        new_status = "failed"
+        error_msg = f"No audio sources found for: {search_artist} - {search_title}"
+        job_ref.update({
+            "status": new_status,
+            "message": error_msg,
+            "error_message": error_msg,
+        })
+        logger.warning(f"Audio search failed for job {job_id}: {error_msg}")
+
+    except AudioSearchError as e:
+        new_status = "failed"
+        error_msg = f"Audio search failed: {e}"
+        job_ref.update({
+            "status": new_status,
+            "message": error_msg,
+            "error_message": error_msg,
+        })
+        logger.error(f"Audio search error for job {job_id}: {e}")
+
+    return OverrideAudioSourceResponse(
+        status="success" if not error_msg else "error",
+        job_id=job_id,
+        message=f"Found {search_results_count} audio sources - select one in the admin panel." if not error_msg
+        else error_msg,
+        previous_source=previous_source,
+        new_source="audio_search",
+        cleared_data=cleared_keys,
+        new_status=new_status,
+        search_results_count=search_results_count,
+        error=error_msg,
+    )
+
+
+# =============================================================================
+# Payment Admin Endpoints
+# =============================================================================
+
+class RevenueSummaryResponse(BaseModel):
+    """Revenue summary metrics."""
+    total_gross: int
+    total_fees: int
+    total_net: int
+    total_refunds: int
+    transaction_count: int
+    average_order_value: int
+    revenue_by_type: Dict[str, int]
+
+
+class RevenueChartPoint(BaseModel):
+    """Single data point for revenue chart."""
+    date: str
+    gross: int
+    net: int
+    fees: int
+    count: int
+
+
+class PaymentSummary(BaseModel):
+    """Payment record for list view."""
+    session_id: str
+    amount_total: int = 0
+    currency: str = "usd"
+    stripe_fee: int = 0
+    net_amount: int = 0
+    customer_email: str = ""
+    customer_name: str = ""
+    payment_method_type: str = ""
+    card_brand: str = ""
+    card_last4: str = ""
+    order_type: str = ""
+    product_description: str = ""
+    status: str = ""
+    refund_amount: int = 0
+    created_at: Optional[str] = None
+    is_test: bool = False
+
+    class Config:
+        extra = "allow"
+
+
+class PaymentListResponse(BaseModel):
+    """Response for payment list."""
+    payments: List[PaymentSummary]
+    total: int
+    has_more: bool
+
+
+class StripeBalanceResponse(BaseModel):
+    """Stripe account balance."""
+    available: int
+    pending: int
+    currency: str = "usd"
+
+
+class PayoutItem(BaseModel):
+    """Payout record."""
+    id: str
+    amount: int
+    currency: str = "usd"
+    status: str = ""
+    arrival_date: Optional[int] = None
+    created: Optional[int] = None
+    description: Optional[str] = None
+    method: Optional[str] = None
+
+
+class DisputeItem(BaseModel):
+    """Dispute record."""
+    id: str
+    amount: int
+    currency: str = "usd"
+    status: str = ""
+    reason: str = ""
+    charge_id: Optional[str] = None
+    created: Optional[int] = None
+    evidence_due_by: Optional[int] = None
+    payment_intent_id: Optional[str] = None
+
+
+class RefundRequest(BaseModel):
+    """Request to issue a refund."""
+    amount: Optional[int] = None
+    reason: str = "requested_by_customer"
+
+
+class RefundResponse(BaseModel):
+    """Response from refund processing."""
+    success: bool
+    message: str
+    session_id: str
+
+
+class UserPaymentHistoryResponse(BaseModel):
+    """Payment history for a user."""
+    email: str
+    payments: List[PaymentSummary]
+    total_spent: int
+    total_refunded: int
+    net_spent: int
+    payment_count: int
+    first_payment_at: Optional[str] = None
+    last_payment_at: Optional[str] = None
+
+
+class WebhookEventItem(BaseModel):
+    """Webhook event record."""
+    event_id: str = ""
+    event_type: str = ""
+    created_at: Optional[str] = None
+    processed_at: Optional[str] = None
+    status: str = ""
+    error_message: Optional[str] = None
+    session_id: Optional[str] = None
+    customer_email: Optional[str] = None
+    summary: Optional[str] = None
+
+
+@router.get("/payments/summary", response_model=RevenueSummaryResponse)
+def get_payment_summary(
+    days: int = 30,
+    exclude_test: bool = True,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get revenue summary metrics for the given period."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    result = service.get_revenue_summary(days=days, exclude_test=exclude_test)
+    # Remove internal cache key
+    result.pop("_key", None)
+    return RevenueSummaryResponse(**result)
+
+
+@router.get("/payments/revenue-chart", response_model=List[RevenueChartPoint])
+def get_revenue_chart(
+    days: int = 30,
+    group_by: str = "day",
+    exclude_test: bool = True,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get revenue data grouped by time period for charting."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return service.get_revenue_by_period(days=days, group_by=group_by, exclude_test=exclude_test)
+
+
+@router.get("/payments", response_model=PaymentListResponse)
+def list_payments(
+    limit: int = 50,
+    offset: int = 0,
+    order_type: Optional[str] = None,
+    status: Optional[str] = None,
+    email: Optional[str] = None,
+    exclude_test: bool = True,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """List payments with pagination and filters."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    result = service.list_payments(
+        limit=limit, offset=offset, order_type=order_type,
+        status=status, email=email, exclude_test=exclude_test,
+    )
+    return PaymentListResponse(**result)
+
+
+@router.get("/payments/balance", response_model=StripeBalanceResponse)
+def get_stripe_balance(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get current Stripe account balance."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return StripeBalanceResponse(**service.get_stripe_balance())
+
+
+@router.get("/payments/payouts", response_model=List[PayoutItem])
+def get_payouts(
+    limit: int = 20,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get recent payouts."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return service.get_recent_payouts(limit=limit)
+
+
+@router.get("/payments/disputes", response_model=List[DisputeItem])
+def get_disputes(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get open and recent disputes."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return service.get_recent_disputes()
+
+
+@router.get("/payments/webhook-events", response_model=List[WebhookEventItem])
+def get_webhook_events(
+    limit: int = 50,
+    event_type: Optional[str] = None,
+    status: Optional[str] = None,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get recent webhook events for audit trail."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return service.list_webhook_events(limit=limit, event_type=event_type, status=status)
+
+
+@router.get("/payments/by-user/{email}")
+def get_user_payments(
+    email: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get all payments for a specific user."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return service.get_user_payment_history(email)
+
+
+@router.get("/users/{email}/emails")
+def get_user_emails(
+    email: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """List every email ever sent to a user (Postmark + our persisted log)."""
+    from backend.services.postmark_admin_service import get_postmark_admin_service
+    service = get_postmark_admin_service()
+    return service.get_user_email_history(email)
+
+
+@router.get("/emails/{message_id}")
+def get_email_detail(
+    message_id: str,
+    source: str = "postmark",
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Full detail for a single email — rendered HTML + delivery metadata.
+
+    ``source=log`` reads our persisted copy directly (for mail older than
+    Postmark's ~45-day retention); otherwise Postmark is queried with a
+    fallback to the stored log.
+    """
+    from backend.services.postmark_admin_service import get_postmark_admin_service
+    service = get_postmark_admin_service()
+    result = service.get_email_detail(message_id, source=source)
+    if not result:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return result
+
+
+@router.get("/payments/{session_id}")
+def get_payment_detail(
+    session_id: str,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Get full details for a single payment."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    result = service.get_payment_detail(session_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return result
+
+
+@router.post("/payments/{session_id}/refund", response_model=RefundResponse)
+def refund_payment(
+    session_id: str,
+    request: RefundRequest,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """
+    Issue a full or partial refund for a payment.
+
+    If amount is not specified, issues a full refund.
+    Automatically deducts proportional credits from user.
+    """
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+
+    # Get payment details first to determine credits to deduct
+    payment = service.get_payment_detail(session_id)
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    success, message = service.process_refund(
+        session_id=session_id,
+        amount=request.amount,
+        reason=request.reason,
+    )
+
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+
+    # Deduct proportional credits if this was a credit purchase
+    if payment.get("order_type") == "credit_purchase" and payment.get("credits_granted", 0) > 0:
+        try:
+            original_amount = payment.get("amount_total", 0)
+            refund_amount = request.amount or original_amount
+            credits_to_deduct = int(
+                payment["credits_granted"] * (refund_amount / original_amount)
+            )
+            if credits_to_deduct > 0:
+                user_email = payment.get("customer_email", "")
+                user_service = get_user_service()
+                user_service.add_credits(
+                    email=user_email,
+                    amount=-credits_to_deduct,
+                    reason=f"refund_{session_id}",
+                )
+                logger.info(
+                    f"Deducted {credits_to_deduct} credits from {user_email} "
+                    f"for refund on {session_id}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to deduct credits for refund {session_id}: {e}")
+
+    admin_email = getattr(auth_data, "user_email", None) or "unknown"
+    logger.info(f"Admin {admin_email} issued refund for {session_id}: {message}")
+
+    return RefundResponse(success=True, message=message, session_id=session_id)
+
+
+@router.post("/payments/normalize-emails")
+def normalize_payment_emails(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """One-time backfill: lowercase all customer_email values in stripe_payments."""
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+    service = get_stripe_admin_service()
+    return service.normalize_customer_emails()
+
+
+@router.post("/backfill/user-stats")
+def backfill_user_stats(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """One-time backfill: recalculate total_jobs_completed and total_spent for all users."""
+    from google.cloud import firestore as firestore_lib
+    db = firestore_lib.Client()
+
+    # Get all users
+    users_docs = list(db.collection(USERS_COLLECTION).stream())
+    updated = 0
+
+    for user_doc in users_docs:
+        user_data = user_doc.to_dict()
+        email = user_data.get("email", "")
+        if not email:
+            continue
+
+        # Count completed jobs (try both original email and lowercase)
+        completed_jobs = 0
+        seen_job_ids = set()
+        for email_variant in set([email, email.lower().strip()]):
+            jobs_query = db.collection("jobs").where("user_email", "==", email_variant).where(
+                "status", "in", ["complete", "prep_complete"]
+            )
+            for job_doc in jobs_query.stream():
+                if job_doc.id not in seen_job_ids:
+                    seen_job_ids.add(job_doc.id)
+                    completed_jobs += 1
+
+        # Sum payments
+        total_spent = 0
+        payments_query = db.collection("stripe_payments").where(
+            "customer_email", "==", email.lower().strip()
+        )
+        for pay_doc in payments_query.stream():
+            pay_data = pay_doc.to_dict()
+            status = pay_data.get("status", "")
+            if status not in ("refunded",):
+                total_spent += pay_data.get("amount_total", 0)
+                total_spent -= pay_data.get("refund_amount", 0)
+
+        # Update user document
+        updates = {}
+        if completed_jobs != user_data.get("total_jobs_completed", 0):
+            updates["total_jobs_completed"] = completed_jobs
+        if total_spent != user_data.get("total_spent", 0):
+            updates["total_spent"] = total_spent
+
+        if updates:
+            user_doc.reference.update(updates)
+            updated += 1
+
+    return {"status": "success", "users_checked": len(users_docs), "users_updated": updated}
+
+
+# =============================================================================
+# Edit Review Endpoints
+# =============================================================================
+
+class EditReviewSummary(BaseModel):
+    job_id: str
+    artist: str
+    title: str
+    user_email: str
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    edit_log_session: Optional[str] = None
+    edit_log_path: Optional[str] = None
+    has_corrections_updated: bool = False
+
+
+class EditReviewListResponse(BaseModel):
+    reviews: List[EditReviewSummary]
+    total: int
+    has_more: bool
+
+
+@router.get("/edit-reviews", response_model=EditReviewListResponse)
+def list_edit_reviews(
+    limit: int = 50,
+    offset: int = 0,
+    exclude_test: bool = False,
+    search: Optional[str] = None,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """List jobs that have completed lyrics review with edit log data."""
+    user_service = get_user_service()
+    db = user_service.db
+
+    STREAM_LIMIT = 10000
+    reviews = []
+    streamed = 0
+
+    for doc in db.collection("jobs").limit(STREAM_LIMIT).stream():
+        streamed += 1
+        data = doc.to_dict()
+
+        # Must have an edit log path
+        state_data = data.get("state_data") or {}
+        edit_log_path = state_data.get("last_edit_log_path")
+        if not edit_log_path:
+            continue
+
+        email = data.get("user_email", "")
+
+        # Filter test emails
+        if exclude_test and is_test_email(email):
+            continue
+
+        artist = data.get("artist", "")
+        title = data.get("title", "")
+
+        # Search filter
+        if search:
+            search_lower = search.lower()
+            if (
+                search_lower not in (artist or "").lower()
+                and search_lower not in (title or "").lower()
+                and search_lower not in (email or "").lower()
+            ):
+                continue
+
+        file_urls = data.get("file_urls") or {}
+        has_corrections_updated = bool(
+            file_urls.get("lyrics", {}).get("corrections_updated")
+        )
+
+        created_at = data.get("created_at")
+        updated_at = data.get("updated_at")
+
+        def _to_iso(val) -> Optional[str]:
+            if val is None:
+                return None
+            if hasattr(val, 'isoformat'):
+                return val.isoformat()
+            return str(val)
+
+        try:
+            reviews.append(EditReviewSummary(
+                job_id=doc.id,
+                artist=artist or "",
+                title=title or "",
+                user_email=email or "",
+                status=data.get("status", ""),
+                created_at=_to_iso(created_at),
+                updated_at=_to_iso(updated_at),
+                edit_log_session=state_data.get("last_edit_log_session"),
+                edit_log_path=edit_log_path,
+                has_corrections_updated=has_corrections_updated,
+            ))
+        except Exception as e:
+            logger.warning(f"Job {doc.id}: Error building edit review summary: {e}")
+            continue
+
+    if streamed >= STREAM_LIMIT:
+        logger.warning(f"Edit reviews stream hit limit ({STREAM_LIMIT}), results may be incomplete")
+
+    # Sort by most recently updated (or created) descending
+    reviews.sort(
+        key=lambda r: r.updated_at or r.created_at or "",
+        reverse=True,
+    )
+
+    total = len(reviews)
+    paginated = reviews[offset : offset + limit]
+
+    return EditReviewListResponse(
+        reviews=paginated,
+        total=total,
+        has_more=(offset + limit) < total,
+    )
+
+
+@router.get("/edit-reviews/{job_id}")
+async def get_edit_review_detail(
+    job_id: str,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """Get full immutable review snapshot for one job. Read-only, no state mutations."""
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    storage = StorageService()
+
+    # Job metadata
+    job_meta = {
+        "job_id": job.job_id,
+        "artist": job.artist,
+        "title": job.title,
+        "user_email": job.user_email,
+        "status": job.status.value if hasattr(job.status, "value") else str(job.status),
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+    }
+
+    # Load corrections.json (original)
+    original_corrections = None
+    corrections_path = (job.file_urls.get("lyrics") or {}).get("corrections")
+    if corrections_path:
+        try:
+            original_corrections = storage.download_json(corrections_path)
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Could not load original corrections from {corrections_path}: {e}")
+
+    # Load corrections_updated.json
+    updated_corrections = None
+    corrections_updated_path = (job.file_urls.get("lyrics") or {}).get("corrections_updated")
+    if corrections_updated_path:
+        try:
+            updated_corrections = storage.download_json(corrections_updated_path)
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Could not load updated corrections from {corrections_updated_path}: {e}")
+
+    # Load edit log from GCS
+    edit_log = None
+    edit_log_path = (job.state_data or {}).get("last_edit_log_path")
+    if edit_log_path:
+        try:
+            edit_log = storage.download_json(edit_log_path)
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Could not load edit log from {edit_log_path}: {e}")
+
+    # Load annotations
+    annotations = None
+    annotations_path = f"jobs/{job_id}/lyrics/annotations.json"
+    try:
+        if storage.file_exists(annotations_path):
+            annotations = storage.download_json(annotations_path)
+    except Exception as e:
+        logger.warning(f"Job {job_id}: Could not load annotations from {annotations_path}: {e}")
+
+    # Generate signed audio URL
+    audio_url = None
+    audio_gcs_path = (
+        (job.file_urls.get("lyrics") or {}).get("audio")
+        or (job.file_urls.get("stems") or {}).get("lead_vocals")
+        or job.input_media_gcs_path
+    )
+    if audio_gcs_path:
+        try:
+            transcoding = AudioTranscodingService(storage_service=storage)
+            audio_url = await transcoding.get_review_audio_url_async(
+                audio_gcs_path, expiration_minutes=120
+            )
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Could not generate audio URL for {audio_gcs_path}: {e}")
+
+    return {
+        "job": job_meta,
+        "original_corrections": original_corrections,
+        "updated_corrections": updated_corrections,
+        "edit_log": edit_log,
+        "annotations": annotations,
+        "audio_url": audio_url,
+    }
+
+
+# ─── Audio Edit Reviews ─────────────────────────────────────────────────────
+
+
+class AudioEditReviewSummary(BaseModel):
+    job_id: str
+    artist: str
+    title: str
+    user_email: str
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    session_count: int = 0
+    total_edits: int = 0
+    original_duration: Optional[float] = None
+    current_duration: Optional[float] = None
+    latest_trigger: Optional[str] = None
+
+
+class AudioEditReviewListResponse(BaseModel):
+    reviews: List[AudioEditReviewSummary]
+    total: int
+    has_more: bool
+
+
+@router.get("/audio-edit-reviews", response_model=AudioEditReviewListResponse)
+def list_audio_edit_reviews(
+    limit: int = 50,
+    offset: int = 0,
+    exclude_test: bool = False,
+    search: Optional[str] = None,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """List jobs that have audio edit sessions."""
+    from backend.services.firestore_service import FirestoreService
+
+    user_service = get_user_service()
+    db = user_service.db
+    fs = FirestoreService()
+
+    STREAM_LIMIT = 10000
+    reviews = []
+    streamed = 0
+
+    for doc in db.collection("jobs").limit(STREAM_LIMIT).stream():
+        streamed += 1
+        data = doc.to_dict()
+        state_data = data.get("state_data") or {}
+
+        # Only include jobs that have been through audio edit
+        # (have edit stack or have audio edit sessions)
+        has_edit_stack = bool(state_data.get("audio_edit_stack"))
+        status = data.get("status", "")
+        is_in_audio_edit = status in (
+            "awaiting_audio_edit", "in_audio_edit", "audio_edit_complete"
+        )
+
+        if not has_edit_stack and not is_in_audio_edit:
+            # Quick check: does this job have any audio edit sessions subcollection?
+            sessions_ref = db.collection("jobs").document(doc.id).collection("audio_edit_sessions")
+            if not next(sessions_ref.limit(1).stream(), None):
+                continue
+
+        email = data.get("user_email", "")
+        if exclude_test and is_test_email(email):
+            continue
+
+        artist = data.get("artist", "")
+        title = data.get("title", "")
+
+        if search:
+            search_lower = search.lower()
+            if (
+                search_lower not in (artist or "").lower()
+                and search_lower not in (title or "").lower()
+                and search_lower not in (email or "").lower()
+            ):
+                continue
+
+        # Get session summary info
+        sessions = fs.list_audio_edit_sessions(doc.id)
+        session_count = len(sessions)
+        total_edits = 0
+        latest_trigger = None
+        current_duration = None
+        original_duration = None
+
+        if sessions:
+            latest = sessions[0]  # Already sorted by updated_at DESC
+            total_edits = latest.edit_count
+            latest_trigger = latest.trigger
+            current_duration = latest.audio_duration_seconds
+            original_duration = latest.original_duration_seconds
+
+        created_at = data.get("created_at")
+        updated_at = data.get("updated_at")
+
+        def _to_iso(val) -> Optional[str]:
+            if val is None:
+                return None
+            if hasattr(val, 'isoformat'):
+                return val.isoformat()
+            return str(val)
+
+        try:
+            reviews.append(AudioEditReviewSummary(
+                job_id=doc.id,
+                artist=artist or "",
+                title=title or "",
+                user_email=email or "",
+                status=status,
+                created_at=_to_iso(created_at),
+                updated_at=_to_iso(updated_at),
+                session_count=session_count,
+                total_edits=total_edits,
+                original_duration=original_duration,
+                current_duration=current_duration,
+                latest_trigger=latest_trigger,
+            ))
+        except Exception as e:
+            logger.warning(f"Job {doc.id}: Error building audio edit review summary: {e}")
+            continue
+
+    if streamed >= STREAM_LIMIT:
+        logger.warning(f"Audio edit reviews stream hit limit ({STREAM_LIMIT}), results may be incomplete")
+
+    reviews.sort(
+        key=lambda r: r.updated_at or r.created_at or "",
+        reverse=True,
+    )
+
+    total = len(reviews)
+    paginated = reviews[offset : offset + limit]
+
+    return AudioEditReviewListResponse(
+        reviews=paginated,
+        total=total,
+        has_more=(offset + limit) < total,
+    )
+
+
+@router.get("/audio-edit-reviews/{job_id}")
+async def get_audio_edit_review_detail(
+    job_id: str,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """Get full audio edit review detail for one job, including all sessions."""
+    from backend.services.firestore_service import FirestoreService
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    storage = StorageService()
+    fs = FirestoreService()
+
+    job_meta = {
+        "job_id": job.job_id,
+        "artist": job.artist,
+        "title": job.title,
+        "user_email": job.user_email,
+        "status": job.status.value if hasattr(job.status, "value") else str(job.status),
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+    }
+
+    # Get all sessions
+    sessions = fs.list_audio_edit_sessions(job_id)
+    sessions_data = []
+    for session in sessions:
+        session_dict = session.to_dict()
+        # Convert datetimes to ISO strings
+        for key in ("created_at", "updated_at"):
+            val = session_dict.get(key)
+            if hasattr(val, "isoformat"):
+                session_dict[key] = val.isoformat()
+        sessions_data.append(session_dict)
+
+    # Get current edit stack from state_data
+    state_data = job.state_data or {}
+    edit_stack = state_data.get("audio_edit_stack", [])
+
+    # Generate signed URLs for original and current audio
+    original_audio_url = None
+    current_audio_url = None
+    transcoding = AudioTranscodingService(storage_service=storage)
+
+    if job.input_media_gcs_path:
+        try:
+            current_audio_url = await transcoding.get_review_audio_url_async(
+                job.input_media_gcs_path, expiration_minutes=120
+            )
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Could not generate current audio URL: {e}")
+
+    # Original audio (before edits)
+    original_path = state_data.get("original_input_media_gcs_path") or job.input_media_gcs_path
+    if original_path and original_path != job.input_media_gcs_path:
+        try:
+            original_audio_url = await transcoding.get_review_audio_url_async(
+                original_path, expiration_minutes=120
+            )
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Could not generate original audio URL: {e}")
+
+    # Load edit log if it exists
+    edit_log = None
+    edit_log_path = f"jobs/{job_id}/audio_edit/edit_log.json"
+    try:
+        if storage.file_exists(edit_log_path):
+            edit_log = storage.download_json(edit_log_path)
+    except Exception as e:
+        logger.warning(f"Job {job_id}: Could not load audio edit log: {e}")
+
+    return {
+        "job": job_meta,
+        "sessions": sessions_data,
+        "edit_stack": edit_stack,
+        "edit_log": edit_log,
+        "original_audio_url": original_audio_url,
+        "current_audio_url": current_audio_url,
+    }
+
+
+# =============================================================================
+# Anti-Abuse Investigation
+# =============================================================================
+
+
+@router.get("/abuse/related/{email}")
+def find_related_accounts(
+    email: str,
+    auth_result: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Find accounts related to the given email by shared signup IP or device fingerprint.
+
+    Returns the target user plus lists of other accounts from the same IP and/or fingerprint.
+    """
+    result = user_service.find_related_accounts(email)
+
+    if not result["user"]:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = result["user"]
+    return {
+        "user": {
+            "email": user.email,
+            "signup_ip": user.signup_ip,
+            "device_fingerprint": user.device_fingerprint,
+            "credits": user.credits,
+            "total_jobs_created": user.total_jobs_created,
+            "total_spent": user.total_spent,
+            "created_at": str(user.created_at),
+        },
+        "related_by_ip": [
+            {
+                "email": u.email,
+                "credits": u.credits,
+                "total_jobs_created": u.total_jobs_created,
+                "total_spent": u.total_spent,
+                "created_at": str(u.created_at),
+            }
+            for u in result["by_ip"]
+        ],
+        "related_by_fingerprint": [
+            {
+                "email": u.email,
+                "credits": u.credits,
+                "total_jobs_created": u.total_jobs_created,
+                "total_spent": u.total_spent,
+                "created_at": str(u.created_at),
+            }
+            for u in result["by_fingerprint"]
+        ],
+    }
+
+
+@router.get("/abuse/correlations")
+def find_account_correlations(
+    auth_result: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Find clusters of accounts sharing the same device fingerprint or signup IP.
+
+    Returns fingerprint clusters (RED flag - near-certain multi-accounting) and
+    IP clusters (ORANGE flag - suspicious but could be shared network), sorted
+    by group size. Includes user agent data for additional correlation signal.
+    """
+    result = user_service.find_account_correlations()
+    user_agents = result.get("user_agents", {})
+
+    def serialize_cluster_user(u, include_user_agent=True):
+        data = {
+            "email": u.email,
+            "signup_ip": u.signup_ip,
+            "device_fingerprint": u.device_fingerprint,
+            "credits": u.credits,
+            "total_jobs_created": u.total_jobs_created,
+            "total_jobs_completed": u.total_jobs_completed,
+            "total_spent": u.total_spent,
+            "created_at": str(u.created_at),
+        }
+        if include_user_agent:
+            data["user_agent"] = user_agents.get(u.email)
+        return data
+
+    return {
+        "fingerprint_clusters": [
+            {
+                "fingerprint": cluster["fingerprint"],
+                "count": len(cluster["users"]),
+                "users": [serialize_cluster_user(u) for u in cluster["users"]],
+            }
+            for cluster in result["fingerprint_clusters"]
+        ],
+        "ip_clusters": [
+            {
+                "ip": cluster["ip"],
+                "count": len(cluster["users"]),
+                "users": [serialize_cluster_user(u) for u in cluster["users"]],
+            }
+            for cluster in result["ip_clusters"]
+        ],
+    }
+
+
+@router.get("/abuse/suspicious")
+def find_suspicious_accounts(
+    min_jobs: int = 2,
+    max_spend: int = 0,
+    auth_result: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Find accounts with many jobs but no (or low) spend.
+
+    Detects potential free-credit abusers: people creating multiple accounts
+    to get welcome credits without ever paying.
+
+    Args:
+        min_jobs: Minimum jobs created to flag (default: 2)
+        max_spend: Maximum total_spent in cents (default: 0 = only free accounts)
+    """
+    users = user_service.find_suspicious_accounts(min_jobs=min_jobs, max_spend=max_spend)
+
+    return {
+        "count": len(users),
+        "users": [
+            {
+                "email": u.email,
+                "signup_ip": u.signup_ip,
+                "device_fingerprint": u.device_fingerprint,
+                "credits": u.credits,
+                "total_jobs_created": u.total_jobs_created,
+                "total_jobs_completed": u.total_jobs_completed,
+                "total_spent": u.total_spent,
+                "has_submitted_feedback": u.has_submitted_feedback,
+                "created_at": str(u.created_at),
+                "last_login_at": str(u.last_login_at) if u.last_login_at else None,
+            }
+            for u in users
+        ],
+    }
+
+
+@router.get("/abuse/by-ip/{ip_address:path}")
+def find_users_by_ip(
+    ip_address: str,
+    auth_result: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Find all users who signed up from a specific IP address."""
+    users = user_service.find_users_by_signup_ip(ip_address)
+    return {
+        "ip_address": ip_address,
+        "count": len(users),
+        "users": [
+            {
+                "email": u.email,
+                "device_fingerprint": u.device_fingerprint,
+                "credits": u.credits,
+                "total_jobs_created": u.total_jobs_created,
+                "total_spent": u.total_spent,
+                "created_at": str(u.created_at),
+            }
+            for u in users
+        ],
+    }
+
+
+@router.get("/abuse/by-fingerprint/{fingerprint}")
+def find_users_by_fingerprint(
+    fingerprint: str,
+    auth_result: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Find all users who signed up with a specific device fingerprint."""
+    users = user_service.find_users_by_fingerprint(fingerprint)
+    return {
+        "device_fingerprint": fingerprint,
+        "count": len(users),
+        "users": [
+            {
+                "email": u.email,
+                "signup_ip": u.signup_ip,
+                "credits": u.credits,
+                "total_jobs_created": u.total_jobs_created,
+                "total_spent": u.total_spent,
+                "created_at": str(u.created_at),
+            }
+            for u in users
+        ],
+    }
+
+
+@router.post("/abuse/backfill-ips")
+def backfill_signup_ips(
+    auth_result: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Backfill signup_ip for existing users from their earliest session or magic link.
+
+    One-time operation to populate signup_ip for users created before the field was added.
+    Only updates users who currently have signup_ip=None.
+    """
+    from backend.services.user_service import SESSIONS_COLLECTION, MAGIC_LINKS_COLLECTION
+    from google.cloud.firestore_v1 import FieldFilter
+
+    db = user_service.db
+    updated = 0
+    skipped = 0
+    no_ip_found = 0
+
+    # Known bad IPs (load balancer / proxy IPs that aren't real client IPs)
+    BAD_IPS = {"169.254.169.126", "unknown", ""}
+
+    # Find all users without signup_ip or with a known-bad IP
+    users_query = db.collection(USERS_COLLECTION).stream()
+
+    for user_doc in users_query:
+        user_data = user_doc.to_dict()
+        current_ip = user_data.get("signup_ip")
+        if current_ip and current_ip not in BAD_IPS:
+            skipped += 1
+            continue
+
+        email = user_data.get("email", "")
+        if not email:
+            continue
+
+        ip = None
+
+        # Try sessions first (most reliable — created at verification)
+        # No order_by to avoid needing extra composite index; any IP is fine
+        sessions = (
+            db.collection(SESSIONS_COLLECTION)
+            .where(filter=FieldFilter("user_email", "==", email))
+            .limit(5)
+            .stream()
+        )
+        for session_doc in sessions:
+            session_data = session_doc.to_dict()
+            candidate_ip = session_data.get("ip_address")
+            if candidate_ip and candidate_ip not in BAD_IPS:
+                ip = candidate_ip
+                break
+
+        # Fallback: try magic links
+        if not ip:
+            links = (
+                db.collection(MAGIC_LINKS_COLLECTION)
+                .where(filter=FieldFilter("email", "==", email))
+                .limit(5)
+                .stream()
+            )
+            for link_doc in links:
+                link_data = link_doc.to_dict()
+                candidate_ip = link_data.get("ip_address")
+                if candidate_ip:
+                    ip = candidate_ip
+                    break
+
+        if ip:
+            user_doc.reference.update({"signup_ip": ip})
+            updated += 1
+            logger.info(f"Backfilled signup_ip for {email}: {ip}")
+        else:
+            # Clear bad IP if one was set (e.g., load balancer IP)
+            if current_ip and current_ip in BAD_IPS:
+                user_doc.reference.update({"signup_ip": None})
+                updated += 1
+                logger.info(f"Cleared bad signup_ip for {email}: {current_ip}")
+            else:
+                no_ip_found += 1
+
+    return {
+        "status": "success",
+        "updated": updated,
+        "skipped_already_set": skipped,
+        "no_ip_found": no_ip_found,
+    }
+
+
+# =============================================================================
+# IP Geolocation Lookup
+# =============================================================================
+
+
+class IpBatchRequest(BaseModel):
+    """Request for batch IP geolocation lookup."""
+    ips: list[str]
+
+
+@router.get("/abuse/ip-info/{ip_address:path}")
+def get_ip_info(
+    ip_address: str,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """Look up geolocation info for a single IP address."""
+    geo_service = get_ip_geolocation_service()
+    return geo_service.lookup_ip(ip_address)
+
+
+@router.post("/abuse/ip-info/batch")
+def get_ip_info_batch(
+    request: IpBatchRequest,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """Look up geolocation info for multiple IP addresses."""
+    if len(request.ips) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 IPs per batch request")
+    geo_service = get_ip_geolocation_service()
+    return geo_service.lookup_ips_batch(request.ips)
+
+
+# =============================================================================
+# User Feedback
+# =============================================================================
+
+
+class AdminFeedbackItem(BaseModel):
+    """Single feedback submission for admin view."""
+    id: str
+    user_email: str
+    created_at: Optional[str] = None
+    overall_rating: int
+    ease_of_use_rating: int
+    lyrics_accuracy_rating: int
+    correction_experience_rating: int
+    what_went_well: Optional[str] = None
+    what_could_improve: Optional[str] = None
+    additional_comments: Optional[str] = None
+    would_recommend: bool = True
+    would_use_again: bool = True
+
+
+class AdminFeedbackListResponse(BaseModel):
+    """Paginated list of feedback submissions."""
+    items: List[AdminFeedbackItem]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+    avg_overall_rating: Optional[float] = None
+    avg_ease_of_use_rating: Optional[float] = None
+    avg_lyrics_accuracy_rating: Optional[float] = None
+    avg_correction_experience_rating: Optional[float] = None
+
+
+@router.get("/feedback", response_model=AdminFeedbackListResponse)
+def list_user_feedback(
+    limit: int = 50,
+    offset: int = 0,
+    search: Optional[str] = None,
+    exclude_test: bool = False,
+    auth_result: AuthResult = Depends(require_admin),
+):
+    """List all user feedback submissions with pagination and search."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    user_service = get_user_service()
+    db = user_service.db
+
+    items = []
+    for doc in db.collection("user_feedback").stream():
+        data = doc.to_dict()
+        email = data.get("user_email", "")
+
+        if exclude_test and is_test_email(email):
+            continue
+
+        if search and search.lower() not in email.lower():
+            continue
+
+        created_at = data.get("created_at")
+        if created_at is not None and hasattr(created_at, "isoformat"):
+            created_at = created_at.isoformat()
+        elif created_at is not None:
+            created_at = str(created_at)
+
+        items.append(AdminFeedbackItem(
+            id=data.get("id", doc.id),
+            user_email=email,
+            created_at=created_at,
+            overall_rating=data.get("overall_rating", 0),
+            ease_of_use_rating=data.get("ease_of_use_rating", 0),
+            lyrics_accuracy_rating=data.get("lyrics_accuracy_rating", 0),
+            correction_experience_rating=data.get("correction_experience_rating", 0),
+            what_went_well=data.get("what_went_well"),
+            what_could_improve=data.get("what_could_improve"),
+            additional_comments=data.get("additional_comments"),
+            would_recommend=data.get("would_recommend", True),
+            would_use_again=data.get("would_use_again", True),
+        ))
+
+    # Sort by newest first
+    items.sort(key=lambda x: x.created_at or "", reverse=True)
+
+    # Compute aggregate stats
+    total = len(items)
+    avg_overall = sum(i.overall_rating for i in items) / total if total else None
+    avg_ease = sum(i.ease_of_use_rating for i in items) / total if total else None
+    avg_lyrics = sum(i.lyrics_accuracy_rating for i in items) / total if total else None
+    avg_correction = sum(i.correction_experience_rating for i in items) / total if total else None
+
+    paginated = items[offset:offset + limit]
+
+    return AdminFeedbackListResponse(
+        items=paginated,
+        total=total,
+        offset=offset,
+        limit=limit,
+        has_more=(offset + limit) < total,
+        avg_overall_rating=round(avg_overall, 2) if avg_overall is not None else None,
+        avg_ease_of_use_rating=round(avg_ease, 2) if avg_ease is not None else None,
+        avg_lyrics_accuracy_rating=round(avg_lyrics, 2) if avg_lyrics is not None else None,
+        avg_correction_experience_rating=round(avg_correction, 2) if avg_correction is not None else None,
+    )
+
+
+# =============================================================================
+# Requests board — full request history (admin view)
+# =============================================================================
+
+class CommunityRequestItem(BaseModel):
+    """A requests-board song request, any status, for the admin history view."""
+    id: str
+    artist: str
+    title: str
+    status: str
+    submitted_by: str
+    owner_email: Optional[str] = None
+    vote_count: int
+    job_id: Optional[str] = None
+    youtube_url: Optional[str] = None
+    review_state: Optional[str] = None
+    created_at: Optional[str] = None
+    picked_at: Optional[str] = None
+
+
+class CommunityRequestListResponse(BaseModel):
+    requests: List[CommunityRequestItem]
+
+
+@router.get("/community-requests", response_model=CommunityRequestListResponse)
+def list_community_requests(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Full history of requests-board submissions across every status — who asked,
+    how it was voted, which job made it, and where it landed on YouTube."""
+    from backend.services.song_request_service import get_song_request_service
+    service = get_song_request_service()
+    items = [
+        CommunityRequestItem(
+            id=r.id, artist=r.artist, title=r.title, status=r.status,
+            submitted_by=r.submitted_by, owner_email=r.owner_email,
+            vote_count=r.vote_count, job_id=r.job_id, youtube_url=r.youtube_url,
+            review_state=r.review_state,
+            created_at=r.created_at.isoformat() if r.created_at else None,
+            picked_at=r.picked_at.isoformat() if r.picked_at else None,
+        )
+        for r in service.list_all()
+    ]
+    return CommunityRequestListResponse(requests=items)
+
+
+# =============================================================================
+# Requests board — existing-community-version review queue
+# =============================================================================
+
+class CommunityReviewItem(BaseModel):
+    """A requests-board pick held for existing-community-version review."""
+    id: str
+    artist: str
+    title: str
+    submitted_by: str
+    vote_count: int
+    upvoter_count: int
+    community_versions: Optional[Dict[str, Any]] = None
+    community_checked_at: Optional[str] = None
+
+
+class CommunityReviewListResponse(BaseModel):
+    reviews: List[CommunityReviewItem]
+
+
+class CommunityReviewActionBody(BaseModel):
+    # make = make our own version anyway; reject = decline + notify up-voters of the
+    # existing version; keep = leave on the board, snooze re-review.
+    action: Literal["make", "reject", "keep"]
+
+
+class CommunityReviewActionResponse(BaseModel):
+    status: str
+    request_id: str
+    message: str
+
+
+@router.get("/community-reviews", response_model=CommunityReviewListResponse)
+def list_community_reviews(
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """List requests-board picks the daily picker flagged because an existing
+    community karaoke version was found (awaiting keep/make/reject)."""
+    from backend.services.song_request_service import get_song_request_service
+    service = get_song_request_service()
+    items = []
+    for r in service.list_pending_reviews():
+        try:
+            upvoters = service.list_upvoters(r.id)
+        except Exception:
+            upvoters = []
+        items.append(CommunityReviewItem(
+            id=r.id, artist=r.artist, title=r.title, submitted_by=r.submitted_by,
+            vote_count=r.vote_count, upvoter_count=len(upvoters),
+            community_versions=r.community_versions,
+            community_checked_at=r.community_checked_at.isoformat() if r.community_checked_at else None,
+        ))
+    return CommunityReviewListResponse(reviews=items)
+
+
+@router.post("/community-reviews/{request_id}", response_model=CommunityReviewActionResponse)
+async def action_community_review(
+    request_id: str,
+    body: CommunityReviewActionBody,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+):
+    """Resolve a flagged pick: make our own version, reject (notify up-voters of the
+    existing version), or keep it on the board (snooze re-review)."""
+    from backend.config import get_settings
+    from backend.services.song_request_service import get_song_request_service
+    service = get_song_request_service()
+    settings = get_settings()
+
+    req = service.get_request(request_id)
+    if req is None or req.review_state != "pending":
+        raise HTTPException(status_code=404, detail="No pending review for that request.")
+
+    if body.action == "keep":
+        until = datetime.now(timezone.utc) + timedelta(days=settings.community_review_snooze_days)
+        service.snooze_review(request_id, until)
+        return CommunityReviewActionResponse(
+            status="snoozed", request_id=request_id,
+            message=f"Kept on the board; won't be re-flagged for {settings.community_review_snooze_days} days.",
+        )
+
+    if body.action == "reject":
+        versions = req.community_versions or {}
+        best_url = versions.get("best_youtube_url")
+        if not best_url:
+            tracks = versions.get("tracks") or []
+            best_url = tracks[0].get("youtube_url") if tracks else None
+        service.reject_request(request_id)
+        # Notify up-voters of the existing community version (best-effort fan-out).
+        notified = 0
+        try:
+            from backend.services.job_notification_service import get_job_notification_service
+            notifier = get_job_notification_service()
+            for voter in service.list_upvoters(request_id):
+                ok = await notifier.send_community_existing_version_email(
+                    to_email=voter, artist=req.artist, title=req.title, youtube_url=best_url,
+                )
+                notified += 1 if ok else 0
+        except Exception:
+            logger.exception("community-review reject: voter notify failed for %s", request_id)
+        return CommunityReviewActionResponse(
+            status="rejected", request_id=request_id,
+            message=f"Rejected; notified {notified} up-voter(s) of the existing version.",
+        )
+
+    # action == "make": clear the flag and provision the job now (grant + create).
+    from backend.workers.community_daily_pick import _provision_and_start
+    service.clear_review(request_id)
+    owner = (req.owner_email or req.submitted_by).lower()
+    result = await _provision_and_start(service, settings, req, owner)
+    if result.get("status") != "made":
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to make request ({result.get('step')}): {result.get('message')}",
+        )
+    return CommunityReviewActionResponse(
+        status="made", request_id=request_id,
+        message=f"Making our version (job {result.get('job_id')}).",
+    )
+
+
+class PersistUploadsResponse(BaseModel):
+    dry_run: bool
+    jobs: Dict[str, Any]  # job_id -> {"copied", "updated"} | {"would_copy"} | {"error"} | {"orphan"}
+
+
+@router.post("/persist-uploads", response_model=PersistUploadsResponse)
+def persist_uploads(dry_run: bool = True, auth_data: AuthResult = Depends(require_admin)):
+    """Backfill: copy every job's ``uploads/{job_id}/**`` into ``jobs/{job_id}/input/``.
+
+    Same operation the workers run on entry (``input_persistence``), for jobs that
+    no worker will touch again. Folders with no job document (abandoned uploads)
+    are reported as ``orphan`` and left in place. Plain ``def``: blocking GCS and
+    Firestore calls run in the threadpool.
+    """
+    from backend.services.input_persistence import persist_job_inputs, persisted_path
+
+    storage = StorageService()
+    job_manager = JobManager()
+    by_job: Dict[str, List[str]] = {}
+    for blob in storage.bucket.list_blobs(prefix="uploads/"):
+        parts = blob.name.split("/")
+        if len(parts) > 2 and parts[1]:
+            by_job.setdefault(parts[1], []).append(blob.name)
+
+    results: Dict[str, Any] = {}
+    for job_id, names in sorted(by_job.items()):
+        try:
+            job = job_manager.get_job(job_id)
+            if job is None:
+                results[job_id] = {"orphan": len(names)}
+                continue
+            if dry_run:
+                results[job_id] = {"would_copy": {n: persisted_path(job_id, n) for n in names}}
+                continue
+            copied, updates = persist_job_inputs(job, storage, job_manager)
+            results[job_id] = {"copied": copied, "updated": updates}
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"persist-uploads: job {job_id} failed: {e}")
+            results[job_id] = {"error": str(e)}
+    return PersistUploadsResponse(dry_run=dry_run, jobs=results)

@@ -1,0 +1,418 @@
+"""Tests for POST /api/internal/recover-stuck-jobs resilience paths.
+
+Covers the three recovery behaviours the endpoint drives every 5 min:
+  1. Stuck torrent downloads (RED/OPS) → parked into DOWNLOAD_PENDING_RETRY and
+     re-tried for up to 24h (rare tracks / intermittent seeders / tracker blips).
+  2. Parked downloads → re-triggered, or permanently failed after 24h.
+  3. Orphaned renders stuck at RENDERING_VIDEO → re-parked into
+     RENDER_PENDING_CAPACITY so the existing retry cron resumes them.
+"""
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from backend.api.dependencies import require_admin
+from backend.main import app
+from backend.models.job import Job, JobStatus
+from backend.services.auth_service import AuthResult, UserType
+
+
+@pytest.fixture
+def client():
+    async def fake_admin():
+        return AuthResult(
+            is_valid=True, user_type=UserType.ADMIN, remaining_uses=999,
+            message="test admin", is_admin=True, user_email="test@example.com",
+        )
+
+    app.dependency_overrides[require_admin] = fake_admin
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+def _doc(job_id, status):
+    doc = MagicMock()
+    doc.id = job_id
+    doc.to_dict.return_value = {"job_id": job_id, "status": status.value}
+    return doc
+
+
+def _job(job_id, status, *, minutes_stale=0, source_name=None, download_retry=None):
+    sd = {}
+    if download_retry is not None:
+        sd["download_retry"] = download_retry
+    return Job(
+        job_id=job_id, artist="A", title="B", status=status,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_stale),
+        state_data=sd, source_name=source_name, audio_source_type="audio_search",
+        source_id="123",
+    )
+
+
+def _mock_jm(*, downloading=None, pending=None, rendering=None, review_complete=None,
+             downloading_prep=None, instrumental_selected=None, generating_screens=None,
+             jobs=None):
+    """Wire a JobManager mock for the endpoint's 4 status queries.
+
+    downloading/rendering/review_complete use .where().stream(); pending uses
+    .where().limit().stream(). `jobs` maps job_id -> Job returned by get_job().
+    """
+    mock_jm = MagicMock()
+    where = mock_jm.firestore.db.collection.return_value.where.return_value
+    # Non-limited .stream() calls in order: downloading_audio, rendering_video,
+    # review_complete (lost-render-trigger sweep), generating_screens (expired
+    # auto-review holds)
+    where.stream.side_effect = [
+        iter(downloading or []), iter(rendering or []), iter(review_complete or []),
+        iter(generating_screens or []),
+    ]
+    # Four .limit().stream() calls in order: download_pending_retry, then downloading
+    # (lost-screens-trigger sweep, bounded by SCREENS_RECOVERY_SCAN_LIMIT), then
+    # lyrics_complete (stalled storage-retention stems restore), then
+    # instrumental_selected (final encode parked on stems / lost video trigger)
+    where.limit.return_value.stream.side_effect = [
+        iter(pending or []), iter(downloading_prep or []), iter([]),
+        iter(instrumental_selected or []),
+    ]
+    mock_jm.get_job.side_effect = lambda jid: (jobs or {}).get(jid)
+    mock_jm.transition_to_state.return_value = True
+    return mock_jm
+
+
+def _run(client, mock_jm):
+    mock_ws = MagicMock()
+    mock_ws.trigger_audio_download_worker = AsyncMock(return_value=True)
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=mock_ws):
+        resp = client.post("/api/internal/recover-stuck-jobs")
+    return resp, mock_ws
+
+
+def test_stuck_torrent_download_is_parked(client):
+    """A stuck RED download is parked into DOWNLOAD_PENDING_RETRY, not failed."""
+    job = _job("dl1", JobStatus.DOWNLOADING_AUDIO, minutes_stale=15, source_name="RED")
+    mock_jm = _mock_jm(downloading=[_doc("dl1", JobStatus.DOWNLOADING_AUDIO)], jobs={"dl1": job})
+    resp, _ = _run(client, mock_jm)
+    data = resp.json()
+    assert data["download_parked_jobs"] == ["dl1"]
+    assert data["recovered_count"] == 0
+    assert mock_jm.transition_to_state.call_args.kwargs["new_status"] == JobStatus.DOWNLOAD_PENDING_RETRY
+    mock_jm.fail_job.assert_not_called()
+
+
+def test_stuck_nontorrent_download_is_failed(client):
+    """A stuck YouTube download still fails (deterministic source, no auto-retry)."""
+    job = _job("dl2", JobStatus.DOWNLOADING_AUDIO, minutes_stale=15, source_name="YouTube")
+    mock_jm = _mock_jm(downloading=[_doc("dl2", JobStatus.DOWNLOADING_AUDIO)], jobs={"dl2": job})
+    resp, _ = _run(client, mock_jm)
+    data = resp.json()
+    assert data["recovered_jobs"] == ["dl2"]
+    assert data["download_parked_jobs"] == []
+    mock_jm.fail_job.assert_called_once()
+
+
+def test_parked_download_is_retriggered(client):
+    """A parked download within 24h is re-triggered."""
+    job = _job("dl3", JobStatus.DOWNLOAD_PENDING_RETRY,
+               download_retry={"first_seen_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+                               "attempt_count": 3})
+    mock_jm = _mock_jm(pending=[_doc("dl3", JobStatus.DOWNLOAD_PENDING_RETRY)], jobs={"dl3": job})
+    resp, mock_ws = _run(client, mock_jm)
+    data = resp.json()
+    assert data["download_retried_jobs"] == ["dl3"]
+    mock_ws.trigger_audio_download_worker.assert_awaited_once_with("dl3")
+
+
+def test_parked_download_retry_cap_counts_failed_dispatches(client):
+    """Dispatch attempts count against the per-tick cap even when the audio
+    worker trigger fails, so an outage can't fan out to every queried job."""
+    import backend.api.routes.internal as mod
+
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    n = mod.DOWNLOAD_RETRIES_PER_TICK + 5
+    docs = [_doc(f"p{i}", JobStatus.DOWNLOAD_PENDING_RETRY) for i in range(n)]
+    jobs = {f"p{i}": _job(f"p{i}", JobStatus.DOWNLOAD_PENDING_RETRY,
+                          download_retry={"first_seen_at": fresh, "attempt_count": 1})
+            for i in range(n)}
+    mock_jm = _mock_jm(pending=docs, jobs=jobs)
+
+    mock_ws = MagicMock()
+    # Every dispatch raises → helper returns False, but attempts must still be capped.
+    mock_ws.trigger_audio_download_worker = AsyncMock(side_effect=RuntimeError("audio worker down"))
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=mock_ws):
+        resp = client.post("/api/internal/recover-stuck-jobs")
+
+    assert resp.status_code == 200
+    # No more than the per-tick cap of dispatch attempts, despite n>cap parked jobs.
+    assert mock_ws.trigger_audio_download_worker.await_count == mod.DOWNLOAD_RETRIES_PER_TICK
+    assert resp.json()["download_retried_jobs"] == []  # all dispatches failed
+
+
+def test_parked_download_times_out_after_24h(client):
+    """A parked download older than 24h is permanently failed."""
+    job = _job("dl4", JobStatus.DOWNLOAD_PENDING_RETRY,
+               download_retry={"first_seen_at": (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+                               "attempt_count": 40})
+    mock_jm = _mock_jm(pending=[_doc("dl4", JobStatus.DOWNLOAD_PENDING_RETRY)], jobs={"dl4": job})
+    resp, mock_ws = _run(client, mock_jm)
+    data = resp.json()
+    assert data["download_timed_out_jobs"] == ["dl4"]
+    assert data["download_retried_jobs"] == []
+    mock_jm.fail_job.assert_called_once()
+    mock_ws.trigger_audio_download_worker.assert_not_awaited()
+
+
+def test_orphaned_render_is_reparked(client):
+    """A render stale >45 min is re-parked into RENDER_PENDING_CAPACITY."""
+    job = _job("r1", JobStatus.RENDERING_VIDEO, minutes_stale=60)
+    mock_jm = _mock_jm(rendering=[_doc("r1", JobStatus.RENDERING_VIDEO)], jobs={"r1": job})
+    resp, _ = _run(client, mock_jm)
+    data = resp.json()
+    assert data["reparked_render_jobs"] == ["r1"]
+    assert mock_jm.transition_to_state.call_args.kwargs["new_status"] == JobStatus.RENDER_PENDING_CAPACITY
+    meta = mock_jm.update_state_data.call_args.args[2]
+    assert meta["last_code"] == "render_stalled"
+
+
+def test_fresh_render_not_reparked(client):
+    """A render updated 10 min ago is NOT re-parked."""
+    job = _job("r2", JobStatus.RENDERING_VIDEO, minutes_stale=10)
+    mock_jm = _mock_jm(rendering=[_doc("r2", JobStatus.RENDERING_VIDEO)], jobs={"r2": job})
+    resp, _ = _run(client, mock_jm)
+    assert resp.json()["reparked_render_count"] == 0
+
+
+def test_stuck_downloading_with_lyrics_done_retriggers_screens(client):
+    """A job stuck at DOWNLOADING >10 min with lyrics_complete=True (a lost screens
+    trigger) is re-advanced to screen generation."""
+    job = _job("s1", JobStatus.DOWNLOADING, minutes_stale=15)
+    job.state_data["lyrics_complete"] = True
+    mock_jm = _mock_jm(downloading_prep=[_doc("s1", JobStatus.DOWNLOADING)], jobs={"s1": job})
+    mock_jm.advance_to_screens_if_ready = AsyncMock(return_value=True)
+    resp, _ = _run(client, mock_jm)
+    data = resp.json()
+    assert data["screens_retriggered_jobs"] == ["s1"]
+    mock_jm.advance_to_screens_if_ready.assert_awaited_once_with("s1")
+
+
+def test_stuck_audio_edit_complete_with_lyrics_done_retriggers_screens(client):
+    """Audio-edited jobs prep at AUDIO_EDIT_COMPLETE, not DOWNLOADING. A lost
+    screens trigger there must be recovered too (job 2c1b922e sat stuck)."""
+    job = _job("ae1", JobStatus.AUDIO_EDIT_COMPLETE, minutes_stale=15)
+    job.state_data["lyrics_complete"] = True
+    mock_jm = _mock_jm(downloading_prep=[_doc("ae1", JobStatus.AUDIO_EDIT_COMPLETE)], jobs={"ae1": job})
+    mock_jm.advance_to_screens_if_ready = AsyncMock(return_value=True)
+    resp, _ = _run(client, mock_jm)
+    assert resp.json()["screens_retriggered_jobs"] == ["ae1"]
+    mock_jm.advance_to_screens_if_ready.assert_awaited_once_with("ae1")
+
+
+def test_lost_screens_sweep_queries_all_prep_statuses(client):
+    """The lost-screens sweep must query both prep statuses, not just DOWNLOADING."""
+    mock_jm = _mock_jm()
+    # Record FieldFilter args directly — other test modules may stub the
+    # firestore package, so the real FieldFilter's attributes aren't reliable.
+    with patch("google.cloud.firestore_v1.FieldFilter",
+               side_effect=lambda field, op, value: (field, op, value)):
+        _run(client, mock_jm)
+    filters = [
+        c.kwargs["filter"]
+        for c in mock_jm.firestore.db.collection.return_value.where.call_args_list
+    ]
+    in_filters = [f for f in filters if f[1] == "in"]
+    assert len(in_filters) == 1
+    assert set(in_filters[0][2]) == {
+        JobStatus.DOWNLOADING.value, JobStatus.AUDIO_EDIT_COMPLETE.value,
+    }
+
+
+def test_fresh_downloading_not_retriggered(client):
+    """A DOWNLOADING job updated 2 min ago (audio still separating) is NOT re-triggered."""
+    job = _job("s2", JobStatus.DOWNLOADING, minutes_stale=2)
+    job.state_data["lyrics_complete"] = True
+    mock_jm = _mock_jm(downloading_prep=[_doc("s2", JobStatus.DOWNLOADING)], jobs={"s2": job})
+    mock_jm.advance_to_screens_if_ready = AsyncMock(return_value=True)
+    resp, _ = _run(client, mock_jm)
+    assert resp.json()["screens_retriggered_count"] == 0
+    mock_jm.advance_to_screens_if_ready.assert_not_awaited()
+
+
+def test_downloading_without_lyrics_not_retriggered(client):
+    """A DOWNLOADING job stale >10 min but WITHOUT lyrics_complete is still
+    legitimately processing (download/separate/transcribe) — not re-triggered."""
+    job = _job("s3", JobStatus.DOWNLOADING, minutes_stale=15)  # no lyrics_complete
+    mock_jm = _mock_jm(downloading_prep=[_doc("s3", JobStatus.DOWNLOADING)], jobs={"s3": job})
+    mock_jm.advance_to_screens_if_ready = AsyncMock(return_value=True)
+    resp, _ = _run(client, mock_jm)
+    assert resp.json()["screens_retriggered_count"] == 0
+    mock_jm.advance_to_screens_if_ready.assert_not_awaited()
+    mock_jm.transition_to_state.assert_not_called()
+
+
+def test_stalled_review_complete_render_is_retriggered(client):
+    """REVIEW_COMPLETE >10 min with no render_progress = lost render trigger
+    (e.g. Cloud Tasks enqueue failed from the GPU worker) -> re-trigger."""
+    job = _job("rc1", JobStatus.REVIEW_COMPLETE, minutes_stale=30)
+    mock_jm = _mock_jm(
+        review_complete=[_doc("rc1", JobStatus.REVIEW_COMPLETE)],
+        jobs={"rc1": job},
+    )
+    mock_ws = MagicMock()
+    mock_ws.trigger_audio_download_worker = AsyncMock(return_value=True)
+    mock_ws.trigger_render_video_worker = AsyncMock(return_value=True)
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=mock_ws):
+        resp = client.post("/api/internal/recover-stuck-jobs")
+    assert resp.status_code == 200
+    assert resp.json()["render_retriggered_jobs"] == ["rc1"]
+    mock_ws.trigger_render_video_worker.assert_awaited_once_with("rc1")
+
+
+def test_fresh_review_complete_is_left_alone(client):
+    job = _job("rc2", JobStatus.REVIEW_COMPLETE, minutes_stale=1)
+    mock_jm = _mock_jm(
+        review_complete=[_doc("rc2", JobStatus.REVIEW_COMPLETE)],
+        jobs={"rc2": job},
+    )
+    mock_ws = MagicMock()
+    mock_ws.trigger_render_video_worker = AsyncMock(return_value=True)
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=mock_ws):
+        resp = client.post("/api/internal/recover-stuck-jobs")
+    assert resp.status_code == 200
+    assert resp.json()["render_retriggered_jobs"] == []
+    mock_ws.trigger_render_video_worker.assert_not_awaited()
+
+
+def _is_job(job_id, *, minutes_stale, audio_complete, stem_ready, selection="clean"):
+    job = _job(job_id, JobStatus.INSTRUMENTAL_SELECTED, minutes_stale=minutes_stale)
+    job.state_data.update({"instrumental_selection": selection, "audio_complete": audio_complete})
+    if stem_ready:
+        job.file_urls = {"stems": {"instrumental_clean": "gs://b/clean.flac",
+                                   "instrumental_with_backing": "gs://b/backing.flac"}}
+    return job
+
+
+def _run_is(client, job):
+    mock_jm = _mock_jm(
+        instrumental_selected=[_doc(job.job_id, JobStatus.INSTRUMENTAL_SELECTED)],
+        jobs={job.job_id: job},
+    )
+    mock_ws = MagicMock()
+    mock_ws.trigger_video_worker = AsyncMock(return_value=True)
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=mock_ws):
+        resp = client.post("/api/internal/recover-stuck-jobs")
+    assert resp.status_code == 200
+    return resp.json(), mock_jm, mock_ws
+
+
+def test_instrumental_selected_with_stems_ready_retriggers_video(client):
+    """Parked/lost video trigger: stems landed but no encode started -> re-trigger."""
+    body, mock_jm, mock_ws = _run_is(
+        client, _is_job("is1", minutes_stale=15, audio_complete=True, stem_ready=True))
+    assert body["video_retriggered_jobs"] == ["is1"]
+    mock_ws.trigger_video_worker.assert_awaited_once_with("is1")
+    mock_jm.claim_video_stems_wait.assert_called_once_with("is1")
+
+
+def test_instrumental_selected_fresh_is_left_alone(client):
+    body, _, mock_ws = _run_is(
+        client, _is_job("is2", minutes_stale=2, audio_complete=True, stem_ready=True))
+    assert body["video_retriggered_jobs"] == []
+    mock_ws.trigger_video_worker.assert_not_awaited()
+
+
+def test_instrumental_selected_still_separating_waits(client):
+    """Separation still running (<60 min): neither re-trigger nor fail."""
+    body, mock_jm, mock_ws = _run_is(
+        client, _is_job("is3", minutes_stale=30, audio_complete=False, stem_ready=False))
+    assert body["video_retriggered_jobs"] == []
+    assert body["stems_wait_failed_jobs"] == []
+    mock_ws.trigger_video_worker.assert_not_awaited()
+    mock_jm.mark_job_failed.assert_not_called()
+
+
+def test_instrumental_selected_stems_never_ready_fails_loudly(client):
+    """Separation never finished (>60 min): fail so the job isn't stuck silently."""
+    body, mock_jm, mock_ws = _run_is(
+        client, _is_job("is4", minutes_stale=90, audio_complete=False, stem_ready=False))
+    assert body["stems_wait_failed_jobs"] == ["is4"]
+    mock_jm.mark_job_failed.assert_called_once()
+    assert mock_jm.mark_job_failed.call_args.kwargs["error_details"]["stage"] == "video_waiting_for_stems"
+    mock_ws.trigger_video_worker.assert_not_awaited()
+
+
+def test_instrumental_selected_older_than_24h_is_never_revived(client):
+    body, mock_jm, mock_ws = _run_is(
+        client, _is_job("is5", minutes_stale=25 * 60, audio_complete=True, stem_ready=True))
+    assert body["video_retriggered_jobs"] == []
+    assert body["stems_wait_failed_jobs"] == []
+    mock_ws.trigger_video_worker.assert_not_awaited()
+    mock_jm.mark_job_failed.assert_not_called()
+
+
+
+# --- GENERATING_SCREENS auto-review hold never released (review_gate.py) ---
+
+HOLD_KEY = "auto_review_waiting_for_stems"
+
+
+def _held_job(job_id, *, minutes_held):
+    since = (datetime.utcnow() - timedelta(minutes=minutes_held)).isoformat()
+    job = _job(job_id, JobStatus.GENERATING_SCREENS)
+    job.state_data[HOLD_KEY] = since
+    return job, since
+
+
+def _gs_doc(job_id, since):
+    doc = MagicMock()
+    doc.id = job_id
+    doc.to_dict.return_value = {"job_id": job_id, "status": JobStatus.GENERATING_SCREENS.value,
+                                "state_data": {HOLD_KEY: since}}
+    return doc
+
+
+def _run_hold(client, job, since, release_result="review"):
+    mock_jm = _mock_jm(generating_screens=[_gs_doc(job.job_id, since)], jobs={job.job_id: job})
+    release = AsyncMock(return_value=release_result)
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=MagicMock()), \
+         patch("backend.services.auto_approval.review_gate.release_audio_hold", release):
+        resp = client.post("/api/internal/recover-stuck-jobs")
+    assert resp.status_code == 200
+    return resp.json(), release
+
+
+def test_expired_auto_review_hold_is_released(client):
+    job, since = _held_job("gs1", minutes_held=25)
+    body, release = _run_hold(client, job, since)
+    assert body["auto_review_hold_released_jobs"] == ["gs1"]
+    release.assert_awaited_once_with("gs1", reason="hold_timeout")
+
+
+def test_fresh_auto_review_hold_is_left_alone(client):
+    job, since = _held_job("gs2", minutes_held=3)
+    body, release = _run_hold(client, job, since)
+    assert body["auto_review_hold_released_jobs"] == []
+    release.assert_not_awaited()
+
+
+def test_generating_screens_without_hold_is_ignored(client):
+    job = _job("gs3", JobStatus.GENERATING_SCREENS)
+    doc = _doc("gs3", JobStatus.GENERATING_SCREENS)
+    mock_jm = _mock_jm(generating_screens=[doc], jobs={"gs3": job})
+    release = AsyncMock()
+    with patch("backend.api.routes.internal.JobManager", return_value=mock_jm), \
+         patch("backend.services.worker_service.get_worker_service", return_value=MagicMock()), \
+         patch("backend.services.auto_approval.review_gate.release_audio_hold", release):
+        body = client.post("/api/internal/recover-stuck-jobs").json()
+    assert body["auto_review_hold_released_jobs"] == []
+    release.assert_not_awaited()

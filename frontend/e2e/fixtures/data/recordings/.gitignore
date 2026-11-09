@@ -1,0 +1,4 @@
+# Ignore recording session files (temporary, should be reviewed and approved)
+*.json
+# But keep the gitkeep
+!.gitkeep

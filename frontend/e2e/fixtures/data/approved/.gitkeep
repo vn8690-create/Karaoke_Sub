@@ -1,0 +1,3 @@
+# This directory contains approved API fixtures
+# Each fixture is a JSON file representing a single API request/response pair
+# These fixtures are used by the mock server during E2E tests

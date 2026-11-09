@@ -1,0 +1,356 @@
+"""
+Real renders of the tenant theme preview (title card + karaoke frame).
+
+Uses the production renderers end-to-end with a colour-background theme and a
+bundled font; storage is faked in-memory. Skipped without ffmpeg (CI installs it).
+"""
+import io
+import shutil
+
+import pytest
+from PIL import Image
+
+from backend.services import theme_preview_service as tps
+
+pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+
+
+def _theme(sung="255, 0, 0, 255", bg="#102030"):
+    return {
+        "intro": {
+            "background_color": bg,
+            "background_image": None,
+            "font": "AvenirNext-Bold.ttf",
+            "title_color": "#ffffff",
+            "artist_color": "#ffdf6b",
+            "title_region": "370,980,3100,350",
+            "artist_region": "370,1400,3100,450",
+        },
+        "karaoke": {
+            "background_color": bg,
+            "background_image": None,
+            "font_path": "AvenirNext-Bold.ttf",
+            "font": "Avenir Next Bold",
+            "ass_name": "Nomad",
+            "primary_color": sung,
+            "secondary_color": "255, 255, 255, 255",
+            "outline_color": "0, 0, 0, 255",
+            "back_color": "0, 0, 0, 0",
+            "bold": False, "italic": False, "scale_x": 100, "scale_y": 100, "spacing": 0,
+            "border_style": 1, "outline": 1, "shadow": 0, "margin_l": 0, "margin_r": 0, "margin_v": 0,
+        },
+        "end": {},
+        "cdg": {},
+    }
+
+
+class _NoGcsAssets:
+    """Storage whose theme has no uploaded assets (font resolves to bundled)."""
+
+    class _Bucket:
+        def get_blob(self, path):
+            return None
+
+    bucket = _Bucket()
+
+
+def _img(data: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def test_renders_title_card_and_karaoke_frame():
+    tps._CACHE.clear()
+    result = tps.render_theme_preview("t1", _theme(), artist="Randy Vild", title="What Goes Up", storage=_NoGcsAssets())
+    title, karaoke = _img(result.title_card), _img(result.karaoke_frame)
+    assert title.size == (1280, 720)
+    assert karaoke.size == (1280, 720)
+    # The theme's solid #102030 background is what's in the corners of both frames
+    for frame in (title, karaoke):
+        r, g, b = frame.getpixel((8, 8))
+        assert abs(r - 0x10) <= 6 and abs(g - 0x20) <= 6 and abs(b - 0x30) <= 6
+    urls = result.as_data_urls()
+    assert urls["title_card"].startswith("data:image/jpeg;base64,")
+
+
+def test_sung_colour_is_what_changes_in_the_karaoke_frame():
+    """The frame shows a part-sung line, so changing only the sung colour must
+    change the karaoke frame (and not the title card)."""
+    tps._CACHE.clear()
+    red = tps.render_theme_preview("t1", _theme(sung="255, 0, 0, 255"), storage=_NoGcsAssets())
+    green = tps.render_theme_preview("t1", _theme(sung="0, 255, 0, 255"), storage=_NoGcsAssets())
+    assert red.title_card == green.title_card
+    assert red.karaoke_frame != green.karaoke_frame
+    reds = sum(1 for r, g, b in _img(red.karaoke_frame).getdata() if r > 200 and g < 60 and b < 60)
+    greens = sum(1 for r, g, b in _img(green.karaoke_frame).getdata() if g > 200 and r < 60 and b < 60)
+    assert reds > 200 and greens > 200
+
+
+def test_identical_drafts_are_cached():
+    tps._CACHE.clear()
+    a = tps.render_theme_preview("t1", _theme(), storage=_NoGcsAssets())
+    b = tps.render_theme_preview("t1", _theme(), storage=_NoGcsAssets())
+    assert a is b
+
+
+def test_missing_background_asset_is_a_preview_error():
+    theme = _theme()
+    theme["karaoke"]["background_image"] = "missing.jpg"
+    with pytest.raises(tps.ThemePreviewError, match="missing.jpg"):
+        tps.resolve_assets(theme, "t1", storage=_NoGcsAssets())
+
+
+def test_font_family_name_from_bundled_font():
+    import os
+
+    name = tps.font_family_name(os.path.join(tps.BUNDLED_FONTS_DIR, "AvenirNext-Bold.ttf"))
+    assert name.startswith("Avenir Next")
+
+
+def test_evict_keeps_cache_under_limit(tmp_path):
+    import os
+    import time
+
+    for i in range(5):
+        p = tmp_path / f"f{i}"
+        p.write_bytes(b"x" * 100)
+        os.utime(p, (time.time() - 100 + i, time.time()))
+    tps._evict(str(tmp_path), 250, keep=str(tmp_path / "f0"))
+    remaining = sorted(p.name for p in tmp_path.iterdir())
+    assert sum((tmp_path / n).stat().st_size for n in remaining) <= 250
+    assert "f0" in remaining  # the file just written is never evicted
+
+
+def test_failed_download_leaves_no_partial_cache_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(tps, "ASSET_CACHE_ROOT", str(tmp_path))
+
+    class Blob:
+        generation = 7
+
+        def download_to_filename(self, path):
+            open(path, "wb").write(b"partial")
+            raise IOError("network died")
+
+    class Storage:
+        class bucket:
+            @staticmethod
+            def get_blob(path):
+                return Blob()
+
+    with pytest.raises(IOError):
+        tps._local_theme_asset(Storage, "t1", "bg.jpg")
+    assert not any(f.is_file() for f in tmp_path.rglob("*"))
+
+
+def _with_end(theme, **end):
+    theme["end"] = {
+        "background_color": "#301020",
+        "background_image": None,
+        "font": "AvenirNext-Bold.ttf",
+        "title_color": "#ffffff",
+        "artist_color": "#ffdf6b",
+        "title_region": "370,900,3100,350",
+        "artist_region": "370,1450,3100,200",
+        "extra_text": "THANK YOU FOR SINGING!",
+        "extra_text_color": "#ff7acc",
+        "extra_text_region": "370,400,3100,400",
+        **end,
+    }
+    return theme
+
+
+def test_renders_the_end_screen_with_its_own_background_and_layout():
+    tps._CACHE.clear()
+    result = tps.render_theme_preview("t1", _with_end(_theme()), artist="Randy Vild", storage=_NoGcsAssets())
+    end = _img(result.end_screen)
+    assert end.size == (1280, 720)
+    r, g, b = end.getpixel((8, 8))  # the end section's own #301020, not the title card's
+    assert abs(r - 0x30) <= 6 and abs(g - 0x10) <= 6 and abs(b - 0x20) <= 6
+    assert result.as_data_urls()["end_screen"].startswith("data:image/jpeg;base64,")
+
+
+def test_end_screen_text_size_changes_only_the_end_screen():
+    """Randy Vild's report: the end screen's text size is its own setting."""
+    tps._CACHE.clear()
+    big = tps.render_theme_preview("t1", _with_end(_theme()), storage=_NoGcsAssets())
+    small = tps.render_theme_preview(
+        "t1", _with_end(_theme(), title_region="370,900,3100,120", extra_text_region="370,400,3100,120"),
+        storage=_NoGcsAssets(),
+    )
+    assert big.title_card == small.title_card
+    assert big.end_screen != small.end_screen
+
+    def text_pixels(data):
+        return sum(1 for r, g, b in _img(data).getdata() if r > 200 and g > 200 and b > 200)
+
+    assert text_pixels(small.end_screen) < text_pixels(big.end_screen) * 0.6
+
+
+def test_omitted_screens_are_not_rendered():
+    tps._CACHE.clear()
+    theme = _with_end(_theme())
+    theme["intro"]["enabled"] = False
+    theme["end"]["enabled"] = False
+    result = tps.render_theme_preview("t1", theme, storage=_NoGcsAssets())
+    assert result.title_card is None and result.end_screen is None
+    assert _img(result.karaoke_frame).size == (1280, 720)
+    urls = result.as_data_urls()
+    assert urls["title_card"] is None and urls["end_screen"] is None
+
+
+# --- CD+G previews ----------------------------------------------------------------
+
+CDG_YELLOW, CDG_BLUE, CDG_WHITE = (255, 255, 0), (0, 102, 255), (255, 255, 255)
+
+
+def _cdg_section(**overrides):
+    cdg = {
+        "title_color": "#ffff00", "artist_color": "#ffff00", "background_color": "#000000",
+        "border_color": "#000000", "font_path": "Oswald-SemiBold.ttf", "font_size": 18,
+        "stroke_width": 0, "stroke_style": "octagon", "active_fill": "#006CF9", "active_stroke": "#000000",
+        "inactive_fill": "#ffff00", "inactive_stroke": "#000000", "title_screen_background": "card.png",
+        "instrumental_background": "card.png", "instrumental_transition": "wipein",
+        "instrumental_font_color": "#ffff00", "title_screen_transition": "wipein", "row": 4,
+        "line_tile_height": 3, "lines_per_page": 4, "clear_mode": "eager", "sync_offset": 0,
+        "instrumental_gap_threshold": 99999, "instrumental_text": "INSTRUMENTAL",
+        "lead_in_threshold": 99999, "lead_in_symbols": [">"], "lead_in_duration": 30, "lead_in_total": 200,
+        "title_artist_gap": 8, "title_top_padding": 0, "intro_duration_seconds": 5.0,
+        "first_syllable_buffer_seconds": 0.5, "outro_background": "card.png", "outro_transition": "wipein",
+        "outro_text_line1": "$title", "outro_text_line2": "$artist", "outro_line1_color": "#ffff00",
+        "outro_line2_color": "#ffff00", "outro_line1_line2_gap": 10,
+        "title_separator_text": "MADE FAMOUS BY", "title_separator_color": "#ffffff",
+    }
+    cdg.update(overrides)
+    return cdg
+
+
+class _CdgAssets:
+    """Storage whose theme holds one 300x216 black CD+G card (other assets absent)."""
+
+    def __init__(self, tmp_path):
+        card = tmp_path / "card.png"
+        Image.new("RGB", (300, 216), (0, 0, 0)).save(card)
+        self._card = str(card)
+        outer = self
+
+        class _Blob:
+            generation = 1
+
+            def download_to_filename(self, path):
+                shutil.copy(outer._card, path)
+
+        class _Bucket:
+            def get_blob(self, path):
+                return _Blob() if path.endswith("/card.png") else None
+
+        self.bucket = _Bucket()
+
+
+@pytest.fixture
+def cdg_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(tps, "ASSET_CACHE_ROOT", str(tmp_path / "assets"))
+    tps._CACHE.clear()
+    return _CdgAssets(tmp_path)
+
+
+def _colours(img):
+    return {rgb for n, rgb in img.getcolors(300 * 216 * 9) if n > 40}
+
+
+def test_cdg_previews_only_when_requested(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section()
+    result = tps.render_theme_preview("t1", theme, storage=cdg_cache)
+    assert result.cdg_title_card is None and result.cdg_lyrics is None
+
+
+def test_cdg_up_card_and_lyrics_page_render_from_the_real_cdg(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section()
+    result = tps.render_theme_preview(
+        "t1", theme, artist="Lady Gaga", title="Abracadabra", storage=cdg_cache, include_cdg=True
+    )
+    card, lyrics = _img(result.cdg_title_card), _img(result.cdg_lyrics)
+    assert card.size == lyrics.size == (900, 648)  # 300x216 at 3x, hard pixels
+    assert {CDG_YELLOW, CDG_WHITE} <= _colours(card)  # title/artist + "MADE FAMOUS BY"
+    assert {CDG_YELLOW, CDG_BLUE} <= _colours(lyrics)  # part-sung first line
+    urls = result.as_data_urls()
+    assert urls["cdg_title_card"].startswith("data:image/png;base64,")
+
+
+def test_cdg_colour_changes_show_in_the_preview(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section(active_fill="#ff0000")
+    lyrics = _img(tps.render_theme_preview("t1", theme, storage=cdg_cache, include_cdg=True).cdg_lyrics)
+    assert (255, 0, 0) in _colours(lyrics) and CDG_BLUE not in _colours(lyrics)
+
+
+def test_resolve_assets_keeps_a_distinct_cdg_font_and_titles_use_the_main_font(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section()
+    styles = tps.resolve_assets(theme, "t1", cdg_cache, include_cdg=True)
+    assert styles["cdg"]["font_path"].endswith("Oswald-SemiBold.ttf")
+    assert styles["cdg"]["title_font_path"].endswith("AvenirNext-Bold.ttf")
+    assert styles["cdg"]["title_screen_background"].endswith("card.png")
+
+
+def test_missing_cdg_background_is_a_preview_error(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section(title_screen_background="missing.png")
+    with pytest.raises(tps.ThemePreviewError, match="missing.png"):
+        tps.render_theme_preview("t1", theme, storage=cdg_cache, include_cdg=True)
+    # ... but the other previews don't need CD+G assets
+    tps.render_theme_preview("t1", theme, storage=cdg_cache)
+
+
+def test_pick_lyrics_frame_falls_back_to_the_busiest_frame():
+    blank = Image.new("RGB", (300, 216), (0, 0, 0))
+    busy = blank.copy()
+    busy.paste((255, 255, 0), (10, 10, 200, 40))
+    assert tps._pick_lyrics_frame([blank, busy, blank], {"active_fill": "#006CF9", "inactive_fill": "#ffff00"}) is busy
+
+
+
+def test_cdg_audio_timeout_is_a_preview_error(cdg_cache, monkeypatch):
+    import subprocess
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=1)
+
+    monkeypatch.setattr(tps.subprocess, "run", boom)
+    theme = _theme()
+    theme["cdg"] = _cdg_section()
+    with pytest.raises(tps.ThemePreviewError, match="timed out"):
+        tps.render_cdg_previews(tps.resolve_assets(theme, "t1", cdg_cache, include_cdg=True), "A", "T", ["la la"], str(cdg_cache._card).rsplit("/", 1)[0])
+
+
+def test_cdg_instrumental_break_and_closing_screen_render(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section(instrumental_font_color="#00ff00", instrumental_gap_threshold=1500)
+    result = tps.render_theme_preview(
+        "t1", theme, artist="Lady Gaga", title="Abracadabra", storage=cdg_cache, include_cdg=True
+    )
+    instrumental, outro = _img(result.cdg_instrumental), _img(result.cdg_outro)
+    assert (0, 255, 0) in _colours(instrumental)  # "INSTRUMENTAL / N seconds" in its own colour
+    assert CDG_BLUE not in _colours(instrumental)  # not a lyrics page
+    assert CDG_YELLOW in _colours(outro)  # title + artist on the closing screen
+    assert result.as_data_urls()["cdg_outro"].startswith("data:image/png;base64,")
+
+
+def test_kinds_limits_which_mp4_screens_render(cdg_cache):
+    result = tps.render_theme_preview("t1", _theme(), storage=cdg_cache, kinds=["karaoke_frame"])
+    assert result.karaoke_frame and result.title_card is None and result.end_screen is None
+    only_title = tps.render_theme_preview("t1", _theme(), storage=cdg_cache, kinds=["title_card"])
+    assert only_title.title_card and only_title.karaoke_frame is None
+
+
+def test_cdg_transitions_are_the_built_in_masks():
+    names = tps.cdg_transitions()
+    assert {"centertexttoplogobottomtext", "topleftmusicalnotes", "wipein"} <= set(names)
+
+
+
+def test_a_one_line_sample_still_shows_the_instrumental_break(cdg_cache):
+    theme = _theme()
+    theme["cdg"] = _cdg_section(instrumental_font_color="#00ff00")
+    result = tps.render_theme_preview("t1", theme, lyrics=["Only one line here"], storage=cdg_cache, include_cdg=True)
+    assert (0, 255, 0) in _colours(_img(result.cdg_instrumental))

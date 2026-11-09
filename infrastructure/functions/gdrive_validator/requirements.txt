@@ -1,0 +1,10 @@
+# Google Drive API
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+
+# Cloud Functions framework
+functions-framework>=3.0.0
+
+# HTTP requests for Pushbullet and Postmark APIs
+requests>=2.31.0
+

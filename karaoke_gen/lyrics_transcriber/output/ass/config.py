@@ -1,0 +1,274 @@
+from dataclasses import dataclass
+from typing import Optional
+
+# Translated-lyrics layout defaults (see apply_translation_layout)
+DEFAULT_TRANSLATION_FONT_RATIO = 0.5  # translation font size / lyric font size
+DEFAULT_TRANSLATION_MAX_ROWS = 1  # rows reserved under each lyric line
+DEFAULT_TRANSLATION_MAX_VISIBLE_LINES = 3  # lyric lines per screen when translating
+TRANSLATION_GAP_RATIO = 0.12  # gap between a lyric line and its translation / lyric font size
+TRANSLATION_ROW_RATIO = 1.15  # translation row height / translation font size
+
+# Guitar-chord layout defaults (see chord_layout)
+DEFAULT_CHORD_FONT_RATIO = 0.55  # chord symbol font size / lyric font size
+DEFAULT_CHORD_MAX_VISIBLE_LINES = 4  # lyric lines per screen when showing chords
+CHORD_GAP_RATIO = 0.0  # gap between the chord row and its lyric line / lyric font size
+CHORD_ROW_RATIO = 1.05  # chord row height / chord font size
+
+
+class ScreenConfig:
+    """Configuration for screen timing and layout.
+    
+    Lead-in Indicator Configuration:
+        lead_in_enabled: bool - Enable/disable the lead-in indicator entirely (default: True)
+        lead_in_width_percent: float - Width as percentage of screen width (default: 3.5)
+        lead_in_height_percent: float - Height as percentage of screen height (default: 4.0)
+        lead_in_opacity_percent: float - Opacity percentage, 0-100 (default: 70.0)
+        lead_in_outline_thickness: int - Outline thickness in pixels, 0 for no outline (default: 0)
+        lead_in_outline_color: str - Outline color in RGB format "R, G, B" (default: "0, 0, 0")
+        lead_in_gap_threshold: float - Minimum gap in seconds to show lead-in (default: 5.0)
+        lead_in_color: str - Fill color in RGB format "R, G, B" (default: "112, 112, 247")
+        lead_in_horiz_offset_percent: float - Horizontal offset as percentage of screen width, can be negative (default: 0.0)
+        lead_in_vert_offset_percent: float - Vertical offset as percentage of screen height, can be negative (default: 0.0)
+        
+    Example JSON configuration:
+        {
+          "karaoke": {
+            "lead_in_enabled": true,
+            "lead_in_width_percent": 4.0,
+            "lead_in_height_percent": 5.0,
+            "lead_in_opacity_percent": 80,
+            "lead_in_outline_thickness": 2,
+            "lead_in_outline_color": "255, 255, 255",
+            "lead_in_gap_threshold": 3.0,
+            "lead_in_color": "230, 139, 33",
+            "lead_in_horiz_offset_percent": -2.0,
+            "lead_in_vert_offset_percent": 1.0
+          }
+        }
+    """
+
+    def __init__(
+        self,
+        line_height: int = 50,
+        max_visible_lines: int = 4,
+        top_padding: int = None,
+        video_width: int = 640,
+        video_height: int = 360,
+        screen_gap_threshold: float = 5.0,
+        post_roll_time: float = 1.0,
+        fade_in_ms: int = 200,
+        fade_out_ms: int = 300,
+        lead_in_color: str = "112, 112, 247",  # Default blue color in RGB format
+        text_case_transform: str = "none",  # Options: "none", "uppercase", "lowercase", "propercase"
+        # New lead-in indicator configuration options
+        lead_in_enabled: bool = True,
+        lead_in_width_percent: float = 3.5,
+        lead_in_height_percent: float = 4.0,
+        lead_in_opacity_percent: float = 70.0,
+        lead_in_outline_thickness: int = 0,
+        lead_in_outline_color: str = "0, 0, 0",
+        lead_in_gap_threshold: float = 5.0,
+        lead_in_horiz_offset_percent: float = 0.0,
+        lead_in_vert_offset_percent: float = 0.0,
+    ):
+        # Screen layout
+        self.max_visible_lines = max_visible_lines
+        self.line_height = line_height
+        self.top_padding = top_padding if top_padding is not None else line_height
+        self.video_height = video_height
+        self.video_width = video_width
+        # Timing configuration
+        self.screen_gap_threshold = screen_gap_threshold
+        self.post_roll_time = post_roll_time
+        self.fade_in_ms = fade_in_ms
+        self.fade_out_ms = fade_out_ms
+        # Lead-in configuration
+        self.lead_in_color = lead_in_color
+        self.lead_in_enabled = lead_in_enabled
+        self.lead_in_width_percent = lead_in_width_percent
+        self.lead_in_height_percent = lead_in_height_percent
+        self.lead_in_opacity_percent = lead_in_opacity_percent
+        self.lead_in_outline_thickness = lead_in_outline_thickness
+        self.lead_in_outline_color = lead_in_outline_color
+        self.lead_in_gap_threshold = lead_in_gap_threshold
+        self.lead_in_horiz_offset_percent = lead_in_horiz_offset_percent
+        self.lead_in_vert_offset_percent = lead_in_vert_offset_percent
+        # Text formatting configuration
+        self.text_case_transform = text_case_transform
+        # Translated-lyrics layout: set by apply_translation_layout when any line
+        # carries a translation. None = no translation row (classic layout).
+        self.translation_style = None
+        self.translation_font_size: int = 0
+        self.translation_gap: int = 0
+        self.translation_max_rows: int = DEFAULT_TRANSLATION_MAX_ROWS
+        # Height of the lyric line itself within its (taller) slot
+        self.lyric_line_height: int = line_height
+        # Guitar-chord layout: set by SubtitlesGenerator when chords are supplied.
+        # The chord row sits at the top of each slot and the lyric line is pushed
+        # down by lyric_y_offset. None = no chord row (classic layout).
+        self.chord_style = None
+        self.chord_font_size: int = 0
+        self.lyric_y_offset: int = 0
+
+    def get_lead_in_color_ass_format(self) -> str:
+        """Convert RGB lead-in color to ASS format.
+        
+        Accepts either:
+        - RGB format: "112, 112, 247" 
+        - ASS format: "&HF77070&" (for backward compatibility)
+        
+        Returns ASS format color string.
+        """
+        color_str = self.lead_in_color.strip()
+        
+        # If already in ASS format, return as-is
+        if color_str.startswith("&H") and color_str.endswith("&"):
+            return color_str
+            
+        # Parse RGB format "R, G, B" or "R, G, B, A"
+        try:
+            parts = [int(x.strip()) for x in color_str.split(",")]
+            if len(parts) == 3:
+                r, g, b = parts
+                a = 255  # Default full opacity
+            elif len(parts) == 4:
+                r, g, b, a = parts
+            else:
+                raise ValueError(f"Invalid color format: {color_str}")
+                
+            # Convert to ASS format: &H{alpha}{blue}{green}{red}&
+            # Note: alpha is inverted in ASS (255-a)
+            return f"&H{255-a:02X}{b:02X}{g:02X}{r:02X}&"
+            
+        except (ValueError, TypeError) as e:
+            # Fallback to default blue if parsing fails
+            return "&HF77070&"
+
+    def get_lead_in_outline_color_ass_format(self) -> str:
+        """Convert RGB lead-in outline color to ASS format.
+        
+        Accepts either:
+        - RGB format: "0, 0, 0" 
+        - ASS format: "&H000000&" (for backward compatibility)
+        
+        Returns ASS format color string.
+        """
+        color_str = self.lead_in_outline_color.strip()
+        
+        # If already in ASS format, return as-is
+        if color_str.startswith("&H") and color_str.endswith("&"):
+            return color_str
+            
+        # Parse RGB format "R, G, B" or "R, G, B, A"
+        try:
+            parts = [int(x.strip()) for x in color_str.split(",")]
+            if len(parts) == 3:
+                r, g, b = parts
+                a = 255  # Default full opacity
+            elif len(parts) == 4:
+                r, g, b, a = parts
+            else:
+                raise ValueError(f"Invalid color format: {color_str}")
+                
+            # Convert to ASS format: &H{alpha}{blue}{green}{red}&
+            # Note: alpha is inverted in ASS (255-a)
+            return f"&H{255-a:02X}{b:02X}{g:02X}{r:02X}&"
+            
+        except (ValueError, TypeError) as e:
+            # Fallback to default black if parsing fails
+            return "&H000000&"
+    
+    def get_lead_in_opacity_ass_format(self) -> str:
+        """Convert opacity percentage to ASS alpha format.
+        
+        Returns ASS alpha value (e.g., &H4D& for 70% opacity).
+        """
+        # ASS alpha is inverted: 0=opaque, 255=transparent
+        # Convert percentage to alpha value
+        alpha = int((100 - self.lead_in_opacity_percent) / 100 * 255)
+        return f"&H{alpha:02X}&"
+
+
+@dataclass
+class TranslationLayout:
+    """Geometry of a lyric slot that has a translation row beneath the line."""
+
+    slot_height: int  # lyric line + gap + translation rows (the new line_height)
+    lyric_line_height: int
+    translation_font_size: int
+    gap: int
+    max_rows: int
+    max_visible_lines: int
+
+
+def translation_layout(font_size: float, line_height: int, karaoke_styles: Optional[dict] = None) -> TranslationLayout:
+    """Slot geometry for translated lyrics.
+
+    Theme keys (all optional, in the ``karaoke`` block): ``translation_font_size``
+    (absolute) or ``translation_font_ratio``, ``translation_max_rows``,
+    ``translation_max_visible_lines``.
+    """
+    k = karaoke_styles or {}
+    t_size = k.get("translation_font_size") or font_size * float(k.get("translation_font_ratio", DEFAULT_TRANSLATION_FONT_RATIO))
+    t_size = max(1, int(round(t_size)))
+    max_rows = max(1, int(k.get("translation_max_rows", DEFAULT_TRANSLATION_MAX_ROWS)))
+    gap = int(round(font_size * TRANSLATION_GAP_RATIO))
+    slot = int(line_height + gap + max_rows * t_size * TRANSLATION_ROW_RATIO)
+    max_visible = int(k.get("translation_max_visible_lines", DEFAULT_TRANSLATION_MAX_VISIBLE_LINES))
+    return TranslationLayout(
+        slot_height=slot,
+        lyric_line_height=line_height,
+        translation_font_size=t_size,
+        gap=gap,
+        max_rows=max_rows,
+        max_visible_lines=max_visible,
+    )
+
+
+@dataclass
+class ChordLayout:
+    """Geometry of a lyric slot with a chord-symbol row above the line."""
+
+    slot_height: int  # chord row + gap + lyric line (the new line_height)
+    lyric_line_height: int
+    chord_font_size: int
+    lyric_y_offset: int  # chord row + gap: where the lyric line starts within the slot
+    max_visible_lines: int
+
+
+def chord_layout(font_size: float, line_height: int, karaoke_styles: Optional[dict] = None) -> ChordLayout:
+    """Slot geometry for guitar chords.
+
+    Theme keys (all optional, in the ``karaoke`` block): ``chord_font_size`` (absolute)
+    or ``chord_font_ratio``, ``chord_max_visible_lines``.
+    """
+    k = karaoke_styles or {}
+    c_size = k.get("chord_font_size") or font_size * float(k.get("chord_font_ratio", DEFAULT_CHORD_FONT_RATIO))
+    c_size = max(1, int(round(c_size)))
+    offset = int(round(c_size * CHORD_ROW_RATIO + font_size * CHORD_GAP_RATIO))
+    return ChordLayout(
+        slot_height=line_height + offset,
+        lyric_line_height=line_height,
+        chord_font_size=c_size,
+        lyric_y_offset=offset,
+        max_visible_lines=int(k.get("chord_max_visible_lines", DEFAULT_CHORD_MAX_VISIBLE_LINES)),
+    )
+
+
+@dataclass
+class LineTimingInfo:
+    """Timing information for a single line."""
+
+    fade_in_time: float
+    end_time: float
+    fade_out_time: float
+    clear_time: float
+
+
+@dataclass
+class LineState:
+    """Complete state for a single line."""
+
+    text: str
+    timing: LineTimingInfo
+    y_position: int

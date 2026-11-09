@@ -1,0 +1,106 @@
+# Base image with all Python dependencies pre-installed
+# This image is rebuilt only when poetry.lock or this Dockerfile changes
+#
+# Build with: gcloud builds submit --config=cloudbuild-base.yaml
+# Or manually: docker build -f backend/Dockerfile.base -t karaoke-backend-base .
+#
+# Layer caching strategy:
+# 1. System deps + fonts + ffmpeg (rarely change, always cached)
+# 2. pyproject.toml + package stubs (changes with dep updates)
+# 3. pip install (the slow part - cached unless pyproject.toml changes)
+# 4. Source code copy (changes every rebuild, but AFTER deps are installed)
+# 5. spaCy model download (cached unless pip install layer changes)
+
+FROM python:3.11-slim
+
+# Install system dependencies required by karaoke-gen
+# Note: Transmission daemon removed - torrent downloads now handled by
+# dedicated flacfetch VM service (see docs/00-current-plan/TORRENT-SERVICE-PLAN.md)
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    libsox-dev \
+    sox \
+    build-essential \
+    curl \
+    xz-utils \
+    chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install comprehensive font support for international lyrics and symbols
+# Noto fonts provide full Unicode coverage including:
+# - Latin, Greek, Cyrillic (core)
+# - CJK: Chinese, Japanese, Korean (~150MB)
+# - Arabic, Hebrew, Thai, Hindi, and other scripts (extra)
+# - Color emoji (limited support in libass, but available)
+# - Musical symbols (♪ ♫ etc.)
+# Note: This adds ~200-300MB to the image but ensures all languages render correctly
+RUN apt-get update && apt-get install -y \
+    fonts-noto-core \
+    fonts-noto-cjk \
+    fonts-noto-extra \
+    fonts-noto-color-emoji \
+    fontconfig \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install optimized static FFmpeg build (7.0.2) instead of Debian package (5.1.8)
+# John Van Sickle's builds are compiled with better optimizations for x86_64
+# This provides ~20-40% performance improvement for encoding tasks
+# Source: https://johnvansickle.com/ffmpeg/
+RUN curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz && \
+    tar -xf /tmp/ffmpeg.tar.xz -C /tmp && \
+    cp /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ && \
+    cp /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ && \
+    chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
+    rm -rf /tmp/ffmpeg* && \
+    ffmpeg -version
+
+# Set working directory
+WORKDIR /app
+
+# Copy ONLY dependency specification files first (changes less often than source code)
+COPY pyproject.toml README.md LICENSE /app/
+
+# Create minimal package stubs so pip can resolve the editable install
+# pip install -e . needs package directories to exist but doesn't validate content
+RUN mkdir -p /app/karaoke_gen /app/lyrics_transcriber_temp /app/backend && \
+    touch /app/karaoke_gen/__init__.py /app/lyrics_transcriber_temp/__init__.py /app/backend/__init__.py
+
+# Install all Python dependencies (the slow part)
+# BuildKit cache mount preserves downloaded wheels across builds, so partial
+# dependency updates only download changed packages instead of everything
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && \
+    pip install -e .
+
+# Pre-build matplotlib's font cache at BUILD time. Without it, the first
+# `import matplotlib.pyplot` on every new Cloud Run instance scanned all the
+# Noto fonts above (20-40s of GIL-holding CPU) and froze the API's event loop
+# — prod logged "Matplotlib is building the font cache" in 17 of 28
+# "servers unavailable" banner episodes (2026-10-03 analysis). The cache lives
+# in MPLCONFIGDIR so it ships in the image instead of the in-memory $HOME.
+ENV MPLCONFIGDIR=/opt/mplconfig
+RUN mkdir -p /opt/mplconfig && \
+    python -c "import matplotlib; matplotlib.use('Agg'); import matplotlib.font_manager as fm; print(len(fm.fontManager.ttflist), 'fonts cached')" && \
+    ls /opt/mplconfig/fontlist-*.json && \
+    chmod -R a+rwX /opt/mplconfig
+
+# Now copy actual source code (AFTER deps installed, so code changes don't
+# invalidate the expensive pip install layer in registry cache)
+COPY karaoke_gen /app/karaoke_gen
+COPY lyrics_transcriber_temp /app/lyrics_transcriber_temp
+COPY backend /app/backend
+
+# Download spaCy language model for lyrics transcription
+# This must be done at build time, not runtime (Cloud Run network restrictions)
+RUN python -m spacy download en_core_web_sm
+
+# Label with build info
+ARG BUILD_DATE
+ARG BUILD_ID
+ARG BASE_CONTENT_HASH
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.revision="${BUILD_ID}"
+LABEL org.opencontainers.image.title="karaoke-backend-base"
+LABEL org.opencontainers.image.description="Base image with Python dependencies and system tools for karaoke-backend"
+LABEL base.content.hash="${BASE_CONTENT_HASH}"

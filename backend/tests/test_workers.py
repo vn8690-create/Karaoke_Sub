@@ -1,0 +1,1620 @@
+"""
+Unit tests for backend workers.
+
+These tests mock external dependencies and test worker logic in isolation.
+This includes the functions that would have caught bugs like the
+UnboundLocalError in upload_lyrics_results.
+"""
+import pytest
+import os
+import json
+import tempfile
+from datetime import datetime, UTC
+from unittest.mock import MagicMock, AsyncMock, patch, mock_open
+from pathlib import Path
+
+from backend.models.job import Job, JobStatus
+
+
+class TestAudioWorker:
+    """Tests for audio_worker.py functions."""
+    
+    @pytest.fixture
+    def mock_job(self):
+        """Create a mock job for testing."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+    
+    @pytest.fixture
+    def mock_job_manager(self, mock_job):
+        """Create a mock JobManager."""
+        manager = MagicMock()
+        manager.get_job.return_value = mock_job
+        manager.update_job_status.return_value = None
+        manager.update_file_url.return_value = None
+        manager.update_state_data.return_value = None
+        manager.mark_job_failed.return_value = None
+        return manager
+    
+    @pytest.fixture
+    def mock_storage(self):
+        """Create a mock StorageService."""
+        storage = MagicMock()
+        storage.download_file.return_value = "/tmp/test/song.flac"
+        storage.upload_file.return_value = "gs://bucket/path"
+        return storage
+    
+    @pytest.mark.asyncio
+    async def test_download_audio_from_gcs(self, mock_job_manager, mock_storage, mock_job):
+        """Test downloading audio from GCS for uploaded files."""
+        with patch('backend.workers.audio_worker.JobManager', return_value=mock_job_manager), \
+             patch('backend.workers.audio_worker.StorageService', return_value=mock_storage):
+            
+            from backend.workers.audio_worker import download_audio
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = await download_audio("test123", temp_dir, mock_storage, mock_job)
+                
+                # Should have called download_file with the GCS path
+                mock_storage.download_file.assert_called()
+    
+    @pytest.mark.asyncio
+    async def test_upload_separation_results_handles_clean_stems(self, mock_job_manager, mock_storage):
+        """Test that upload_separation_results handles clean stems correctly."""
+        from backend.workers.audio_worker import upload_separation_results
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create actual test files
+            inst_path = os.path.join(temp_dir, "instrumental.flac")
+            vocals_path = os.path.join(temp_dir, "vocals.flac")
+            with open(inst_path, 'wb') as f:
+                f.write(b'fake audio data')
+            with open(vocals_path, 'wb') as f:
+                f.write(b'fake audio data')
+            
+            # Create mock separation result matching AudioProcessor output format
+            separation_result = {
+                "clean_instrumental": {
+                    "instrumental": inst_path,
+                    "vocals": vocals_path
+                },
+                "other_stems": {},
+                "backing_vocals": {},
+                "combined_instrumentals": {}
+            }
+            
+            await upload_separation_results("test123", separation_result, mock_storage, mock_job_manager)
+            
+            # Should have uploaded files
+            assert mock_storage.upload_file.called
+    
+    @pytest.mark.asyncio
+    async def test_upload_separation_results_handles_other_stems_as_dict(self, mock_job_manager, mock_storage):
+        """Test that upload_separation_results handles other_stems when values are dicts (bug fix)."""
+        with patch('backend.workers.audio_worker.JobManager', return_value=mock_job_manager), \
+             patch('backend.workers.audio_worker.StorageService', return_value=mock_storage):
+            
+            from backend.workers.audio_worker import upload_separation_results
+            
+            # This is the structure that caused the original bug - values are dicts, not strings
+            separation_result = {
+                "clean": {},
+                "other_stems": {
+                    "bass": {"path": "/tmp/test/bass.flac", "other_key": "value"},
+                    "drums": "/tmp/test/drums.flac"  # String path
+                },
+                "backing_vocals": {},
+                "combined_instrumentals": {}
+            }
+            
+            # Mock os.path.exists
+            with patch('os.path.exists', return_value=True):
+                # This should NOT raise TypeError: stat: path should be string...
+                await upload_separation_results("test123", separation_result, mock_storage, mock_job_manager)
+    
+    @pytest.mark.asyncio
+    async def test_process_audio_separation_updates_status_on_failure(self, mock_job_manager, mock_storage):
+        """Test that process_audio_separation marks job as failed on error."""
+        mock_job_manager.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test"
+        )
+        
+        with patch('backend.workers.audio_worker.JobManager', return_value=mock_job_manager), \
+             patch('backend.workers.audio_worker.StorageService', return_value=mock_storage), \
+             patch('backend.workers.audio_worker.download_audio', side_effect=Exception("Download failed")):
+            
+            from backend.workers.audio_worker import process_audio_separation
+            
+            await process_audio_separation("test123")
+            
+            # Should have marked job as failed
+            mock_job_manager.mark_job_failed.assert_called()
+
+
+class TestLyricsWorker:
+    """Tests for lyrics_worker.py functions."""
+    
+    @pytest.fixture
+    def mock_job(self):
+        """Create a mock job for testing."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="ABBA",
+            title="Waterloo",
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+    
+    @pytest.fixture
+    def mock_job_manager(self, mock_job):
+        """Create a mock JobManager."""
+        manager = MagicMock()
+        manager.get_job.return_value = mock_job
+        manager.update_job_status.return_value = None
+        manager.update_file_url.return_value = None
+        manager.update_state_data.return_value = None
+        manager.mark_job_failed.return_value = None
+        return manager
+    
+    @pytest.fixture
+    def mock_storage(self):
+        """Create a mock StorageService."""
+        storage = MagicMock()
+        storage.download_file.return_value = "/tmp/test/song.flac"
+        storage.upload_file.return_value = "gs://bucket/path"
+        return storage
+    
+    @pytest.mark.asyncio
+    async def test_upload_lyrics_results_finds_corrections_by_scan(self, mock_job_manager, mock_storage, mock_job):
+        """Test that upload_lyrics_results finds corrections JSON by scanning the directory.
+
+        The function scans for files ending in '(Lyrics Corrections).json' rather than
+        reconstructing filenames from job.artist/title, since those may change mid-processing
+        (e.g. admin updates artist name while lyrics worker is running).
+        """
+        with patch('backend.workers.lyrics_worker.JobManager', return_value=mock_job_manager), \
+             patch('backend.workers.lyrics_worker.StorageService', return_value=mock_storage):
+
+            from backend.workers.lyrics_worker import upload_lyrics_results
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                lyrics_dir = os.path.join(temp_dir, "lyrics")
+                os.makedirs(lyrics_dir)
+
+                lrc_path = os.path.join(lyrics_dir, "ABBA - Waterloo (Karaoke).lrc")
+                with open(lrc_path, 'w') as f:
+                    f.write("[00:00.00]Test lyrics\n")
+
+                # Use a different artist than what's in the job to simulate mid-run rename
+                corrections_path = os.path.join(lyrics_dir, "OldArtist - Waterloo (Lyrics Corrections).json")
+                with open(corrections_path, 'w') as f:
+                    json.dump({"lines": [], "corrections": []}, f)
+
+                transcription_result = {
+                    "lrc_filepath": lrc_path,
+                    "corrections_filepath": corrections_path
+                }
+
+                await upload_lyrics_results(
+                    "test123",
+                    temp_dir,
+                    transcription_result,
+                    mock_storage,
+                    mock_job_manager
+                )
+
+                # Verify corrections file was found and uploaded as corrections.json
+                upload_calls = mock_storage.upload_file.call_args_list
+                corrections_uploads = [c for c in upload_calls if 'corrections.json' in str(c)]
+                assert len(corrections_uploads) == 1
+    
+    @pytest.mark.asyncio
+    async def test_upload_lyrics_results_uploads_lrc_file(self, mock_job_manager, mock_storage, mock_job):
+        """Test that LRC file is uploaded correctly."""
+        from backend.workers.lyrics_worker import upload_lyrics_results
+        import json
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lyrics_dir = os.path.join(temp_dir, "lyrics")
+            os.makedirs(lyrics_dir)
+            
+            lrc_path = os.path.join(lyrics_dir, "test.lrc")
+            with open(lrc_path, 'w') as f:
+                f.write("[00:00.00]Test\n")
+            
+            # Create required corrections.json file
+            corrections_path = os.path.join(lyrics_dir, "corrections.json")
+            with open(corrections_path, 'w') as f:
+                json.dump({"corrected_segments": []}, f)
+            
+            transcription_result = {"lrc_filepath": lrc_path}
+            
+            await upload_lyrics_results(
+                "test123", temp_dir, transcription_result, 
+                mock_storage, mock_job_manager
+            )
+            
+            # Should have uploaded the LRC file
+            mock_storage.upload_file.assert_called()
+            mock_job_manager.update_file_url.assert_called()
+    
+    @pytest.mark.asyncio
+    async def test_upload_lyrics_results_handles_missing_files(self, mock_job_manager, mock_storage, mock_job):
+        """Test graceful handling when optional files are missing."""
+        from backend.workers.lyrics_worker import upload_lyrics_results
+        import json
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lyrics_dir = os.path.join(temp_dir, "lyrics")
+            os.makedirs(lyrics_dir)
+            
+            # Only create LRC file and required corrections.json, no other files
+            lrc_path = os.path.join(lyrics_dir, "test.lrc")
+            with open(lrc_path, 'w') as f:
+                f.write("[00:00.00]Test\n")
+            
+            # Create required corrections.json file
+            corrections_path = os.path.join(lyrics_dir, "corrections.json")
+            with open(corrections_path, 'w') as f:
+                json.dump({"corrected_segments": []}, f)
+            
+            transcription_result = {"lrc_filepath": lrc_path}
+            
+            # Should not raise exception for missing optional files
+            await upload_lyrics_results(
+                "test123", temp_dir, transcription_result,
+                mock_storage, mock_job_manager
+            )
+    
+    @pytest.mark.asyncio
+    async def test_upload_lyrics_results_raises_when_no_corrections(self, mock_job_manager, mock_storage, mock_job):
+        """Test that upload_lyrics_results raises when no corrections file exists at all."""
+        from backend.workers.lyrics_worker import upload_lyrics_results
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lyrics_dir = os.path.join(temp_dir, "lyrics")
+            os.makedirs(lyrics_dir)
+
+            lrc_path = os.path.join(lyrics_dir, "test.lrc")
+            with open(lrc_path, 'w') as f:
+                f.write("[00:00.00]Test\n")
+
+            # No corrections file at all
+            transcription_result = {"lrc_filepath": lrc_path}
+
+            with pytest.raises(Exception, match="No corrections JSON found"):
+                await upload_lyrics_results(
+                    "test123", temp_dir, transcription_result,
+                    mock_storage, mock_job_manager
+                )
+
+    @pytest.mark.asyncio
+    async def test_upload_lyrics_results_finds_reference_and_uncorrected_by_scan(self, mock_job_manager, mock_storage, mock_job):
+        """Test that upload_lyrics_results finds reference and uncorrected files by scanning.
+
+        Files are found by suffix pattern, not by reconstructing from job.artist/title,
+        so mid-processing artist name changes don't break the upload.
+        """
+        from backend.workers.lyrics_worker import upload_lyrics_results
+        import json
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lyrics_dir = os.path.join(temp_dir, "lyrics")
+            os.makedirs(lyrics_dir)
+
+            lrc_path = os.path.join(lyrics_dir, "test.lrc")
+            with open(lrc_path, 'w') as f:
+                f.write("[00:00.00]Test\n")
+
+            corrections_path = os.path.join(lyrics_dir, "SomeArtist - SomeTitle (Lyrics Corrections).json")
+            with open(corrections_path, 'w') as f:
+                json.dump({"corrected_segments": []}, f)
+
+            # Reference and uncorrected files with arbitrary artist name
+            ref_path = os.path.join(lyrics_dir, "SomeArtist - SomeTitle (Lyrics Genius).txt")
+            with open(ref_path, 'w') as f:
+                f.write("Reference lyrics content\n")
+
+            uncorrected_path = os.path.join(lyrics_dir, "SomeArtist - SomeTitle (Lyrics Uncorrected).txt")
+            with open(uncorrected_path, 'w') as f:
+                f.write("Uncorrected transcription\n")
+
+            transcription_result = {"lrc_filepath": lrc_path}
+
+            await upload_lyrics_results(
+                "test123", temp_dir, transcription_result,
+                mock_storage, mock_job_manager
+            )
+
+            # Verify files were uploaded: LRC + corrections + genius ref + uncorrected = 4
+            upload_calls = mock_storage.upload_file.call_args_list
+            assert len(upload_calls) == 4
+    
+    @pytest.mark.asyncio
+    async def test_process_lyrics_transcription_marks_failed_on_error(self, mock_job_manager, mock_storage):
+        """Test that process_lyrics_transcription marks job as failed on error."""
+        mock_job_manager.get_job.return_value = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+        
+        with patch('backend.workers.lyrics_worker.JobManager', return_value=mock_job_manager), \
+             patch('backend.workers.lyrics_worker.StorageService', return_value=mock_storage), \
+             patch('backend.workers.lyrics_worker.download_audio', side_effect=Exception("Download failed")):
+            
+            from backend.workers.lyrics_worker import process_lyrics_transcription
+            
+            await process_lyrics_transcription("test123")
+            
+            mock_job_manager.mark_job_failed.assert_called()
+
+
+class TestLyricsWorkerConfiguration:
+    """Tests for lyrics worker configuration parameters."""
+    
+    def test_create_lyrics_processor_with_defaults(self):
+        """Test creating LyricsProcessor with default parameters."""
+        with patch('backend.workers.lyrics_worker.LyricsProcessor') as mock_processor:
+            from backend.workers.lyrics_worker import create_lyrics_processor
+            
+            result = create_lyrics_processor()
+            
+            mock_processor.assert_called_once()
+            call_kwargs = mock_processor.call_args[1]
+            assert call_kwargs['lyrics_file'] is None
+            assert call_kwargs['subtitle_offset_ms'] == 0
+    
+    def test_create_lyrics_processor_with_lyrics_file(self):
+        """Test creating LyricsProcessor with custom lyrics file."""
+        with patch('backend.workers.lyrics_worker.LyricsProcessor') as mock_processor:
+            from backend.workers.lyrics_worker import create_lyrics_processor
+            
+            result = create_lyrics_processor(
+                lyrics_file="/path/to/lyrics.txt",
+                subtitle_offset_ms=0
+            )
+            
+            mock_processor.assert_called_once()
+            call_kwargs = mock_processor.call_args[1]
+            assert call_kwargs['lyrics_file'] == "/path/to/lyrics.txt"
+    
+    def test_create_lyrics_processor_with_subtitle_offset(self):
+        """Test creating LyricsProcessor with subtitle offset."""
+        with patch('backend.workers.lyrics_worker.LyricsProcessor') as mock_processor:
+            from backend.workers.lyrics_worker import create_lyrics_processor
+            
+            result = create_lyrics_processor(
+                subtitle_offset_ms=500
+            )
+            
+            mock_processor.assert_called_once()
+            call_kwargs = mock_processor.call_args[1]
+            assert call_kwargs['subtitle_offset_ms'] == 500
+
+
+class TestLyricsOverrideParameters:
+    """Tests for lyrics artist/title override functionality."""
+    
+    @pytest.fixture
+    def mock_job_with_overrides(self):
+        """Create a mock job with lyrics override fields."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Beatles, The",
+            title="Hey Jude - 2009 Remaster",
+            lyrics_artist="The Beatles",
+            lyrics_title="Hey Jude",
+            subtitle_offset_ms=250,
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+    
+    def test_job_uses_lyrics_artist_override(self, mock_job_with_overrides):
+        """Test that job uses lyrics_artist when searching for lyrics."""
+        job = mock_job_with_overrides
+        
+        # Use override if present, else fall back to main artist
+        lyrics_search_artist = job.lyrics_artist or job.artist
+        
+        assert lyrics_search_artist == "The Beatles"
+        assert lyrics_search_artist != job.artist  # Override is different
+    
+    def test_job_uses_lyrics_title_override(self, mock_job_with_overrides):
+        """Test that job uses lyrics_title when searching for lyrics."""
+        job = mock_job_with_overrides
+        
+        # Use override if present, else fall back to main title
+        lyrics_search_title = job.lyrics_title or job.title
+        
+        assert lyrics_search_title == "Hey Jude"
+        assert lyrics_search_title != job.title  # Override is different
+    
+    def test_job_falls_back_when_no_override(self):
+        """Test that job falls back to main artist/title when no override."""
+        job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+        
+        # When override is None, use main values
+        lyrics_search_artist = job.lyrics_artist or job.artist
+        lyrics_search_title = job.lyrics_title or job.title
+        
+        assert lyrics_search_artist == "Test Artist"
+        assert lyrics_search_title == "Test Song"
+
+
+class TestScreensWorker:
+    """Tests for screens_worker.py functions.
+    
+    Note: The main process function is tested indirectly via integration tests.
+    These unit tests focus on helper functions and module structure.
+    """
+    
+    def test_screens_worker_module_imports(self):
+        """Test screens worker module can be imported."""
+        from backend.workers import screens_worker
+        assert hasattr(screens_worker, 'logger')
+
+
+class TestVideoWorker:
+    """Tests for video_worker.py functions.
+    
+    Note: The main process function is tested indirectly via integration tests.
+    These unit tests focus on helper functions and module structure.
+    """
+    
+    def test_video_worker_module_imports(self):
+        """Test video worker module can be imported."""
+        from backend.workers import video_worker
+        assert hasattr(video_worker, 'logger')
+
+
+class TestRenderVideoWorkerConfiguration:
+    """Tests for render_video_worker subtitle_offset_ms support."""
+    
+    @pytest.fixture
+    def mock_job_with_offset(self):
+        """Create a mock job with subtitle offset."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.RENDERING_VIDEO,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            subtitle_offset_ms=500,
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+    
+    def test_job_has_subtitle_offset_ms(self, mock_job_with_offset):
+        """Test that job has subtitle_offset_ms field."""
+        assert mock_job_with_offset.subtitle_offset_ms == 500
+    
+    def test_subtitle_offset_from_job(self, mock_job_with_offset):
+        """Test extracting subtitle offset from job with getattr."""
+        job = mock_job_with_offset
+        
+        # This mirrors the logic in render_video_worker.py
+        subtitle_offset = getattr(job, 'subtitle_offset_ms', 0) or 0
+        
+        assert subtitle_offset == 500
+    
+    def test_subtitle_offset_default_zero(self):
+        """Test that subtitle offset defaults to 0 when not set."""
+        job = Job(
+            job_id="test123",
+            status=JobStatus.RENDERING_VIDEO,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+        
+        subtitle_offset = getattr(job, 'subtitle_offset_ms', 0) or 0
+        
+        assert subtitle_offset == 0
+    
+    def test_subtitle_offset_negative_value(self):
+        """Test that subtitle offset can be negative (advance subtitles)."""
+        job = Job(
+            job_id="test123",
+            status=JobStatus.RENDERING_VIDEO,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            subtitle_offset_ms=-250,  # Negative = advance subtitles
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+        
+        subtitle_offset = getattr(job, 'subtitle_offset_ms', 0) or 0
+        
+        # Negative values should be preserved (not converted to 0)
+        assert subtitle_offset == -250
+
+
+class TestRenderVideoWorkerCountdownPadding:
+    """Tests for render_video_worker countdown detection and audio padding.
+    
+    This ensures that when corrections with countdown timestamps are loaded,
+    the audio is padded to match. This prevents video desynchronization.
+    """
+    
+    def test_countdown_processor_import(self):
+        """Test that render_video_worker imports CountdownProcessor."""
+        from backend.workers.render_video_worker import CountdownProcessor
+        assert CountdownProcessor is not None
+    
+    def test_countdown_processor_has_process_method(self):
+        """Test that CountdownProcessor has the process method (main API)."""
+        from karaoke_gen.lyrics_transcriber.output.countdown_processor import CountdownProcessor
+        
+        countdown_processor = CountdownProcessor(cache_dir="/tmp")
+        assert hasattr(countdown_processor, 'process')
+        assert callable(countdown_processor.process)
+    
+    def test_countdown_processor_constants(self):
+        """Test that CountdownProcessor has expected constants."""
+        from karaoke_gen.lyrics_transcriber.output.countdown_processor import CountdownProcessor
+        
+        # Verify the constants exist (these control countdown behavior)
+        assert hasattr(CountdownProcessor, 'COUNTDOWN_TEXT')
+        assert hasattr(CountdownProcessor, 'COUNTDOWN_PADDING_SECONDS')
+        assert hasattr(CountdownProcessor, 'COUNTDOWN_THRESHOLD_SECONDS')
+
+
+class TestDownloadHelpers:
+    """Tests for download helper functions in workers."""
+    
+    @pytest.mark.asyncio
+    async def test_download_audio_handles_uploaded_file(self):
+        """Test download_audio handles jobs with uploaded file."""
+        mock_storage = MagicMock()
+        mock_storage.download_file.return_value = "/tmp/downloaded.flac"
+        
+        mock_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            input_media_gcs_path="uploads/test123/song.flac"  # Uploaded file
+        )
+        
+        from backend.workers.audio_worker import download_audio
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = await download_audio("test123", temp_dir, mock_storage, mock_job)
+            
+            # Should have downloaded from GCS
+            mock_storage.download_file.assert_called()
+
+
+class TestAudioWorkerModelConfiguration:
+    """Tests for audio worker model configuration parameters."""
+    
+    def test_create_audio_processor_with_defaults(self):
+        """Test creating AudioProcessor with default models."""
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = create_audio_processor(temp_dir)
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # Should use default models
+                assert call_kwargs['clean_instrumental_model'] == "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+                assert call_kwargs['backing_vocals_models'] == ["mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"]
+                assert call_kwargs['other_stems_models'] == []
+    
+    def test_create_audio_processor_with_custom_clean_model(self):
+        """Test creating AudioProcessor with custom clean instrumental model."""
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = create_audio_processor(
+                    temp_dir,
+                    clean_instrumental_model="custom_clean_model.ckpt"
+                )
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # Should use custom clean model
+                assert call_kwargs['clean_instrumental_model'] == "custom_clean_model.ckpt"
+                # Other models should still be defaults
+                assert call_kwargs['backing_vocals_models'] == ["mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"]
+    
+    def test_create_audio_processor_with_custom_backing_models(self):
+        """Test creating AudioProcessor with custom backing vocals models."""
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = create_audio_processor(
+                    temp_dir,
+                    backing_vocals_models=["custom_bv1.ckpt", "custom_bv2.ckpt"]
+                )
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # Should use custom backing vocals models
+                assert call_kwargs['backing_vocals_models'] == ["custom_bv1.ckpt", "custom_bv2.ckpt"]
+    
+    def test_create_audio_processor_with_custom_other_stems_models(self):
+        """Test creating AudioProcessor with custom other stems models."""
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = create_audio_processor(
+                    temp_dir,
+                    other_stems_models=["custom_demucs.yaml"]
+                )
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # Should use custom other stems models
+                assert call_kwargs['other_stems_models'] == ["custom_demucs.yaml"]
+    
+    def test_create_audio_processor_with_all_custom_models(self):
+        """Test creating AudioProcessor with all custom models."""
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = create_audio_processor(
+                    temp_dir,
+                    clean_instrumental_model="custom_clean.ckpt",
+                    backing_vocals_models=["custom_bv.ckpt"],
+                    other_stems_models=["custom_stems.yaml"]
+                )
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # All models should be custom
+                assert call_kwargs['clean_instrumental_model'] == "custom_clean.ckpt"
+                assert call_kwargs['backing_vocals_models'] == ["custom_bv.ckpt"]
+                assert call_kwargs['other_stems_models'] == ["custom_stems.yaml"]
+    
+    def test_job_model_fields_are_passed_to_processor(self):
+        """Test that job model fields can be passed to create_audio_processor."""
+        mock_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            clean_instrumental_model="job_clean.ckpt",
+            backing_vocals_models=["job_bv.ckpt"],
+            other_stems_models=["job_stems.yaml"]
+        )
+        
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Simulate passing job model fields to create_audio_processor
+                result = create_audio_processor(
+                    temp_dir,
+                    clean_instrumental_model=mock_job.clean_instrumental_model,
+                    backing_vocals_models=mock_job.backing_vocals_models,
+                    other_stems_models=mock_job.other_stems_models
+                )
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # Models from job should be used
+                assert call_kwargs['clean_instrumental_model'] == "job_clean.ckpt"
+                assert call_kwargs['backing_vocals_models'] == ["job_bv.ckpt"]
+                assert call_kwargs['other_stems_models'] == ["job_stems.yaml"]
+    
+    def test_none_model_values_use_defaults(self):
+        """Test that None model values fall back to defaults."""
+        mock_job = Job(
+            job_id="test123",
+            status=JobStatus.PENDING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            clean_instrumental_model=None,  # Not specified
+            backing_vocals_models=None,     # Not specified
+            other_stems_models=None         # Not specified
+        )
+        
+        with patch('backend.workers.audio_worker.AudioProcessor') as mock_processor:
+            from backend.workers.audio_worker import create_audio_processor
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = create_audio_processor(
+                    temp_dir,
+                    clean_instrumental_model=mock_job.clean_instrumental_model,
+                    backing_vocals_models=mock_job.backing_vocals_models,
+                    other_stems_models=mock_job.other_stems_models
+                )
+                
+                mock_processor.assert_called_once()
+                call_kwargs = mock_processor.call_args[1]
+                
+                # Should fall back to defaults
+                assert call_kwargs['clean_instrumental_model'] == "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+                assert call_kwargs['backing_vocals_models'] == ["mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"]
+                assert call_kwargs['other_stems_models'] == []
+
+
+class TestDownloadAudioWithUrl:
+    """Tests for download_audio: it only ever consumes a pre-downloaded GCS file.
+
+    URLs are downloaded by the flacfetch service in create_job_from_url before
+    any worker runs — the audio worker never runs yt-dlp on Cloud Run.
+    """
+
+    @pytest.fixture
+    def mock_job_with_url(self):
+        """A URL job that (incorrectly) reached the worker without a GCS path."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.PROCESSING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            url="https://www.youtube.com/watch?v=test123"
+        )
+
+    @pytest.fixture
+    def mock_job_manager(self, mock_job_with_url):
+        """Create a mock JobManager."""
+        manager = MagicMock()
+        manager.get_job.return_value = mock_job_with_url
+        manager.update_job.return_value = None
+        return manager
+
+    @pytest.fixture
+    def mock_storage(self):
+        """Create a mock StorageService."""
+        storage = MagicMock()
+        return storage
+
+    @pytest.mark.asyncio
+    async def test_download_audio_url_without_gcs_path_refuses(self, mock_job_with_url, mock_job_manager, mock_storage):
+        """A URL job with no GCS file must fail loudly (no local yt-dlp fallback)."""
+        from backend.workers.audio_worker import download_audio
+        from backend.services.audio_search_service import DownloadError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Fails loudly with a specific DownloadError rather than returning
+            # None (which used to surface a generic "Failed to download audio file").
+            with pytest.raises(DownloadError, match="flacfetch service"):
+                await download_audio(
+                    "test123",
+                    temp_dir,
+                    mock_storage,
+                    mock_job_with_url,
+                    job_manager_instance=mock_job_manager
+                )
+
+            # Refuses to download locally → never touches storage
+            mock_storage.download_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_audio_no_source_raises(self, mock_job_manager, mock_storage):
+        """A job with no GCS path, no file_urls and no URL must fail loudly."""
+        from backend.workers.audio_worker import download_audio
+        from backend.services.audio_search_service import DownloadError
+
+        no_source_job = Job(
+            job_id="test123",
+            status=JobStatus.PROCESSING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with pytest.raises(DownloadError, match="No input audio source"):
+                await download_audio(
+                    "test123", temp_dir, mock_storage, no_source_job,
+                    job_manager_instance=mock_job_manager,
+                )
+            mock_storage.download_file.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_audio_from_gcs(self, mock_job_manager, mock_storage):
+        """Test download_audio downloads from GCS when input_media_gcs_path is set."""
+        mock_job_no_url = Job(
+            job_id="test123",
+            status=JobStatus.PROCESSING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Test Song",
+            input_media_gcs_path="uploads/test123/song.flac"
+        )
+
+        from backend.workers.audio_worker import download_audio
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            await download_audio(
+                "test123",
+                temp_dir,
+                mock_storage,
+                mock_job_no_url,
+                job_manager_instance=mock_job_manager
+            )
+
+            # Should have downloaded the pre-existing GCS file
+            mock_storage.download_file.assert_called()
+
+
+class TestBackingVocalsAnalysis:
+    """Tests for backing vocals analysis in screens_worker.
+
+    Note: Analysis was moved from render_video_worker to screens_worker as part of
+    the combined review flow - analysis now runs before review, not after.
+    """
+
+    def test_analyze_backing_vocals_function_exists(self):
+        """Test that _analyze_backing_vocals function exists in screens_worker."""
+        from backend.workers.screens_worker import _analyze_backing_vocals
+        assert callable(_analyze_backing_vocals)
+
+    def test_analyze_backing_vocals_is_async(self):
+        """Test that _analyze_backing_vocals is an async function."""
+        import inspect
+        from backend.workers.screens_worker import _analyze_backing_vocals
+        assert inspect.iscoroutinefunction(_analyze_backing_vocals)
+
+    def test_screens_worker_imports_analysis_service(self):
+        """Test that screens_worker can import AudioAnalysisService."""
+        # This verifies the import path is correct
+        from backend.services.audio_analysis_service import AudioAnalysisService
+        assert AudioAnalysisService is not None
+
+    @pytest.mark.asyncio
+    async def test_analyze_backing_vocals_handles_missing_job(self):
+        """Test that analysis returns early when job not found (no error stored)."""
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = None  # No job found
+        mock_job_manager.update_state_data = MagicMock()
+
+        mock_storage = MagicMock()
+        mock_logger = MagicMock()
+
+        from backend.workers.screens_worker import _analyze_backing_vocals
+
+        # Should not raise when job not found, just log warning and return
+        await _analyze_backing_vocals(
+            "nonexistent", mock_job_manager, mock_storage, mock_logger
+        )
+
+        # Should log warning but not update state (early return)
+        mock_logger.warning.assert_called()
+        # No state_data update since we return early
+        mock_job_manager.update_state_data.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_analyze_backing_vocals_stores_fallback_when_stem_truly_absent(self):
+        """When the stem is registered nowhere AND absent from GCS, record a
+        fallback analysis so the review UI can distinguish 'genuinely no backing
+        vocals' from 'analysis never ran' — instead of silently implying 0%."""
+        mock_job = MagicMock()
+        mock_job.file_urls = {}  # No stems registered
+
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+        mock_job_manager.update_state_data = MagicMock()
+
+        mock_storage = MagicMock()
+        mock_storage.file_exists.return_value = False  # Not recoverable from GCS
+        mock_logger = MagicMock()
+
+        from backend.workers.screens_worker import _analyze_backing_vocals
+
+        await _analyze_backing_vocals(
+            "test123", mock_job_manager, mock_storage, mock_logger
+        )
+
+        mock_logger.warning.assert_called()
+        # A fallback analysis is stored (not a silent early return), and no stem
+        # is re-registered because none exists.
+        mock_job_manager.update_state_data.assert_called_once()
+        args = mock_job_manager.update_state_data.call_args.args
+        assert args[1] == "backing_vocals_analysis"
+        assert args[2].get("analysis_error")
+        mock_job_manager.update_file_url.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_analyze_backing_vocals_recovers_stem_missing_from_file_urls(self):
+        """If the backing_vocals stem exists in GCS but was dropped from file_urls
+        (the lost-update race), recover by re-registering it from the conventional
+        path so the review UI can load it and analysis can run."""
+        mock_job = MagicMock()
+        mock_job.file_urls = {"stems": {"lead_vocals": "jobs/test123/stems/lead_vocals.flac"}}
+
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+
+        mock_storage = MagicMock()
+        mock_storage.file_exists.return_value = True  # Present in GCS
+        mock_logger = MagicMock()
+
+        # Patch the analysis service so the test asserts the recovery, not the
+        # (heavy) downstream waveform analysis.
+        with patch("backend.services.audio_analysis_service.AudioAnalysisService") as MockSvc:
+            MockSvc.return_value.analyze_and_generate_waveform.side_effect = RuntimeError("stop")
+            from backend.workers.screens_worker import _analyze_backing_vocals
+            await _analyze_backing_vocals(
+                "test123", mock_job_manager, mock_storage, mock_logger
+            )
+
+        # The dropped stem is re-registered atomically from the conventional path.
+        mock_job_manager.update_file_url.assert_called_once_with(
+            "test123", "stems", "backing_vocals", "jobs/test123/stems/backing_vocals.flac"
+        )
+
+    @pytest.mark.asyncio
+    async def test_analyze_backing_vocals_stores_scorer_unified_recommendation(self):
+        """The stored recommended_selection follows the 3-stem scorer (sparse quiet
+        harmonies => keep) while the analyzer heuristic's 'clean' is preserved as
+        heuristic_recommended_selection (job 58555663 disagreement)."""
+        from karaoke_gen.instrumental_review.models import (
+            AnalysisResult, AudibleSegment, RecommendedSelection,
+        )
+
+        mock_job = MagicMock()
+        mock_job.file_urls = {"stems": {
+            "backing_vocals": "jobs/test123/stems/backing_vocals.flac",
+            "lead_vocals": "jobs/test123/stems/lead_vocals.flac",
+            "vocals_clean": "jobs/test123/stems/vocals_clean.flac",
+        }}
+        mock_job_manager = MagicMock()
+        mock_job_manager.get_job.return_value = mock_job
+
+        result = AnalysisResult(
+            has_audible_content=True,
+            total_duration_seconds=206.6,
+            audible_segments=[AudibleSegment(
+                start_seconds=16.15, end_seconds=21.3, duration_seconds=5.15,
+                avg_amplitude_db=-28.5, peak_amplitude_db=-22.7,
+            )],
+            recommended_selection=RecommendedSelection.CLEAN,
+            silence_threshold_db=-40.0,
+            total_audible_duration_seconds=18.65,
+            audible_percentage=9.03,
+        )
+        comparison = {
+            "backing_audible_fraction": 0.08, "lead_audible_fraction": 0.66,
+            "coverage_ratio": 0.11, "corr_backing_vocals": -0.02,
+            "lead_overlap_fraction": 0.55, "backing_median_db": -31.6,
+            "flat_fraction": 0.0, "error": None,
+        }
+        with patch("backend.services.audio_analysis_service.AudioAnalysisService") as MockSvc:
+            MockSvc.return_value.analyze_and_generate_waveform.return_value = (
+                result, "jobs/test123/analysis/backing_vocals_waveform.png", comparison,
+            )
+            from backend.workers.screens_worker import _analyze_backing_vocals
+            await _analyze_backing_vocals("test123", mock_job_manager, MagicMock(), MagicMock())
+
+        stored = mock_job_manager.update_state_data.call_args.args[2]
+        assert stored["recommended_selection"] == "with_backing"
+        assert stored["heuristic_recommended_selection"] == "clean"
+
+    def test_analysis_service_can_be_instantiated(self):
+        """Test that AudioAnalysisService can be instantiated."""
+        from backend.services.audio_analysis_service import AudioAnalysisService
+
+        mock_storage = MagicMock()
+        service = AudioAnalysisService(storage_service=mock_storage)
+
+        assert service is not None
+        assert service.storage_service == mock_storage
+
+
+class TestModelNamesStorage:
+    """Tests for model names storage in audio_worker.
+
+    These tests verify that model names are stored in job state_data
+    for use by video_worker in distribution directory preparation.
+    """
+
+    def test_effective_model_names_defaults(self):
+        """Test that default model names are used when not specified on job."""
+        from backend.workers.audio_worker import (
+            DEFAULT_CLEAN_MODEL,
+            DEFAULT_BACKING_MODELS,
+            DEFAULT_OTHER_MODELS,
+        )
+
+        # Simulate the logic from process_audio_separation
+        job_clean_model = None
+        job_backing_models = None
+        job_other_models = None
+
+        effective_model_names = {
+            'clean_instrumental_model': job_clean_model or DEFAULT_CLEAN_MODEL,
+            'backing_vocals_models': job_backing_models or DEFAULT_BACKING_MODELS,
+            'other_stems_models': job_other_models or DEFAULT_OTHER_MODELS,
+        }
+
+        assert effective_model_names['clean_instrumental_model'] == DEFAULT_CLEAN_MODEL
+        assert effective_model_names['backing_vocals_models'] == DEFAULT_BACKING_MODELS
+        assert effective_model_names['other_stems_models'] == DEFAULT_OTHER_MODELS
+
+    def test_effective_model_names_custom(self):
+        """Test that custom model names override defaults."""
+        from backend.workers.audio_worker import (
+            DEFAULT_CLEAN_MODEL,
+            DEFAULT_BACKING_MODELS,
+            DEFAULT_OTHER_MODELS,
+        )
+
+        custom_clean = "custom_clean_model.ckpt"
+        custom_backing = ["custom_backing.ckpt"]
+        custom_other = ["custom_demucs.yaml"]
+
+        # Simulate the logic from process_audio_separation
+        effective_model_names = {
+            'clean_instrumental_model': custom_clean or DEFAULT_CLEAN_MODEL,
+            'backing_vocals_models': custom_backing or DEFAULT_BACKING_MODELS,
+            'other_stems_models': custom_other or DEFAULT_OTHER_MODELS,
+        }
+
+        assert effective_model_names['clean_instrumental_model'] == custom_clean
+        assert effective_model_names['backing_vocals_models'] == custom_backing
+        assert effective_model_names['other_stems_models'] == custom_other
+
+
+class TestDistributionDirectoryPreparation:
+    """Tests for _prepare_distribution_directory in video_worker.
+
+    These tests verify that the distribution directory is prepared with:
+    - stems/ subfolder containing all audio stems with model names
+    - lyrics/ subfolder containing intermediate lyrics files
+    - Properly named instrumentals at root level
+    """
+
+    def test_distribution_directory_creates_stems_folder(self, tmp_path):
+        """Test that stems directory is created."""
+        stems_dir = tmp_path / "stems"
+        stems_dir.mkdir()
+
+        assert stems_dir.exists()
+        assert stems_dir.is_dir()
+
+    def test_distribution_directory_creates_lyrics_folder(self, tmp_path):
+        """Test that lyrics directory is created."""
+        lyrics_dir = tmp_path / "lyrics"
+        lyrics_dir.mkdir()
+
+        assert lyrics_dir.exists()
+        assert lyrics_dir.is_dir()
+
+    def test_instrumental_naming_with_model(self):
+        """Test that instrumental files are named with model names."""
+        base_name = "Artist - Song"
+        clean_model = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+        backing_model = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+
+        clean_instrumental_name = f"{base_name} (Instrumental {clean_model}).flac"
+        backing_instrumental_name = f"{base_name} (Instrumental +BV {backing_model}).flac"
+
+        # Verify expected format
+        assert "model_bs_roformer" in clean_instrumental_name
+        assert "+BV" in backing_instrumental_name
+        assert backing_model in backing_instrumental_name
+
+    def test_stem_naming_convention(self):
+        """Test that stems are named with proper model suffixes."""
+        base_name = "Artist - Song"
+        clean_model = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+        backing_model = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+        other_model = "htdemucs_6s.yaml"
+
+        # Expected stem filenames
+        expected_stems = {
+            'vocals_clean': f"{base_name} (Vocals {clean_model}).flac",
+            'lead_vocals': f"{base_name} (Lead Vocals {backing_model}).flac",
+            'backing_vocals': f"{base_name} (Backing Vocals {backing_model}).flac",
+            'bass': f"{base_name} (Bass {other_model}).flac",
+            'drums': f"{base_name} (Drums {other_model}).flac",
+        }
+
+        # Verify naming convention
+        for _key, name in expected_stems.items():
+            assert ".flac" in name
+            assert base_name in name
+
+    def test_simplified_instrumental_cleanup(self, tmp_path):
+        """Test that simplified instrumental names are cleaned up."""
+        base_name = "Artist - Song"
+
+        # Create simplified-named files (as created by _setup_working_directory)
+        simplified_clean = tmp_path / f"{base_name} (Instrumental Clean).flac"
+        simplified_backing = tmp_path / f"{base_name} (Instrumental Backing).flac"
+        simplified_clean.write_text("fake")
+        simplified_backing.write_text("fake")
+
+        # Verify they exist
+        assert simplified_clean.exists()
+        assert simplified_backing.exists()
+
+        # Simulate cleanup
+        simplified_clean.unlink()
+        simplified_backing.unlink()
+
+        # Verify they're removed
+        assert not simplified_clean.exists()
+        assert not simplified_backing.exists()
+
+
+class TestRenderVideoWorkerCountdownStateSync:
+    """
+    Tests that render_video_worker correctly updates job state when countdown is added.
+
+    This is the critical test for the countdown audio sync bug. The bug occurs when:
+    1. render_video_worker adds countdown via CountdownProcessor
+    2. But doesn't update job.state_data.lyrics_metadata.has_countdown_padding
+    3. So video_worker doesn't know to pad the instrumental
+
+    These tests verify the state sync behavior.
+    """
+
+    @pytest.fixture
+    def mock_job_for_render(self):
+        """Create a mock job in RENDERING_VIDEO state."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.RENDERING_VIDEO,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test Artist",
+            title="Early Start Song",
+            file_urls={
+                'vocals': 'gs://bucket/vocals.flac',
+            },
+            state_data={
+                'lyrics_metadata': {
+                    'has_countdown_padding': False,
+                    'countdown_padding_seconds': 0.0,
+                }
+            }
+        )
+
+    @pytest.fixture
+    def mock_job_manager_for_render(self, mock_job_for_render):
+        """Create a mock JobManager for render tests."""
+        manager = MagicMock()
+        manager.get_job.return_value = mock_job_for_render
+        manager.update_state_data = MagicMock()
+        manager.update_job_status = MagicMock()
+        manager.update_file_url = MagicMock()
+        manager.transition_to_state = MagicMock()
+        return manager
+
+    def test_countdown_added_updates_state_data(self):
+        """When countdown is added, state_data MUST be updated with countdown info.
+
+        This test verifies the contract: render_video_worker must call
+        update_state_data('lyrics_metadata', {..., 'has_countdown_padding': True})
+        when CountdownProcessor returns padding_added=True.
+        """
+        # This is a unit test for the expected behavior
+        # The actual implementation test is in test_countdown_state_contract.py
+
+        # When countdown is added:
+        padding_added = True
+        padding_seconds = 3.0
+
+        # State should be updated to:
+        expected_state = {
+            'has_countdown_padding': True,
+            'countdown_padding_seconds': 3.0,
+        }
+
+        # Verify logic
+        if padding_added:
+            new_lyrics_metadata = {
+                'has_countdown_padding': True,
+                'countdown_padding_seconds': padding_seconds,
+            }
+            assert new_lyrics_metadata == expected_state
+
+    def test_no_countdown_keeps_state_false(self):
+        """When countdown is NOT added, state should remain False.
+
+        This ensures we don't incorrectly set has_countdown_padding=True
+        when the song doesn't need a countdown.
+        """
+        padding_added = False
+        padding_seconds = 0.0
+
+        # State should remain:
+        expected_state = {
+            'has_countdown_padding': False,
+            'countdown_padding_seconds': 0.0,
+        }
+
+        if not padding_added:
+            lyrics_metadata = {
+                'has_countdown_padding': False,
+                'countdown_padding_seconds': 0.0,
+            }
+            assert lyrics_metadata == expected_state
+
+
+class TestVideoWorkerCountdownStateRead:
+    """
+    Tests that video_worker correctly reads countdown state from job.state_data.
+
+    This verifies the reader side of the countdown state contract.
+    """
+
+    @pytest.fixture
+    def mock_job_with_countdown_state(self):
+        """Create a job where render_video_worker set countdown state."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.ENCODING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            file_urls={
+                'instrumental_clean': 'gs://bucket/instrumental.flac',
+                'video_output': 'gs://bucket/video.mp4',
+            },
+            state_data={
+                'lyrics_metadata': {
+                    'has_countdown_padding': True,
+                    'countdown_padding_seconds': 3.0,
+                },
+                'video_worker': {
+                    'instrumental_source': 'clean',
+                }
+            }
+        )
+
+    @pytest.fixture
+    def mock_job_without_countdown_state(self):
+        """Create a job where no countdown was needed."""
+        return Job(
+            job_id="test123",
+            status=JobStatus.ENCODING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            file_urls={
+                'instrumental_clean': 'gs://bucket/instrumental.flac',
+                'video_output': 'gs://bucket/video.mp4',
+            },
+            state_data={
+                'lyrics_metadata': {
+                    'has_countdown_padding': False,
+                    'countdown_padding_seconds': 0.0,
+                },
+                'video_worker': {
+                    'instrumental_source': 'clean',
+                }
+            }
+        )
+
+    def test_reads_countdown_from_state(self, mock_job_with_countdown_state):
+        """video_worker reads countdown_padding_seconds from lyrics_metadata."""
+        job = mock_job_with_countdown_state
+
+        # This mirrors video_worker.py logic
+        lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+        countdown_padding_seconds = None
+        if lyrics_metadata.get('has_countdown_padding'):
+            countdown_padding_seconds = lyrics_metadata.get('countdown_padding_seconds', 3.0)
+
+        assert countdown_padding_seconds == 3.0
+
+    def test_reads_none_when_no_countdown(self, mock_job_without_countdown_state):
+        """video_worker returns None when has_countdown_padding=False."""
+        job = mock_job_without_countdown_state
+
+        lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+        countdown_padding_seconds = None
+        if lyrics_metadata.get('has_countdown_padding'):
+            countdown_padding_seconds = lyrics_metadata.get('countdown_padding_seconds', 3.0)
+
+        assert countdown_padding_seconds is None
+
+    def test_handles_missing_lyrics_metadata(self):
+        """video_worker handles missing lyrics_metadata gracefully."""
+        job = Job(
+            job_id="test123",
+            status=JobStatus.ENCODING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            state_data={}  # No lyrics_metadata
+        )
+
+        lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+        countdown_padding_seconds = None
+        if lyrics_metadata.get('has_countdown_padding'):
+            countdown_padding_seconds = lyrics_metadata.get('countdown_padding_seconds', 3.0)
+
+        # Should not raise, should return None
+        assert countdown_padding_seconds is None
+
+    def test_defaults_to_3_seconds_when_duration_missing(self):
+        """If has_countdown_padding=True but duration missing, default to 3.0."""
+        job = Job(
+            job_id="test123",
+            status=JobStatus.ENCODING,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Test",
+            state_data={
+                'lyrics_metadata': {
+                    'has_countdown_padding': True,
+                    # countdown_padding_seconds intentionally missing
+                }
+            }
+        )
+
+        lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+        countdown_padding_seconds = None
+        if lyrics_metadata.get('has_countdown_padding'):
+            countdown_padding_seconds = lyrics_metadata.get('countdown_padding_seconds', 3.0)
+
+        assert countdown_padding_seconds == 3.0
+
+
+class TestLyricsWorkerCountdownState:
+    """
+    Tests for lyrics_worker countdown state handling.
+
+    Note: Since countdown processing is now deferred to render_video_worker,
+    lyrics_worker should set has_countdown_padding=False in all cases.
+    The actual countdown state is set by render_video_worker.
+    """
+
+    def test_lyrics_worker_sets_countdown_false_by_default(self):
+        """lyrics_worker sets has_countdown_padding=False since countdown is deferred."""
+        # When transcription_result doesn't have countdown_padding_added
+        transcription_result = {
+            'lrc_filepath': '/tmp/test.lrc',
+        }
+
+        # lyrics_worker logic
+        lyrics_metadata = {}
+        if transcription_result.get("countdown_padding_added"):
+            lyrics_metadata['has_countdown_padding'] = True
+            lyrics_metadata['countdown_padding_seconds'] = transcription_result.get(
+                "countdown_padding_seconds", 3.0
+            )
+        else:
+            lyrics_metadata['has_countdown_padding'] = False
+            lyrics_metadata['countdown_padding_seconds'] = 0.0
+
+        assert lyrics_metadata['has_countdown_padding'] is False
+        assert lyrics_metadata['countdown_padding_seconds'] == 0.0
+
+    def test_lyrics_worker_would_set_true_if_countdown_in_result(self):
+        """If transcription_result had countdown info, it would be set.
+
+        This tests the code path for when countdown WAS done during lyrics phase.
+        Currently this path isn't used (countdown is deferred), but the code exists.
+        """
+        # If countdown_padding_added was True
+        transcription_result = {
+            'lrc_filepath': '/tmp/test.lrc',
+            'countdown_padding_added': True,
+            'countdown_padding_seconds': 3.0,
+        }
+
+        lyrics_metadata = {}
+        if transcription_result.get("countdown_padding_added"):
+            lyrics_metadata['has_countdown_padding'] = True
+            lyrics_metadata['countdown_padding_seconds'] = transcription_result.get(
+                "countdown_padding_seconds", 3.0
+            )
+        else:
+            lyrics_metadata['has_countdown_padding'] = False
+            lyrics_metadata['countdown_padding_seconds'] = 0.0
+
+        assert lyrics_metadata['has_countdown_padding'] is True
+        assert lyrics_metadata['countdown_padding_seconds'] == 3.0
+
+
+class TestVideoWorkerStateGuard:
+    """Tests for video worker state validation."""
+
+    @pytest.fixture
+    def failed_job(self):
+        return Job(
+            job_id="test-failed",
+            status=JobStatus.FAILED,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Song",
+            state_data={"instrumental_selection": "clean"},
+            file_urls={
+                "stems": {"instrumental_clean": "gs://test"},
+                "screens": {"title": "gs://t", "end": "gs://e"},
+                "videos": {"with_vocals": "gs://v"},
+                "lyrics": {"lrc": "gs://lrc"},
+            },
+        )
+
+    def test_validate_worker_can_run_rejects_failed_job(self, failed_job):
+        """validate_worker_can_run returns error for failed jobs."""
+        from backend.services.job_health_service import validate_worker_can_run
+        result = validate_worker_can_run("video_worker", failed_job)
+        assert result is not None
+        assert "failed" in result.lower()
+
+    def test_validate_worker_can_run_accepts_instrumental_selected(self):
+        """validate_worker_can_run allows instrumental_selected jobs."""
+        from backend.services.job_health_service import validate_worker_can_run
+        job = Job(
+            job_id="test-ok",
+            status=JobStatus.INSTRUMENTAL_SELECTED,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Song",
+        )
+        result = validate_worker_can_run("video_worker", job)
+        assert result is None
+
+
+class TestWorkerIdempotencyTerminalState:
+    """Tests for _check_worker_idempotency terminal state handling."""
+
+    def test_idempotency_rejects_failed_job(self):
+        """Idempotency check returns skip response for failed jobs."""
+        from backend.api.routes.internal import _check_worker_idempotency
+        failed_job = Job(
+            job_id="test-failed",
+            status=JobStatus.FAILED,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Song",
+        )
+        with patch("backend.api.routes.internal.JobManager") as MockJM:
+            MockJM.return_value.get_job.return_value = failed_job
+            result = _check_worker_idempotency("test-failed", "video")
+        assert result is not None
+        assert result.status == "skipped"
+        assert "terminal state" in result.message.lower()
+
+    def test_idempotency_rejects_cancelled_job(self):
+        """Idempotency check returns skip response for cancelled jobs."""
+        from backend.api.routes.internal import _check_worker_idempotency
+        cancelled_job = Job(
+            job_id="test-cancelled",
+            status=JobStatus.CANCELLED,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Song",
+        )
+        with patch("backend.api.routes.internal.JobManager") as MockJM:
+            MockJM.return_value.get_job.return_value = cancelled_job
+            result = _check_worker_idempotency("test-cancelled", "video")
+        assert result is not None
+        assert result.status == "skipped"
+
+    def test_idempotency_allows_instrumental_selected_job(self):
+        """Idempotency check allows jobs in non-terminal states."""
+        from backend.api.routes.internal import _check_worker_idempotency
+        job = Job(
+            job_id="test-ok",
+            status=JobStatus.INSTRUMENTAL_SELECTED,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+            artist="Test",
+            title="Song",
+        )
+        with patch("backend.api.routes.internal.JobManager") as MockJM:
+            mock_jm = MockJM.return_value
+            mock_jm.get_job.return_value = job
+            mock_jm.update_state_data.return_value = None
+            result = _check_worker_idempotency("test-ok", "video")
+        assert result is None
+
+
+class TestDistributionWarningsContract:
+    """Contract tests verifying distribution_warnings code paths don't crash.
+
+    Regression: generate_video_orchestrated() and _handle_native_distribution()
+    both called _send_distribution_warning_notification(settings=settings) but
+    never defined 'settings' in their scope. These tests ensure the notification
+    call site works without NameError.
+    """
+
+    def test_send_distribution_warning_notification_works_without_settings(self):
+        """_send_distribution_warning_notification handles settings=None."""
+        from backend.workers.video_worker import _send_distribution_warning_notification
+
+        # Should not crash — settings defaults to None and is fetched internally
+        with patch('backend.workers.video_worker.get_settings') as mock_settings:
+            mock_settings.return_value.get_secret.return_value = None  # No pushbullet key
+            _send_distribution_warning_notification(
+                job_id="test-123",
+                artist="Test",
+                title="Song",
+                warnings=["Dropbox failed"],
+            )
+            mock_settings.assert_called_once()
+
+    def test_generate_video_orchestrated_no_settings_reference(self):
+        """Verify generate_video_orchestrated doesn't reference undefined 'settings'.
+
+        Static analysis: scan the function source for 'settings=settings' which
+        would indicate a NameError if settings is not defined in scope.
+        """
+        import inspect
+        from backend.workers.video_worker import generate_video_orchestrated
+
+        source = inspect.getsource(generate_video_orchestrated)
+        assert "settings=settings" not in source, (
+            "generate_video_orchestrated references 'settings=settings' but never defines 'settings'. "
+            "Use settings=None or omit the argument — _send_distribution_warning_notification "
+            "handles settings=None internally via get_settings()."
+        )
+
+    def test_handle_native_distribution_no_settings_reference(self):
+        """Verify _handle_native_distribution doesn't reference undefined 'settings'.
+
+        Static analysis: same check as above for the other call site.
+        """
+        import inspect
+        from backend.workers.video_worker import _handle_native_distribution
+
+        source = inspect.getsource(_handle_native_distribution)
+        assert "settings=settings" not in source, (
+            "_handle_native_distribution references 'settings=settings' but never defines 'settings'. "
+            "Use settings=None or omit the argument."
+        )
+

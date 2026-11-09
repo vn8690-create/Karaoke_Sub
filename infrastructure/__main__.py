@@ -1,0 +1,944 @@
+"""
+Pulumi Infrastructure for Karaoke Generator Backend.
+
+This is the entry point that wires together all infrastructure modules.
+See individual modules for resource definitions.
+
+Structure:
+- config.py: Shared configuration and constants
+- modules/: Core GCP resources (database, storage, IAM, etc.)
+- compute/: VM-based resources (Phase 2)
+"""
+
+import pulumi
+import pulumi_gcp as gcp
+from pulumi_gcp import (
+    artifactregistry,
+    cloudrun,
+    cloudrunv2,
+    cloudscheduler,
+    cloudtasks,
+    cloudfunctionsv2,
+    compute,
+    firestore,
+    secretmanager,
+    serviceaccount,
+    storage,
+)
+
+from config import (
+    PROJECT_ID,
+    get_project_number,
+    REGION,
+    ZONE,
+    GDRIVE_FOLDER_ID,
+    NUM_GITHUB_RUNNERS,
+    MachineTypes,
+    DiskSizes,
+    EncodingWorkerConfig,
+)
+from modules import database, storage as storage_module, artifact_registry, secrets
+from modules import cloud_tasks, cloud_run, monitoring, runner_manager
+from modules import divebar_mirror, kn_data_sync, divebar_lookup, backup
+from modules import audio_separator_service
+from modules import edge_security
+from modules import play_rtdn
+from modules import gpu_artifact_registry
+from modules import encoding_worker_manager
+from modules import error_monitor as error_monitor_module
+from modules.iam import backend_sa, github_actions_sa, claude_automation_sa, claude_readonly_sa, worker_sas
+from compute import encoding_worker_vm, github_runners, divebar_sync_vm
+
+# ==================== Core Infrastructure ====================
+
+# Firestore database and indexes
+db_resources = database.create_database()
+
+# Cloud Storage bucket
+bucket = storage_module.create_bucket()
+
+# Artifact Registry for Docker images
+artifact_repo = artifact_registry.create_repository()
+
+# GPU Artifact Registry in us-east4 (for audio worker GPU images)
+gpu_artifact_repo = gpu_artifact_registry.create_gpu_artifact_repo()
+
+# Secret Manager secrets
+all_secrets = secrets.create_secrets()
+
+# Cloud Tasks queues
+queues = cloud_tasks.create_queues()
+
+# ==================== Networking ====================
+# The serverless VPC connector (cloud-run-connector) was removed 2026-09-26:
+# it only existed to reach the old flacfetch GCE VM's internal IP, and flacfetch
+# now runs off-GCP behind a public HTTPS URL. All backend egress is public.
+
+# ==================== Cloud Build IAM ====================
+# These bindings allow Cloud Build to access Artifact Registry and deploy as the backend SA
+
+# List of Cloud Build service accounts that need Artifact Registry access
+cloudbuild_service_accounts = [
+    f"serviceAccount:{get_project_number()}@cloudbuild.gserviceaccount.com",  # Default Cloud Build SA
+    f"serviceAccount:service-{get_project_number()}@gcp-sa-cloudbuild.iam.gserviceaccount.com",  # Cloud Build service agent
+    f"serviceAccount:{get_project_number()}-compute@developer.gserviceaccount.com",  # Compute service account
+]
+
+# Grant Cloud Build service accounts access to Artifact Registry
+artifact_registry_iam = artifactregistry.RepositoryIamBinding(
+    "cloudbuild-artifact-registry-access",
+    repository=artifact_repo.name,
+    location=artifact_repo.location,
+    role="roles/artifactregistry.writer",
+    members=cloudbuild_service_accounts,
+)
+
+# Grant Cloud Build access to GPU Artifact Registry (us-east4)
+gpu_artifact_registry_iam = artifactregistry.RepositoryIamBinding(
+    "cloudbuild-gpu-artifact-registry-access",
+    repository=gpu_artifact_repo.name,
+    location=gpu_artifact_repo.location,
+    role="roles/artifactregistry.writer",
+    members=cloudbuild_service_accounts,
+)
+
+# Grant Cloud Build compute service account logging permissions
+cloudbuild_logging_iam = gcp.projects.IAMMember(
+    "cloudbuild-logging-access",
+    project=PROJECT_ID,
+    role="roles/logging.logWriter",
+    member=f"serviceAccount:{get_project_number()}-compute@developer.gserviceaccount.com",
+)
+
+# ==================== Service Accounts ====================
+
+# Backend service account (Cloud Run)
+backend_service_account = backend_sa.create_backend_service_account()
+backend_iam_bindings = backend_sa.grant_backend_permissions(backend_service_account)
+cloud_tasks_invoker = backend_sa.grant_cloud_tasks_invoker_permission()
+
+# NOTE: CI uses GitHub Actions for deployments, not Cloud Build.
+# If Cloud Build is ever needed, grant roles/iam.serviceAccountUser to
+# {project_number}-compute@ on the karaoke-backend service account.
+
+# GitHub Actions service account with Workload Identity Federation
+github_actions_service_account = github_actions_sa.create_github_actions_service_account()
+wif_pool = github_actions_sa.create_workload_identity_pool()
+wif_provider = github_actions_sa.create_workload_identity_provider(wif_pool)
+github_actions_iam_bindings = github_actions_sa.grant_github_actions_permissions(
+    github_actions_service_account, wif_pool
+)
+
+# Claude Code automation service account
+claude_automation_service_account = claude_automation_sa.create_claude_automation_service_account()
+claude_automation_iam_bindings = claude_automation_sa.grant_claude_automation_permissions(
+    claude_automation_service_account
+)
+claude_impersonation = claude_automation_sa.grant_impersonation_permission(
+    claude_automation_service_account
+)
+
+# Claude read-only service account (default for Claude Code sessions)
+claude_readonly_service_account = claude_readonly_sa.create_claude_readonly_service_account()
+claude_readonly_iam_bindings = claude_readonly_sa.grant_claude_readonly_permissions(
+    claude_readonly_service_account
+)
+claude_readonly_impersonation = claude_readonly_sa.grant_impersonation_permission(
+    claude_readonly_service_account
+)
+
+# Break-glass service account (excepted from deny policies)
+break_glass_service_account = claude_readonly_sa.create_break_glass_service_account()
+
+# IAM deny policies (prevent catastrophic deletes for all principals)
+# TODO: Deny policy creation fails via Pulumi (v2beta API 404 / IAM permissions issue).
+# Create manually via gcloud once permissions are sorted:
+#   gcloud iam policies create deny-destructive-operations \
+#     --attachment-point="cloudresourcemanager.googleapis.com/projects/718638054799" \
+#     --kind=denypolicies --policy-file=deny-policy.json
+# deny_policies = claude_readonly_sa.create_deny_policies(break_glass_service_account)
+
+# Worker service accounts (VMs)
+encoding_worker_sa = worker_sas.create_encoding_worker_service_account()
+encoding_worker_iam_bindings = worker_sas.grant_encoding_worker_permissions(
+    encoding_worker_sa, bucket
+)
+
+# AWS encoding worker (EC2) → GCP as encoding-worker@ via Workload Identity
+# Federation (no keys). See modules/aws_encoding_wif.py.
+from modules import aws_encoding_wif  # noqa: E402
+
+aws_encoding_wif_resources = aws_encoding_wif.create_aws_encoding_wif(
+    encoding_worker_sa, backend_service_account
+)
+
+gdrive_validator_sa = worker_sas.create_gdrive_validator_service_account()
+gdrive_validator_iam_bindings = worker_sas.grant_gdrive_validator_permissions(
+    gdrive_validator_sa
+)
+
+github_runner_sa = worker_sas.create_github_runner_service_account()
+github_runner_iam_bindings = worker_sas.grant_github_runner_permissions(github_runner_sa)
+
+# ==================== Cloud Run ====================
+
+# Domain mapping for api.nomadkaraoke.com
+domain_mapping = cloud_run.create_domain_mapping()
+
+# Cloudflare edge security (WAF / rate limiting / origin lock) for the backend.
+# No-op until `edge:cloudflareZoneId` + `cloudflare:apiToken` are set in Pulumi
+# config. Rollout is staged via `edge:rolloutStage` (staging|cutover); the
+# default "staging" is non-disruptive to the live `api` record. See
+# docs/archive/2026-07-20-edge-security-hardening-plan.md.
+edge_resources = edge_security.configure_edge_security()
+
+# Cloud Run Jobs for batch processing
+# These use Cloud Run Jobs instead of Cloud Tasks to avoid instance termination
+# during long-running processing (the BackgroundTasks issue)
+audio_separation_job = cloud_run.create_audio_separation_job(bucket, backend_service_account)
+# Voice-pool separate-only GPU job (started by karaoke-decide's fetch job). decide's
+# Pulumi creates the voice-pool SA and grants it run access on this job.
+voice_pool_separate_job = cloud_run.create_voice_pool_separate_job(bucket, backend_service_account)
+# Latency-critical CPU jobs run in CPU_JOBS_REGION (us-east4): us-central1 Cloud
+# Run Jobs queue 2-5 min before starting. The legacy us-central1 copies were
+# removed after the us-east4 jobs were verified in prod (2026-09-30). To roll
+# back, recreate them here with the default region (see TROUBLESHOOTING.md).
+lyrics_transcription_job = cloud_run.create_lyrics_transcription_job(
+    bucket, backend_service_account, region=cloud_run.CPU_JOBS_REGION
+)
+audio_download_job = cloud_run.create_audio_download_job(
+    bucket, backend_service_account, region=cloud_run.CPU_JOBS_REGION
+)
+bulk_search_job = cloud_run.create_bulk_search_job(
+    bucket, backend_service_account, region=cloud_run.CPU_JOBS_REGION
+)
+storage_retention_job = cloud_run.create_storage_retention_job(
+    bucket, backend_service_account, region=cloud_run.CPU_JOBS_REGION
+)
+video_encoding_job = cloud_run.create_video_encoding_job(
+    bucket, backend_service_account, region=cloud_run.CPU_JOBS_REGION
+)
+
+# ==================== Error Monitor ====================
+
+# Cloud Run Job + Cloud Scheduler for automated error detection and digest reports
+error_monitor_resources = error_monitor_module.create_error_monitor(
+    backend_image=f"{REGION}-docker.pkg.dev/{PROJECT_ID}/karaoke-repo/karaoke-backend:latest",
+    backend_sa_email=backend_service_account.email,
+)
+
+# ==================== Monitoring ====================
+
+# Notification channels — every alert policy attaches all of these. Without
+# this step alerts fire into the void (verified 2026-05-17: three runner-
+# dispatcher create failures went undelivered for 14h).
+notification_channels = monitoring.create_notification_channels()
+
+# Alert policies
+alert_policies = monitoring.create_alert_policies(notification_channels)
+
+# Ephemeral GHA-runner dispatcher: log-based metrics + alerts
+runner_observability = monitoring.create_ephemeral_runner_observability(notification_channels)
+
+# Postmark SMTP-fallback failures (emails lost despite the fallback): metric + alert
+email_delivery_observability = monitoring.create_email_delivery_observability(notification_channels)
+
+# Event-loop stall alert (loop watchdog, 2026-10-03)
+event_loop_stall_observability = monitoring.create_event_loop_stall_observability(notification_channels)
+
+# ==================== Cloud Function: GDrive Validator ====================
+
+# Cloud Storage bucket for function source code
+function_bucket = storage.Bucket(
+    "gdrive-validator-function-source",
+    name=f"gdrive-validator-source-{PROJECT_ID}",
+    location="US-CENTRAL1",
+    force_destroy=True,
+    uniform_bucket_level_access=True,
+)
+
+# GDrive validator Cloud Function
+gdrive_validator_function = cloudfunctionsv2.Function(
+    "gdrive-validator-function",
+    name="gdrive-validator",
+    location=REGION,
+    description="Validates Nomad Karaoke Google Drive folder for duplicates and issues",
+    build_config=cloudfunctionsv2.FunctionBuildConfigArgs(
+        runtime="python312",
+        entry_point="validate_gdrive",
+        source=cloudfunctionsv2.FunctionBuildConfigSourceArgs(
+            storage_source=cloudfunctionsv2.FunctionBuildConfigSourceStorageSourceArgs(
+                bucket=function_bucket.name,
+                object="gdrive-validator-source.zip",
+            ),
+        ),
+    ),
+    service_config=cloudfunctionsv2.FunctionServiceConfigArgs(
+        available_memory="256M",
+        timeout_seconds=300,
+        min_instance_count=0,
+        max_instance_count=1,
+        service_account_email=gdrive_validator_sa.email,
+        environment_variables={
+            "GDRIVE_FOLDER_ID": GDRIVE_FOLDER_ID,
+            "NOTIFY_ON_SUCCESS": "false",
+            "EMAIL_TO": "gen@nomadkaraoke.com",
+            "EMAIL_FROM": "gen@nomadkaraoke.com",
+        },
+        secret_environment_variables=[
+            cloudfunctionsv2.FunctionServiceConfigSecretEnvironmentVariableArgs(
+                key="PUSHBULLET_API_KEY",
+                project_id=PROJECT_ID,
+                secret=all_secrets["pushbullet-api-key"].secret_id,
+                version="latest",
+            ),
+            cloudfunctionsv2.FunctionServiceConfigSecretEnvironmentVariableArgs(
+                key="POSTMARK_SERVER_TOKEN",
+                project_id=PROJECT_ID,
+                secret=all_secrets["postmark-server-token"].secret_id,
+                version="latest",
+            ),
+        ],
+    ),
+)
+
+# Allow Cloud Scheduler to invoke the function
+gdrive_validator_invoker = cloudfunctionsv2.FunctionIamMember(
+    "gdrive-validator-scheduler-invoker",
+    project=PROJECT_ID,
+    location=REGION,
+    cloud_function=gdrive_validator_function.name,
+    role="roles/cloudfunctions.invoker",
+    member=f"serviceAccount:service-{get_project_number()}@gcp-sa-cloudscheduler.iam.gserviceaccount.com",
+)
+
+# Allow function's service account to invoke itself (for Cloud Scheduler)
+gdrive_validator_sa_invoker = cloudfunctionsv2.FunctionIamMember(
+    "gdrive-validator-sa-invoker",
+    project=PROJECT_ID,
+    location=REGION,
+    cloud_function=gdrive_validator_function.name,
+    role="roles/cloudfunctions.invoker",
+    member=gdrive_validator_sa.email.apply(lambda email: f"serviceAccount:{email}"),
+)
+
+# Gen2 functions need Cloud Run invoker for the validator's own SA too
+# (Cloud Scheduler OIDC token hits Cloud Run, not Cloud Functions IAM)
+gdrive_validator_sa_run_invoker = gcp.cloudrunv2.ServiceIamMember(
+    "gdrive-validator-sa-run-invoker",
+    project=PROJECT_ID,
+    location=REGION,
+    name=gdrive_validator_function.name,
+    role="roles/run.invoker",
+    member=gdrive_validator_sa.email.apply(lambda email: f"serviceAccount:{email}"),
+)
+
+# Allow backend service account to invoke the validator (post-job trigger)
+gdrive_validator_backend_invoker = cloudfunctionsv2.FunctionIamMember(
+    "gdrive-validator-backend-invoker",
+    project=PROJECT_ID,
+    location=REGION,
+    cloud_function=gdrive_validator_function.name,
+    role="roles/cloudfunctions.invoker",
+    member=backend_service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+)
+
+# For Gen2 functions, also need Cloud Run invoker on the underlying service
+gdrive_validator_backend_run_invoker = gcp.cloudrunv2.ServiceIamMember(
+    "gdrive-validator-backend-run-invoker",
+    project=PROJECT_ID,
+    location=REGION,
+    name=gdrive_validator_function.name,  # Gen2 Cloud Run service matches function name
+    role="roles/run.invoker",
+    member=backend_service_account.email.apply(lambda email: f"serviceAccount:{email}"),
+)
+
+# Cloud Scheduler job to trigger validation daily
+gdrive_validator_scheduler = cloudscheduler.Job(
+    "gdrive-validator-scheduler",
+    name="gdrive-validator-daily",
+    description="Daily validation of Nomad Karaoke Google Drive folder",
+    region=REGION,
+    schedule="0 21 * * *",  # 9:00 PM every day
+    time_zone="America/New_York",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri=gdrive_validator_function.url,
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=gdrive_validator_sa.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=2,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# ==================== YouTube Upload Queue Processor ====================
+
+# Cloud Scheduler job to process deferred YouTube uploads hourly
+youtube_queue_scheduler = cloudscheduler.Job(
+    "youtube-queue-scheduler",
+    name="youtube-queue-hourly",
+    description="Process deferred YouTube uploads when API quota is available",
+    region=REGION,
+    schedule="0 * * * *",  # Every hour on the hour
+    time_zone="America/Los_Angeles",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/youtube-queue/process",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# ==================== Stale Review Processor ====================
+
+# Cloud Scheduler job to send review reminders and expire stale review jobs
+stale_review_scheduler = cloudscheduler.Job(
+    "stale-review-scheduler",
+    name="stale-review-hourly",
+    description="Send review reminders and expire stale review jobs",
+    region=REGION,
+    schedule="0 * * * *",  # Every hour on the hour
+    time_zone="America/Los_Angeles",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/process-stale-reviews",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# ==================== Requests Voting Board — Daily Community Track ====================
+
+# Cloud Scheduler job to pick + make the daily free community track. Fires at noon
+# US Eastern (DST-aware) so the picked requester has the afternoon/evening to do
+# their lyrics review. Idempotent: the per-UTC-day lock enforces one track/day.
+# Deploys dark — the picker no-ops until COMMUNITY_DAILY_PICK_ENABLED is set.
+community_daily_pick_scheduler = cloudscheduler.Job(
+    "community-daily-pick-scheduler",
+    name="community-daily-pick",
+    description="Pick and make the daily free community track from the requests board",
+    region=REGION,
+    schedule="0 12 * * *",  # Noon, in the timezone below
+    time_zone="America/New_York",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/community-daily-pick",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# Cloud Scheduler job to run the 24h ownership handoff for community picks hourly.
+community_handoff_scheduler = cloudscheduler.Job(
+    "community-handoff-scheduler",
+    name="community-handoff-hourly",
+    description="Hand off stale community-pick reviews to the next voter",
+    region=REGION,
+    schedule="30 * * * *",  # Every hour at :30 (offset from other hourly crons)
+    time_zone="UTC",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/community-handoffs",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# ==================== Disposable Domain Blocklist Sync ====================
+
+# Cloud Scheduler job to sync disposable email domain blocklist daily
+disposable_domains_sync_scheduler = cloudscheduler.Job(
+    "disposable-domains-sync-scheduler",
+    name="disposable-domains-sync-daily",
+    description="Daily sync of disposable email domain blocklist from GitHub",
+    region=REGION,
+    schedule="0 3 * * *",  # 3:00 AM UTC daily
+    time_zone="UTC",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/sync-disposable-domains",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=2,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# Cloud Scheduler job to rewrite existing YouTube video descriptions to the
+# current template (drains a quota-capped batch daily until the channel is done;
+# self-restarts a fresh cycle whenever the template changes). See
+# backend/workers/youtube_description_backfill_worker.py.
+youtube_description_backfill_scheduler = cloudscheduler.Job(
+    "youtube-description-backfill-scheduler",
+    name="youtube-description-backfill-daily",
+    description="Daily batch rewrite of existing YouTube video descriptions to the current template",
+    region=REGION,
+    schedule="0 9 * * *",  # 09:00 UTC daily
+    time_zone="UTC",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/youtube-backfill/run",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# Hourly YouTube comment auto-reply: replies to song requests in new channel
+# comments with a requests-board link. The backend no-ops unless
+# YOUTUBE_COMMENT_AUTOREPLY_ENABLED is set. See
+# backend/workers/youtube_comment_bot_worker.py.
+youtube_comment_autoreply_scheduler = cloudscheduler.Job(
+    "youtube-comment-autoreply-scheduler",
+    name="youtube-comment-autoreply-hourly",
+    description="Hourly reply to song requests in YouTube comments (requests board links)",
+    region=REGION,
+    schedule="17 * * * *",
+    time_zone="UTC",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/youtube-comments/run",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=0,
+    ),
+)
+
+# ==================== Storage Retention ====================
+
+# Daily purge of regenerable files (big finals, rendered videos, stems, ...) from
+# jobs completed >30 days ago — see backend/services/storage_retention.py. The
+# backend runs it DRY-RUN (report only) until STORAGE_RETENTION_DRY_RUN=false.
+storage_retention_scheduler = cloudscheduler.Job(
+    "storage-retention-scheduler",
+    name="storage-retention-daily",
+    description="Daily storage-retention pass (dry-run report until enabled)",
+    region=REGION,
+    schedule="30 10 * * *",  # 10:30 UTC daily (quiet hours for US customers)
+    time_zone="UTC",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/storage-retention/run",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# ==================== Stuck Job Recovery ====================
+
+# Cloud Scheduler job to detect and recover stuck audio downloads
+recover_stuck_downloads_scheduler = cloudscheduler.Job(
+    "recover-stuck-downloads-scheduler",
+    name="recover-stuck-downloads",
+    description="Detect and recover jobs stuck in downloading_audio status",
+    region=REGION,
+    # Every 10 min (was 5; 2026-09-26 cost cut — each tick streams the
+    # processing-status job docs from Firestore). Recovery sweeps only, with
+    # ~10-min stall thresholds, so worst-case detection moves from ~15 to ~20 min.
+    schedule="*/10 * * * *",
+    time_zone="America/Los_Angeles",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/recover-stuck-jobs",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# Cloud Scheduler job to auto-retry render jobs parked on GCE capacity exhaustion.
+# When us-central1-c is out of c4d-highcpu-32 capacity, the render worker now
+# parks the job in RENDER_PENDING_CAPACITY (instead of failing it) and this
+# scheduler retries up to 1 job per tick until it succeeds or hits the 24h
+# permanent-failure timeout.
+retry_pending_render_jobs_scheduler = cloudscheduler.Job(
+    "retry-pending-render-jobs-scheduler",
+    name="retry-pending-render-jobs",
+    description="Auto-retry render jobs parked on GCE encoding capacity exhaustion",
+    region=REGION,
+    # Every 10 min (was 5; 2026-09-26 cost cut — each tick streams the
+    # processing-status job docs from Firestore). Recovery sweeps only, with
+    # ~10-min stall thresholds, so worst-case detection moves from ~15 to ~20 min.
+    schedule="*/10 * * * *",
+    time_zone="America/Los_Angeles",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        uri="https://api.nomadkaraoke.com/api/internal/retry-pending-render-jobs",
+        http_method="POST",
+        oidc_token=cloudscheduler.JobHttpTargetOidcTokenArgs(
+            service_account_email=backend_service_account.email,
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# ==================== Divebar Mirror (Phase 1) ====================
+# Index diveBar Karaoke Google Drive files into BigQuery for search
+
+divebar_mirror_resources = divebar_mirror.create_divebar_mirror_resources(all_secrets)
+
+# Grant the karaoke-backend SA write+delete on the Divebar files bucket so it can
+# fast-sync freshly-published Nomad 720p masters straight into the GCS mirror that
+# kjbox pulls from every 5 min (nomad-master fast-sync). objectAdmin (not just
+# objectCreator) because the edit/rename/delete path removes stale objects too.
+# Scoped in code to the "files/Nomad Karaoke/MP4-720p/" prefix + NOMAD brand only.
+gcp.storage.BucketIAMMember(
+    "backend-divebar-files-master-writer",
+    bucket=divebar_mirror_resources["files_bucket"].name,
+    role="roles/storage.objectAdmin",
+    member=backend_service_account.email.apply(
+        lambda email: f"serviceAccount:{email}"
+    ),
+)
+
+# ==================== KaraokeNerds Data Sync (Phase 2) ====================
+# Daily sync of KN catalog and community data to BigQuery/GCS
+
+kn_data_sync_resources = kn_data_sync.create_kn_data_sync_resources(all_secrets)
+
+# ==================== Google Play RTDN ====================
+# Lets Google Play publish purchase notifications to the RevenueCat-owned topic
+
+play_rtdn_resources = play_rtdn.create_play_rtdn_resources()
+
+# ==================== Divebar Lookup API (Phase 3) ====================
+# Search/lookup API for KJ Controller + KN cross-reference index
+
+divebar_lookup_resources = divebar_lookup.create_divebar_lookup_resources(all_secrets)
+
+# The index function (divebar_mirror) chains the index-dependent scheduler jobs
+# (file-sync VM + xref rebuild) on completion, so its SA needs run permission on
+# those jobs — same least-privilege custom role the lookup SA uses for on-demand
+# refresh. Fixes the "Refresh catalog" race (sync VM ran before the index finished).
+gcp.projects.IAMMember(
+    "divebar-mirror-scheduler-runner",
+    project=PROJECT_ID,
+    role=divebar_lookup_resources["scheduler_runner_role"].id,
+    member=divebar_mirror_resources["service_account"].email.apply(
+        lambda email: f"serviceAccount:{email}"
+    ),
+)
+
+# ==================== Divebar File Sync VM ====================
+# Divebar File Sync VM (downloads karaoke files from Drive to GCS)
+divebar_sync_instance = divebar_sync_vm.create_divebar_sync_vm(
+    divebar_mirror_resources["service_account"]
+)
+
+# Cloud Scheduler to start the sync VM daily (uses compute.instances.start API)
+divebar_sync_scheduler = cloudscheduler.Job(
+    "divebar-sync-vm-scheduler",  # Must match Pulumi state
+    name="divebar-sync-vm-daily",
+    description="Start Divebar file sync VM daily to download new files from Drive to GCS",
+    region=REGION,
+    schedule="0 3 * * *",  # 3:00 AM ET (after index refresh at 2 AM)
+    time_zone="America/New_York",
+    http_target=cloudscheduler.JobHttpTargetArgs(
+        # Build the compute.instances.start endpoint from the instance name.
+        # NOTE: instance.self_link already resolves to a FULL URL
+        # (https://www.googleapis.com/compute/v1/projects/.../instances/divebar-sync),
+        # so prepending another host produced a doubled URL that 404'd (NOT_FOUND),
+        # silently stopping the nightly Drive->GCS byte sync. Construct the URL
+        # explicitly from project/zone/name to avoid depending on self_link's format.
+        uri=divebar_sync_instance.name.apply(
+            lambda name: (
+                f"https://compute.googleapis.com/compute/v1/"
+                f"projects/{PROJECT_ID}/zones/{ZONE}/instances/{name}/start"
+            )
+        ),
+        http_method="POST",
+        # compute.googleapis.com is a native Google API, so it requires an OAuth 2.0
+        # access token (cloud-platform scope) — NOT an OIDC identity token. Using
+        # oidc_token here caused HTTP 401 UNAUTHENTICATED once the URL was correct.
+        oauth_token=cloudscheduler.JobHttpTargetOauthTokenArgs(
+            service_account_email=divebar_mirror_resources["service_account"].email,
+            scope="https://www.googleapis.com/auth/cloud-platform",
+        ),
+    ),
+    retry_config=cloudscheduler.JobRetryConfigArgs(
+        retry_count=1,
+        min_backoff_duration="60s",
+        max_backoff_duration="300s",
+    ),
+)
+
+# Grant the SA permission to start/stop its own VM
+divebar_sync_compute_admin = gcp.projects.IAMMember(
+    "divebar-mirror-compute-instance-admin",  # Must match Pulumi state
+    project=PROJECT_ID,
+    role="roles/compute.instanceAdmin.v1",
+    member=divebar_mirror_resources["service_account"].email.apply(
+        lambda email: f"serviceAccount:{email}"
+    ),
+)
+
+# ==================== Backup to AWS ====================
+backup_resources = backup.create_backup_resources(all_secrets)
+
+# ==================== Audio Separator GPU Service ====================
+# Standalone Cloud Run GPU (L4, us-east4) audio-separator API service.
+# SHUT DOWN 2026-10-01 (GCP cost cut, ~$22/mo): prod jobs never used it —
+# separation runs in the `audio-separation-job` GPU Cloud Run Job (local GPU
+# mode). Its only callers were Andrew's own tools (kjbox original-vocals
+# scripts, kjbox/fastgen). To bring it back on demand, see
+# docs/GCP-COST-OPTIMIZATION.md § "Audio separator service (shut down, on-demand redeploy)":
+#   pulumi config set audioSeparatorServiceEnabled true && pulumi up --target ...
+AUDIO_SEPARATOR_SERVICE_ENABLED = (
+    pulumi.Config().get_bool("audioSeparatorServiceEnabled") or False
+)
+audio_separator_resources = None
+if AUDIO_SEPARATOR_SERVICE_ENABLED:
+    audio_separator_resources = audio_separator_service.create_all_resources()
+
+    # Grant audio separator read access to main storage bucket (for GCS URI passthrough)
+    gcp.storage.BucketIAMMember(
+        "audio-separator-storage-reader",
+        bucket=bucket.name,
+        role="roles/storage.objectViewer",
+        member=audio_separator_resources["service_account"].email.apply(
+            lambda email: f"serviceAccount:{email}"
+        ),
+    )
+
+# ==================== Compute VMs ====================
+
+# The c4d Spot blue-green pair (encoding-worker-a/-b + static IPs) was retired
+# 2026-11: the AWS EC2 worker (infrastructure/aws/) is the preferred encoder and
+# runs distribution; the c2df VM below is the GCP fallback.
+
+# Capacity-fallback Encoding Worker VM — one ON-DEMAND VM in a different zone AND
+# machine family from the c4d Spot pair, so a Spot/c4d stockout can't take out
+# every lane (incident 2026-08-12). Provisioned stopped; only started by the
+# application when the primary rejects a start. Cost when idle: the boot disk.
+# See EncodingWorkerConfig.FALLBACKS for the fleet definition.
+encoding_worker_fallback_ips = encoding_worker_vm.create_encoding_worker_fallback_ips()
+encoding_worker_fallback_instances = encoding_worker_vm.create_encoding_worker_fallback_vms(
+    encoding_worker_fallback_ips, encoding_worker_sa
+)
+
+encoding_worker_firewall = encoding_worker_vm.create_encoding_worker_firewall()
+
+# Grant backend SA permission to start encoding worker VMs
+backend_compute_perms = worker_sas.grant_backend_compute_permissions(backend_service_account)
+
+# Encoding Worker Idle Shutdown (auto-stop after 5 min idle, checked every 2 min)
+encoding_worker_idle_resources = encoding_worker_manager.create_idle_shutdown_resources()
+
+# GitHub Runners (CI/CD self-hosted runners)
+# Phase 4 (2026-05-17): the 7 long-lived github-runner-*/github-build-runner/
+# github-gpu-runner-* VMs and their always-billed 200GB pd-ssd boot disks were
+# decommissioned. The dispatcher now creates a fresh ephemeral VM per queued
+# job via JIT registration (RUNNER_MODE=ephemeral, see runner_manager Cloud
+# Function + ephemeral.py). The Cloud NAT below stays — ephemeral VMs use it
+# for outbound traffic with no external IPs.
+github_runners_router, github_runners_nat = github_runners.create_cloud_nat()
+
+# Create runner manager (webhook → ephemeral VM dispatch; scheduler → orphan
+# cleanup). No fixed VM pool to track anymore.
+runner_manager_resources = runner_manager.create_runner_manager_resources(
+    all_secrets["github-webhook-secret"],
+    all_secrets["github-runner-pat"],
+    runner_service_account=github_runner_sa,
+)
+
+
+# ==================== Exports ====================
+
+# Core infrastructure
+pulumi.export("project_id", PROJECT_ID)
+pulumi.export("bucket_name", bucket.name)
+pulumi.export("firestore_database", db_resources["firestore_db"].name)
+
+# Firestore indexes
+pulumi.export("firestore_index_jobs_user_email", db_resources["firestore_index_jobs_user_email"].name)
+pulumi.export("firestore_index_jobs_status", db_resources["firestore_index_jobs_status"].name)
+pulumi.export("firestore_index_jobs_tenant", db_resources["firestore_index_jobs_tenant"].name)
+pulumi.export("firestore_index_jobs_user_tenant", db_resources["firestore_index_jobs_user_tenant"].name)
+pulumi.export("firestore_index_sessions_active", db_resources["firestore_index_sessions_active"].name)
+pulumi.export("firestore_index_magic_links", db_resources["firestore_index_magic_links"].name)
+pulumi.export("firestore_index_gen_users_active_created", db_resources["firestore_index_gen_users_active_created"].name)
+pulumi.export("firestore_index_gen_users_active_login", db_resources["firestore_index_gen_users_active_login"].name)
+pulumi.export("firestore_index_gen_users_active_credits", db_resources["firestore_index_gen_users_active_credits"].name)
+pulumi.export("firestore_index_gen_users_active_email", db_resources["firestore_index_gen_users_active_email"].name)
+pulumi.export("firestore_field_logs_ttl", db_resources["firestore_field_logs_ttl"].name)
+pulumi.export("firestore_index_logs_worker_timestamp", db_resources["firestore_index_logs_worker_timestamp"].name)
+pulumi.export("firestore_index_gen_users_signup_ip", db_resources["firestore_index_gen_users_signup_ip"].name)
+pulumi.export("firestore_index_gen_users_device_fingerprint", db_resources["firestore_index_gen_users_device_fingerprint"].name)
+
+# Service accounts
+pulumi.export("service_account_email", backend_service_account.email)
+pulumi.export("github_actions_service_account", github_actions_service_account.email)
+pulumi.export("claude_automation_service_account", claude_automation_service_account.email)
+pulumi.export("claude_readonly_service_account", claude_readonly_service_account.email)
+pulumi.export("break_glass_service_account", break_glass_service_account.email)
+
+# Artifact Registry
+pulumi.export("artifact_repo_url", artifact_registry.get_repo_url(artifact_repo))
+
+# Workload Identity Federation
+pulumi.export("workload_identity_provider", wif_provider.name)
+
+# Cloud Tasks queues
+pulumi.export("audio_worker_queue", queues["audio-worker-queue"].name)
+pulumi.export("lyrics_worker_queue", queues["lyrics-worker-queue"].name)
+pulumi.export("screens_worker_queue", queues["screens-worker-queue"].name)
+pulumi.export("render_worker_queue", queues["render-worker-queue"].name)
+pulumi.export("video_worker_queue", queues["video-worker-queue"].name)
+
+# Cloud Run Jobs
+pulumi.export("video_encoding_job", video_encoding_job.name)
+pulumi.export("lyrics_transcription_job", lyrics_transcription_job.name)
+pulumi.export("audio_separation_job", audio_separation_job.name)
+pulumi.export("voice_pool_separate_job", voice_pool_separate_job.name)
+pulumi.export("audio_download_job", audio_download_job.name)
+pulumi.export("bulk_search_job", bulk_search_job.name)
+pulumi.export("backend_url", "https://api.nomadkaraoke.com")
+pulumi.export("backend_default_url", "https://karaoke-backend-ipzqd2k4yq-uc.a.run.app")
+
+# Cloudflare edge (DNS records, WAF, rate limiting, origin lock) — now managed
+# in modules/edge_security.py rather than hand-configured in the dashboard. The
+# `api` CNAME is proxied only when `edge:proxyProdApi=true`; otherwise it stays
+# DNS-only, exactly as before. Edge rules scope to prod via `edge:rolloutStage`.
+if edge_resources:
+    pulumi.export("edge_rollout_stage", edge_resources.get("stage"))
+    pulumi.export("edge_proxy_prod", edge_resources.get("proxy_prod"))
+    pulumi.export("edge_protected_hosts", edge_resources.get("hosts"))
+    pulumi.export(
+        "edge_staging_domain",
+        edge_resources["staging_domain_mapping"].name,
+    )
+
+# Alert policies
+pulumi.export("error_rate_alert_id", alert_policies["error_rate"].name)
+pulumi.export("queue_backlog_alert_id", alert_policies["queue_backlog"].name)
+pulumi.export("memory_alert_id", alert_policies["memory"].name)
+pulumi.export("service_unavailable_alert_id", alert_policies["service_unavailable"].name)
+pulumi.export(
+    "smtp_fallback_failure_alert_id",
+    email_delivery_observability["smtp_fallback_failure_alert"].name,
+)
+pulumi.export(
+    "event_loop_stall_alert_id",
+    event_loop_stall_observability["event_loop_stall_alert"].name,
+)
+
+# YouTube upload queue
+pulumi.export("youtube_upload_queue", queues["youtube-upload-queue"].name)
+pulumi.export("youtube_queue_scheduler_name", youtube_queue_scheduler.name)
+
+# GDrive validator
+pulumi.export("gdrive_validator_function_url", gdrive_validator_function.url)
+pulumi.export("gdrive_validator_function_name", gdrive_validator_function.name)
+pulumi.export("gdrive_validator_scheduler_name", gdrive_validator_scheduler.name)
+pulumi.export("recover_stuck_downloads_scheduler_name", recover_stuck_downloads_scheduler.name)
+pulumi.export("disposable_domains_sync_scheduler_name", disposable_domains_sync_scheduler.name)
+pulumi.export("gdrive_validator_service_account", gdrive_validator_sa.email)
+
+# Capacity-fallback VM exports (one per EncodingWorkerConfig.FALLBACKS entry,
+# keyed by suffix, e.g. encoding_worker_fallback_c2df_ip).
+for _fb, _fb_ip in zip(EncodingWorkerConfig.FALLBACKS, encoding_worker_fallback_ips):
+    pulumi.export(f"encoding_worker_fallback_{_fb['suffix']}_ip", _fb_ip.address)
+    pulumi.export(
+        f"encoding_worker_fallback_{_fb['suffix']}_url",
+        _fb_ip.address.apply(lambda ip: f"http://{ip}:8080"),
+    )
+pulumi.export("encoding_worker_service_account", encoding_worker_sa.email)
+
+# GitHub runners
+pulumi.export("github_runner_service_account", github_runner_sa.email)
+pulumi.export("github_runners_nat", github_runners_nat.name)
+
+# GitHub runner manager (auto-start/stop)
+pulumi.export("runner_manager_function_url", runner_manager_resources["function"].url)
+pulumi.export("runner_manager_scheduler_job", runner_manager_resources["scheduler_job"].name)
+
+# Divebar mirror (Phase 1)
+pulumi.export("divebar_mirror_function_url", divebar_mirror_resources["function"].url)
+pulumi.export("divebar_mirror_scheduler_name", divebar_mirror_resources["scheduler"].name)
+pulumi.export("divebar_files_bucket", divebar_mirror_resources["files_bucket"].name)
+
+# KaraokeNerds data sync (Phase 2)
+pulumi.export("kn_data_sync_function_url", kn_data_sync_resources["function"].url)
+pulumi.export("kn_data_bucket", kn_data_sync_resources["data_bucket"].name)
+
+# Divebar lookup API (Phase 3)
+pulumi.export("divebar_lookup_function_url", divebar_lookup_resources["function"].url)
+
+# Divebar file sync VM
+pulumi.export("divebar_sync_vm_name", divebar_sync_instance.name)
+pulumi.export("divebar_sync_scheduler_name", divebar_sync_scheduler.name)
+
+# Audio separator GPU service (only when re-enabled on demand)
+if audio_separator_resources is not None:
+    pulumi.export("audio_separator_service_url", audio_separator_resources["service"].uri)
+    pulumi.export("audio_separator_service_account", audio_separator_resources["service_account"].email)
+
+# Encoding worker idle shutdown
+pulumi.export("encoding_worker_idle_function_url", encoding_worker_idle_resources["function"].url)
+pulumi.export("encoding_worker_idle_scheduler", encoding_worker_idle_resources["scheduler"].name)
+
+# Backup to AWS
+pulumi.export("backup_function_url", backup_resources["function"].url)
+pulumi.export("backup_staging_bucket", backup_resources["staging_bucket"].name)
+pulumi.export("backup_scheduler_name", backup_resources["scheduler"].name)
+pulumi.export("backup_service_account", backup_resources["service_account"].email)
+
+# Error Monitor
+pulumi.export("error_monitor_job_name", error_monitor_resources["job"].name)
+pulumi.export("error_monitor_scheduler_sa", error_monitor_resources["scheduler_sa"].email)
+pulumi.export("error_monitor_scheduler_name", error_monitor_resources["monitor_scheduler"].name)
+pulumi.export("error_monitor_digest_scheduler_name", error_monitor_resources["digest_scheduler"].name)

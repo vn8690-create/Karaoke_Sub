@@ -1,0 +1,330 @@
+[
+  {
+    "slug": "maximo-park-by-the-monument",
+    "artist": "Maximo Park",
+    "title": "By the Monument",
+    "resultCount": 19,
+    "status": "awaiting_selection",
+    "file": "maximo-park-by-the-monument.json"
+  },
+  {
+    "slug": "hot-mulligan-pop-shuvit-hall-of-meat-duh-acoustic",
+    "artist": "Hot Mulligan",
+    "title": "Pop Shuvit (Hall of Meat, Duh) (Acoustic)",
+    "resultCount": 9,
+    "status": "awaiting_selection",
+    "file": "hot-mulligan-pop-shuvit-hall-of-meat-duh-acoustic.json"
+  },
+  {
+    "slug": "bon-jovi-it-s-my-life",
+    "artist": "Bon Jovi",
+    "title": "It's My Life",
+    "resultCount": 47,
+    "status": "awaiting_selection",
+    "file": "bon-jovi-it-s-my-life.json"
+  },
+  {
+    "slug": "pony-bradshaw-10x10",
+    "artist": "Pony Bradshaw",
+    "title": "10x10",
+    "resultCount": 8,
+    "status": "awaiting_selection",
+    "file": "pony-bradshaw-10x10.json"
+  },
+  {
+    "slug": "sawyer-hill-masochistic-lover",
+    "artist": "Sawyer Hill",
+    "title": "Masochistic Lover",
+    "resultCount": 9,
+    "status": "awaiting_selection",
+    "file": "sawyer-hill-masochistic-lover.json"
+  },
+  {
+    "slug": "astn-happier-than-ever",
+    "artist": "ASTN",
+    "title": "Happier Than Ever",
+    "resultCount": 5,
+    "status": "awaiting_selection",
+    "file": "astn-happier-than-ever.json"
+  },
+  {
+    "slug": "quail-what-you-got",
+    "artist": "Quail",
+    "title": "What You Got",
+    "resultCount": 5,
+    "status": "awaiting_selection",
+    "file": "quail-what-you-got.json"
+  },
+  {
+    "slug": "hot-mulligan-pop-shuvit-hall-of-meat-duh",
+    "artist": "Hot Mulligan",
+    "title": "Pop Shuvit (Hall of Meat, Duh)",
+    "resultCount": 7,
+    "status": "awaiting_selection",
+    "file": "hot-mulligan-pop-shuvit-hall-of-meat-duh.json"
+  },
+  {
+    "slug": "the-mountain-goats-source-decay",
+    "artist": "The Mountain Goats",
+    "title": "Source Decay",
+    "resultCount": 14,
+    "status": "awaiting_selection",
+    "file": "the-mountain-goats-source-decay.json"
+  },
+  {
+    "slug": "linkin-park-final-masquerade",
+    "artist": "Linkin Park",
+    "title": "Final Masquerade",
+    "resultCount": 32,
+    "status": "awaiting_selection",
+    "file": "linkin-park-final-masquerade.json"
+  },
+  {
+    "slug": "purim-shpiel-i-love-you-koreh",
+    "artist": "Purim Shpiel",
+    "title": "I Love You, KoREH",
+    "resultCount": 10,
+    "status": "awaiting_selection",
+    "file": "purim-shpiel-i-love-you-koreh.json"
+  },
+  {
+    "slug": "purim-shpiel-keep-on-achieving",
+    "artist": "Purim Shpiel",
+    "title": "Keep On Achieving",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "purim-shpiel-keep-on-achieving.json"
+  },
+  {
+    "slug": "purim-shpiel-525-060-b-nai-mitzvah",
+    "artist": "Purim Shpiel",
+    "title": "525,060 B'nai Mitzvah",
+    "resultCount": 10,
+    "status": "awaiting_selection",
+    "file": "purim-shpiel-525-060-b-nai-mitzvah.json"
+  },
+  {
+    "slug": "purim-shpiel-i-ve-been-changed-at-koreh",
+    "artist": "Purim Shpiel",
+    "title": "I've Been Changed at KoREH",
+    "resultCount": 10,
+    "status": "awaiting_selection",
+    "file": "purim-shpiel-i-ve-been-changed-at-koreh.json"
+  },
+  {
+    "slug": "hollow-coves-blessings",
+    "artist": "Hollow Coves",
+    "title": "Blessings",
+    "resultCount": 17,
+    "status": "awaiting_selection",
+    "file": "hollow-coves-blessings.json"
+  },
+  {
+    "slug": "eyehategod-jack-ass-in-the-will-of-god",
+    "artist": "Eyehategod",
+    "title": "Jack ass in the will of god",
+    "resultCount": 22,
+    "status": "awaiting_selection",
+    "file": "eyehategod-jack-ass-in-the-will-of-god.json"
+  },
+  {
+    "slug": "jack-kays-the-rug",
+    "artist": "Jack Kays",
+    "title": "The Rug",
+    "resultCount": 9,
+    "status": "awaiting_selection",
+    "file": "jack-kays-the-rug.json"
+  },
+  {
+    "slug": "pitchshifter-genius",
+    "artist": "Pitchshifter",
+    "title": "Genius",
+    "resultCount": 29,
+    "status": "awaiting_selection",
+    "file": "pitchshifter-genius.json"
+  },
+  {
+    "slug": "japanese-breakfast-till-death",
+    "artist": "Japanese Breakfast",
+    "title": "Till Death",
+    "resultCount": 21,
+    "status": "awaiting_selection",
+    "file": "japanese-breakfast-till-death.json"
+  },
+  {
+    "slug": "pierce-the-veil-she-makes-dirty-words-sound-pretty",
+    "artist": "Pierce The Veil",
+    "title": "She Makes Dirty Words Sound Pretty",
+    "resultCount": 17,
+    "status": "awaiting_selection",
+    "file": "pierce-the-veil-she-makes-dirty-words-sound-pretty.json"
+  },
+  {
+    "slug": "cage-the-elephant-ain-t-no-rest-for-the-wicked",
+    "artist": "Cage The elephant",
+    "title": "Ain't no rest for the wicked",
+    "resultCount": 37,
+    "status": "awaiting_selection",
+    "file": "cage-the-elephant-ain-t-no-rest-for-the-wicked.json"
+  },
+  {
+    "slug": "steve-taylor-jim-morrison-s-grave",
+    "artist": "Steve Taylor",
+    "title": "Jim Morrison's Grave",
+    "resultCount": 11,
+    "status": "awaiting_selection",
+    "file": "steve-taylor-jim-morrison-s-grave.json"
+  },
+  {
+    "slug": "eyehategod-shoplift",
+    "artist": "Eyehategod",
+    "title": "Shoplift",
+    "resultCount": 21,
+    "status": "awaiting_selection",
+    "file": "eyehategod-shoplift.json"
+  },
+  {
+    "slug": "eyehategod-blank",
+    "artist": "Eyehategod",
+    "title": "Blank",
+    "resultCount": 21,
+    "status": "awaiting_selection",
+    "file": "eyehategod-blank.json"
+  },
+  {
+    "slug": "eyehategod-agitation-propaganda",
+    "artist": "Eyehategod",
+    "title": "Agitation! Propaganda!",
+    "resultCount": 18,
+    "status": "awaiting_selection",
+    "file": "eyehategod-agitation-propaganda.json"
+  },
+  {
+    "slug": "eyehategod-medicine-noose",
+    "artist": "Eyehategod",
+    "title": "Medicine noose",
+    "resultCount": 9,
+    "status": "awaiting_selection",
+    "file": "eyehategod-medicine-noose.json"
+  },
+  {
+    "slug": "the-swirling-eddies-pyro-sets-a-wildfire",
+    "artist": "The Swirling Eddies",
+    "title": "Pyro Sets a Wildfire",
+    "resultCount": 17,
+    "status": "awaiting_selection",
+    "file": "the-swirling-eddies-pyro-sets-a-wildfire.json"
+  },
+  {
+    "slug": "novo-amor-vantablack",
+    "artist": "novo amor",
+    "title": "Vantablack",
+    "resultCount": 21,
+    "status": "awaiting_selection",
+    "file": "novo-amor-vantablack.json"
+  },
+  {
+    "slug": "super-cassette-invincibility-star",
+    "artist": "Super Cassette",
+    "title": "Invincibility Star",
+    "resultCount": 6,
+    "status": "awaiting_selection",
+    "file": "super-cassette-invincibility-star.json"
+  },
+  {
+    "slug": "pigeon-pit-josephine-county-blues",
+    "artist": "Pigeon Pit",
+    "title": "Josephine County Blues",
+    "resultCount": 3,
+    "status": "awaiting_selection",
+    "file": "pigeon-pit-josephine-county-blues.json"
+  },
+  {
+    "slug": "set-it-off-wolf-in-sheep-s-clothing",
+    "artist": "Set it off",
+    "title": "Wolf in sheep's clothing",
+    "resultCount": 27,
+    "status": "awaiting_selection",
+    "file": "set-it-off-wolf-in-sheep-s-clothing.json"
+  },
+  {
+    "slug": "joe-nichols-sunny-and-75",
+    "artist": "Joe Nichols",
+    "title": "Sunny and 75",
+    "resultCount": 17,
+    "status": "awaiting_selection",
+    "file": "joe-nichols-sunny-and-75.json"
+  },
+  {
+    "slug": "the-something-specials-aces",
+    "artist": "The Something Specials",
+    "title": "Aces",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "the-something-specials-aces.json"
+  },
+  {
+    "slug": "over-the-garden-wall-the-blasting-company-patient-is-the-night",
+    "artist": "Over The Garden Wall (The Blasting Company)",
+    "title": "Patient Is The Night",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "over-the-garden-wall-the-blasting-company-patient-is-the-night.json"
+  },
+  {
+    "slug": "dawid-podsiad-o-p-t-adamczyk-phantom-liberty",
+    "artist": "Dawid Podsiadło, P.T. Adamczyk",
+    "title": "Phantom Liberty",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "dawid-podsiad-o-p-t-adamczyk-phantom-liberty.json"
+  },
+  {
+    "slug": "social-distortion-1945-13th-floor-version",
+    "artist": "Social Distortion",
+    "title": "1945 (13th Floor Version)",
+    "resultCount": 17,
+    "status": "awaiting_selection",
+    "file": "social-distortion-1945-13th-floor-version.json"
+  },
+  {
+    "slug": "yarbrough-and-peoples-guilty",
+    "artist": "Yarbrough And Peoples",
+    "title": "Guilty",
+    "resultCount": 17,
+    "status": "awaiting_selection",
+    "file": "yarbrough-and-peoples-guilty.json"
+  },
+  {
+    "slug": "phil-collins-amy-keys-separate-lives-live-in-paris-2004",
+    "artist": "Phil Collins & Amy Keys",
+    "title": "Separate Lives (Live In Paris 2004)",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "phil-collins-amy-keys-separate-lives-live-in-paris-2004.json"
+  },
+  {
+    "slug": "kenny-wayne-shepherd-everything-is-broken",
+    "artist": "Kenny Wayne Shepherd",
+    "title": "Everything Is Broken",
+    "resultCount": 18,
+    "status": "awaiting_selection",
+    "file": "kenny-wayne-shepherd-everything-is-broken.json"
+  },
+  {
+    "slug": "nick-lowe-true-love-travels-on-a-gravel-road",
+    "artist": "Nick Lowe",
+    "title": "True Love Travels on a Gravel Road",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "nick-lowe-true-love-travels-on-a-gravel-road.json"
+  },
+  {
+    "slug": "jasmine-thompson-you-are-my-sunshine",
+    "artist": "Jasmine Thompson",
+    "title": "You Are My Sunshine",
+    "resultCount": 15,
+    "status": "awaiting_selection",
+    "file": "jasmine-thompson-you-are-my-sunshine.json"
+  }
+]

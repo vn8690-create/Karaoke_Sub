@@ -1,0 +1,1132 @@
+"""
+Worker coordination service.
+
+Handles triggering and coordinating background workers.
+Supports two modes:
+- Cloud Tasks (production): Guaranteed delivery, automatic retries, horizontal scaling
+- Direct HTTP (development): Faster iteration, simpler debugging
+
+SOLID Principles:
+- Single Responsibility: Only handles worker coordination
+- Dependency Inversion: Depends on HTTP abstraction, not implementation
+- Open/Closed: Can add new workers without modifying existing code
+
+Observability:
+- Propagates trace context through Cloud Tasks for distributed tracing
+- All worker invocations create spans linked to original request trace
+"""
+import asyncio
+import logging
+import os
+import json
+from typing import Optional
+import httpx
+from google.api_core import exceptions as gcp_exceptions
+from google.protobuf import duration_pb2
+
+from backend.config import get_settings, is_production
+from backend.services.fake_workers import fake_workers_enabled
+from backend.services.tracing import inject_trace_context
+
+
+logger = logging.getLogger(__name__)
+
+
+# Transient control-plane errors from the Cloud Run Jobs Admin API (`JobsClient.run_job`)
+# that are safe to retry. run_job only *enqueues* an execution, so a one-off 5xx/429 from
+# the API control plane should be retried rather than hard-failing a real job's trigger.
+# (2026-08-24: a single 503 from lyrics-transcription-job's trigger failed a real job's
+# transcription with no retry — this is the guard.)
+_TRANSIENT_RUN_JOB_ERRORS = (
+    gcp_exceptions.ServiceUnavailable,    # 503
+    gcp_exceptions.InternalServerError,   # 500
+    gcp_exceptions.GatewayTimeout,        # 504
+    gcp_exceptions.TooManyRequests,       # 429
+)
+_RUN_JOB_MAX_ATTEMPTS = 3
+_RUN_JOB_BASE_DELAY_SECONDS = 1.0
+
+
+# Mapping of worker types to their Cloud Tasks queue names
+# These queues are created by Pulumi in infrastructure/__main__.py
+WORKER_QUEUES = {
+    "audio": "audio-worker-queue",
+    "lyrics": "lyrics-worker-queue",
+    "screens": "screens-worker-queue",
+    "render-video": "render-worker-queue",
+    "video": "video-worker-queue",
+    "idle-reminder": "idle-reminder-queue",  # For delayed idle reminder checks
+    "gdrive-validation": "gdrive-validation-queue",  # For delayed post-job validation
+}
+
+# Dispatch deadlines for each worker type (in seconds)
+# Cloud Tasks max is 1800s (30 min). These set how long Cloud Tasks waits
+# for the HTTP handler to respond before considering it failed.
+# Must be >= actual worker timeout + buffer for startup/upload.
+WORKER_DISPATCH_DEADLINES = {
+    "audio": 1800,       # 30 min - Modal separation can take 15-20 min
+    "lyrics": 1500,      # 25 min - TRANSCRIPTION_TIMEOUT_SECONDS is 1200s (20 min)
+    "screens": 600,      # 10 min - Screen generation is fast
+    "render-video": 1800,  # 30 min - Video encoding can be slow
+    "video": 1800,       # 30 min - Video encoding can be slow
+    "idle-reminder": 60, # 1 min - Quick check and potential email send
+    "gdrive-validation": 120, # 2 min - Calls Cloud Function which validates GDrive
+}
+
+# Default delay for idle reminders (seconds)
+IDLE_REMINDER_DELAY_SECONDS = 2 * 60  # 2 minutes
+
+# Default delay for post-job GDrive validation (seconds)
+# Gives E2E tests time to verify output and clean up before validator runs
+GDRIVE_VALIDATION_DELAY_SECONDS = 5 * 60  # 5 minutes
+
+
+class WorkerService:
+    """
+    Service for coordinating background workers.
+    
+    Supports two execution modes controlled by ENABLE_CLOUD_TASKS env var:
+    
+    1. Cloud Tasks mode (production, ENABLE_CLOUD_TASKS=true):
+       - Tasks enqueued to Cloud Tasks for guaranteed delivery
+       - Automatic retries on failure
+       - Each task runs in dedicated Cloud Run instance
+       - Rate limiting to protect external APIs (Modal, AudioShake)
+       
+    2. Direct HTTP mode (development, ENABLE_CLOUD_TASKS=false):
+       - Direct HTTP POST to internal worker endpoints
+       - Worker runs as FastAPI BackgroundTask
+       - Faster iteration for local development
+       - No retry guarantees
+    """
+    
+    def __init__(self):
+        """Initialize worker service."""
+        self.settings = get_settings()
+        self._base_url = self._get_base_url()
+        self._admin_token = self._get_admin_token()
+        self._use_cloud_tasks = self._should_use_cloud_tasks()
+        self._tasks_client = None
+        # Strong refs to in-flight encoding-worker warmups (see
+        # _start_encoding_worker_warmup) so the event loop can't GC them mid-run.
+        self._warmup_tasks: set = set()
+        
+        if self._use_cloud_tasks:
+            logger.info("WorkerService initialized with Cloud Tasks mode")
+        else:
+            logger.info("WorkerService initialized with direct HTTP mode")
+    
+    def _should_use_cloud_tasks(self) -> bool:
+        """
+        Check if Cloud Tasks should be used for worker coordination.
+        
+        Controlled by ENABLE_CLOUD_TASKS setting (from environment variable).
+        Default is false (direct HTTP mode) for backward compatibility.
+        
+        Returns:
+            True if Cloud Tasks should be used, False for direct HTTP
+        """
+        return self.settings.enable_cloud_tasks
+    
+    @property
+    def tasks_client(self):
+        """
+        Lazy-initialize Cloud Tasks client.
+        
+        Only created when needed to avoid import overhead in development mode.
+        """
+        if self._tasks_client is None and self._use_cloud_tasks:
+            try:
+                from google.cloud import tasks_v2
+                self._tasks_client = tasks_v2.CloudTasksClient()
+            except ImportError:
+                logger.error(
+                    "google-cloud-tasks not installed. "
+                    "Install with: pip install google-cloud-tasks"
+                )
+                raise
+        return self._tasks_client
+    
+    def _get_admin_token(self) -> Optional[str]:
+        """
+        Get admin token for internal API authentication.
+        
+        Returns the first admin token from ADMIN_TOKENS env var.
+        """
+        admin_tokens_str = self.settings.admin_tokens or ""
+        tokens = [t.strip() for t in admin_tokens_str.split(",") if t.strip()]
+        if tokens:
+            return tokens[0]
+        return None
+    
+    def _get_base_url(self) -> str:
+        """
+        Get base URL for internal API calls.
+        
+        Priority:
+        1. TEST_SERVER_URL env var (for tests)
+        2. CLOUD_RUN_SERVICE_URL env var (for Cloud Tasks to call back)
+        3. localhost with PORT env var (for development)
+        
+        Returns:
+            Base URL for API calls
+        """
+        # Check for test environment override
+        test_url = os.getenv("TEST_SERVER_URL")
+        if test_url:
+            return test_url
+        
+        # Production: Cloud Run service URL
+        # This must be the publicly accessible URL for Cloud Tasks to call
+        service_url = os.getenv("CLOUD_RUN_SERVICE_URL")
+        if service_url:
+            return service_url
+        
+        # Development mode: use localhost with PORT env var
+        port = os.getenv("PORT", "8000")
+        return f"http://localhost:{port}"
+    
+    async def trigger_worker(
+        self,
+        worker_type: str,
+        job_id: str,
+        timeout_seconds: int = 30
+    ) -> bool:
+        """
+        Trigger a background worker for a job.
+        
+        In production (ENABLE_CLOUD_TASKS=true):
+          - Enqueues task to Cloud Tasks queue
+          - Cloud Tasks delivers HTTP request to internal endpoint
+          - Automatic retries on failure with exponential backoff
+          - Rate limiting protects external APIs
+          
+        In development (ENABLE_CLOUD_TASKS=false):
+          - Direct HTTP POST to internal endpoint
+          - Faster iteration, but no retry guarantees
+          - Worker runs in same container as API
+        
+        Args:
+            worker_type: Worker type ("audio", "lyrics", "screens", "render-video", "video")
+            job_id: Job ID to process
+            timeout_seconds: Request timeout (for direct HTTP mode)
+            
+        Returns:
+            True if trigger successful (or task enqueued), False otherwise
+        """
+        if self._use_cloud_tasks:
+            return await self._enqueue_cloud_task(worker_type, job_id)
+        else:
+            return await self._trigger_http(worker_type, job_id, timeout_seconds)
+    
+    async def _enqueue_cloud_task(self, worker_type: str, job_id: str) -> bool:
+        """
+        Enqueue task to Cloud Tasks for guaranteed delivery.
+        
+        The task will be delivered as an HTTP POST to the internal worker endpoint.
+        Cloud Tasks handles:
+        - Retry on failure (with exponential backoff)
+        - Rate limiting (max dispatches per second)
+        - Deduplication (via task name if needed)
+        - OIDC authentication for Cloud Run
+        
+        Observability:
+        - Injects trace context headers so worker spans link to parent trace
+        
+        Args:
+            worker_type: Worker type
+            job_id: Job ID to process
+            
+        Returns:
+            True if task enqueued successfully, False otherwise
+        """
+        try:
+            from google.cloud import tasks_v2
+            
+            queue_name = WORKER_QUEUES.get(worker_type)
+            if not queue_name:
+                logger.error(f"Unknown worker type: {worker_type}")
+                return False
+            
+            project = self.settings.google_cloud_project
+            if not project:
+                logger.error("GOOGLE_CLOUD_PROJECT not set, cannot enqueue Cloud Task")
+                return False
+                
+            location = self.settings.cloud_tasks_region  # queues all live here, NOT gcp_region
+            
+            # Build queue path
+            parent = self.tasks_client.queue_path(project, location, queue_name)
+            
+            # Build base headers
+            headers = {
+                "Content-Type": "application/json",
+            }
+            
+            # Add admin auth via custom header
+            # NOTE: We use X-Admin-Token instead of Authorization because Cloud Tasks
+            # OIDC token overwrites the Authorization header when oidc_token is specified.
+            # The OIDC token handles Cloud Run authentication (allows Cloud Tasks to invoke
+            # the service), while X-Admin-Token handles application-level authentication.
+            if self._admin_token:
+                headers["X-Admin-Token"] = self._admin_token
+                logger.debug(
+                    f"[job:{job_id}] Using admin token for Cloud Task auth via X-Admin-Token, "
+                    f"token prefix: {self._admin_token[:8]}..., len={len(self._admin_token)}"
+                )
+            
+            # Inject trace context for distributed tracing
+            # This allows worker spans to link back to the original request trace
+            headers = inject_trace_context(headers)
+            
+            # Get dispatch deadline for this worker type (how long Cloud Tasks waits for response)
+            dispatch_deadline_seconds = WORKER_DISPATCH_DEADLINES.get(worker_type, 600)
+
+            # Build task payload
+            task = {
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": f"{self._base_url}/api/internal/workers/{worker_type}",
+                    "headers": headers,
+                    "body": json.dumps({"job_id": job_id}).encode(),
+                    # Use OIDC token for Cloud Run authentication
+                    # This allows Cloud Tasks to invoke the Cloud Run service
+                    "oidc_token": {
+                        "service_account_email": f"karaoke-backend@{project}.iam.gserviceaccount.com",
+                    },
+                },
+                # Set dispatch_deadline - how long Cloud Tasks waits for the handler to respond
+                # Default is 10 min, but audio separation can take 30+ min
+                # Max is 1800s (30 min) for Cloud Tasks
+                "dispatch_deadline": duration_pb2.Duration(seconds=dispatch_deadline_seconds),
+            }
+            
+            # Create task
+            # Note: We don't set a task name, allowing Cloud Tasks to generate one
+            # This prevents duplicate task errors on retries
+            response = self.tasks_client.create_task(parent=parent, task=task)
+            logger.info(
+                f"[job:{job_id}] Created Cloud Task for {worker_type} worker: {response.name} "
+                f"(dispatch_deadline={dispatch_deadline_seconds}s)"
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(
+                f"[job:{job_id}] Failed to enqueue Cloud Task for {worker_type}: {e}",
+                exc_info=True
+            )
+            return False
+    
+    async def _trigger_http(
+        self,
+        worker_type: str,
+        job_id: str,
+        timeout_seconds: int = 30
+    ) -> bool:
+        """
+        Trigger worker via direct HTTP call (development mode).
+        
+        This is the original implementation - direct HTTP POST to internal endpoint.
+        The endpoint adds the worker function to FastAPI BackgroundTasks.
+        
+        Observability:
+        - Injects trace context headers so worker spans link to parent trace
+        
+        Args:
+            worker_type: Worker type
+            job_id: Job ID to process
+            timeout_seconds: Request timeout
+            
+        Returns:
+            True if trigger successful, False otherwise
+        """
+        try:
+            # Build headers with admin auth token
+            headers = {}
+            if self._admin_token:
+                headers["Authorization"] = f"Bearer {self._admin_token}"
+            
+            # Inject trace context for distributed tracing
+            headers = inject_trace_context(headers)
+            
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                url = f"{self._base_url}/api/internal/workers/{worker_type}"
+                
+                response = await client.post(
+                    url,
+                    json={"job_id": job_id},
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"[job:{job_id}] Successfully triggered {worker_type} worker")
+                    return True
+                else:
+                    logger.error(
+                        f"[job:{job_id}] Failed to trigger {worker_type} worker: "
+                        f"HTTP {response.status_code} - {response.text}"
+                    )
+                    return False
+                    
+        except httpx.TimeoutException:
+            logger.error(f"[job:{job_id}] Timeout triggering {worker_type} worker")
+            return False
+            
+        except Exception as e:
+            logger.error(
+                f"[job:{job_id}] Error triggering {worker_type} worker: {e}",
+                exc_info=True
+            )
+            return False
+    
+    def _dispatch_fake(self, kind: str, job_id: str) -> bool:
+        """FAKE_WORKERS (local stack): run the in-process fake instead of the real worker."""
+        from backend.services.fake_workers import dispatch
+
+        return dispatch(kind, job_id)
+
+    # Convenience methods for specific workers
+    # These provide a cleaner API and better IDE autocomplete
+
+    async def trigger_audio_download_worker(self, job_id: str, keep_trying: bool = False) -> bool:
+        """
+        Trigger audio download worker.
+
+        Downloads audio from the selected source (Spotify, YouTube, RED, OPS)
+        and then triggers audio separation + lyrics workers.
+
+        Uses Cloud Run Jobs to avoid instance termination during long-running
+        downloads. This replaces the BackgroundTasks approach that caused
+        jobs to get stuck when Cloud Run scaled down instances.
+
+        The execution timeout is overridden to fit the torrent stall budget
+        (longer for a user's "Keep trying" retry) — see audio_download_limits.
+        """
+        if fake_workers_enabled(self.settings):
+            return self._dispatch_fake("audio_download", job_id)
+        from backend.services.audio_download_limits import task_timeout_seconds
+
+        return await self._trigger_worker_cloud_run_job(
+            job_id=job_id,
+            cloud_run_job_name="audio-download-job",
+            worker_module="audio_download_worker",
+            location=self.settings.cpu_jobs_region,
+            timeout_seconds=task_timeout_seconds(keep_trying),
+        )
+
+    async def trigger_bulk_search_worker(self, batch_id: str) -> bool:
+        """Trigger the Bulk Mode search worker for a whole batch as a Cloud Run Job.
+
+        The worker processes every job stamped with ``batch_id``: it runs each
+        audio search, auto-selects confident lossless matches, and parks the rest
+        in AWAITING_AUDIO_SELECTION. Uses a Cloud Run Job (not BackgroundTasks) so
+        the batch survives API instance scale-down and the user can close the tab.
+        """
+        if not self._use_cloud_tasks and not is_production():
+            return self._run_worker_module_locally(
+                "bulk_search_worker", ["--batch-id", batch_id], log_prefix=f"[batch:{batch_id}]"
+            )
+        try:
+            from google.cloud import run_v2
+
+            project = self.settings.google_cloud_project
+            if not project:
+                logger.error("GOOGLE_CLOUD_PROJECT not set, cannot trigger bulk search job")
+                return False
+
+            location = self.settings.cpu_jobs_region
+            job_name = f"projects/{project}/locations/{location}/jobs/bulk-search-job"
+            client = run_v2.JobsClient()
+            request = run_v2.RunJobRequest(
+                name=job_name,
+                overrides=run_v2.RunJobRequest.Overrides(
+                    container_overrides=[
+                        run_v2.RunJobRequest.Overrides.ContainerOverride(
+                            args=[
+                                "python", "-m", "backend.workers.bulk_search_worker",
+                                "--batch-id", batch_id,
+                            ],
+                        )
+                    ]
+                ),
+            )
+            operation = await self._run_job_with_retry(
+                client, request, log_prefix=f"[batch:{batch_id}]"
+            )
+            logger.info(f"[batch:{batch_id}] Started Cloud Run Job bulk-search-job: {operation.metadata}")
+            return True
+        except Exception as e:
+            logger.error(
+                f"[batch:{batch_id}] Failed to trigger bulk-search-job: {e}", exc_info=True
+            )
+            return False
+
+    async def trigger_storage_retention_job(
+        self,
+        dry_run: bool,
+        report_path: str,
+        max_jobs: Optional[int] = None,
+        include_orphans: bool = False,
+        mode: str = "job_purge",
+        max_folders: Optional[int] = None,
+    ) -> bool:
+        """Start the storage-retention pass as the ``storage-retention-job`` Cloud Run Job.
+
+        A full pass takes minutes; the API service throttles CPU outside requests
+        and Cloudflare cuts requests at 100s, so it can't run in the request.
+        """
+        args = ["--dry-run", "true" if dry_run else "false", "--report-path", report_path]
+        if max_jobs is not None:
+            args += ["--max-jobs", str(int(max_jobs))]
+        if include_orphans:
+            args.append("--include-orphans")
+        if mode != "job_purge":
+            args += ["--mode", mode]
+        if max_folders is not None:
+            args += ["--max-folders", str(int(max_folders))]
+        if not self._use_cloud_tasks and not is_production():
+            return self._run_worker_module_locally("storage_retention_worker", args, log_prefix="[storage-retention]")
+        try:
+            from google.cloud import run_v2
+
+            project = self.settings.google_cloud_project
+            if not project:
+                logger.error("GOOGLE_CLOUD_PROJECT not set, cannot trigger storage-retention-job")
+                return False
+            job_name = f"projects/{project}/locations/{self.settings.cpu_jobs_region}/jobs/storage-retention-job"
+            request = run_v2.RunJobRequest(
+                name=job_name,
+                overrides=run_v2.RunJobRequest.Overrides(
+                    container_overrides=[
+                        run_v2.RunJobRequest.Overrides.ContainerOverride(
+                            args=["python", "-m", "backend.workers.storage_retention_worker", *args],
+                        )
+                    ]
+                ),
+            )
+            operation = await self._run_job_with_retry(
+                run_v2.JobsClient(), request, log_prefix="[storage-retention]"
+            )
+            logger.info(f"[storage-retention] Started Cloud Run Job storage-retention-job: {operation.metadata}")
+            return True
+        except Exception as e:
+            logger.error(f"[storage-retention] Failed to trigger storage-retention-job: {e}", exc_info=True)
+            return False
+
+    async def trigger_audio_worker(self, job_id: str) -> bool:
+        """
+        Trigger audio separation worker.
+
+        Uses Cloud Run Jobs with L4 GPU in us-east4 for direct audio separation.
+        """
+        if fake_workers_enabled(self.settings):
+            return self._dispatch_fake("audio", job_id)
+        return await self._trigger_worker_cloud_run_job(
+            job_id=job_id,
+            cloud_run_job_name="audio-separation-job",
+            worker_module="audio_worker",
+            location="us-east4",  # GPU job runs in us-east4 (L4 quota)
+        )
+
+    async def trigger_lyrics_worker(self, job_id: str) -> bool:
+        """
+        Trigger lyrics transcription worker.
+
+        Always uses Cloud Run Jobs to avoid instance termination during long-running
+        AudioShake transcription. The BackgroundTasks approach caused Cloud Run to
+        terminate instances mid-processing (e.g., job c94cc9d6) when no HTTP requests
+        were active, even though the worker was still processing.
+        """
+        if fake_workers_enabled(self.settings):
+            return self._dispatch_fake("lyrics", job_id)
+        return await self._trigger_worker_cloud_run_job(
+            job_id=job_id,
+            cloud_run_job_name="lyrics-transcription-job",
+            worker_module="lyrics_worker",
+            location=self.settings.cpu_jobs_region,
+        )
+    
+    async def trigger_screens_worker(self, job_id: str) -> bool:
+        """Trigger screen generation worker."""
+        if fake_workers_enabled(self.settings):
+            return self._dispatch_fake("screens", job_id)
+        return await self.trigger_worker("screens", job_id)
+
+    async def trigger_auto_correct(self, job_id: str, timeout_seconds: int = 200) -> bool:
+        """Trigger proactive auto-correct generation on the API service.
+
+        Direct, awaited HTTP call (NOT Cloud Tasks): the endpoint runs the work
+        synchronously, so awaiting it keeps both the caller (lyrics job) and the
+        service instance alive until the cache is written. Best-effort — returns
+        False on any failure and never raises, so it can't affect the job.
+        """
+        if not self._base_url:
+            logger.info(f"[job:{job_id}] auto-correct trigger skipped: no service base URL")
+            return False
+        url = f"{self._base_url}/api/internal/workers/auto-correct"
+        headers = {"Content-Type": "application/json"}
+        if self._admin_token:
+            headers["X-Admin-Token"] = self._admin_token
+        # Propagate trace context so the service-side span links to this job.
+        headers = inject_trace_context(headers)
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                resp = await client.post(url, json={"job_id": job_id}, headers=headers)
+            logger.info(
+                f"[job:{job_id}] auto-correct trigger -> HTTP {resp.status_code}"
+            )
+            return resp.status_code < 400
+        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning(f"[job:{job_id}] auto-correct trigger failed (non-fatal): {e}")
+            return False
+    
+    def _start_encoding_worker_warmup(self, job_id: str) -> None:
+        """Kick off the encoding-worker warmup WITHOUT blocking the caller.
+
+        ``_warmup_encoding_worker`` is blocking (Compute API get + start +
+        wait-for-operation — 10-20 s when the VM is stopped). Calling it inline
+        from the async trigger methods did two bad things: the user-facing
+        ``/complete`` request took that long to respond, and — because the
+        calls are synchronous — the whole event loop froze, so EVERY request on
+        that API instance stalled with it (incident 2026-09-23: 62/142 review
+        completes over 14 days took >3 s, max 35 s). The warmup is purely an
+        optimisation — the render/video worker self-heals with its own warmup
+        fallback if the VM isn't up yet — so run it in a worker thread as a
+        tracked background task and return immediately.
+
+        Outside an event loop (sync callers / tests) it degrades to the
+        original inline call.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._warmup_encoding_worker(job_id)
+            return
+        task = loop.create_task(asyncio.to_thread(self._warmup_encoding_worker, job_id))
+        self._warmup_tasks.add(task)
+        task.add_done_callback(self._warmup_tasks.discard)
+
+    def _warmup_encoding_worker(self, job_id: str) -> None:
+        """Warm up the encoding worker VM (BLOCKING — see _start_encoding_worker_warmup).
+
+        Called before dispatching video/render workers so the GCE encoding
+        VM starts booting while the worker downloads files and prepares.
+        Failures are logged but never block worker dispatch.
+        """
+        try:
+            from backend.services.encoding_worker_manager import EncodingWorkerManager
+            from google.cloud import compute_v1, firestore
+            db = firestore.Client(project=self.settings.google_cloud_project)
+            compute_client = compute_v1.InstancesClient()
+            manager = EncodingWorkerManager(
+                db=db,
+                compute_client=compute_client,
+                project_id=self.settings.google_cloud_project,
+            )
+            result = manager.ensure_preferred_running()
+            if result["started"]:
+                logger.info(f"[job:{job_id}] Encoding worker warmup: started VM {result['vm_name']}")
+            else:
+                logger.info(f"[job:{job_id}] Encoding worker warmup: VM {result['vm_name']} already running")
+        except Exception as e:
+            logger.warning(f"[job:{job_id}] Encoding worker warmup failed (non-fatal): {e}")
+
+    async def trigger_video_worker(self, job_id: str) -> bool:
+        """
+        Trigger video generation worker.
+
+        When USE_CLOUD_RUN_JOBS_FOR_VIDEO=true and ENABLE_CLOUD_TASKS=true,
+        uses Cloud Run Jobs for execution (supports >30 min encoding).
+        Otherwise, uses Cloud Tasks or direct HTTP.
+        """
+        if fake_workers_enabled(self.settings):
+            return self._dispatch_fake("video", job_id)
+        await asyncio.to_thread(self._bump_worker_generation, job_id)  # Firestore write
+        self._start_encoding_worker_warmup(job_id)
+        if self._use_cloud_tasks and self.settings.use_cloud_run_jobs_for_video:
+            if await self._trigger_video_worker_on_aws(job_id):
+                return True
+            return await self._trigger_cloud_run_job(job_id)
+        return await self.trigger_worker("video", job_id)
+
+    async def _trigger_video_worker_on_aws(self, job_id: str) -> bool:
+        """Run the video worker on the AWS encoding box instead of Cloud Run, if enabled.
+
+        Only when Firestore ``config/encoding-worker.aws_video_worker`` is true AND
+        the AWS worker ranks first (it's the preferred encoder, via
+        ``speed_rank_overrides``). There the distribution uploads (Dropbox/YouTube/
+        Drive) leave from AWS, and finals are handed over locally instead of
+        downloaded back out of GCS. Returns False on any doubt or failure so the
+        caller falls back to the Cloud Run job — this path must never lose a job.
+        """
+        try:
+            from backend.services.encoding_service import get_encoding_service
+
+            manager = self._build_encoding_worker_manager()
+            config = await asyncio.to_thread(manager.get_config)
+            if not getattr(config, "aws_video_worker", False):
+                return False
+            candidates = await asyncio.to_thread(manager.ranked_candidates, config)
+            if not candidates or candidates[0].provider != "aws":
+                logger.info(
+                    f"[job:{job_id}] AWS video worker enabled but not the preferred encoder "
+                    f"(top: {candidates[0].vm_name if candidates else 'none'}); using Cloud Run"
+                )
+                return False
+            aws = candidates[0]
+            result = await asyncio.to_thread(manager.ensure_any_running, candidates)
+            if result.get("vm_name") != aws.vm_name:
+                logger.warning(
+                    f"[job:{job_id}] AWS video worker: {aws.vm_name} unavailable "
+                    f"(started {result.get('vm_name')}); using Cloud Run"
+                )
+                return False
+            await manager.wait_for_worker_ready(aws.vm_name, f"{aws.url}/health", zone=aws.zone)
+
+            service = get_encoding_service()
+            service._load_credentials()
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{aws.url}/run-worker",
+                    json={"job_id": job_id, "module": "video_worker"},
+                    headers={"X-API-Key": service._api_key},
+                )
+            if resp.status_code == 200 and resp.json().get("status") in ("accepted", "in_progress"):
+                logger.info(f"[job:{job_id}] Video worker started on AWS ({aws.vm_name})")
+                return True
+            logger.warning(
+                f"[job:{job_id}] AWS video worker refused ({resp.status_code}: {resp.text[:300]}); using Cloud Run"
+            )
+            return False
+        except Exception as e:  # noqa: BLE001 — fall back to Cloud Run, never drop the job
+            logger.warning(f"[job:{job_id}] AWS video worker dispatch failed ({e}); using Cloud Run")
+            return False
+
+    def _build_encoding_worker_manager(self):
+        from backend.services.encoding_worker_manager import EncodingWorkerManager
+        from google.cloud import compute_v1, firestore
+
+        return EncodingWorkerManager(
+            db=firestore.Client(project=self.settings.google_cloud_project),
+            compute_client=compute_v1.InstancesClient(),
+            project_id=self.settings.google_cloud_project,
+        )
+    
+    async def _trigger_cloud_run_job(self, job_id: str) -> bool:
+        """
+        Trigger video encoding as a Cloud Run Job.
+
+        Cloud Run Jobs support up to 24 hours of execution time,
+        making them suitable for very long video encoding tasks.
+
+        Args:
+            job_id: Job ID to process
+
+        Returns:
+            True if job was triggered successfully, False otherwise
+        """
+        return await self._trigger_worker_cloud_run_job(
+            job_id=job_id,
+            cloud_run_job_name="video-encoding-job",
+            worker_module="video_worker",
+            location=self.settings.cpu_jobs_region,
+        )
+
+    async def _run_job_with_retry(self, client, request, log_prefix: str):
+        """Invoke ``JobsClient.run_job`` with a small bounded retry on transient errors.
+
+        ``run_job`` only enqueues an execution, so a one-off 5xx/429 from the Cloud Run
+        Jobs Admin control plane is safe to retry rather than hard-failing the trigger.
+        Non-transient errors (NotFound / PermissionDenied / InvalidArgument) are NOT
+        caught here — they propagate immediately to the caller's error handling.
+        Sleeps with ``asyncio.sleep`` so the event loop isn't blocked between attempts.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _RUN_JOB_MAX_ATTEMPTS + 1):
+            try:
+                # Sync gRPC call (~1s) — keep it off the event loop.
+                return await asyncio.to_thread(client.run_job, request=request)
+            except _TRANSIENT_RUN_JOB_ERRORS as e:
+                last_exc = e
+                if attempt >= _RUN_JOB_MAX_ATTEMPTS:
+                    break
+                delay = _RUN_JOB_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    f"{log_prefix} transient error triggering Cloud Run Job "
+                    f"({type(e).__name__}, attempt {attempt}/{_RUN_JOB_MAX_ATTEMPTS}); "
+                    f"retrying in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+        # Exhausted transient retries — re-raise so the caller logs + returns False.
+        raise last_exc
+
+    def _run_worker_module_locally(
+        self, worker_module: str, args: list[str], log_prefix: str = ""
+    ) -> bool:
+        """
+        Run a worker module as a detached local subprocess (development mode).
+
+        Mirrors what the corresponding Cloud Run Job would execute
+        (``python -m backend.workers.<module> <args>``), so contributors can run
+        the full pipeline locally against the emulators without GCP credentials.
+        Worker output is streamed to the backend console.
+        """
+        import subprocess
+        import sys
+
+        cmd = [sys.executable, "-m", f"backend.workers.{worker_module}", *args]
+        try:
+            subprocess.Popen(cmd, env=os.environ.copy())
+            logger.info(f"{log_prefix} Started local worker subprocess: {' '.join(cmd)}")
+            return True
+        except Exception as e:
+            logger.error(f"{log_prefix} Failed to start local worker {worker_module}: {e}", exc_info=True)
+            return False
+
+    async def _trigger_worker_cloud_run_job(
+        self,
+        job_id: str,
+        cloud_run_job_name: str,
+        worker_module: str,
+        location: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> bool:
+        """
+        Trigger a worker as a Cloud Run Job.
+
+        Cloud Run Jobs run to completion without HTTP request lifecycle concerns,
+        avoiding the instance termination issue where Cloud Run would shut down
+        instances mid-processing when using BackgroundTasks.
+
+        Args:
+            job_id: Job ID to process
+            cloud_run_job_name: Name of the Cloud Run Job (e.g., "lyrics-transcription-job")
+            worker_module: Worker module name (e.g., "lyrics_worker")
+            location: GCP region for the job (defaults to settings.gcp_region)
+            timeout_seconds: Per-execution task timeout override (default: the
+                job's configured timeout)
+
+        Returns:
+            True if job was triggered successfully, False otherwise
+        """
+        # Local development (ENABLE_CLOUD_TASKS=false): run the worker module as a
+        # local subprocess with the exact args the Cloud Run Job would receive.
+        # The is_production() guard ensures a deployed environment that omits
+        # ENABLE_CLOUD_TASKS still dispatches to Cloud Run Jobs, never Popen.
+        if not self._use_cloud_tasks and not is_production():
+            return self._run_worker_module_locally(
+                worker_module, ["--job-id", job_id], log_prefix=f"[job:{job_id}]"
+            )
+
+        try:
+            from google.cloud import run_v2
+
+            project = self.settings.google_cloud_project
+            if not project:
+                logger.error("GOOGLE_CLOUD_PROJECT not set, cannot trigger Cloud Run Job")
+                return False
+
+            location = location or self.settings.gcp_region
+            job_name = f"projects/{project}/locations/{location}/jobs/{cloud_run_job_name}"
+
+            # Create Cloud Run Jobs client
+            client = run_v2.JobsClient()
+
+            # Run the job with overrides for the specific job_id
+            overrides = run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=[
+                            "python", "-m", f"backend.workers.{worker_module}",
+                            "--job-id", job_id,
+                        ],
+                    )
+                ]
+            )
+            if timeout_seconds:
+                from google.protobuf import duration_pb2
+                overrides.timeout = duration_pb2.Duration(seconds=int(timeout_seconds))
+            request = run_v2.RunJobRequest(name=job_name, overrides=overrides)
+
+            # Run the job (async operation), retrying transient control-plane errors.
+            operation = await self._run_job_with_retry(
+                client, request, log_prefix=f"[job:{job_id}]"
+            )
+            logger.info(
+                f"[job:{job_id}] Started Cloud Run Job {cloud_run_job_name}: "
+                f"{operation.metadata}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"[job:{job_id}] Failed to trigger Cloud Run Job {cloud_run_job_name}: {e}",
+                exc_info=True
+            )
+            return False
+    
+    async def trigger_render_video_worker(self, job_id: str) -> bool:
+        """
+        Trigger render video worker (post-review).
+
+        When USE_CLOUD_RUN_JOBS_FOR_RENDER=true and ENABLE_CLOUD_TASKS=true,
+        runs as a Cloud Run Job (reusing video-encoding-job with an args
+        override) so the render orchestration survives Cloud Run Service
+        deployment rollouts. As a BackgroundTask it was killed ~10s after
+        SIGTERM whenever a deploy landed mid-render, freezing the job at
+        rendering_video (incident 2026-09-13, job 41e06b90 — same class as
+        incident 2026-03-08 which migrated the video worker to Cloud Run Jobs).
+        """
+        if fake_workers_enabled(self.settings):
+            return self._dispatch_fake("render_video", job_id)
+        await asyncio.to_thread(self._bump_worker_generation, job_id)  # Firestore write
+        self._start_encoding_worker_warmup(job_id)
+        if self._use_cloud_tasks and self.settings.use_cloud_run_jobs_for_render:
+            return await self._trigger_worker_cloud_run_job(
+                job_id=job_id,
+                cloud_run_job_name="video-encoding-job",
+                worker_module="render_video_worker",
+                location=self.settings.cpu_jobs_region,
+            )
+        return await self.trigger_worker("render-video", job_id)
+
+    def _bump_worker_generation(self, job_id: str) -> None:
+        """
+        Advance the supersession fence before dispatching a render/video worker.
+
+        Bumping here (the single choke point for both workers) means every run
+        captures a unique generation at start. If an older run of the same stage
+        is still in flight — because an admin reset then re-triggered the job —
+        it will observe the newer generation and discard its stale result
+        instead of overwriting fresh outputs or failing the job. Best-effort:
+        a failed bump is logged and ignored (the status fence still applies).
+        """
+        try:
+            from backend.services.job_manager import JobManager
+            JobManager().bump_worker_generation(job_id)
+        except Exception as e:
+            logger.warning(f"[job:{job_id}] Failed to bump worker generation before trigger: {e}")
+
+    async def schedule_idle_reminder(
+        self,
+        job_id: str,
+        delay_seconds: int = IDLE_REMINDER_DELAY_SECONDS
+    ) -> bool:
+        """
+        Schedule an idle reminder check for a job.
+
+        The reminder task will be delivered after the specified delay.
+        When the task executes, it checks if the job is still in a blocking
+        state and sends a reminder email if the user hasn't taken action.
+
+        Args:
+            job_id: Job ID to check
+            delay_seconds: Delay before executing the check (default: 5 minutes)
+
+        Returns:
+            True if task was scheduled successfully, False otherwise
+        """
+        if not self._use_cloud_tasks:
+            # In development mode, log and skip (no delayed execution support)
+            logger.info(
+                f"[job:{job_id}] Idle reminder not scheduled (Cloud Tasks disabled). "
+                f"Would have fired in {delay_seconds}s."
+            )
+            return True
+
+        try:
+            from google.cloud import tasks_v2
+            from google.protobuf import timestamp_pb2
+            import time
+
+            queue_name = WORKER_QUEUES.get("idle-reminder")
+            if not queue_name:
+                logger.error("Idle reminder queue not configured")
+                return False
+
+            project = self.settings.google_cloud_project
+            if not project:
+                logger.error("GOOGLE_CLOUD_PROJECT not set")
+                return False
+
+            location = self.settings.cloud_tasks_region  # queues all live here, NOT gcp_region
+
+            # Build queue path
+            parent = self.tasks_client.queue_path(project, location, queue_name)
+
+            # Build headers
+            headers = {
+                "Content-Type": "application/json",
+            }
+
+            if self._admin_token:
+                headers["X-Admin-Token"] = self._admin_token
+
+            # Inject trace context
+            headers = inject_trace_context(headers)
+
+            # Calculate schedule time
+            schedule_time = timestamp_pb2.Timestamp()
+            schedule_time.FromSeconds(int(time.time()) + delay_seconds)
+
+            dispatch_deadline_seconds = WORKER_DISPATCH_DEADLINES.get("idle-reminder", 60)
+
+            # Build task payload
+            task = {
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": f"{self._base_url}/api/internal/jobs/{job_id}/check-idle-reminder",
+                    "headers": headers,
+                    "body": json.dumps({"job_id": job_id}).encode(),
+                    "oidc_token": {
+                        "service_account_email": f"karaoke-backend@{project}.iam.gserviceaccount.com",
+                    },
+                },
+                "schedule_time": schedule_time,
+                "dispatch_deadline": duration_pb2.Duration(seconds=dispatch_deadline_seconds),
+            }
+
+            # Create task
+            response = self.tasks_client.create_task(parent=parent, task=task)
+            logger.info(
+                f"[job:{job_id}] Scheduled idle reminder check in {delay_seconds}s: {response.name}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"[job:{job_id}] Failed to schedule idle reminder: {e}",
+                exc_info=True
+            )
+            return False
+
+    async def schedule_gdrive_validation(
+        self,
+        delay_seconds: int = GDRIVE_VALIDATION_DELAY_SECONDS,
+        brand_code: Optional[str] = None,
+        expect_cdg: bool = False,
+    ) -> bool:
+        """
+        Schedule a delayed GDrive validation check.
+
+        Fires after the specified delay so that E2E test cleanup completes
+        before the validator runs, avoiding false "all clear" reports.
+
+        Args:
+            delay_seconds: Delay before executing the validation (default: 5 minutes)
+            brand_code: Optional brand code of the just-published track. When set,
+                the validator additionally checks this track is present in all
+                expected folders same-run (incident-hardening D2).
+
+        Returns:
+            True if task was scheduled successfully, False otherwise
+        """
+        if not self._use_cloud_tasks:
+            logger.info(
+                f"GDrive validation not scheduled (Cloud Tasks disabled). "
+                f"Would have fired in {delay_seconds}s."
+            )
+            return True
+
+        try:
+            from google.cloud import tasks_v2
+            from google.protobuf import timestamp_pb2
+            import time
+
+            queue_name = WORKER_QUEUES.get("gdrive-validation")
+            if not queue_name:
+                logger.error("GDrive validation queue not configured")
+                return False
+
+            project = self.settings.google_cloud_project
+            if not project:
+                logger.error("GOOGLE_CLOUD_PROJECT not set")
+                return False
+
+            location = self.settings.cloud_tasks_region  # queues all live here, NOT gcp_region
+
+            # Build queue path
+            parent = self.tasks_client.queue_path(project, location, queue_name)
+
+            # Build headers
+            headers = {
+                "Content-Type": "application/json",
+            }
+
+            if self._admin_token:
+                headers["X-Admin-Token"] = self._admin_token
+
+            headers = inject_trace_context(headers)
+
+            # Calculate schedule time
+            schedule_time = timestamp_pb2.Timestamp()
+            schedule_time.FromSeconds(int(time.time()) + delay_seconds)
+
+            dispatch_deadline_seconds = WORKER_DISPATCH_DEADLINES.get("gdrive-validation", 120)
+
+            # Carry the brand code so the validator can check this track's own
+            # completeness same-run (incident-hardening D2). Absent → "{}".
+            # expect_cdg tells the validator whether to require the CDG folder.
+            body_bytes = b"{}"
+            if brand_code:
+                body_bytes = json.dumps(
+                    {"brand_code": brand_code, "expect_cdg": expect_cdg}
+                ).encode("utf-8")
+
+            # Build task payload
+            task = {
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": f"{self._base_url}/api/internal/trigger-gdrive-validation",
+                    "headers": headers,
+                    "body": body_bytes,
+                    "oidc_token": {
+                        "service_account_email": f"karaoke-backend@{project}.iam.gserviceaccount.com",
+                    },
+                },
+                "schedule_time": schedule_time,
+                "dispatch_deadline": duration_pb2.Duration(seconds=dispatch_deadline_seconds),
+            }
+
+            response = self.tasks_client.create_task(parent=parent, task=task)
+            logger.info(
+                f"Scheduled GDrive validation in {delay_seconds}s: {response.name}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(
+                f"Failed to schedule GDrive validation: {e}",
+                exc_info=True
+            )
+            return False
+
+
+# Global worker service instance
+_worker_service: Optional[WorkerService] = None
+
+
+def get_worker_service() -> WorkerService:
+    """
+    Get global worker service instance.
+    
+    Singleton pattern to reuse HTTP client pool.
+    
+    Returns:
+        WorkerService instance
+    """
+    global _worker_service
+    if _worker_service is None:
+        _worker_service = WorkerService()
+    return _worker_service
+
+
+def reset_worker_service() -> None:
+    """
+    Reset the global worker service instance.
+    
+    Used in tests to ensure clean state between test cases.
+    """
+    global _worker_service
+    _worker_service = None

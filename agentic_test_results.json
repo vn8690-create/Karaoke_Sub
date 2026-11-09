@@ -1,0 +1,75 @@
+[
+  {
+    "test_name": "Sound-alike error (wurld -> world)",
+    "success": true,
+    "proposals": [
+      {
+        "action": "ReplaceWord",
+        "word_id": null,
+        "word_ids": [
+          "w1"
+        ],
+        "replacement_text": "world",
+        "confidence": 0.75,
+        "reason": "Sound-alike error. Reference suggests: 'world'. The transcription 'wurld' is a phonetic misspelling or sound-alike of the word 'world' which appears in both reference sources (Genius and LRCLIB).",
+        "gap_category": "GapCategory.SOUND_ALIKE",
+        "requires_human_review": false
+      }
+    ]
+  },
+  {
+    "test_name": "Punctuation difference",
+    "success": true,
+    "proposals": [
+      {
+        "action": "NoAction",
+        "word_id": null,
+        "word_ids": [
+          "w2"
+        ],
+        "replacement_text": null,
+        "confidence": 0.99,
+        "reason": "Transcription matches at least one reference source. The gap text 'Hello' followed by the context 'is it me you're looking for' matches the Genius reference lyrics exactly, excluding punctuation. According to the guidelines, if any reference source matches the transcription text (ignoring punctuation), it should be classified as NO_ERROR.",
+        "gap_category": "GapCategory.NO_ERROR",
+        "requires_human_review": false
+      }
+    ]
+  },
+  {
+    "test_name": "Extra filler word",
+    "success": true,
+    "proposals": [
+      {
+        "action": "DeleteWord",
+        "word_id": "w3",
+        "word_ids": null,
+        "replacement_text": null,
+        "confidence": 0.8,
+        "reason": "Extra filler word 'And' at sentence start not in reference. The transcription includes the filler word 'And' at the beginning of the phrase, which is not present in the reference lyrics. This matches the definition of EXTRA_WORDS.",
+        "gap_category": "GapCategory.EXTRA_WORDS",
+        "requires_human_review": false
+      }
+    ]
+  },
+  {
+    "test_name": "Complex multi-word error",
+    "success": true,
+    "proposals": [
+      {
+        "action": "NoAction",
+        "word_id": null,
+        "word_ids": [
+          "w7",
+          "w8",
+          "w9",
+          "w10"
+        ],
+        "replacement_text": null,
+        "confidence": 0.99,
+        "reason": "Transcription matches at least one reference source. The transcription text 'gonna give you up' matches the Genius reference lyrics exactly when ignoring punctuation and capitalization. In context, the full phrase 'never gonna give you up' is correctly transcribed and aligns perfectly with the known lyrics and title of the song.",
+        "gap_category": "GapCategory.NO_ERROR",
+        "requires_human_review": false
+      }
+    ]
+  }
+]

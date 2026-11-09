@@ -1,0 +1,2090 @@
+"""
+Video generation and finalization worker.
+
+This worker has two code paths controlled by USE_NEW_ORCHESTRATOR:
+
+1. NEW PATH (USE_NEW_ORCHESTRATOR=true):
+   Uses VideoWorkerOrchestrator which provides a unified pipeline for all
+   encoding backends (GCE or local). This ensures features like YouTube upload,
+   Discord notifications, and CDG/TXT packaging work regardless of encoding backend.
+
+2. LEGACY PATH (USE_NEW_ORCHESTRATOR=false):
+   Uses KaraokeFinalise from the karaoke_gen package. This path has divergent
+   behavior between GCE and local encoding - GCE encoding bypasses many features.
+
+The orchestrator-based approach is preferred as it:
+- Eliminates GCE vs local code path divergence
+- Ensures all features work consistently
+- Provides better testability and maintainability
+
+Observability:
+- All operations wrapped in tracing spans for Cloud Trace visibility
+- Logs include [job:ID] prefix for easy filtering in Cloud Logging
+- Worker start/end timing logged with WORKER_START/WORKER_END markers
+"""
+import asyncio
+import logging
+import os
+import shutil
+import tempfile
+import time
+import json
+from typing import Optional, Dict, Any
+from pathlib import Path
+
+from google.cloud.firestore_v1 import DELETE_FIELD
+
+from backend.models.job import JobStatus
+from backend.exceptions import InvalidStateTransitionError
+from backend.services.job_manager import JobManager, with_notification_drain
+from backend.services.input_persistence import ensure_job_inputs_persisted
+from backend.services.input_recovery import recover_missing_inputs
+from backend.services.storage_service import StorageService
+from backend.services.admin_rerender_service import (
+    active_admin_rerender,
+    admin_rerender_kept_outputs,
+    suppress_customer_notifications,
+)
+from backend.services.regenerate_service import active_regenerate
+from backend.utils.existing_instrumental import resolve_existing_instrumental
+from backend.services.job_health_service import selected_stem_pending, validate_worker_can_run
+from backend.services.rclone_service import get_rclone_service
+from backend.services.youtube_service import get_youtube_service
+from backend.services.youtube_description import translated_language_name
+from backend.services.encoding_service import get_encoding_service, run_with_lost_job_resubmit
+from backend.config import get_settings
+from backend.workers.style_helper import load_style_config, screen_included
+from backend.workers.worker_logging import create_job_logger, setup_job_logging, job_logging_context
+from backend.services.tracing import job_span, add_span_event, add_span_attribute
+
+# Import from karaoke_gen package - reuse existing implementation
+from karaoke_gen.karaoke_finalise.karaoke_finalise import KaraokeFinalise
+from karaoke_gen.utils import sanitize_filename
+
+
+logger = logging.getLogger(__name__)
+
+
+# Feature flag for new orchestrator-based pipeline
+# Set to True to use the new unified pipeline that works with any encoding backend
+# Set to False to use the legacy KaraokeFinalise-based pipeline
+USE_NEW_ORCHESTRATOR = os.environ.get("USE_NEW_ORCHESTRATOR", "true").lower() == "true"
+
+
+# Loggers to capture for video worker
+# Include the full module path to properly capture KaraokeFinalise logs
+VIDEO_WORKER_LOGGERS = [
+    "karaoke_gen.karaoke_finalise",
+    "karaoke_gen.karaoke_finalise.karaoke_finalise",  # The actual logger name from __name__
+]
+
+
+async def _encode_via_gce(
+    job_id: str,
+    job,
+    job_manager: JobManager,
+    storage: StorageService,
+    temp_dir: str,
+    base_name: str,
+    job_log,
+) -> Dict[str, Any]:
+    """
+    Encode videos using the high-performance GCE encoding worker.
+
+    This offloads FFmpeg encoding to a dedicated C4 GCE instance with
+    Intel Granite Rapids 3.9 GHz CPU for 2-3x faster encoding.
+
+    Args:
+        job_id: Job ID
+        job: Job object
+        job_manager: Job manager instance
+        storage: Storage service instance
+        temp_dir: Temporary directory for output files
+        base_name: Base name for output files (e.g., "Artist - Title")
+        job_log: Job-specific logger
+
+    Returns:
+        Result dict with paths to encoded files
+    """
+    settings = get_settings()
+    encoding_service = get_encoding_service()
+
+    job_log.info("Using GCE encoding worker for high-performance encoding")
+    logger.info(f"[job:{job_id}] Using GCE encoding worker")
+
+    # Construct GCS paths for the encoding worker
+    bucket_name = settings.gcs_bucket_name
+    input_gcs_path = f"gs://{bucket_name}/jobs/{job_id}/"
+    output_gcs_path = f"gs://{bucket_name}/jobs/{job_id}/encoded/"
+
+    # Determine instrumental selection for encoding config
+    instrumental_selection = job.state_data.get('instrumental_selection', 'clean')
+    existing_instrumental = getattr(job, 'existing_instrumental_gcs_path', None)
+
+    # Stage the user-provided instrumental into the encoder's input prefix (jobs/{job_id}/).
+    # It is uploaded under uploads/, which the GCE encoder does NOT pull via input_gcs_path;
+    # copying it here makes the encoder's recursive find_file("*existing_instrumental*")
+    # locate it regardless of the worker image version (older encoder images predate the
+    # encoding_config "existing_instrumental" download path). Without this, tenant /
+    # existing-instrumental jobs fail with "No instrumental audio found".
+    if existing_instrumental:
+        try:
+            ext = os.path.splitext(existing_instrumental)[1].lower() or ".mp3"
+            staged_path = f"jobs/{job_id}/existing_instrumental{ext}"
+            storage.copy_blob(existing_instrumental, staged_path)
+            job_log.info(f"Staged existing instrumental for encoder: {staged_path}")
+        except Exception as e:
+            job_log.warning(f"Failed to stage existing instrumental into jobs/ prefix: {e}")
+
+    encoding_config = {
+        "formats": ["mp4_4k_lossless", "mp4_4k_lossy", "mp4_720p"],
+        "base_name": base_name,
+        "instrumental_selection": instrumental_selection,
+        "existing_instrumental": existing_instrumental,
+        # Screens the theme leaves out (the encoder must not rebuild them from other PNGs).
+        "include_title_screen": screen_included(job.state_data, "title"),
+        "include_end_screen": screen_included(job.state_data, "end"),
+        # NOTE: intentionally no "ffmpeg_threads" — finalization ffmpeg commands in
+        # LocalEncodingService carry no -threads flag, so x264 uses its all-core auto
+        # default (measured ~66-78% of a 32-vCPU worker busy during the heavy libx264
+        # stages — not capped). See docs/archive/2026-08-16-finalization-cpu-efficiency-handoff.md.
+    }
+
+    job_log.info(f"Submitting encoding job to GCE worker")
+    job_log.info(f"  Input: {input_gcs_path}")
+    job_log.info(f"  Output: {output_gcs_path}")
+
+    def progress_callback(progress: int):
+        # Update job progress (encoding is 75-95% of total)
+        # Use update_job instead of transition_to_state since job is already in ENCODING state
+        scaled_progress = 75 + int(progress * 0.2)  # Map 0-100 to 75-95
+        job_manager.update_job(job_id, {
+            'progress': scaled_progress,
+            'message': f"Encoding videos ({progress}%)",
+        })
+
+    try:
+        # Submit and wait for encoding
+        with job_span("gce-encoding", job_id) as encoding_span:
+            encode_start = time.time()
+            add_span_event("gce_encoding_started")
+
+            # Resubmit under a fresh id if the worker loses the job mid-run
+            # (OOM/deploy restart wipes its in-memory registry).
+            async def _submit_encode(encode_job_id: str):
+                return await encoding_service.encode_videos(
+                    job_id=encode_job_id,
+                    input_gcs_path=input_gcs_path,
+                    output_gcs_path=output_gcs_path,
+                    encoding_config=encoding_config,
+                    progress_callback=progress_callback,
+                )
+
+            result = await run_with_lost_job_resubmit(
+                _submit_encode, job_id, log=job_log
+            )
+
+            encode_duration = time.time() - encode_start
+            encoding_span.set_attribute("duration_seconds", encode_duration)
+            add_span_event("gce_encoding_completed", {"duration_seconds": encode_duration})
+
+        job_log.info(f"GCE encoding complete in {encode_duration:.1f}s")
+        logger.info(f"[job:{job_id}] GCE encoding complete in {encode_duration:.1f}s")
+
+        # Download encoded files from GCS to temp_dir
+        output_files = result.get("output_files", [])
+        local_files = {}
+
+        for gcs_path in output_files:
+            filename = os.path.basename(gcs_path)
+            local_path = os.path.join(temp_dir, filename)
+
+            job_log.info(f"Downloading encoded file: {filename}")
+            storage.download_file(gcs_path, local_path)
+
+            # Map to result keys expected by _upload_results
+            # Files are named like "Artist - Title (Final Karaoke Lossless 4k).mp4"
+            filename_lower = filename.lower()
+            if "lossless 4k" in filename_lower:
+                if filename.endswith(".mkv"):
+                    local_files["final_video_mkv"] = local_path
+                else:
+                    local_files["final_video"] = local_path
+            elif "lossy 4k" in filename_lower:
+                local_files["final_video_lossy"] = local_path
+            elif "720p" in filename_lower:
+                local_files["final_video_720p"] = local_path
+            elif "with vocals" in filename_lower and filename.endswith(".mp4"):
+                local_files["final_with_vocals_mp4"] = local_path
+
+        job_log.info(f"Downloaded {len(local_files)} encoded files")
+
+        return local_files
+
+    except Exception as e:
+        job_log.error(f"GCE encoding failed: {e}")
+        logger.error(f"[job:{job_id}] GCE encoding failed: {e}")
+        raise
+
+
+async def generate_video_orchestrated(job_id: str) -> bool:
+    """
+    Generate final karaoke videos using the new VideoWorkerOrchestrator.
+
+    This provides a unified pipeline that works with any encoding backend
+    (GCE or local), ensuring all features like YouTube upload, Discord
+    notifications, and CDG/TXT packaging work consistently.
+
+    Args:
+        job_id: Job ID to process
+
+    Returns:
+        True if successful, False otherwise
+    """
+    from backend.workers.video_worker_orchestrator import (
+        VideoWorkerOrchestrator,
+        create_orchestrator_config_from_job,
+    )
+
+    start_time = time.time()
+    job_manager = JobManager()
+    storage = StorageService()
+
+    # Create job logger for remote debugging
+    job_log = create_job_logger(job_id, "video")
+
+    # Log with structured markers for easy Cloud Logging queries
+    logger.info(f"[job:{job_id}] WORKER_START worker=video orchestrator=true")
+
+    # Set up log capture for KaraokeFinalise (still used by some services)
+    log_handler = setup_job_logging(job_id, "video", *VIDEO_WORKER_LOGGERS)
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        logger.error(f"[job:{job_id}] Job not found")
+        return False
+
+    # Copy uploads/{job_id}/** into jobs/{job_id}/input/ (uploads/ expires) and repoint the job.
+    await asyncio.to_thread(ensure_job_inputs_persisted, job, storage, job_manager, "video")
+    # Repoint an expired bring-your-own instrumental at its surviving staged copy.
+    try:
+        await asyncio.to_thread(recover_missing_inputs, job, storage, job_manager)
+    except Exception as e:  # noqa: BLE001 - the render stage already reported a missing mix
+        logger.error(f"[job:{job_id}] Input recovery failed in video worker: {e}")
+
+    # Review can finish before stem separation does: wait for the stems instead
+    # of failing prerequisites (which used to strand the job forever).
+    parked, job = _park_until_stems_ready(job_id, job, job_manager, job_log)
+    if parked:
+        return True
+
+    # Validate prerequisites
+    if not _validate_prerequisites(job):
+        logger.error(f"[job:{job_id}] Prerequisites not met for video generation")
+        return False
+
+    # Validate job status is appropriate for video worker
+    from backend.services.job_health_service import validate_worker_can_run
+    status_error = validate_worker_can_run("video_worker", job)
+    if status_error:
+        logger.warning(f"[job:{job_id}] {status_error}")
+        job_log.warning(status_error)
+        return False
+
+    # A user-supplied instrumental recorded under uploads/ expires (bucket lifecycle);
+    # fall back to (and repoint the job at) its staged copy under jobs/{id}/.
+    if getattr(job, 'existing_instrumental_gcs_path', None):
+        job.existing_instrumental_gcs_path = resolve_existing_instrumental(
+            job, storage, job_manager=job_manager, log=job_log,
+        )
+
+    # Storage-retention regenerate: GCS outputs only (snapshot taken at worker
+    # start — the marker is cleared with the COMPLETE transition below).
+    regenerate = active_regenerate(job)
+
+    # Create temporary working directory
+    temp_dir = tempfile.mkdtemp(prefix=f"karaoke_video_{job_id}_")
+    original_cwd = os.getcwd()
+
+    # Set up rclone config if needed (for legacy Dropbox upload path)
+    rclone_service = None
+    if getattr(job, 'organised_dir_rclone_root', None):
+        rclone_service = get_rclone_service()
+        if rclone_service.setup_rclone_config():
+            job_log.info("Rclone config loaded for Dropbox upload")
+
+    # Load YouTube credentials if needed (skip for private/non-published tracks)
+    youtube_credentials = None
+    if getattr(job, 'enable_youtube_upload', False) and not getattr(job, 'is_private', False):
+        youtube_service = get_youtube_service()
+        if youtube_service.is_configured:
+            youtube_credentials = youtube_service.get_credentials_dict()
+            job_log.info("YouTube credentials loaded for video upload")
+        else:
+            job_log.warning("YouTube credentials not available - upload will be skipped")
+    elif getattr(job, 'is_private', False):
+        job_log.info("Private track - skipping YouTube upload")
+
+    try:
+        # Wrap entire worker in a tracing span
+        with job_span("video-worker-orchestrated", job_id, {"artist": job.artist, "title": job.title}) as root_span:
+            with job_logging_context(job_id):
+                job_log.info(f"Starting orchestrated video generation for {job.artist} - {job.title}")
+                logger.info(f"[job:{job_id}] Starting orchestrated video generation")
+
+            # Transition to GENERATING_VIDEO state
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.GENERATING_VIDEO,
+                progress=70,
+                message="Preparing files for video generation"
+            )
+
+            # Download and set up files
+            # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+            safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+            safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+            base_name = f"{safe_artist} - {safe_title}"
+            with job_span("download-files", job_id):
+                job_log.info("Downloading files from GCS...")
+                await _setup_working_directory(job_id, job, storage, temp_dir, base_name, job_log)
+                job_log.info("All files downloaded successfully")
+
+            # Load style config for CDG styles
+            style_config = await load_style_config(job, storage, temp_dir)
+            cdg_styles = style_config.get_cdg_styles()
+
+            # Change to working directory
+            os.chdir(temp_dir)
+
+            # Create orchestrator config from job
+            config = create_orchestrator_config_from_job(
+                job=job,
+                temp_dir=temp_dir,
+                youtube_credentials=youtube_credentials,
+                cdg_styles=cdg_styles,
+            )
+
+            # Run the orchestrated pipeline
+            orchestrator = VideoWorkerOrchestrator(
+                config=config,
+                job_manager=job_manager,
+                storage=storage,
+                job_logger=job_log,
+            )
+            # The native distribution pass below retries a failed Drive upload, so
+            # check publish completeness only after it (see check further down).
+            orchestrator.defer_publish_completeness_check = True
+
+            with job_span("orchestrator-run", job_id):
+                result = await orchestrator.run()
+
+            if not result.success:
+                raise Exception(result.error_message or "Orchestrator failed")
+
+            # Prepare distribution directory for native uploads. A GCS-only
+            # regenerate publishes nothing.
+            if regenerate:
+                job_log.info("GCS-only regenerate: skipping native distribution")
+            else:
+                native_result = {
+                    'brand_code': result.brand_code,
+                    'youtube_url': result.youtube_url,
+                    'final_video': result.final_video,
+                    'final_video_lossy': result.final_video_lossy,
+                    'final_video_720p': result.final_video_720p,
+                    'final_karaoke_cdg_zip': result.final_karaoke_cdg_zip,
+                    'original_vocals_guide': result.original_vocals_guide,
+                    'dropbox_link': result.dropbox_link,
+                    'gdrive_files': result.gdrive_files,
+                }
+                with job_span("distribution", job_id):
+                    await _handle_native_distribution(
+                        job_id=job_id,
+                        job=job,
+                        job_log=job_log,
+                        job_manager=job_manager,
+                        temp_dir=temp_dir,
+                        result=native_result,
+                        storage=storage,
+                    )
+                _adopt_fallback_gdrive_upload(config, result, native_result, job_log)
+                orchestrator.check_publish_completeness()
+
+            # Upload generated files to GCS
+            # Note: State transition to PACKAGING is handled by the orchestrator in _run_distribution()
+            with job_span("upload-results", job_id):
+                await _upload_results(job_id, job_manager, storage, temp_dir, {
+                    'final_video': result.final_video,
+                    'final_video_mkv': result.final_video_mkv,
+                    'final_video_lossy': result.final_video_lossy,
+                    'final_video_720p': result.final_video_720p,
+                    'final_with_vocals_mp4': result.final_with_vocals_mp4,
+                    'final_karaoke_cdg_zip': result.final_karaoke_cdg_zip,
+                    'final_karaoke_txt_zip': result.final_karaoke_txt_zip,
+                    'title_mov': result.title_mov,
+                    'end_mov': result.end_mov,
+                    'portrait_video': result.portrait_video,
+                })
+
+            # Store result metadata in job BEFORE transitioning to COMPLETE
+            # This ensures youtube_url is available when completion email is sent
+            logger.info(f"[job:{job_id}] Video generation complete")
+            # Atomic per-field writes. Rewriting the whole state_data map from a
+            # snapshot could clobber a concurrent write here — most dangerously the
+            # visibility-change flow or the worker_generation supersession fence
+            # (an Increment reverted by a stale full-map write). Dot-path writes
+            # touch only the distribution-result keys.
+            # An admin re-render leaves outputs it doesn't re-publish in place
+            # (e.g. YouTube now disabled) — keep their links.
+            kept_outputs = admin_rerender_kept_outputs(job)
+            if regenerate:
+                # GCS-only regenerate: nothing was published, so the job's
+                # existing brand code / YouTube / Dropbox / Drive links stand.
+                state_updates: Dict[str, Any] = {}
+            else:
+                state_updates = {
+                    'state_data.brand_code': result.brand_code,
+                    'state_data.youtube_url': result.youtube_url or kept_outputs.get('youtube_url'),
+                    'state_data.youtube_upload_queued': result.youtube_upload_queued,
+                    'state_data.dropbox_link': result.dropbox_link or kept_outputs.get('dropbox_link'),
+                    'state_data.gdrive_files': result.gdrive_files or kept_outputs.get('gdrive_files'),
+                }
+            state_updates.update({
+                # Fresh renders were just uploaded, so a storage-retention purge
+                # marker is stale (the stems marker is cleared by the restore).
+                'renders_purged_at': None,
+                # Clear the visibility-change guard flag (previously popped from the map).
+                'state_data.visibility_change_in_progress': DELETE_FIELD,
+                # Fresh finals were just uploaded, so any earlier "outputs deleted"
+                # marker (edit flow, admin delete) is stale — regardless of whether
+                # this job distributes anywhere (tenant jobs never do).
+                'outputs_deleted_at': None,
+                'outputs_deleted_by': None,
+                # A theme/admin re-render (if any) finished; only a FAILED
+                # re-render keeps its marker (it lets the retry re-run it).
+                'state_data.theme_rerender': DELETE_FIELD,
+                # The admin re-render / regenerate markers are cleared atomically
+                # WITH the COMPLETE transition below, so a failed transition keeps them.
+            })
+            if regenerate and regenerate.get('after') == 'change_to_private':
+                # The chained visibility change sets its own guard right away.
+                state_updates.pop('state_data.visibility_change_in_progress', None)
+            if result.distribution_warnings:
+                state_updates['state_data.distribution_warnings'] = result.distribution_warnings
+            job_manager.update_job(job_id, state_updates)
+
+            # Send Pushbullet alert if any distribution uploads failed
+            if result.distribution_warnings:
+                _send_distribution_warning_notification(
+                    job_id=job_id,
+                    artist=job.artist,
+                    title=job.title,
+                    warnings=result.distribution_warnings,
+                )
+
+            # Store video processing metadata
+            duration = time.time() - start_time
+            _store_video_processing_metadata(job_manager, job_id, result, duration)
+
+            # Mark job as complete (triggers completion email with youtube_url now available)
+            completion_metadata = {
+                "action": "completed",
+                "brand_code": result.brand_code,
+                "youtube_url": result.youtube_url,
+                "youtube_upload_queued": result.youtube_upload_queued,
+                "dropbox_link": result.dropbox_link,
+                "gdrive_file_ids": result.gdrive_files,
+                "edit_count": getattr(job, 'edit_count', 0),
+                "duration_seconds": round(duration, 1),
+            }
+            if result.distribution_warnings:
+                completion_metadata["distribution_warnings"] = result.distribution_warnings
+            # An admin re-render only emails/pushes the customer if the admin
+            # opted in (read from the snapshot taken at worker start — the
+            # marker itself was just cleared above).
+            notify_customer = not suppress_customer_notifications(job)
+            is_admin_rerender = bool(active_admin_rerender(job))
+            if is_admin_rerender:
+                completion_metadata["admin_rerender"] = True
+                completion_metadata["customer_notified"] = notify_customer
+            if regenerate:
+                completion_metadata["regenerate"] = True
+                completion_metadata["customer_notified"] = notify_customer
+                completion_metadata["regenerate_source"] = regenerate.get("source")
+            if not notify_customer:
+                job_log.info("Re-render/regenerate: completion email/push suppressed (notify_customer=False)")
+            extra_updates = {'state_data.admin_rerender': DELETE_FIELD}
+            if regenerate:
+                from datetime import datetime as _dt, timezone as _tz
+                extra_updates['state_data.regenerate'] = DELETE_FIELD
+                extra_updates['renders_regenerated_at'] = _dt.now(_tz.utc)
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.COMPLETE,
+                progress=100,
+                message="Karaoke generation complete!" if not regenerate else "Video regenerated",
+                timeline_metadata=completion_metadata,
+                notify=notify_customer,
+                extra_updates=extra_updates,
+                # An admin re-render / regenerate isn't a newly completed job for the user.
+                count_completion=not (is_admin_rerender or regenerate),
+            )
+
+            # A regenerate started by a public->private visibility change (the
+            # redistribution needs the full finals set): run that change now.
+            if regenerate and regenerate.get('after') == 'change_to_private':
+                await _run_chained_change_to_private(job_id, job_manager, regenerate, job_log)
+
+            # If this was a requests-board community pick published directly here
+            # (i.e. not deferred to the youtube_upload_queue), advance its request
+            # to `published` and fan out "your track is live" voter emails. The
+            # queue path fires the same helper; jobs deferred to the queue are
+            # handled there instead, so we skip them to avoid a premature publish.
+            if result.youtube_url and not result.youtube_upload_queued:
+                try:
+                    from backend.services.community_publish import notify_community_publish
+                    # Idempotent: voters already fully notified are never
+                    # re-emailed, so a quiet admin re-render only completes an
+                    # OWED fan-out (voters are owed "it's live").
+                    await notify_community_publish(job_id, result.youtube_url)
+                except Exception:
+                    logger.exception(f"[job:{job_id}] Community publish fan-out failed (non-fatal)")
+
+            root_span.set_attribute("duration_seconds", duration)
+            root_span.set_attribute("brand_code", result.brand_code or '')
+            logger.info(f"[job:{job_id}] WORKER_END worker=video orchestrator=true status=success duration={duration:.1f}s")
+
+            # Mark video progress as complete for idempotency
+            # This allows the worker to be re-triggered after admin reset
+            job_manager.update_state_data(job_id, 'video_progress', {'stage': 'complete'})
+            return True
+
+    except InvalidStateTransitionError as e:
+        # The job was reset/cancelled out from under us mid-encode (e.g. admin
+        # reset while generating_video/encoding). Discard our stale result quietly
+        # rather than failing a job the operator deliberately moved. See
+        # backend/workers/supersede.py and render_video_worker for the same guard.
+        duration = time.time() - start_time
+        logger.info(
+            f"[job:{job_id}] WORKER_END worker=video orchestrator=true status=superseded "
+            f"duration={duration:.1f}s reason={e}"
+        )
+        return False
+
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"[job:{job_id}] WORKER_END worker=video orchestrator=true status=error duration={duration:.1f}s error={e}")
+        job_manager.mark_job_failed(
+            job_id=job_id,
+            error_message=f"Video generation failed: {str(e)}",
+            error_details={"stage": "video_generation", "error": str(e)}
+        )
+        return False
+
+    finally:
+        # Restore original working directory
+        os.chdir(original_cwd)
+
+        # Remove log handler
+        for logger_name in VIDEO_WORKER_LOGGERS:
+            try:
+                logging.getLogger(logger_name).removeHandler(log_handler)
+            except Exception:
+                pass
+
+        # Cleanup rclone config file
+        if rclone_service:
+            rclone_service.cleanup()
+
+        # Cleanup temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.debug(f"Cleaned up temp directory: {temp_dir}")
+
+
+async def _run_chained_change_to_private(job_id: str, job_manager: JobManager, regenerate: Dict[str, Any], job_log) -> None:
+    """Finish a public->private visibility change that waited for a regenerate."""
+    from backend.services.visibility_change_service import VisibilityChangeService
+    requested_by = regenerate.get('requested_by') or 'unknown'
+    try:
+        fresh = job_manager.get_job(job_id)
+        await VisibilityChangeService(job_manager).change_to_private(
+            job_id, fresh, requested_by, regenerate_if_missing=False, holds_claim=True,
+        )
+        job_log.info("Regenerated finals redistributed: visibility changed to private")
+    except Exception as e:  # noqa: BLE001 - the regenerate itself succeeded
+        job_log.error(f"Visibility change to private after regenerate failed: {e}")
+        logger.exception(f"[job:{job_id}] Chained change_to_private failed")
+        try:
+            job_manager.update_job(job_id, {'state_data.visibility_change_in_progress': DELETE_FIELD})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# GCS finals/ can hold each output twice: under the short canonical key written by
+# _upload_results (``lossy_4k_mp4.mp4``, the job's file_urls) and under the readable
+# name the encoder produced (``Artist - Title (Final Karaoke Lossy 4k).mp4``).
+# Redistribution downloads the whole folder, so without this it uploaded every final
+# to Dropbox twice (2026-10-25: 17 files / ~400 MB for one track), and the short-named
+# lossless 4K MP4 slipped past the " (Final Karaoke Lossless 4k).mp4" Dropbox
+# exclusion. Readable suffixes match the original Dropbox naming (KaraokeFinalise).
+_REDISTRIBUTION_READABLE_SUFFIXES = {
+    "lossless_4k_mp4.mp4": " (Final Karaoke Lossless 4k).mp4",
+    "lossless_4k_mkv.mkv": " (Final Karaoke Lossless 4k).mkv",
+    "lossy_4k_mp4.mp4": " (Final Karaoke Lossy 4k).mp4",
+    "lossy_720p_mp4.mp4": " (Final Karaoke Lossy 720p).mp4",
+    "portrait_1080x1920.mp4": " (Final Karaoke Portrait 1080x1920).mp4",
+    "with_vocals_mp4.mp4": " (With Vocals).mp4",
+    "title_mov.mov": " (Title).mov",
+    "end_mov.mov": " (End).mov",
+    "cdg_zip.zip": " (Final Karaoke CDG).zip",
+    "txt_zip.zip": " (Final Karaoke TXT).zip",
+}
+
+
+def _dedupe_redistribution_files(downloaded: Dict[str, str], base_name: str) -> Dict[str, str]:
+    """Keep one copy of each final, under its readable name.
+
+    A short-named file whose readable twin was also downloaded is deleted; a
+    short-named file with no twin is renamed to the readable name, so the Dropbox
+    folder looks like the original upload and suffix-based exclusions apply.
+    Unrecognised files pass through untouched.
+    """
+    result = dict(downloaded)
+    for filename, path in downloaded.items():
+        suffix = _REDISTRIBUTION_READABLE_SUFFIXES.get(filename)
+        if not suffix:
+            continue
+        readable = f"{base_name}{suffix}"
+        del result[filename]
+        # Twin match on the suffix, not the exact name: the encoder may have spelt
+        # the artist/title slightly differently from sanitize_filename.
+        if any(name.endswith(suffix) for name in result):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        readable_path = os.path.join(os.path.dirname(path), readable)
+        os.replace(path, readable_path)
+        result[readable] = readable_path
+    return result
+
+
+def redistribute_video_off_loop(job_id: str) -> bool:
+    """Run ``redistribute_video`` to completion on the CALLING thread's own event loop.
+
+    For ``await asyncio.to_thread(redistribute_video_off_loop, job_id)`` from the API.
+    ``redistribute_video`` is async but every step inside it is sync (GCS downloads,
+    Firestore, ~400 MB of Dropbox uploads), so awaiting it on the API loop froze every
+    request on the instance (2026-10-25: 39s, 13 requests incl. /api/health). Nothing
+    it touches is bound to the API loop: it builds its own JobManager/StorageService,
+    the Dropbox/YouTube/GDrive clients are sync, and job-log writes go through
+    log_write_offload's thread. Notification tasks it schedules land on this private
+    loop, so drain them before the loop closes (with_notification_drain).
+    """
+    return asyncio.run(with_notification_drain(redistribute_video(job_id)))
+
+
+async def redistribute_video(job_id: str) -> bool:
+    """
+    Redistribute existing finals for a completed job (no re-encoding).
+
+    Used by visibility change (public -> private) to redistribute existing
+    encoded files to a different destination without re-rendering or re-encoding.
+
+    Downloads finals from GCS, runs only organization + distribution stages.
+    """
+    from backend.workers.video_worker_orchestrator import (
+        VideoWorkerOrchestrator,
+        OrchestratorConfig,
+    )
+    from backend.services.job_defaults_service import get_effective_distribution_for_job
+
+    job_manager = JobManager()
+    storage = StorageService()
+    job_log = create_job_logger(job_id, "video-redistribute")
+
+    logger.info(f"[job:{job_id}] WORKER_START worker=video-redistribute")
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        logger.error(f"[job:{job_id}] Job not found for redistribution")
+        return False
+
+    temp_dir = tempfile.mkdtemp(prefix=f"karaoke_redist_{job_id}_")
+    orchestrator = None
+
+    try:
+        # Download existing finals from GCS by listing the finals folder
+        safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+        safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+
+        downloaded_files = {}
+        blobs = storage.list_files(f"jobs/{job_id}/finals/")
+        for blob_name in blobs:
+            filename = os.path.basename(blob_name)
+            if not filename:
+                continue
+            local_path = os.path.join(temp_dir, filename)
+            try:
+                storage.download_file(blob_name, local_path)
+                downloaded_files[filename] = local_path
+                job_log.info(f"Downloaded {filename} from GCS")
+            except Exception as e:
+                job_log.warning(f"Could not download {filename}: {e}")
+
+        # Also download CDG/TXT packages if they exist
+        package_blobs = storage.list_files(f"jobs/{job_id}/packages/")
+        for blob_name in package_blobs:
+            filename = os.path.basename(blob_name)
+            if not filename:
+                continue
+            local_path = os.path.join(temp_dir, filename)
+            try:
+                storage.download_file(blob_name, local_path)
+                downloaded_files[filename] = local_path
+                job_log.info(f"Downloaded package {filename} from GCS")
+            except Exception as e:
+                job_log.warning(f"Could not download package {filename}: {e}")
+
+        if not downloaded_files:
+            raise RuntimeError("No finals files found in GCS for redistribution")
+
+        downloaded_files = _dedupe_redistribution_files(
+            downloaded_files, f"{safe_artist} - {safe_title}"
+        )
+
+        # Get effective distribution settings for the (now-updated) job
+        # Re-read job since is_private was just toggled
+        job = job_manager.get_job(job_id)
+        dist = get_effective_distribution_for_job(job)
+
+        # Load YouTube credentials if needed
+        youtube_credentials = None
+        if dist.enable_youtube_upload:
+            youtube_service = get_youtube_service()
+            if youtube_service.is_configured:
+                youtube_credentials = youtube_service.get_credentials_dict()
+
+        # Create a minimal orchestrator config for distribution only
+        config = OrchestratorConfig(
+            job_id=job_id,
+            artist=job.artist,
+            title=job.title,
+            # Input files - not needed for distribution, but required by dataclass
+            title_video_path="",
+            karaoke_video_path="",
+            instrumental_audio_path="",
+            output_dir=temp_dir,
+            # Distribution settings
+            enable_youtube_upload=dist.enable_youtube_upload,
+            brand_prefix=dist.brand_prefix,
+            discord_webhook_url=dist.discord_webhook_url,
+            youtube_credentials=youtube_credentials,
+            youtube_description_template=dist.youtube_description,
+            translation_language_name=translated_language_name(job.state_data),
+            dropbox_path=dist.dropbox_path,
+            gdrive_folder_id=dist.gdrive_folder_id,
+            enable_cdg=getattr(job, 'enable_cdg', False),
+            enable_txt=getattr(job, 'enable_txt', False),
+            # Redistributing an already-`complete` job: progress updates must not
+            # attempt status transitions (complete -> packaging is illegal and
+            # would abort the redistribution).
+            redistribute_mode=True,
+        )
+
+        orchestrator = VideoWorkerOrchestrator(
+            config=config,
+            job_manager=job_manager,
+            storage=storage,
+            job_logger=job_log,
+        )
+
+        # Map downloaded files to orchestrator result attributes by their format tag.
+        # Classify on the trailing parenthetical (not the whole filename) so a track
+        # whose artist/title contains a format word — e.g. "Portrait of Jennie", whose
+        # 720p was misfiled as the portrait video in the encode path (NOMAD-1632) —
+        # redistributes correctly here too.
+        from backend.services.encoding_interface import classify_encoded_output
+        _RESULT_ATTR_BY_FORMAT = {
+            'mp4_4k_lossless': 'final_video',
+            'mkv_4k': 'final_video_mkv',
+            'mp4_4k_lossy': 'final_video_lossy',
+            'mp4_720p': 'final_video_720p',
+            'cdg_zip': 'final_karaoke_cdg_zip',
+            'txt_zip': 'final_karaoke_txt_zip',
+        }
+        for filename, path in downloaded_files.items():
+            attr = _RESULT_ATTR_BY_FORMAT.get(classify_encoded_output(filename))
+            if attr:
+                setattr(orchestrator.result, attr, path)
+
+        # Run only organization + distribution + notifications
+        await orchestrator._run_organization()
+        await orchestrator._run_distribution()
+        await orchestrator._run_notifications()
+
+        # Verify the redistribution actually produced the archive before reporting
+        # success. The orchestrator swallows brand-code and Dropbox failures as
+        # non-fatal warnings, so an apparent "success" can hide a missing archive.
+        # Reporting success in that case would let the caller (public->private
+        # visibility change) delete the still-live public outputs against a
+        # non-existent private archive — the exact data-loss bug this path fixes.
+        if config.brand_prefix and not orchestrator.result.brand_code:
+            raise RuntimeError(
+                "Redistribution produced no brand code — archive identity is missing"
+            )
+        if config.dropbox_path:
+            dropbox_failed = any(
+                "Dropbox upload failed" in w
+                for w in (orchestrator.result.distribution_warnings or [])
+            )
+            if dropbox_failed:
+                raise RuntimeError("Redistribution failed to upload the Dropbox archive")
+
+        # Update job state_data with new distribution results. Atomic per-field
+        # writes so this redistribution can't clobber a concurrent state_data
+        # write (e.g. the visibility-change flow or worker_generation fence).
+        job_manager.update_job(job_id, {
+            'state_data.brand_code': orchestrator.result.brand_code,
+            'state_data.youtube_url': orchestrator.result.youtube_url,
+            'state_data.dropbox_link': orchestrator.result.dropbox_link,
+            'state_data.gdrive_files': orchestrator.result.gdrive_files,
+            'state_data.visibility_change_in_progress': DELETE_FIELD,
+            'outputs_deleted_at': None,
+            'outputs_deleted_by': None,
+        })
+
+        logger.info(f"[job:{job_id}] WORKER_END worker=video-redistribute status=success")
+        return True
+
+    except Exception as e:
+        logger.error(f"[job:{job_id}] WORKER_END worker=video-redistribute status=error error={e}")
+        # A brand code may have been allocated during _run_organization before the
+        # failure. It was never persisted to the job, so return it to the pool to
+        # avoid leaking a number (and, for a public->private change, so the caller's
+        # rollback leaves no orphaned NOMADNP code).
+        allocated = getattr(getattr(orchestrator, "result", None), "brand_code", None)
+        if allocated:
+            try:
+                from backend.services.brand_code_service import (
+                    BrandCodeService,
+                    get_brand_code_service,
+                )
+                prefix, number = BrandCodeService.parse_brand_code(allocated)
+                get_brand_code_service().recycle_brand_code(prefix, number)
+                logger.info(
+                    f"[job:{job_id}] Recycled brand code {allocated} after failed redistribution"
+                )
+            except Exception as recycle_err:
+                logger.warning(
+                    f"[job:{job_id}] Failed to recycle brand code {allocated} "
+                    f"after failed redistribution: {recycle_err}"
+                )
+        return False
+
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+async def generate_video(job_id: str) -> bool:
+    """
+    Generate final karaoke videos.
+
+    Routes to either the new orchestrator-based pipeline or the legacy
+    KaraokeFinalise-based pipeline based on USE_NEW_ORCHESTRATOR flag.
+
+    Args:
+        job_id: Job ID to process
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if USE_NEW_ORCHESTRATOR:
+        logger.info(f"[job:{job_id}] Using new orchestrator-based pipeline")
+        return await generate_video_orchestrated(job_id)
+    else:
+        logger.info(f"[job:{job_id}] Using legacy KaraokeFinalise pipeline")
+        return await generate_video_legacy(job_id)
+
+
+async def generate_video_legacy(job_id: str) -> bool:
+    """
+    Generate final karaoke videos using KaraokeFinalise (legacy path).
+
+    This is the original implementation that has divergent behavior between
+    GCE and local encoding paths. Kept for rollback purposes.
+
+    Args:
+        job_id: Job ID to process
+
+    Returns:
+        True if successful, False otherwise
+    """
+    start_time = time.time()
+    job_manager = JobManager()
+    storage = StorageService()
+    settings = get_settings()
+    
+    # Create job logger for remote debugging
+    job_log = create_job_logger(job_id, "video")
+    
+    # Log with structured markers for easy Cloud Logging queries
+    logger.info(f"[job:{job_id}] WORKER_START worker=video")
+    
+    # Set up log capture for KaraokeFinalise
+    log_handler = setup_job_logging(job_id, "video", *VIDEO_WORKER_LOGGERS)
+    
+    job = job_manager.get_job(job_id)
+    if not job:
+        logger.error(f"[job:{job_id}] Job not found")
+        return False
+    
+    # Review can finish before stem separation does: wait for the stems instead
+    # of failing prerequisites (which used to strand the job forever).
+    parked, job = _park_until_stems_ready(job_id, job, job_manager, job_log)
+    if parked:
+        return True
+
+    # Validate prerequisites
+    if not _validate_prerequisites(job):
+        logger.error(f"[job:{job_id}] Prerequisites not met for video generation")
+        return False
+
+    # Validate job status is appropriate for video worker
+    from backend.services.job_health_service import validate_worker_can_run
+    status_error = validate_worker_can_run("video_worker", job)
+    if status_error:
+        logger.warning(f"[job:{job_id}] {status_error}")
+        job_log.warning(status_error)
+        return False
+
+    # Create temporary working directory
+    temp_dir = tempfile.mkdtemp(prefix=f"karaoke_video_{job_id}_")
+    original_cwd = os.getcwd()
+
+    # Set up rclone config if needed for Dropbox upload
+    rclone_service = None
+    if getattr(job, 'organised_dir_rclone_root', None):
+        rclone_service = get_rclone_service()
+        if rclone_service.setup_rclone_config():
+            job_log.info("Rclone config loaded for Dropbox upload")
+        else:
+            job_log.warning("Rclone config not available - Dropbox upload will be skipped")
+    
+    # Load YouTube credentials if needed (skip for private/non-published tracks)
+    youtube_credentials = None
+    if getattr(job, 'enable_youtube_upload', False) and not getattr(job, 'is_private', False):
+        youtube_service = get_youtube_service()
+        if youtube_service.is_configured:
+            youtube_credentials = youtube_service.get_credentials_dict()
+            job_log.info("YouTube credentials loaded for video upload")
+        else:
+            job_log.warning("YouTube credentials not available - upload will be skipped")
+    elif getattr(job, 'is_private', False):
+        job_log.info("Private track - skipping YouTube upload")
+
+    try:
+        # Wrap entire worker in a tracing span
+        with job_span("video-worker", job_id, {"artist": job.artist, "title": job.title}) as root_span:
+            # Use job_logging_context for proper log isolation when multiple jobs run concurrently
+            # This ensures logs from third-party libraries (karaoke_gen.karaoke_finalise) are only
+            # captured by this job's handler, not handlers from other concurrent jobs
+            with job_logging_context(job_id):
+                job_log.info(f"Starting video finalization for {job.artist} - {job.title}")
+                logger.info(f"[job:{job_id}] Starting video generation for {job.artist} - {job.title}")
+            
+            # Transition to GENERATING_VIDEO state
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.GENERATING_VIDEO,
+                progress=70,
+                message="Preparing files for video generation"
+            )
+            
+            # Download and set up files in the format KaraokeFinalise expects
+            # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+            safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+            safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+            base_name = f"{safe_artist} - {safe_title}"
+            with job_span("download-files", job_id):
+                job_log.info("Downloading files from GCS (this may take a few minutes for large files)...")
+                await _setup_working_directory(job_id, job, storage, temp_dir, base_name, job_log)
+                job_log.info("All files downloaded successfully")
+            
+            # Load style config for CDG styles
+            job_log.info("Loading CDG style configuration...")
+            style_config = await load_style_config(job, storage, temp_dir)
+            cdg_styles = style_config.get_cdg_styles()
+            if cdg_styles:
+                job_log.info("CDG styles loaded from custom configuration")
+            else:
+                job_log.info("Using default CDG styles")
+            
+            # Change to working directory (KaraokeFinalise works in cwd)
+            os.chdir(temp_dir)
+            
+            # Get the selected instrumental file path
+            # Batch 3: If user provided existing instrumental, use that; otherwise use AI-separated
+            instrumental_selection = job.state_data['instrumental_selection']
+            existing_instrumental_path = getattr(job, 'existing_instrumental_gcs_path', None)
+            
+            if existing_instrumental_path:
+                # User provided existing instrumental
+                ext = Path(existing_instrumental_path).suffix.lower()
+                instrumental_file = os.path.join(temp_dir, f"{base_name} (Instrumental User){ext}")
+                instrumental_source = "user-provided"
+            else:
+                # Use AI-separated instrumental
+                instrumental_suffix = "Clean" if instrumental_selection == 'clean' else "Backing"
+                instrumental_file = os.path.join(temp_dir, f"{base_name} (Instrumental {instrumental_suffix}).flac")
+                instrumental_source = instrumental_selection
+            
+            # Transition to encoding state
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.ENCODING,
+                progress=75,
+                message="Encoding videos (15-20 min)"
+            )
+            
+            # Get countdown padding info from lyrics metadata
+            # This ensures instrumental is padded to match vocals if countdown was added
+            lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+            countdown_padding_seconds = None
+            if lyrics_metadata.get('has_countdown_padding'):
+                countdown_padding_seconds = lyrics_metadata.get('countdown_padding_seconds', 3.0)
+                job_log.info(f"Countdown padding detected: {countdown_padding_seconds}s - instrumental will be padded if needed")
+            
+            # Check if GCE encoding is enabled for high-performance encoding
+            encoding_service = get_encoding_service()
+            use_gce_encoding = encoding_service.is_enabled
+
+            if use_gce_encoding:
+                # ============ GCE ENCODING PATH ============
+                # Use dedicated C4 GCE instance for 2-3x faster FFmpeg encoding
+                job_log.info("GCE encoding enabled - using high-performance encoding worker")
+                job_log.info(f"  instrumental source: {instrumental_source}")
+
+                result = await _encode_via_gce(
+                    job_id=job_id,
+                    job=job,
+                    job_manager=job_manager,
+                    storage=storage,
+                    temp_dir=temp_dir,
+                    base_name=base_name,
+                    job_log=job_log,
+                )
+
+                # GCE encoding doesn't generate brand_code, CDG/TXT, or Discord notifications
+                # These will be handled by distribution if needed
+                job_log.info("GCE encoding complete - encoded files downloaded")
+
+            else:
+                # ============ STANDARD ENCODING PATH ============
+                # Use KaraokeFinalise for encoding (runs on Cloud Run)
+
+                # Log finalization parameters
+                job_log.info("Using KaraokeFinalise for encoding (standard path)")
+                job_log.info(f"  enable_cdg: {getattr(job, 'enable_cdg', False)}")
+                job_log.info(f"  enable_txt: {getattr(job, 'enable_txt', False)}")
+                job_log.info(f"  brand_prefix: {getattr(job, 'brand_prefix', None)}")
+                job_log.info(f"  discord_webhook: {'configured' if getattr(job, 'discord_webhook_url', None) else 'not configured'}")
+                job_log.info(f"  instrumental source: {instrumental_source}")
+                job_log.info(f"  countdown_padding_seconds: {countdown_padding_seconds}")
+                if existing_instrumental_path:
+                    job_log.info(f"  using user-provided instrumental (selection was: {instrumental_selection})")
+
+                # Set up YouTube description file if template is provided
+                youtube_desc_path = None
+                if youtube_credentials and getattr(job, 'youtube_description_template', None):
+                    youtube_desc_path = os.path.join(temp_dir, "youtube_description.txt")
+                    with open(youtube_desc_path, 'w') as f:
+                        f.write(job.youtube_description_template)
+                    job_log.info("YouTube description template written to temp file")
+
+                # Duet-aware CDG: download the corrections JSON locally if present
+                # so KaraokeFinalise can read per-segment singer tags for the CDG.
+                is_duet_state = bool(job.state_data.get("is_duet", False))
+                duet_corrections_local_path = None
+                if is_duet_state and getattr(job, 'enable_cdg', False):
+                    try:
+                        corrections_blob = (
+                            f"jobs/{job_id}/lyrics/corrections_updated.json"
+                            if storage.file_exists(f"jobs/{job_id}/lyrics/corrections_updated.json")
+                            else f"jobs/{job_id}/lyrics/corrections.json"
+                        )
+                        duet_corrections_local_path = os.path.join(temp_dir, "corrections_for_cdg.json")
+                        storage.download_file(corrections_blob, duet_corrections_local_path)
+                        job_log.info(f"Downloaded corrections for duet CDG from {corrections_blob}")
+                    except Exception as exc:
+                        job_log.warning(f"Could not download corrections for duet CDG: {exc}")
+                        duet_corrections_local_path = None
+
+                finalise = KaraokeFinalise(
+                    logger=logger,
+                    log_level=logging.INFO,
+                    dry_run=False,
+                    instrumental_format="flac",
+                    # CDG/TXT generation
+                    enable_cdg=getattr(job, 'enable_cdg', False),
+                    enable_txt=getattr(job, 'enable_txt', False),
+                    # Duet-aware CDG rendering
+                    is_duet=is_duet_state,
+                    duet_corrections_json_path=duet_corrections_local_path,
+                    cdg_styles=cdg_styles,
+                    # Brand code and organization (server-side mode uses rclone)
+                    brand_prefix=getattr(job, 'brand_prefix', None),
+                    organised_dir=None,  # Not used in cloud - files stay in GCS
+                    organised_dir_rclone_root=getattr(job, 'organised_dir_rclone_root', None),
+                    public_share_dir=None,  # Not used in cloud
+                    # Notifications
+                    # A quiet admin re-render doesn't announce the new video.
+                    discord_webhook_url=(
+                        None if suppress_customer_notifications(job)
+                        else getattr(job, 'discord_webhook_url', None)
+                    ),
+                    # YouTube upload (server-side with pre-loaded credentials)
+                    youtube_client_secrets_file=None,  # Not used with pre-stored credentials
+                    youtube_description_file=youtube_desc_path,
+                    user_youtube_credentials=youtube_credentials,  # Pre-loaded from Secret Manager
+                    rclone_destination=None,
+                    email_template_file=None,
+                    # Server-side optimizations
+                    non_interactive=True,
+                    server_side_mode=True,
+                    selected_instrumental_file=instrumental_file,
+                    # Audio synchronization - ensure instrumental matches vocal padding
+                    countdown_padding_seconds=countdown_padding_seconds,
+                )
+
+                # Call process() - this does ALL the work:
+                # - Encodes to 4 video formats
+                # - Generates CDG/TXT packages if enabled
+                # - Posts Discord notification if configured
+                # - Handles brand code generation
+                with job_span("karaoke-finalise", job_id) as finalise_span:
+                    finalise_start = time.time()
+                    job_log.info("Starting KaraokeFinalise.process() - this may take 15-20 minutes...")
+                    logger.info(f"[job:{job_id}] Starting KaraokeFinalise.process()")
+                    add_span_event("finalise_started")
+
+                    result = finalise.process()
+
+                    finalise_duration = time.time() - finalise_start
+                    finalise_span.set_attribute("duration_seconds", finalise_duration)
+                    add_span_event("finalise_completed", {"duration_seconds": finalise_duration})
+
+                job_log.info("KaraokeFinalise.process() complete!")
+                if result.get('brand_code'):
+                    job_log.info(f"Brand code: {result.get('brand_code')}")
+                logger.info(f"[job:{job_id}] KaraokeFinalise.process() complete in {finalise_duration:.1f}s")
+                logger.info(f"[job:{job_id}] Brand code: {result.get('brand_code')}")
+            
+            # Native API distribution uploads (used by remote CLI instead of rclone)
+            with job_span("distribution", job_id):
+                await _handle_native_distribution(
+                    job_id=job_id,
+                    job=job,
+                    job_log=job_log,
+                    job_manager=job_manager,
+                    temp_dir=temp_dir,
+                    result=result,
+                    storage=storage,
+                )
+            
+            # Upload generated files to GCS
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.PACKAGING,
+                progress=95,
+                message="Uploading final files"
+            )
+            
+            with job_span("upload-results", job_id):
+                await _upload_results(job_id, job_manager, storage, temp_dir, result)
+            
+            # Store result metadata in job BEFORE transitioning to COMPLETE
+            # This ensures youtube_url is available when completion email is sent
+            # NOTE: Must include dropbox_link and gdrive_files from result, since
+            # _handle_native_distribution already saved them but job.state_data
+            # is stale (fetched before distribution ran)
+            logger.info(f"[job:{job_id}] Video generation complete")
+            notify_customer = not suppress_customer_notifications(job)
+            kept_outputs = admin_rerender_kept_outputs(job)
+            new_state_data = {
+                **job.state_data,
+                'brand_code': result.get('brand_code'),
+                'youtube_url': result.get('youtube_url') or kept_outputs.get('youtube_url'),
+                'dropbox_link': result.get('dropbox_link') or kept_outputs.get('dropbox_link'),
+                'gdrive_files': result.get('gdrive_files') or kept_outputs.get('gdrive_files'),
+            }
+            # A theme/admin re-render finished — drop its marker.
+            new_state_data.pop('theme_rerender', None)
+            new_state_data.pop('admin_rerender', None)
+            job_manager.update_job(job_id, {
+                'state_data': new_state_data,
+                'outputs_deleted_at': None,
+                'outputs_deleted_by': None,
+            })
+
+            # Mark job as complete (triggers completion email with youtube_url now available)
+            duration = time.time() - start_time
+            completion_metadata = {
+                "action": "completed",
+                "brand_code": result.get('brand_code'),
+                "youtube_url": result.get('youtube_url'),
+                "dropbox_link": result.get('dropbox_link'),
+                "gdrive_file_ids": result.get('gdrive_files'),
+                "edit_count": getattr(job, 'edit_count', 0),
+                "duration_seconds": round(duration, 1),
+            }
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.COMPLETE,
+                progress=100,
+                message="Karaoke generation complete!",
+                timeline_metadata=completion_metadata,
+                notify=notify_customer,
+                count_completion=not active_admin_rerender(job),
+            )
+
+            # Advance a requests-board community pick to `published` + fan out
+            # voter emails (legacy path always publishes directly here).
+            if result.get('youtube_url'):
+                try:
+                    from backend.services.community_publish import notify_community_publish
+                    await notify_community_publish(job_id, result.get('youtube_url'))
+                except Exception:
+                    logger.exception(f"[job:{job_id}] Community publish fan-out failed (non-fatal)")
+
+            root_span.set_attribute("duration_seconds", duration)
+            root_span.set_attribute("brand_code", result.get('brand_code', ''))
+            logger.info(f"[job:{job_id}] WORKER_END worker=video status=success duration={duration:.1f}s")
+
+            # Mark video progress as complete for idempotency
+            # This allows the worker to be re-triggered after admin reset
+            job_manager.update_state_data(job_id, 'video_progress', {'stage': 'complete'})
+            return True
+
+    except InvalidStateTransitionError as e:
+        # Job reset/cancelled out from under us mid-encode — discard the stale
+        # result quietly instead of failing the operator's reset (see the
+        # orchestrated path and render_video_worker for the same guard).
+        duration = time.time() - start_time
+        logger.info(
+            f"[job:{job_id}] WORKER_END worker=video status=superseded "
+            f"duration={duration:.1f}s reason={e}"
+        )
+        return False
+
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"[job:{job_id}] WORKER_END worker=video status=error duration={duration:.1f}s error={e}")
+        job_manager.mark_job_failed(
+            job_id=job_id,
+            error_message=f"Video generation failed: {str(e)}",
+            error_details={"stage": "video_generation", "error": str(e)}
+        )
+        return False
+
+    finally:
+        # Restore original working directory
+        os.chdir(original_cwd)
+        
+        # Remove log handler to avoid duplicate logging on future runs
+        for logger_name in VIDEO_WORKER_LOGGERS:
+            try:
+                logging.getLogger(logger_name).removeHandler(log_handler)
+            except Exception:
+                pass
+        
+        # Cleanup rclone config file
+        if rclone_service:
+            rclone_service.cleanup()
+        
+        # Cleanup temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.debug(f"Cleaned up temp directory: {temp_dir}")
+
+
+def _adopt_fallback_gdrive_upload(config, result, native_result: Dict[str, Any], job_log) -> None:
+    """Carry a fallback Drive upload's file ids back onto the orchestrator result.
+
+    When the orchestrator's Drive upload fails, _handle_native_distribution()
+    retries it. Without this, the job's state_data.gdrive_files would be
+    overwritten with the orchestrator's empty result and its stale "Google Drive
+    upload failed" warning persisted and alerted on, even though the release
+    landed (NOMAD-1783).
+    """
+    from backend.services.publish_completeness import compute_publish_shortfall
+
+    recovered = native_result.get('gdrive_files')
+    if result.gdrive_files or not recovered:
+        return
+    result.gdrive_files = recovered
+    job_log.info(f"Google Drive upload recovered by fallback pass: {len(recovered)} files")
+    # Only a complete recovery clears the failure; a partial one keeps the warning
+    # (and the completeness check still alerts).
+    if not compute_publish_shortfall(config, result):
+        result.distribution_warnings = [
+            w for w in (result.distribution_warnings or [])
+            if not w.startswith("Google Drive upload failed")
+        ]
+
+
+async def _handle_native_distribution(
+    job_id: str,
+    job,
+    job_log,
+    job_manager: JobManager,
+    temp_dir: str,
+    result: Dict[str, Any],
+    storage: StorageService = None,
+) -> None:
+    """
+    Handle distribution uploads using native APIs (Dropbox SDK, Google Drive API).
+
+    This is used by the remote CLI instead of rclone-based uploads.
+    The native APIs provide:
+    - Better error handling and retry logic
+    - No need for rclone binary in container
+    - Credentials managed via Secret Manager
+
+    Args:
+        job_id: Job ID
+        job: Job object with dropbox_path and gdrive_folder_id fields
+        job_log: Job-specific logger
+        job_manager: Job manager for updating job state
+        temp_dir: Temporary directory with output files
+        result: Result dict from KaraokeFinalise.process()
+        storage: StorageService instance for downloading stems/lyrics
+    """
+    brand_code = result.get('brand_code')
+    # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+    safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+    safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+    base_name = f"{safe_artist} - {safe_title}"
+
+    # Check if we should preserve existing brand code (Batch 6: --keep-brand-code)
+    from backend.services.theme_rerender_service import rerender_brand_code
+    keep_brand_code = getattr(job, 'keep_brand_code', None) or rerender_brand_code(job)
+    if keep_brand_code:
+        brand_code = keep_brand_code
+        result['brand_code'] = brand_code
+        job_log.info(f"Using preserved brand code: {brand_code}")
+
+    # Get effective distribution settings (applies private track overrides if is_private=True)
+    from backend.services.job_defaults_service import get_effective_distribution_for_job
+    dist = get_effective_distribution_for_job(job)
+
+    # Upload to Dropbox using native SDK
+    dropbox_path = dist.dropbox_path
+    brand_prefix = dist.brand_prefix
+    
+    if dropbox_path and brand_prefix:
+        try:
+            from backend.services.dropbox_service import get_dropbox_service
+            
+            dropbox = get_dropbox_service()
+            
+            if not dropbox.is_configured:
+                job_log.warning("Dropbox credentials not configured - skipping upload")
+            else:
+                job_log.info(f"Starting native Dropbox upload to {dropbox_path}")
+                
+                # Calculate brand code atomically (if not already generated)
+                if not brand_code:
+                    from backend.services.brand_code_service import get_brand_code_service
+                    brand_code_service = get_brand_code_service()
+                    brand_code = brand_code_service.allocate_brand_code(brand_prefix, dropbox_path)
+                    result['brand_code'] = brand_code
+                    job_log.info(f"Generated brand code: {brand_code}")
+                
+                # Prepare full distribution directory with stems/ and lyrics/ subfolders
+                # This must be done before upload to ensure complete output structure
+                if storage:
+                    await _prepare_distribution_directory(
+                        job_id=job_id,
+                        job=job,
+                        storage=storage,
+                        temp_dir=temp_dir,
+                        base_name=base_name,
+                        job_log=job_log,
+                    )
+
+                # Create folder name and upload files
+                folder_name = f"{brand_code} - {base_name}"
+                remote_folder = f"{dropbox_path}/{folder_name}"
+
+                job_log.info(f"Uploading to Dropbox folder: {remote_folder}")
+                from backend.services.dropbox_service import dropbox_skip_suffixes_for
+
+                # The orchestrator already uploaded this folder minus stems/ and
+                # lyrics/ (prepared just above) — only send what's new or changed
+                # instead of re-uploading every file a second time.
+                from backend.workers.video_worker_orchestrator import tenant_track_code_prefix
+
+                dropbox.upload_folder(
+                    temp_dir, remote_folder,
+                    exclude_suffixes=dropbox_skip_suffixes_for(dropbox_path),
+                    skip_unchanged=True,
+                    # Same names as the orchestrator's pass (tenant "<CODE> - " prefix),
+                    # or this pass would add an unprefixed copy of every file.
+                    filename_prefix=tenant_track_code_prefix(job),
+                )
+                
+                # Create sharing link
+                try:
+                    sharing_link = dropbox.create_shared_link(remote_folder)
+                    result['dropbox_link'] = sharing_link
+                    job_log.info(f"Dropbox sharing link: {sharing_link}")
+                except Exception as e:
+                    job_log.warning(f"Failed to create Dropbox sharing link: {e}")
+                
+                job_log.info("Native Dropbox upload complete")
+                
+        except ImportError as e:
+            job_log.warning(f"Dropbox SDK not installed: {e}")
+        except Exception as e:
+            # WARNING, not ERROR: delivery_guard posts the actionable alert
+            # (held completion email) — one per job, not one per pass.
+            job_log.warning(f"Native Dropbox upload failed: {e}", exc_info=True)
+            result.setdefault('distribution_warnings', []).append(f"Dropbox upload failed: {e}")
+            # Don't fail the job - distribution is optional
+    
+    # Upload to Google Drive using native API
+    # Skip if orchestrator already uploaded (gdrive_files already populated)
+    # This prevents duplicate uploads when using the orchestrator path
+    gdrive_folder_id = dist.gdrive_folder_id
+    existing_gdrive_files = result.get('gdrive_files')
+
+    if gdrive_folder_id and not existing_gdrive_files:
+        try:
+            from backend.services.gdrive_service import get_gdrive_service
+            
+            gdrive = get_gdrive_service()
+            
+            if not gdrive.is_configured:
+                job_log.warning("Google Drive credentials not configured - skipping upload")
+            else:
+                job_log.info(f"Starting native Google Drive upload to folder {gdrive_folder_id}")
+                
+                # Use brand code from Dropbox or generate placeholder
+                upload_brand_code = brand_code or f"{brand_prefix or 'TRACK'}-0000"
+                
+                # Map result keys to expected keys for upload_to_public_share
+                output_files = {
+                    'final_karaoke_lossy_mp4': result.get('final_video_lossy'),
+                    'final_karaoke_lossy_720p_mp4': result.get('final_video_720p'),
+                    'final_karaoke_cdg_zip': result.get('final_karaoke_cdg_zip'),
+                }
+                if result.get('original_vocals_guide'):
+                    output_files['original_vocals_guide'] = result['original_vocals_guide']
+                
+                uploaded = gdrive.upload_to_public_share(
+                    root_folder_id=gdrive_folder_id,
+                    brand_code=upload_brand_code,
+                    base_name=base_name,
+                    output_files=output_files,
+                    warnings=result.setdefault('distribution_warnings', []),
+                )
+                
+                result['gdrive_files'] = uploaded
+                job_log.info(f"Google Drive upload complete: {len(uploaded)} files uploaded")
+                
+        except ImportError as e:
+            job_log.warning(f"Google API packages not installed: {e}")
+        except Exception as e:
+            job_log.error(f"Native Google Drive upload failed: {e}", exc_info=True)
+            result.setdefault('distribution_warnings', []).append(f"Google Drive upload failed: {e}")
+            # Don't fail the job - distribution is optional
+    elif existing_gdrive_files:
+        job_log.info(f"Skipping Google Drive upload - orchestrator already uploaded {len(existing_gdrive_files)} files")
+
+    # Update job state_data with brand code and links
+    if brand_code or result.get('dropbox_link') or result.get('gdrive_files'):
+        try:
+            # Atomic per-field writes so this distribution update can't clobber a
+            # concurrent state_data write from a stale full-map snapshot.
+            state_updates: Dict[str, Any] = {
+                'state_data.brand_code': brand_code,
+                'state_data.dropbox_link': result.get('dropbox_link'),
+                'state_data.gdrive_files': result.get('gdrive_files'),
+            }
+            if result.get('distribution_warnings'):
+                state_updates['state_data.distribution_warnings'] = result['distribution_warnings']
+            job_manager.update_job(job_id, state_updates)
+        except Exception as e:
+            job_log.warning(f"Failed to update job state_data: {e}")
+
+    # Send Pushbullet alert if any distribution uploads failed
+    if result.get('distribution_warnings'):
+        _send_distribution_warning_notification(
+            job_id=job_id,
+            artist=job.artist,
+            title=job.title,
+            warnings=result['distribution_warnings'],
+        )
+
+
+def _send_distribution_warning_notification(
+    job_id: str,
+    artist: str,
+    title: str,
+    warnings: list[str],
+    settings=None,
+) -> None:
+    """Send Pushbullet notification when distribution uploads fail."""
+    try:
+        if settings is None:
+            settings = get_settings()
+        api_key = settings.get_secret("pushbullet-api-key")
+        if not api_key:
+            logger.warning("Pushbullet API key not found, skipping distribution warning notification")
+            return
+
+        import requests as req
+
+        push_title = f"Distribution Warning: {artist} - {title}"
+        body = f"Job {job_id} completed but {len(warnings)} upload(s) failed:\n\n"
+        body += "\n".join(f"  - {w}" for w in warnings)
+
+        resp = req.post(
+            "https://api.pushbullet.com/v2/pushes",
+            headers={"Access-Token": api_key, "Content-Type": "application/json"},
+            json={"type": "note", "title": push_title, "body": body},
+            timeout=10,
+        )
+        if resp.ok:
+            logger.info(f"[job:{job_id}] Distribution warning notification sent via Pushbullet")
+        else:
+            logger.warning(f"[job:{job_id}] Pushbullet notification failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.warning(f"[job:{job_id}] Failed to send Pushbullet notification: {e}")
+
+
+def _store_video_processing_metadata(
+    job_manager: JobManager,
+    job_id: str,
+    result,
+    total_duration: float,
+) -> None:
+    """Store encoding, distribution, and output metadata in processing_metadata."""
+    try:
+        # Encoding metadata
+        encoding_data = {
+            "encoding_time_seconds": round(result.encoding_time_seconds, 1) if result.encoding_time_seconds else None,
+            "output_formats": [],
+        }
+        # Track which output formats were generated and their sizes
+        output_sizes = {}
+        for attr, fmt_name in [
+            ("final_video", "lossless_4k_mp4"),
+            ("final_video_mkv", "lossless_4k_mkv"),
+            ("final_video_lossy", "lossy_4k_mp4"),
+            ("final_video_720p", "lossy_720p_mp4"),
+        ]:
+            path = getattr(result, attr, None)
+            if path and os.path.exists(path):
+                encoding_data["output_formats"].append(fmt_name)
+                output_sizes[fmt_name] = os.path.getsize(path)
+        if output_sizes:
+            encoding_data["output_sizes_bytes"] = output_sizes
+        job_manager.update_processing_metadata(job_id, "encoding", encoding_data)
+
+        # Distribution metadata
+        distribution_data = {}
+        if result.youtube_url:
+            distribution_data["youtube_video_url"] = result.youtube_url
+        if result.youtube_upload_queued:
+            distribution_data["youtube_upload_queued"] = True
+        if result.dropbox_link:
+            distribution_data["dropbox_link"] = result.dropbox_link
+        if result.gdrive_files:
+            distribution_data["gdrive_file_count"] = len(result.gdrive_files)
+        if result.brand_code:
+            distribution_data["brand_code"] = result.brand_code
+        if distribution_data:
+            job_manager.update_processing_metadata(job_id, "distribution", distribution_data)
+
+        # Worker timing
+        job_manager.update_processing_metadata(job_id, "timing.video_worker_seconds", round(total_duration, 1))
+
+    except Exception as e:
+        logger.warning(f"Job {job_id}: Failed to store video processing metadata (non-fatal): {e}")
+
+
+def _park_until_stems_ready(job_id: str, job, job_manager: JobManager, job_log):
+    """Park the job if its selected stem is still being separated.
+
+    Returns ``(parked, job)``. When ``parked`` is True the worker should exit
+    successfully: the audio worker re-triggers it once separation completes.
+    When False, carry on with the returned (possibly refreshed) job.
+
+    Race with the audio worker: we set the flag, then re-read. If separation
+    finished in between, exactly one of us wins the atomic claim on the flag —
+    we continue in-process, or the audio worker has already dispatched a fresh
+    run and we exit.
+    """
+    if not selected_stem_pending(job):
+        return False, job
+    job_manager.park_video_for_stems(job_id)
+    refreshed = job_manager.get_job(job_id) or job
+    if selected_stem_pending(refreshed):
+        msg = "Stem separation still running — final encode parked; it resumes automatically when stems are ready"
+        logger.info(f"[job:{job_id}] {msg}")
+        job_log.info(msg)
+        return True, refreshed
+    if job_manager.claim_video_stems_wait(job_id):
+        logger.info(f"[job:{job_id}] Stems landed while parking — continuing")
+        return False, refreshed
+    logger.info(f"[job:{job_id}] Stems landed while parking; audio worker already resumed the encode")
+    return True, refreshed
+
+
+def _validate_prerequisites(job) -> bool:
+    """Validate that all prerequisites are met for video generation."""
+    # Validate job status is appropriate for video worker
+    # This helps catch bugs where the worker is triggered incorrectly
+    status_error = validate_worker_can_run("video_worker", job)
+    if status_error:
+        logger.warning(f"Job {job.job_id}: {status_error}")
+        return False
+
+    # Check instrumental selection
+    instrumental_selection = job.state_data.get('instrumental_selection')
+    if not instrumental_selection:
+        logger.error(f"Job {job.job_id}: No instrumental selected")
+        return False
+    
+    # 'custom' is valid when user provided existing_instrumental
+    if instrumental_selection not in ['clean', 'with_backing', 'custom']:
+        logger.error(f"Job {job.job_id}: Invalid instrumental selection: {instrumental_selection}")
+        return False
+    
+    # Check screens exist (MOV or PNG — MOV is no longer uploaded, PNG is the new default)
+    screens = job.file_urls.get('screens', {})
+    # A screen the theme omits (state_data.screens_included) isn't needed.
+    has_title = screens.get('title') or screens.get('title_png') or not screen_included(job.state_data, 'title')
+    has_end = screens.get('end') or screens.get('end_png') or not screen_included(job.state_data, 'end')
+    if not has_title or not has_end:
+        logger.error(f"Job {job.job_id}: Missing title or end screen")
+        return False
+    
+    # Check lyrics video exists
+    videos = job.file_urls.get('videos', {})
+    if not videos.get('with_vocals'):
+        logger.error(f"Job {job.job_id}: Missing lyrics video")
+        return False
+    
+    # Check instrumental exists - for 'custom', check uploaded file or mute-region stem
+    if instrumental_selection == 'custom':
+        existing_instrumental_path = getattr(job, 'existing_instrumental_gcs_path', None)
+        stems = job.file_urls.get('stems', {})
+        if not existing_instrumental_path and not stems.get('custom_instrumental'):
+            logger.error(f"Job {job.job_id}: Custom instrumental selected but no existing_instrumental_gcs_path or custom_instrumental stem")
+            return False
+        return True  # Other stem checks not needed for custom instrumental
+    
+    stems = job.file_urls.get('stems', {})
+    instrumental_key = 'instrumental_clean' if instrumental_selection == 'clean' else 'instrumental_with_backing'
+    if not stems.get(instrumental_key):
+        logger.error(f"Job {job.job_id}: Missing instrumental: {instrumental_key}")
+        return False
+    
+    return True
+
+
+async def _setup_working_directory(
+    job_id: str,
+    job,
+    storage: StorageService,
+    temp_dir: str,
+    base_name: str,
+    job_log=None
+) -> None:
+    """
+    Download files from GCS and set up the directory structure KaraokeFinalise expects.
+    
+    KaraokeFinalise.process() looks for files with specific naming conventions:
+    - {base_name} (Title).mov
+    - {base_name} (End).mov  
+    - {base_name} (With Vocals).mov
+    - {base_name} (Karaoke).lrc
+    - Instrumental audio file
+    """
+    def log_progress(message: str):
+        """Log to both module logger and job logger if available."""
+        logger.info(f"Job {job_id}: {message}")
+        if job_log:
+            job_log.info(message)
+    
+    log_progress("Setting up working directory")
+    
+    # Download title screen (PNG — MOV video is generated by the GCE encoding worker)
+    screens = job.file_urls.get('screens', {})
+    title_url = screens.get('title') or screens.get('title_png')
+    if title_url:
+        ext = os.path.splitext(title_url)[1] or '.png'
+        title_path = os.path.join(temp_dir, f"{base_name} (Title){ext}")
+        log_progress(f"Downloading title screen ({ext})...")
+        storage.download_file(title_url, title_path)
+        log_progress("Downloaded title screen")
+
+    # Download end screen (PNG — MOV video is generated by the GCE encoding worker)
+    end_url = screens.get('end') or screens.get('end_png')
+    if end_url:
+        ext = os.path.splitext(end_url)[1] or '.png'
+        end_path = os.path.join(temp_dir, f"{base_name} (End){ext}")
+        log_progress(f"Downloading end screen ({ext})...")
+        storage.download_file(end_url, end_path)
+        log_progress("Downloaded end screen")
+    
+    # Download lyrics video (with vocals) - this is the largest file, ~1-2GB
+    log_progress("Downloading karaoke video (largest file, may take 1-2 minutes)...")
+    lyrics_video_url = job.file_urls['videos']['with_vocals']
+    # Use actual extension from GCS path (typically .mkv) instead of hardcoding .mov
+    lyrics_video_ext = os.path.splitext(lyrics_video_url)[1] or '.mkv'
+    lyrics_video_path = os.path.join(temp_dir, f"{base_name} (With Vocals){lyrics_video_ext}")
+    storage.download_file(lyrics_video_url, lyrics_video_path)
+    log_progress("Downloaded karaoke video")
+    
+    # Download instrumental - either user-provided existing instrumental or AI-separated
+    existing_instrumental_path = getattr(job, 'existing_instrumental_gcs_path', None)
+    instrumental_selection = job.state_data['instrumental_selection']
+    
+    if existing_instrumental_path:
+        # Batch 3: Use user-provided existing instrumental
+        ext = Path(existing_instrumental_path).suffix.lower()
+        instrumental_path = os.path.join(temp_dir, f"{base_name} (Instrumental User){ext}")
+        log_progress(f"Downloading user-provided existing instrumental...")
+        storage.download_file(existing_instrumental_path, instrumental_path)
+        log_progress("Downloaded user-provided instrumental")
+    elif instrumental_selection == 'custom':
+        # Custom instrumental from mute-region editing
+        custom_url = job.file_urls['stems']['custom_instrumental']
+        instrumental_path = os.path.join(temp_dir, f"{base_name} (Instrumental Custom).flac")
+        log_progress("Downloading custom (mute-region) instrumental...")
+        storage.download_file(custom_url, instrumental_path)
+        log_progress("Downloaded custom instrumental")
+    else:
+        # Use AI-separated instrumental based on selection
+        instrumental_key = 'instrumental_clean' if instrumental_selection == 'clean' else 'instrumental_with_backing'
+        instrumental_url = job.file_urls['stems'][instrumental_key]
+        instrumental_suffix = "Clean" if instrumental_selection == 'clean' else "Backing"
+        instrumental_path = os.path.join(temp_dir, f"{base_name} (Instrumental {instrumental_suffix}).flac")
+        log_progress(f"Downloading {instrumental_selection} instrumental audio...")
+        storage.download_file(instrumental_url, instrumental_path)
+        log_progress(f"Downloaded instrumental ({instrumental_selection})")
+    
+    # Download LRC file if available (needed for CDG/TXT)
+    lyrics_urls = job.file_urls.get('lyrics', {})
+    if 'lrc' in lyrics_urls:
+        lrc_url = lyrics_urls['lrc']
+        lrc_path = os.path.join(temp_dir, f"{base_name} (Karaoke).lrc")
+        storage.download_file(lrc_url, lrc_path)
+        log_progress("Downloaded LRC file")
+
+    # Download the reviewed-corrections JSON when is_duet is latched so the
+    # CDG path can use segment-based generation (with per-line singer tags).
+    # Prefer corrections_updated.json (post-review) over corrections.json.
+    if bool(job.state_data.get("is_duet", False)) and getattr(job, 'enable_cdg', False):
+        corrections_local_path = os.path.join(temp_dir, "corrections_updated.json")
+        corrections_url = (
+            lyrics_urls.get('corrections_updated') or lyrics_urls.get('corrections')
+        )
+        if corrections_url:
+            try:
+                storage.download_file(corrections_url, corrections_local_path)
+                log_progress(f"Downloaded duet corrections JSON ({corrections_url})")
+            except Exception as exc:
+                log_progress(f"WARNING: failed to download duet corrections JSON: {exc}")
+    
+    # Download title/end JPG files (used for YouTube thumbnail)
+    screens = job.file_urls.get('screens', {})
+    if screens.get('title_jpg'):
+        title_jpg_path = os.path.join(temp_dir, f"{base_name} (Title).jpg")
+        storage.download_file(screens['title_jpg'], title_jpg_path)
+        log_progress("Downloaded title JPG for thumbnail")
+    
+    if screens.get('end_jpg'):
+        end_jpg_path = os.path.join(temp_dir, f"{base_name} (End).jpg")
+        storage.download_file(screens['end_jpg'], end_jpg_path)
+        log_progress("Downloaded end JPG")
+
+
+async def _prepare_distribution_directory(
+    job_id: str,
+    job,
+    storage: StorageService,
+    temp_dir: str,
+    base_name: str,
+    job_log=None
+) -> None:
+    """
+    Prepare the full distribution directory structure matching local CLI output.
+
+    Creates:
+    - stems/ subfolder with all audio stems (proper model names)
+    - lyrics/ subfolder with intermediate lyrics files
+    - Root-level instrumentals with proper model names
+
+    This ensures the Dropbox upload contains the complete output structure.
+    """
+    def log_progress(message: str):
+        """Log to both module logger and job logger if available."""
+        logger.info(f"Job {job_id}: {message}")
+        if job_log:
+            job_log.info(message)
+
+    log_progress("Preparing full distribution directory structure")
+
+    # Get model names from state_data (stored by audio_worker)
+    model_names = job.state_data.get('model_names', {})
+    clean_model = model_names.get('clean_instrumental_model', 'model_bs_roformer_ep_317_sdr_12.9755.ckpt')
+    backing_models = model_names.get('backing_vocals_models', ['mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt'])
+    other_models = model_names.get('other_stems_models', ['htdemucs_6s.yaml'])
+    backing_model = backing_models[0] if backing_models else 'mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt'
+    other_model = other_models[0] if other_models else 'htdemucs_6s.yaml'
+
+    # Create stems subdirectory
+    stems_dir = os.path.join(temp_dir, "stems")
+    os.makedirs(stems_dir, exist_ok=True)
+
+    # Create lyrics subdirectory
+    lyrics_dir = os.path.join(temp_dir, "lyrics")
+    os.makedirs(lyrics_dir, exist_ok=True)
+
+    stems = job.file_urls.get('stems', {})
+    lyrics = job.file_urls.get('lyrics', {})
+
+    # --- Download stems to stems/ subfolder with proper model names ---
+
+    # Clean up simplified-named instrumentals from _setup_working_directory
+    # These were needed for KaraokeFinalise but shouldn't go to distribution
+    simplified_instrumental_patterns = [
+        f"{base_name} (Instrumental Clean).flac",
+        f"{base_name} (Instrumental Backing).flac",
+    ]
+    for pattern in simplified_instrumental_patterns:
+        simplified_path = os.path.join(temp_dir, pattern)
+        if os.path.exists(simplified_path):
+            os.remove(simplified_path)
+            log_progress(f"Removed simplified instrumental: {pattern}")
+
+    # Clean instrumental (from clean_instrumental_model)
+    if stems.get('instrumental_clean'):
+        dest_path = os.path.join(stems_dir, f"{base_name} (Instrumental {clean_model}).flac")
+        storage.download_file(stems['instrumental_clean'], dest_path)
+        log_progress("Downloaded clean instrumental to stems/")
+
+        # Also copy to root level for distribution
+        root_path = os.path.join(temp_dir, f"{base_name} (Instrumental {clean_model}).flac")
+        shutil.copy2(dest_path, root_path)
+
+    # Clean vocals (from clean_instrumental_model)
+    if stems.get('vocals_clean'):
+        dest_path = os.path.join(stems_dir, f"{base_name} (Vocals {clean_model}).flac")
+        storage.download_file(stems['vocals_clean'], dest_path)
+        log_progress("Downloaded clean vocals to stems/")
+
+    # Instrumental with backing vocals (from backing_vocals_model)
+    if stems.get('instrumental_with_backing'):
+        dest_path = os.path.join(stems_dir, f"{base_name} (Instrumental +BV {backing_model}).flac")
+        storage.download_file(stems['instrumental_with_backing'], dest_path)
+        log_progress("Downloaded instrumental+BV to stems/")
+
+        # Also copy to root level for distribution
+        root_path = os.path.join(temp_dir, f"{base_name} (Instrumental +BV {backing_model}).flac")
+        shutil.copy2(dest_path, root_path)
+
+    # Lead vocals (from backing_vocals_model)
+    if stems.get('lead_vocals'):
+        dest_path = os.path.join(stems_dir, f"{base_name} (Lead Vocals {backing_model}).flac")
+        storage.download_file(stems['lead_vocals'], dest_path)
+        log_progress("Downloaded lead vocals to stems/")
+
+    # Backing vocals (from backing_vocals_model)
+    if stems.get('backing_vocals'):
+        dest_path = os.path.join(stems_dir, f"{base_name} (Backing Vocals {backing_model}).flac")
+        storage.download_file(stems['backing_vocals'], dest_path)
+        log_progress("Downloaded backing vocals to stems/")
+
+    # Other stems (from other_stems_model - typically htdemucs_6s)
+    other_stem_keys = ['bass', 'drums', 'guitar', 'piano', 'other']
+    for stem_key in other_stem_keys:
+        if stems.get(stem_key):
+            stem_name = stem_key.capitalize()
+            dest_path = os.path.join(stems_dir, f"{base_name} ({stem_name} {other_model}).flac")
+            storage.download_file(stems[stem_key], dest_path)
+            log_progress(f"Downloaded {stem_key} to stems/")
+
+    # --- Download lyrics files to lyrics/ subfolder ---
+    # Use proper filenames matching local CLI output structure
+
+    # Map job.files.lyrics keys to proper local filenames
+    # Format: (job_files_key, local_filename_pattern)
+    lyrics_file_mappings = [
+        # Karaoke output files
+        ('lrc', f"{base_name} (Karaoke).lrc"),
+        ('ass', f"{base_name} (Karaoke).ass"),
+        # Corrections and transcription files
+        ('corrections', f"{base_name} (Lyrics Corrections).json"),
+        ('corrected_txt', f"{base_name} (Lyrics Corrected).txt"),
+        ('uncorrected', f"{base_name} (Lyrics Uncorrected).txt"),
+        # Reference lyrics from various sources
+        ('reference_genius', f"{base_name} (Lyrics Genius).txt"),
+        ('reference_spotify', f"{base_name} (Lyrics Spotify).txt"),
+        ('reference_musixmatch', f"{base_name} (Lyrics Musixmatch).txt"),
+        ('reference_lrclib', f"{base_name} (Lyrics Lrclib).txt"),
+    ]
+
+    for lyrics_key, local_filename in lyrics_file_mappings:
+        if lyrics.get(lyrics_key):
+            dest_path = os.path.join(lyrics_dir, local_filename)
+            try:
+                storage.download_file(lyrics[lyrics_key], dest_path)
+                log_progress(f"Downloaded {lyrics_key} to lyrics/{local_filename}")
+            except Exception as e:
+                log_progress(f"Could not download {lyrics_key}: {e}")
+
+    # --- Download (With Vocals) to lyrics/ subfolder ---
+    # Local CLI places the karaoke video with vocals in the lyrics folder
+    videos = job.file_urls.get('videos', {})
+    if videos.get('with_vocals'):
+        with_vocals_url = videos['with_vocals']
+        with_vocals_ext = os.path.splitext(with_vocals_url)[1] or '.mkv'
+        with_vocals_dest = os.path.join(lyrics_dir, f"{base_name} (With Vocals){with_vocals_ext}")
+        try:
+            storage.download_file(with_vocals_url, with_vocals_dest)
+            log_progress(f"Downloaded with_vocals to lyrics/{base_name} (With Vocals){with_vocals_ext}")
+        except Exception as e:
+            log_progress(f"Could not download with_vocals to lyrics/: {e}")
+
+    # --- Download preview ASS files to lyrics/previews/ subfolder ---
+    # Preview files are stored in jobs/{job_id}/previews/ in GCS
+    previews_dir = os.path.join(lyrics_dir, "previews")
+    os.makedirs(previews_dir, exist_ok=True)
+
+    # List all preview files from GCS and download them
+    try:
+        preview_prefix = f"jobs/{job_id}/previews/"
+        preview_files = storage.list_files(preview_prefix)
+        for blob_name in preview_files:
+            if blob_name.endswith('.ass'):
+                filename = os.path.basename(blob_name)
+                dest_path = os.path.join(previews_dir, filename)
+                storage.download_file(blob_name, dest_path)
+                log_progress(f"Downloaded preview {filename} to lyrics/previews/")
+    except Exception as e:
+        log_progress(f"Could not download preview files: {e}")
+
+    log_progress("Distribution directory prepared with stems/ and lyrics/ subfolders")
+
+
+async def _upload_results(
+    job_id: str,
+    job_manager: JobManager,
+    storage: StorageService,
+    temp_dir: str,
+    result: Dict[str, Any]
+) -> None:
+    """Upload generated files to GCS."""
+
+    # Map of result keys to GCS paths
+    file_mappings = [
+        ('final_video', 'finals', 'lossless_4k_mp4'),
+        ('final_video_mkv', 'finals', 'lossless_4k_mkv'),
+        ('final_video_lossy', 'finals', 'lossy_4k_mp4'),
+        ('final_video_720p', 'finals', 'lossy_720p_mp4'),
+        ('final_with_vocals_mp4', 'finals', 'with_vocals_mp4'),
+        ('final_karaoke_cdg_zip', 'packages', 'cdg_zip'),
+        ('final_karaoke_txt_zip', 'packages', 'txt_zip'),
+        # Standalone screen videos — recorded so they appear in the admin files
+        # manifest and are verifiable (regression: missing from Dropbox folders)
+        ('title_mov', 'finals', 'title_mov'),
+        ('end_mov', 'finals', 'end_mov'),
+        # Portrait (9:16) karaoke — recorded in the admin files manifest.
+        ('portrait_video', 'finals', 'portrait_1080x1920'),
+    ]
+    
+    for result_key, category, file_key in file_mappings:
+        if result_key in result and result[result_key]:
+            local_path = result[result_key]
+            if os.path.exists(local_path):
+                ext = Path(local_path).suffix
+                gcs_path = f"jobs/{job_id}/{category}/{file_key}{ext}"
+                try:
+                    url = storage.upload_file(local_path, gcs_path)
+                    job_manager.update_file_url(job_id, category, file_key, url)
+                    logger.info(f"Job {job_id}: Uploaded {file_key}")
+                except Exception as e:
+                    logger.error(f"Job {job_id}: Failed to upload {file_key}: {e}")
+
+
+# ==================== CLI Entry Point for Cloud Run Jobs ====================
+# This allows the video worker to be run as a standalone Cloud Run Job.
+# Usage: python -m backend.workers.video_worker --job-id <job_id>
+
+def main():
+    """
+    CLI entry point for running video worker as a Cloud Run Job.
+    
+    This is used when video encoding needs more than 30 minutes
+    (the Cloud Tasks timeout limit). Cloud Run Jobs support up to 24 hours.
+    
+    Usage:
+        python -m backend.workers.video_worker --job-id abc123
+    
+    Environment Variables:
+        GOOGLE_CLOUD_PROJECT: GCP project ID (required)
+        GCS_BUCKET_NAME: Storage bucket name (required)
+    """
+    import argparse
+    import asyncio
+    import sys
+    
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Video encoding worker for karaoke generation"
+    )
+    parser.add_argument(
+        "--job-id",
+        required=True,
+        help="Job ID to process"
+    )
+    
+    args = parser.parse_args()
+    job_id = args.job_id
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    logger.info(f"Starting video worker CLI for job {job_id}")
+    
+    # Run the async worker function
+    try:
+        # Drain: push/email sends scheduled by the job's last state change must
+        # finish before asyncio.run cancels pending tasks on exit.
+        success = asyncio.run(with_notification_drain(generate_video(job_id)))
+        if success:
+            logger.info(f"Video generation completed successfully for job {job_id}")
+            sys.exit(0)
+        else:
+            logger.error(f"Video generation failed for job {job_id}")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Video worker crashed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2748 @@
+"""
+User and authentication API routes.
+
+Handles:
+- Magic link authentication (send, verify)
+- Session management (logout)
+- User profile and credits
+- Stripe checkout and webhooks
+- Admin user management
+"""
+import asyncio
+import hashlib
+import hmac
+import html
+import logging
+import re
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import os
+from typing import Literal, Optional, Tuple
+
+
+def _mask_email(email: str) -> str:
+    """Mask email for logging to avoid PII exposure.
+
+    Example: test@example.com -> te***@ex***.com
+    """
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    masked_local = local[:2] + "***" if len(local) > 2 else "***"
+    domain_parts = domain.split(".")
+    if len(domain_parts) >= 2:
+        masked_domain = domain_parts[0][:2] + "***." + domain_parts[-1]
+    else:
+        masked_domain = "***"
+    return f"{masked_local}@{masked_domain}"
+
+
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, Header
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, EmailStr
+
+from backend.config import get_settings, is_production
+from backend.services.fake_workers import fake_workers_enabled
+from backend.i18n import t, get_locale_from_request, get_full_locale_from_request
+from backend.services.email_validation_service import get_email_validation_service
+from backend.models.user import (
+    UserRole,
+    UserPublic,
+    SendMagicLinkRequest,
+    SendMagicLinkResponse,
+    VerifyMagicLinkResponse,
+    ResendFromTokenRequest,
+    ResendFromTokenResponse,
+    AddCreditsRequest,
+    AddCreditsResponse,
+    AdminCreateUserRequest,
+    AdminCreateUserResponse,
+    UserListResponse,
+    UserFeedback,
+    UserFeedbackRequest,
+    UserFeedbackResponse,
+    FeedbackEligibilityResponse,
+    effective_push_prefs,
+)
+from backend.services.user_service import get_user_service, UserService, USERS_COLLECTION
+from backend.services.email_service import get_email_service, EmailService
+from backend.services.stripe_service import get_stripe_service, StripeService, CREDIT_PACKAGES
+from backend.services.iap_service import IapService, get_iap_service
+from backend.services.account_deletion_service import (
+    AccountDeletionRefused,
+    AccountDeletionService,
+    AccountDeletionStepFailed,
+    AccountNotFound,
+    get_account_deletion_service,
+)
+from backend.services.login_code_store import TransactionContention
+from backend.services.theme_service import get_theme_service
+from backend.services.job_defaults_service import (
+    get_effective_distribution_settings,
+    resolve_cdg_txt_defaults,
+)
+from backend.api.dependencies import require_admin, require_auth
+from backend.services.auth_service import AuthResult
+from backend.api.routes.file_upload import _prepare_theme_for_job
+from backend.services.auth_service import UserType
+from backend.utils.test_data import is_test_email
+
+
+def _build_user_public(user, role_override=None, feedback_eligible=False):
+    """Build UserPublic with computed referral discount status."""
+    from datetime import datetime
+
+    has_discount = False
+    discount_percent = None
+    discount_expires = None
+
+    if user.referral_discount_expires_at:
+        expires = user.referral_discount_expires_at
+        if isinstance(expires, datetime):
+            # Firestore returns timezone-aware datetimes; ensure comparison is compatible
+            now = datetime.utcnow()
+            if expires.tzinfo is not None:
+                now = now.replace(tzinfo=expires.tzinfo)
+            has_discount = expires > now
+            discount_expires = expires.isoformat() if has_discount else None
+
+    if has_discount and user.referred_by_code:
+        # Look up the discount percent from the referral link
+        try:
+            from backend.services.referral_service import get_referral_service
+            link = get_referral_service().get_link_by_code(user.referred_by_code)
+            if link:
+                discount_percent = link.discount_percent
+        except Exception:
+            discount_percent = 10  # default fallback
+
+    from backend.services.conversion_emails import active_promo
+
+    promo = active_promo(user)
+
+    return UserPublic(
+        email=user.email,
+        role=role_override or user.role,
+        credits=user.credits,
+        display_name=user.display_name,
+        total_jobs_created=user.total_jobs_created,
+        total_jobs_completed=user.total_jobs_completed,
+        tenant_id=getattr(user, 'tenant_id', None),
+        feedback_eligible=feedback_eligible,
+        total_spent=getattr(user, 'total_spent', 0),
+        referral_code=user.referral_code,
+        has_active_referral_discount=has_discount,
+        referral_discount_percent=discount_percent,
+        referral_discount_expires_at=discount_expires,
+        promo_discount_percent=promo[0] if promo else None,
+        promo_discount_expires_at=promo[1].isoformat() if promo else None,
+        referred_by_code=user.referred_by_code,
+    )
+from backend.services.youtube_download_service import (
+    get_youtube_download_service,
+    YouTubeDownloadError,
+)
+from backend.exceptions import InvalidStateTransitionError
+from backend.services.tracing import add_span_attribute
+from backend.utils.request_helpers import get_client_ip
+
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/users", tags=["users"])
+
+
+# =============================================================================
+# Request/Response Models
+# =============================================================================
+
+class CreateCheckoutRequest(BaseModel):
+    """Request to create a Stripe checkout session."""
+    package_id: str
+    email: EmailStr
+    # "app": the mobile app's checkout — Stripe returns to gen's own https bounce
+    # (GET /credits/app-return), which hands off to the app's URL scheme. Clients
+    # never send a URL, so there is no open-redirect surface.
+    return_to: Optional[Literal["app"]] = None
+
+
+class CreateCheckoutResponse(BaseModel):
+    """Response with checkout URL."""
+    status: str
+    checkout_url: str
+    message: str
+
+
+class MadeForYouCheckoutRequest(BaseModel):
+    """Request to create a made-for-you karaoke video order."""
+    email: EmailStr
+    artist: str
+    title: str
+    source_type: str = "search"  # search, youtube, or upload
+    youtube_url: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class CreditPackage(BaseModel):
+    """Credit package information."""
+    id: str
+    credits: int
+    price_cents: int
+    name: str
+    description: str
+    store_product_id: Optional[str] = None  # App Store / Play Store product id
+
+
+class WebLinkShowFor(BaseModel):
+    """Store countries (App Store / Play storefront codes) where the app may link to web checkout."""
+    ios: list[str]
+    android: list[str]
+
+
+class WebLink(BaseModel):
+    """Where the mobile app shows the "buy on the web" link, and its copy (app i18n key)."""
+    show_for: WebLinkShowFor
+    copy_key: str
+
+
+DEFAULT_WEB_LINK = {"show_for": {"ios": ["USA"], "android": []}, "copy_key": "credits.webLink.default"}
+
+
+class CreditPackagesResponse(BaseModel):
+    """Response listing available credit packages."""
+    packages: list[CreditPackage]
+    web_link: WebLink = WebLink(**DEFAULT_WEB_LINK)
+
+
+class UserCapabilities(BaseModel):
+    """Server-side feature switches the mobile app reads from /me."""
+    account_deletion: bool = False
+
+
+class PushPrefs(BaseModel):
+    """Mobile push categories; all default on."""
+    ready: bool = True
+    review: bool = True
+    problems: bool = True
+
+
+class PushPrefsUpdate(BaseModel):
+    """Partial update of mobile push categories; omitted keys are unchanged."""
+    ready: Optional[bool] = None
+    review: Optional[bool] = None
+    problems: Optional[bool] = None
+
+
+class UserProfileResponse(BaseModel):
+    """Response with user profile."""
+    user: UserPublic
+    has_session: bool
+    app_user_id: Optional[str] = None
+    capabilities: UserCapabilities = UserCapabilities()
+    push_prefs: PushPrefs = PushPrefs()
+
+
+class LogoutResponse(BaseModel):
+    """Response after logout."""
+    status: str
+    message: str
+
+
+# =============================================================================
+# Magic Link Authentication
+# =============================================================================
+
+
+def _precompute_credit_eval(
+    token: str,
+    email: str,
+    collection: Optional[str] = None,
+    also_store_on: Tuple[Tuple[str, str], ...] = (),
+) -> None:
+    """Run credit evaluation in background and store result on the sign-in doc.
+
+    Called in a background thread after sending a magic link (or an emailed
+    code — pass ``collection`` + that doc's id as ``token``) for new users. If the
+    user verifies before this finishes, verification falls back to inline
+    evaluation (same as before this optimization). ``also_store_on`` lists extra
+    (collection, doc_id) sign-in docs to receive the same result (the login-code
+    email carries both a code and a magic link; either may be used to sign in).
+    """
+    try:
+        from backend.services.credit_evaluation_service import get_credit_evaluation_service
+        from backend.services.user_service import get_user_service, MAGIC_LINKS_COLLECTION
+
+        eval_service = get_credit_evaluation_service()
+        evaluation = eval_service.evaluate(email, "welcome")
+
+        user_service = get_user_service()
+        result = {
+            "credit_eval_decision": evaluation.decision,
+            "credit_eval_reasoning": evaluation.reasoning,
+            "credit_eval_error": evaluation.error,
+        }
+        for coll, doc_id in ((collection or MAGIC_LINKS_COLLECTION, token), *also_store_on):
+            user_service.db.collection(coll).document(doc_id).update(result)
+        logger.info(f"Pre-computed credit eval for {_mask_email(email)}: {evaluation.decision}")
+    except Exception:
+        logger.exception(f"Background credit eval failed for {_mask_email(email)} — verify will compute inline")
+
+
+@router.post("/auth/magic-link", response_model=SendMagicLinkResponse)
+def send_magic_link(
+    request: SendMagicLinkRequest,
+    http_request: Request,
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Send a magic link email for passwordless authentication.
+
+    The user will receive an email with a link that logs them in.
+    Links expire after 24 hours and can only be used once.
+
+    For white-label tenants, validates email domain against tenant config.
+    """
+    from backend.middleware.tenant import get_tenant_from_request, get_tenant_config_from_request
+
+    email = request.email.lower()
+
+    # Check for disposable email domains, blocked emails, and blocked IPs
+    # (done before email service check so we can reject without needing email config)
+    email_validation = get_email_validation_service()
+
+    locale = get_locale_from_request(http_request)
+
+    # On a tenant portal, an address the tenant explicitly allowlisted (by email
+    # or domain) was vouched for by an admin — don't second-guess it with the
+    # disposable-domain heuristics (external APIs have false positives).
+    request_tenant_config = get_tenant_config_from_request(http_request)
+    tenant_vouched = bool(
+        request_tenant_config and request_tenant_config.is_explicitly_allowlisted(email)
+    )
+
+    if not tenant_vouched and email_validation.is_disposable_domain(email):
+        logger.warning(f"Blocked disposable email signup attempt: {_mask_email(email)}")
+        raise HTTPException(
+            status_code=422,
+            detail=t(locale, "users.disposableEmailBlocked")
+        )
+
+    if email_validation.is_email_blocked(email):
+        logger.warning(f"Blocked email signup attempt: {_mask_email(email)}")
+        return SendMagicLinkResponse(
+            status="success",
+            message=t(locale, "users.magicLinkSent")
+        )
+
+    ip_address = get_client_ip(http_request)
+    if ip_address and email_validation.is_ip_blocked(ip_address):
+        logger.warning(f"Blocked IP signup attempt: {ip_address}")
+        return SendMagicLinkResponse(
+            status="success",
+            message=t(locale, "users.magicLinkSent")
+        )
+
+    # Board sign-in ("requests_board") is passwordless identity only: no welcome credit,
+    # and a HIGHER per-IP signup cap (BOARD_MAX_SIGNUPS_PER_IP) so a whole venue on shared
+    # WiFi can sign in to vote — but still a deterministic ceiling, not an open door.
+    is_board_signin = _is_board_purpose(request.purpose)
+
+    # Per-IP and per-fingerprint signup rate limit (only for new users)
+    device_fingerprint = request.device_fingerprint
+    existing_user = user_service.get_user(email)
+    if existing_user is None:
+        signup_limit = user_service.BOARD_MAX_SIGNUPS_PER_IP if is_board_signin else None
+        if user_service.is_signup_rate_limited(
+            ip_address=ip_address, device_fingerprint=device_fingerprint, max_signups=signup_limit
+        ):
+            logger.warning(
+                f"Signup rate limit hit: IP={ip_address} for {_mask_email(email)}"
+            )
+            # Silent reject (anti-enumeration)
+            return SendMagicLinkResponse(
+                status="success",
+                message=t(locale, "users.magicLinkSent")
+            )
+
+    # Check if email service is configured. In development the console provider
+    # logs the magic link to the backend console instead of emailing it, so
+    # contributors can log in locally without a Postmark token.
+    if not email_service.is_configured() and is_production():
+        logger.error("Email service not configured - cannot send magic links")
+        raise HTTPException(
+            status_code=503,
+            detail=t(locale, "users.emailServiceNotConfigured")
+        )
+
+    # Get tenant context from middleware
+    tenant_id = get_tenant_from_request(http_request)
+    tenant_config = get_tenant_config_from_request(http_request)
+
+    # Validate email domain for tenant if configured
+    if tenant_config:
+        if not tenant_config.is_email_allowed(email):
+            logger.warning(f"Email not allowed for tenant {tenant_id}: {_mask_email(email)}")
+            # Return success anyway to prevent email enumeration
+            return SendMagicLinkResponse(
+                status="success",
+                message=t(locale, "users.magicLinkSent")
+            )
+
+    # Get client info for security logging (ip_address already extracted above for blocklist check)
+    user_agent = http_request.headers.get("user-agent")
+
+    # Create magic link token with tenant context and fingerprint
+    magic_link = user_service.create_magic_link(
+        email,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        tenant_id=tenant_id,
+        device_fingerprint=device_fingerprint,
+        referral_code=request.referral_code,
+        purpose=request.purpose,
+        attribution=request.attribution,
+    )
+
+    # Get tenant-specific email configuration
+    sender_email = None
+    tenant_frontend_url = None
+    tenant_name = None
+    if tenant_config:
+        sender_email = tenant_config.get_sender_email()
+        tenant_frontend_url = tenant_config.get_frontend_url()
+        tenant_name = tenant_config.name
+
+    # Send email (with tenant-specific sender, URL, and name if configured)
+    sent = email_service.send_magic_link(
+        email,
+        magic_link.token,
+        sender_email=sender_email,
+        tenant_frontend_url=tenant_frontend_url,
+        tenant_name=tenant_name,
+        locale=locale,
+        referral_code=request.referral_code,
+    )
+
+    if not sent:
+        if getattr(email_service, "last_send_suppressed", False):
+            # Benign: the address is Postmark-suppressed (hard bounce / spam /
+            # manual suppression) — typically a junk/placeholder address entered
+            # at the sign-in form. Not an outage, so don't page on it.
+            logger.info(f"Magic link recipient {email} is suppressed by Postmark — skipping send")
+        else:
+            logger.error(f"Failed to send magic link email to {email}")
+        # Don't reveal failure to prevent email enumeration
+        # Still return success
+
+    # Pre-compute credit evaluation in background for new users.
+    # By the time they check their email and click the link, the decision
+    # will be ready and verification will be instant.
+    # Skip for test emails — they get auto-granted without evaluation.
+    # Skip for board sign-in — it never grants a welcome credit, so there's nothing to eval.
+    # Skip for tenant portals — tenant users are billed under a separate agreement and
+    # never get consumer welcome credits.
+    if existing_user is None and not is_test_email(email) and not is_board_signin and not tenant_id:
+        thread = threading.Thread(
+            target=_precompute_credit_eval,
+            args=(magic_link.token, email),
+            daemon=True,
+        )
+        thread.start()
+
+    return SendMagicLinkResponse(
+        status="success",
+        message=t(locale, "users.magicLinkSent")
+    )
+
+
+_BOARD_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,64}")
+
+
+def _is_board_purpose(purpose) -> bool:
+    """"requests_board", or "requests_board:<request_id>" (sign-in from a link to one
+    request, e.g. the YouTube comment bot's reply) — both are board identity-only."""
+    return isinstance(purpose, str) and (
+        purpose == "requests_board" or purpose.startswith("requests_board:")
+    )
+
+
+def _magic_link_redirect_path(purpose) -> "Optional[str]":
+    """Map a magic-link purpose to a post-login redirect path.
+
+    "requests_board" -> the voting board; "requests_board:<request_id>" -> the board
+    focused on that request, upvoting it on arrival; "job_review:<job_id>" ->
+    straight to that job's lyrics review (used by outreach one-click links).
+    Unknown or malformed purposes fall through to None (frontend default: /app).
+    """
+    import re as _re
+    if purpose == "requests_board":
+        return "/requests"
+    if isinstance(purpose, str) and purpose.startswith("requests_board:"):
+        request_id = purpose.split(":", 1)[1]
+        if _BOARD_REQUEST_ID_RE.fullmatch(request_id):
+            return f"/requests?request={request_id}&upvote=1"
+        return "/requests"
+    if isinstance(purpose, str) and purpose.startswith("job_review:"):
+        job_id = purpose.split(":", 1)[1]
+        if _re.fullmatch(r"[A-Za-z0-9_-]{4,64}", job_id):
+            return f"/app/jobs#/{job_id}/review"
+    return None
+
+
+@dataclass
+class VerifiedLogin:
+    """Outcome of the shared post-verification login steps."""
+    user: object
+    session: object
+    credits_granted: int = 0
+    credit_status: str = "not_applicable"
+
+
+def complete_verified_login(
+    user,
+    *,
+    user_service: UserService,
+    email_service: EmailService,
+    is_first_login: bool,
+    precomputed_eval: Optional[dict],
+    grant_welcome_credit: bool,
+    referral_code: Optional[str],
+    locale: Optional[str],
+    ui_locale: Optional[str],
+    ip_address: Optional[str],
+    user_agent: Optional[str],
+    tenant_id: Optional[str],
+    device_fingerprint: Optional[str],
+    email_locale: str = "en",
+) -> VerifiedLogin:
+    """Everything that happens after an identity proof (magic link click or kjbox
+    emailed code) succeeds: welcome-credit grant (with the precomputed AI eval),
+    referral attribution, locale persistence, session creation and the first-login
+    welcome email.
+
+    ``user`` must already be marked verified (email_verified / last_login_at) by
+    the caller's verification step.
+
+    Args:
+        locale: Narrowed email locale (en/es/de) to persist on the user, or None
+            to leave the stored value untouched (e.g. no Accept-Language header).
+        ui_locale: Full UI language subtag to persist, or None.
+        email_locale: Locale used to render the welcome email.
+    """
+    credits_granted = 0
+    credit_status = "not_applicable"  # returning user, not first login
+    granted = False
+    if grant_welcome_credit:
+        granted, credit_status = user_service.grant_welcome_credits_if_eligible(
+            user.email, precomputed_eval=precomputed_eval,
+        )
+    if granted:
+        credits_granted = user_service.NEW_USER_FREE_CREDITS
+        logger.info(f"Granted {credits_granted} welcome credits to {_mask_email(user.email)}")
+        # Refresh user to get updated credit balance
+        user = user_service.get_user(user.email)
+    elif credit_status == "denied":
+        logger.info(f"Welcome credits denied for {_mask_email(user.email)}")
+
+    if referral_code and not user.referred_by_code:
+        try:
+            from backend.services.referral_service import get_referral_service
+            referral_svc = get_referral_service()
+            attr_success, attr_msg = referral_svc.attribute_referral(
+                referred_email=user.email,
+                referral_code=referral_code,
+            )
+            if attr_success:
+                attr_data = referral_svc.get_attribution_data(referral_code)
+                if attr_data:
+                    user_service.update_user(user.email, **attr_data)
+                    user = user_service.get_user(user.email)  # Refresh to include referral data
+                    logger.info(f"Referral attributed for {_mask_email(user.email)} via code '{referral_code}'")
+        except Exception as ref_err:
+            logger.warning(f"Referral attribution failed for {_mask_email(user.email)}: {ref_err}")
+
+    # `locale` is narrowed to en/es/de for email rendering; `ui_locale` is the
+    # full UI language (any of 33) so admins know what language to communicate in.
+    locale_updates = {}
+    if locale and locale != (user.locale or "en"):
+        locale_updates["locale"] = locale
+    if ui_locale and ui_locale != user.ui_locale:
+        locale_updates["ui_locale"] = ui_locale
+    if locale_updates:
+        try:
+            user_service.update_user(user.email, **locale_updates)
+        except Exception:
+            pass  # Non-critical — don't block login
+
+    session = user_service.create_session(
+        user.email,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        tenant_id=tenant_id,
+        device_fingerprint=device_fingerprint,
+    )
+
+    # Send welcome email to first-time users (not when the welcome credit is
+    # skipped, e.g. board sign-in — the credit-centric copy would be confusing
+    # with a 0 balance).
+    if is_first_login and grant_welcome_credit:
+        email_service.send_welcome_email(user.email, user.credits, locale=email_locale)
+
+    return VerifiedLogin(
+        user=user, session=session,
+        credits_granted=credits_granted, credit_status=credit_status,
+    )
+
+
+@router.get("/auth/verify", response_model=VerifyMagicLinkResponse)
+def verify_magic_link(
+    token: str,
+    http_request: Request,
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Verify a magic link token and create a session.
+
+    Returns a session token that should be stored and used for subsequent requests.
+    The session will be associated with the tenant from the magic link.
+    """
+    locale = get_locale_from_request(http_request)
+
+    # Reject empty tokens early to avoid invalid Firestore document paths
+    if not token or not token.strip():
+        raise HTTPException(status_code=401, detail=t(locale, "users.invalidToken"))
+
+    # Get client info
+    ip_address = get_client_ip(http_request)
+    user_agent = http_request.headers.get("user-agent")
+
+    # Check if this is a first login BEFORE verification (which sets last_login_at)
+    # We need to get the user's state before verify_magic_link updates it
+    # Also extract tenant_id from the magic link for session creation
+    from backend.services.user_service import MAGIC_LINKS_COLLECTION
+    magic_link_doc = user_service.db.collection(MAGIC_LINKS_COLLECTION).document(token).get()
+    is_first_login = False
+    magic_link_tenant_id = None
+    magic_link_purpose = None
+    if magic_link_doc.exists:
+        magic_link_data = magic_link_doc.to_dict()
+        magic_link_tenant_id = magic_link_data.get('tenant_id')
+        magic_link_purpose = magic_link_data.get('purpose')
+        pre_verify_user = user_service.get_user(magic_link_data.get('email', ''))
+        if pre_verify_user:
+            is_first_login = pre_verify_user.total_jobs_created == 0 and not pre_verify_user.last_login_at
+
+    # Verify the magic link
+    success, user, message = user_service.verify_magic_link(token)
+
+    if not success or not user:
+        raise HTTPException(status_code=401, detail=t(locale, "users.verifyError", message=message))
+
+    # Use pre-computed evaluation from magic link if available (computed at send time)
+    precomputed_eval = None
+    if magic_link_doc.exists:
+        precomputed_eval = {
+            k: magic_link_data.get(k)
+            for k in ("credit_eval_decision", "credit_eval_reasoning", "credit_eval_error")
+            if magic_link_data.get(k) is not None
+        } or None
+
+    # Referral attribution: try header first (cookie path), then magic link token (email path)
+    referral_code = (
+        http_request.headers.get("x-referral-code")
+        or (magic_link_data.get("referral_code") if magic_link_doc.exists else None)
+    )
+
+    # Persist user's locale preference (from Accept-Language header).
+    # Only touch locale when the client actually sent an Accept-Language header —
+    # otherwise get_locale_from_request()'s "en" default would clobber a user's
+    # real stored locale on token-only logins (e.g. magic-link scanners).
+    has_accept_language = bool(http_request.headers.get("accept-language"))
+
+    magic_link_fingerprint = magic_link_data.get('device_fingerprint') if magic_link_doc.exists else None
+    # Board sign-in grants NO welcome credit — it's identity only. The credit is granted
+    # later, when the user converts via the "make it yourself now" flow (claim endpoint),
+    # or when their requested track gets picked (Phase 2).
+    # Tenant portal sign-ins never touch consumer credits (no eval, no denial/welcome
+    # emails, no credit interstitial) — tenants have a separate commercial agreement.
+    result = complete_verified_login(
+        user,
+        user_service=user_service,
+        email_service=email_service,
+        is_first_login=is_first_login,
+        precomputed_eval=precomputed_eval,
+        grant_welcome_credit=not _is_board_purpose(magic_link_purpose) and not magic_link_tenant_id,
+        referral_code=referral_code if not magic_link_tenant_id else None,
+        locale=locale if has_accept_language else None,
+        ui_locale=get_full_locale_from_request(http_request),
+        ip_address=ip_address,
+        user_agent=user_agent,
+        tenant_id=magic_link_tenant_id,
+        device_fingerprint=magic_link_fingerprint,
+        email_locale=locale,
+    )
+    user = result.user
+    session = result.session
+    credits_granted = result.credits_granted
+    credit_status = result.credit_status
+
+    # Return user info with tenant_id
+    user_public = _build_user_public(user)
+
+    # Resolve tenant subdomain for cross-domain redirect safety
+    tenant_subdomain = None
+    if magic_link_tenant_id:
+        from backend.services.tenant_service import get_tenant_service
+        tenant_service = get_tenant_service()
+        tenant_cfg = tenant_service.get_tenant_config(magic_link_tenant_id)
+        if tenant_cfg:
+            tenant_subdomain = tenant_cfg.subdomain
+
+    return VerifyMagicLinkResponse(
+        status="success",
+        session_token=session.token,
+        user=user_public,
+        message=t(locale, "users.magicLinkSuccess"),
+        tenant_subdomain=tenant_subdomain,
+        credits_granted=credits_granted,
+        credit_status=credit_status,
+        redirect_path=_magic_link_redirect_path(magic_link_purpose),
+    )
+
+
+class ClaimWelcomeCreditResponse(BaseModel):
+    """Response for the convert-to-gen welcome-credit claim."""
+    status: str  # "granted" | "already_granted" | "denied" | "pending_review" | ...
+    credits: int
+    credits_granted: int = 0
+
+
+@router.post("/claim-welcome-credit", response_model=ClaimWelcomeCreditResponse)
+def claim_welcome_credit(
+    auth_result: AuthResult = Depends(require_auth),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Grant the standard one-time welcome credit to a signed-in user.
+
+    Powers the requests-board "Don't want to wait? Make it yourself now" conversion:
+    board sign-in itself grants no credit, so when a board user decides to use the
+    generator we grant their welcome credit here (idempotent — once per account, with
+    the usual abuse evaluation). Returns the resulting balance.
+    """
+    email = auth_result.user_email
+    if not email:
+        raise HTTPException(status_code=403, detail="A signed-in email is required.")
+
+    granted, credit_status = user_service.grant_welcome_credits_if_eligible(email)
+    user = user_service.get_user(email)
+    balance = user.credits if user else 0
+    return ClaimWelcomeCreditResponse(
+        status=credit_status,
+        credits=balance,
+        credits_granted=user_service.NEW_USER_FREE_CREDITS if granted else 0,
+    )
+
+
+class MagicLinkStatusResponse(BaseModel):
+    status: str  # "valid" | "used" | "expired" | "invalid"
+    # True only for app → web handoff tokens (POST /auth/handoff-token). The verify
+    # page skips the "Complete Sign-In" tap only when this AND the URL's handoff=1.
+    handoff: bool = False
+
+
+@router.get("/auth/link-status", response_model=MagicLinkStatusResponse)
+def magic_link_status(
+    token: str,
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Read-only status of a magic link — does NOT consume it.
+
+    The verify page calls this on load so it can show the correct UI upfront:
+    the "Complete Sign-In" gate for a valid link, or an "already used / expired"
+    message for a dead one — without making the user click only to then fail.
+
+    This endpoint is intentionally non-mutating so that an email link-scanner
+    which renders the verify page (and triggers this read) cannot burn a still-
+    valid token before the real user clicks. Token consumption happens only in
+    the separate GET /auth/verify, which requires an explicit user click.
+    """
+    if not token or not token.strip():
+        return MagicLinkStatusResponse(status="invalid")
+    status, handoff = user_service.get_magic_link_state(token)
+    return MagicLinkStatusResponse(status=status, handoff=handoff)
+
+
+@router.post("/auth/resend-from-token", response_model=ResendFromTokenResponse)
+def resend_magic_link_from_token(
+    request: ResendFromTokenRequest,
+    http_request: Request,
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Resend a magic link to the email associated with a previously-issued token.
+
+    Used by the verify failure UI to give users a one-click recovery when their
+    sign-in link has expired or already been used. The original token is a 32-byte
+    cryptographic secret — only the email recipient could possess it — so resending
+    to the email recorded in the token doc adds no new attack surface.
+
+    Behaviour:
+    - Token doc found → mint a fresh magic link, send it, return masked email.
+    - Token doc missing → return status="no_token" so the UI can fall back to
+      the standard sign-in form.
+    """
+    from backend.services.user_service import MAGIC_LINKS_COLLECTION
+    from backend.middleware.tenant import get_tenant_from_request, get_tenant_config_from_request
+
+    locale = get_locale_from_request(http_request)
+    token = (request.token or "").strip()
+
+    if not token:
+        raise HTTPException(status_code=422, detail=t(locale, "users.invalidToken"))
+
+    magic_link_doc = user_service.db.collection(MAGIC_LINKS_COLLECTION).document(token).get()
+    if not magic_link_doc.exists:
+        return ResendFromTokenResponse(
+            status="no_token",
+            masked_email=None,
+            message=t(locale, "users.resendNoToken"),
+        )
+
+    magic_link_data = magic_link_doc.to_dict() or {}
+    email = (magic_link_data.get("email") or "").lower()
+    if not email:
+        return ResendFromTokenResponse(
+            status="no_token",
+            masked_email=None,
+            message=t(locale, "users.resendNoToken"),
+        )
+
+    if not email_service.is_configured():
+        logger.error("Email service not configured - cannot resend magic links")
+        raise HTTPException(
+            status_code=503,
+            detail=t(locale, "users.emailServiceNotConfigured"),
+        )
+
+    # Per-token cooldown: ignore repeat clicks of the resend button (or
+    # email-scanner pre-fetches) within a short window. We still report
+    # "sent" so the UI doesn't degrade — the user already got an email.
+    RESEND_COOLDOWN_SECONDS = 60
+    last_resend_at = magic_link_data.get("last_resend_at")
+    if last_resend_at is not None:
+        last_resend_dt = last_resend_at
+        if isinstance(last_resend_at, str):
+            try:
+                last_resend_dt = datetime.fromisoformat(last_resend_at.replace("Z", "+00:00"))
+            except ValueError:
+                last_resend_dt = None
+        if last_resend_dt is not None:
+            now = datetime.utcnow()
+            if last_resend_dt.tzinfo is not None:
+                from datetime import timezone as _tz
+                now = now.replace(tzinfo=_tz.utc)
+            elapsed = (now - last_resend_dt).total_seconds()
+            if 0 <= elapsed < RESEND_COOLDOWN_SECONDS:
+                logger.info(
+                    f"Resend cooldown active for {_mask_email(email)} ({elapsed:.0f}s elapsed)"
+                )
+                return ResendFromTokenResponse(
+                    status="sent",
+                    masked_email=_mask_email(email),
+                    message=t(locale, "users.magicLinkSent"),
+                )
+
+    ip_address = get_client_ip(http_request)
+    user_agent = http_request.headers.get("user-agent")
+
+    # Carry forward tenant context: prefer the original token's tenant so the
+    # resent link goes to the same portal the user originally signed up on.
+    original_tenant_id = magic_link_data.get("tenant_id")
+    request_tenant_id = get_tenant_from_request(http_request)
+    request_tenant_config = get_tenant_config_from_request(http_request)
+    tenant_id = original_tenant_id or request_tenant_id
+
+    tenant_config = request_tenant_config
+    if original_tenant_id and original_tenant_id != request_tenant_id:
+        from backend.services.tenant_service import get_tenant_service
+        tenant_config = get_tenant_service().get_tenant_config(original_tenant_id)
+
+    referral_code = magic_link_data.get("referral_code")
+    device_fingerprint = magic_link_data.get("device_fingerprint")
+
+    new_link = user_service.create_magic_link(
+        email,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        tenant_id=tenant_id,
+        device_fingerprint=device_fingerprint,
+        referral_code=referral_code,
+    )
+
+    sender_email = None
+    tenant_frontend_url = None
+    tenant_name = None
+    if tenant_config:
+        sender_email = tenant_config.get_sender_email()
+        tenant_frontend_url = tenant_config.get_frontend_url()
+        tenant_name = tenant_config.name
+
+    sent = email_service.send_magic_link(
+        email,
+        new_link.token,
+        sender_email=sender_email,
+        tenant_frontend_url=tenant_frontend_url,
+        tenant_name=tenant_name,
+        locale=locale,
+        referral_code=referral_code,
+    )
+
+    if not sent:
+        if getattr(email_service, "last_send_suppressed", False):
+            logger.info(
+                f"Resend magic link recipient {_mask_email(email)} is suppressed by Postmark — skipping send"
+            )
+        else:
+            logger.error(f"Failed to resend magic link email to {_mask_email(email)}")
+
+    # Stamp the original token so the cooldown applies to subsequent clicks.
+    try:
+        user_service.db.collection(MAGIC_LINKS_COLLECTION).document(token).update({
+            "last_resend_at": datetime.utcnow(),
+        })
+    except Exception:
+        logger.exception("Failed to stamp last_resend_at on magic link doc")
+
+    logger.info(f"Resent magic link to {_mask_email(email)} from expired/used token")
+
+    return ResendFromTokenResponse(
+        status="sent",
+        masked_email=_mask_email(email),
+        message=t(locale, "users.magicLinkSent"),
+    )
+
+
+@router.post("/auth/logout", response_model=LogoutResponse)
+def logout(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Logout and invalidate the current session.
+    """
+    locale = get_locale_from_request(request)
+    if not authorization:
+        return LogoutResponse(status="success", message=t(locale, "users.logoutSuccess"))
+
+    # Extract token from "Bearer <token>"
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+
+    user_service.revoke_session(token)
+
+    return LogoutResponse(status="success", message=t(locale, "users.logoutSuccess"))
+
+
+# =============================================================================
+# User Profile
+# =============================================================================
+
+def _app_user_id(user, user_service) -> Optional[str]:
+    """The stored mobile-app id, else mint one. A minting failure never fails /me."""
+    existing = getattr(user, "app_user_id", None)
+    if existing:
+        return existing
+    try:
+        return user_service.ensure_app_user_id(user.email)
+    except Exception as e:
+        logger.warning(f"Could not mint app_user_id for {_mask_email(user.email)}: {e}")
+        return None
+
+
+def _profile_response(user, user_public, user_service) -> UserProfileResponse:
+    """Wrap UserPublic with the mobile-app fields (app_user_id, capabilities, push_prefs)."""
+    stored = getattr(user, "push_prefs", None) or {}
+    return UserProfileResponse(
+        user=user_public,
+        has_session=True,
+        app_user_id=_app_user_id(user, user_service),
+        capabilities=UserCapabilities(account_deletion=get_settings().account_deletion_enabled),
+        push_prefs=PushPrefs(**effective_push_prefs(stored)),
+    )
+
+
+@router.patch("/me/push-prefs", response_model=PushPrefs)
+def update_push_prefs(
+    update: PushPrefsUpdate,
+    auth_result: AuthResult = Depends(require_auth),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Set per-type push preferences (gen Expo and Web Push both honour them)."""
+    if not auth_result.user_email:
+        raise HTTPException(status_code=401, detail="User email not available")
+    user = user_service.get_or_create_user(auth_result.user_email)
+    merged = effective_push_prefs(getattr(user, "push_prefs", None))
+    merged.update(update.model_dump(exclude_none=True))
+    if user_service.update_user(auth_result.user_email, push_prefs=merged) is None:
+        raise HTTPException(status_code=500, detail="Could not save push preferences")
+    return PushPrefs(**merged)
+
+
+class DeleteAccountRequest(BaseModel):
+    # iOS: a fresh Sign in with Apple authorization code, so gen can revoke the token
+    apple_authorization_code: Optional[str] = None
+
+
+def _require_account_deletion(auth_result: AuthResult) -> str:
+    if not get_settings().account_deletion_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not auth_result.user_email:
+        raise HTTPException(status_code=401, detail="User email not available")
+    return auth_result.user_email
+
+
+@router.get("/me/deletion-preview")
+def account_deletion_preview(
+    auth_result: AuthResult = Depends(require_auth),
+    deletion: AccountDeletionService = Depends(get_account_deletion_service),
+):
+    """What deleting the account would cost: credits lost, videos cancelled, or a 409 reason."""
+    email = _require_account_deletion(auth_result)
+    try:
+        return deletion.preview(email, is_admin=auth_result.is_admin)
+    except AccountNotFound:
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+@router.delete("/me")
+def delete_my_account(
+    body: Optional[DeleteAccountRequest] = None,
+    auth_result: AuthResult = Depends(require_auth),
+    deletion: AccountDeletionService = Depends(get_account_deletion_service),
+):
+    """Self-serve account deletion (App Store 5.1.1(v), Google Play). 503 = retry."""
+    email = _require_account_deletion(auth_result)
+    apple_code = body.apple_authorization_code if body else None
+    try:
+        summary = deletion.delete(email, apple_code=apple_code, is_admin=auth_result.is_admin)
+    except AccountNotFound:
+        raise HTTPException(status_code=404, detail="User not found")
+    except AccountDeletionRefused as e:
+        return JSONResponse(status_code=409, content={"code": e.code})
+    except AccountDeletionStepFailed as e:
+        return JSONResponse(status_code=503, content={"step": e.step})
+    return {"deleted": True, "summary": summary}
+
+
+@router.get("/me", response_model=UserProfileResponse)
+def get_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Get the current user's profile.
+
+    Requires a valid session token or admin token.
+    """
+    locale = get_locale_from_request(request)
+    from backend.services.auth_service import get_auth_service
+
+    if not authorization:
+        raise HTTPException(status_code=401, detail=t(locale, "users.userNotFound"))
+
+    # Extract token
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+
+    # First try auth service (handles admin tokens and auth_tokens)
+    auth_service = get_auth_service()
+    auth_result = auth_service.validate_token_full(token)
+
+    if auth_result.is_valid and auth_result.user_email:
+        # Get or create user record for the authenticated email
+        user = user_service.get_or_create_user(auth_result.user_email)
+        feedback_eligible = (
+            user.total_jobs_completed >= 2
+            and not user.has_submitted_feedback
+        )
+        user_public = _build_user_public(
+            user,
+            role_override=UserRole.ADMIN if auth_result.is_admin else None,
+            feedback_eligible=feedback_eligible,
+        )
+        return _profile_response(user, user_public, user_service)
+
+    # Fall back to session validation (for magic link sessions)
+    valid, user, message = user_service.validate_session(token)
+
+    if not valid or not user:
+        raise HTTPException(status_code=401, detail=t(locale, "users.userNotFound"))
+
+    feedback_eligible = (
+        user.total_jobs_completed >= 2
+        and not user.has_submitted_feedback
+    )
+    user_public = _build_user_public(user, feedback_eligible=feedback_eligible)
+
+    return _profile_response(user, user_public, user_service)
+
+
+# =============================================================================
+# Credit Packages & Checkout
+# =============================================================================
+
+@router.get("/credits/packages", response_model=CreditPackagesResponse)
+def list_credit_packages():
+    """
+    List available credit packages for purchase.
+
+    No authentication required - this is public information.
+    """
+    packages = [
+        CreditPackage(
+            id=pkg_id,
+            credits=pkg["credits"],
+            price_cents=pkg["price_cents"],
+            name=pkg["name"],
+            description=pkg["description"],
+            store_product_id=pkg.get("store_product_id"),
+        )
+        for pkg_id, pkg in CREDIT_PACKAGES.items()
+    ]
+
+    return CreditPackagesResponse(packages=packages, web_link=WebLink(**DEFAULT_WEB_LINK))
+
+
+def public_api_base_url() -> str:
+    """Public base URL of this API, for absolute links back to it (no trailing slash).
+
+    ``BACKEND_URL`` (default https://api.nomadkaraoke.com); on the local stack the
+    address browsers / devices use (``LOCAL_STACK_API_URL``), like fake checkout.
+    """
+    if fake_workers_enabled():
+        from backend.services.fake_workers.checkout import public_api_url
+        return public_api_url()
+    return os.getenv("BACKEND_URL", "https://api.nomadkaraoke.com").rstrip("/")
+
+
+_APP_RETURN_STATUSES = ("success", "cancelled")
+
+_APP_RETURN_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nomad Karaoke</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;padding:48px 16px">
+<p><a href="{url}">Return to the app</a></p></body></html>"""
+
+
+@router.get("/credits/app-return", response_class=HTMLResponse, status_code=302)
+def checkout_app_return(status: Optional[str] = Query(default=None), session_id: Optional[str] = None):
+    """Stripe's https return URL for app checkouts → 302 to ``{scheme}://checkout?status=…``.
+
+    ``status`` is ``success`` or ``cancelled`` (anything else → ``cancelled``);
+    ``session_id`` is accepted but never forwarded. The tiny HTML body links back
+    to the app for browsers that block scheme redirects. Credits are granted by
+    the Stripe webhook, never by this bounce.
+    """
+    outcome = status if status in _APP_RETURN_STATUSES else "cancelled"
+    url = f"{get_settings().mobile_app_scheme}://checkout?status={outcome}"
+    return HTMLResponse(
+        _APP_RETURN_PAGE.format(url=html.escape(url, quote=True)),
+        status_code=302,
+        headers={"Location": url, "Cache-Control": "no-store"},
+    )
+
+
+@router.post("/credits/checkout", response_model=CreateCheckoutResponse)
+def create_checkout(
+    request: CreateCheckoutRequest,
+    stripe_service: StripeService = Depends(get_stripe_service),
+):
+    """
+    Create a Stripe checkout session for purchasing credits.
+
+    Returns a URL to redirect the user to Stripe's hosted checkout page.
+    No authentication required - email is provided in the request.
+    """
+    if not stripe_service.can_checkout():
+        raise HTTPException(status_code=503, detail="Payment processing is not available")
+
+    # Check for referral discount
+    referral_coupon_id = None
+    referral_percent = 0
+    try:
+        from backend.services.referral_service import get_referral_service
+        referral_svc = get_referral_service()
+        discount_info = referral_svc.get_discount_for_checkout(request.email)
+        if discount_info:
+            referral_coupon_id = discount_info["coupon_id"]
+            referral_percent = discount_info.get("discount_percent") or 0
+    except Exception as ref_err:
+        logger.warning(f"Referral discount lookup failed: {ref_err}")
+
+    # A time-limited conversion-email offer wins when it's the bigger discount
+    try:
+        from backend.services.conversion_emails import promo_coupon_for_checkout
+        promo_coupon = promo_coupon_for_checkout(request.email, better_than_percent=referral_percent)
+        if promo_coupon:
+            referral_coupon_id = promo_coupon
+    except Exception as promo_err:
+        logger.warning(f"Promo discount lookup failed: {promo_err}")
+
+    return_urls = {}
+    if request.return_to == "app":
+        bounce = f"{public_api_base_url()}/api/users/credits/app-return"
+        return_urls = {
+            "success_url": f"{bounce}?status=success&session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{bounce}?status=cancelled",
+        }
+
+    success, checkout_url, message = stripe_service.create_checkout_session(
+        package_id=request.package_id,
+        user_email=request.email,
+        coupon_id=referral_coupon_id,
+        **return_urls,
+    )
+
+    if not success or not checkout_url:
+        raise HTTPException(status_code=400, detail=message)
+
+    return CreateCheckoutResponse(
+        status="success",
+        checkout_url=checkout_url,
+        message=message,
+    )
+
+
+@router.post("/made-for-you/checkout", response_model=CreateCheckoutResponse)
+def create_made_for_you_checkout(
+    request: MadeForYouCheckoutRequest,
+    http_request: Request,
+    stripe_service: StripeService = Depends(get_stripe_service),
+):
+    """
+    Create a Stripe checkout session for a made-for-you karaoke video order.
+
+    This is the full-service option where Nomad Karaoke handles everything:
+    - Finding or processing the audio
+    - Reviewing and correcting lyrics
+    - Selecting the best instrumental
+    - Generating the final video
+
+    $15 with 24-hour delivery guarantee.
+    No authentication required - customer email is provided in the request.
+    """
+    if not stripe_service.can_checkout():
+        raise HTTPException(status_code=503, detail="Payment processing is not available")
+
+    success, checkout_url, message = stripe_service.create_made_for_you_checkout_session(
+        customer_email=request.email,
+        artist=request.artist,
+        title=request.title,
+        source_type=request.source_type,
+        youtube_url=request.youtube_url,
+        notes=request.notes,
+        locale=get_full_locale_from_request(http_request),
+    )
+
+    if not success or not checkout_url:
+        raise HTTPException(status_code=400, detail=message)
+
+    return CreateCheckoutResponse(
+        status="success",
+        checkout_url=checkout_url,
+        message=message,
+    )
+
+
+# =============================================================================
+# Stripe Webhooks
+# =============================================================================
+
+# Admin email for made-for-you order notifications
+ADMIN_EMAIL = "madeforyou@nomadkaraoke.com"
+
+
+def _send_mfy_failure_alert(
+    email_service: EmailService,
+    *,
+    customer_email: str,
+    artist: str,
+    title: str,
+    job_id: Optional[str],
+    error: Exception,
+) -> None:
+    """Best-effort admin alert when a made-for-you order can't be fully processed.
+
+    This never raises: a failure to send the alert must not mask the original
+    error, nor interfere with the customer-facing order-confirmation email
+    (which is sent independently, before audio acquisition is attempted).
+    """
+    safe_customer = html.escape(customer_email or "")
+    safe_artist = html.escape(artist or "")
+    safe_title = html.escape(title or "")
+    safe_error = html.escape(str(error))
+    job_line_html = f"<li><strong>Job ID:</strong> {html.escape(job_id)}</li>" if job_id else ""
+    job_line_text = f"Job ID: {job_id}\n" if job_id else ""
+    remediation = (
+        "The customer's order-confirmation email is sent separately and up-front, so it "
+        "is unaffected by failures during processing. Please review this order and take "
+        "any needed manual action — e.g. provide/repair the audio source, or resend the "
+        "customer confirmation."
+    )
+    try:
+        sent = email_service.send_email(
+            to_email=ADMIN_EMAIL,
+            subject=f"[FAILED] Made For You Order: {artist} - {title}",
+            html_content=f"""
+                <h2>Made-For-You Order — Action Needed</h2>
+                <p>A problem occurred while processing this order:</p>
+                <ul>
+                    <li><strong>Customer:</strong> {safe_customer}</li>
+                    <li><strong>Artist:</strong> {safe_artist}</li>
+                    <li><strong>Title:</strong> {safe_title}</li>
+                    {job_line_html}
+                    <li><strong>Error:</strong> {safe_error}</li>
+                </ul>
+                <p>{remediation}</p>
+            """,
+            text_content=(
+                "Made-For-You Order — Action Needed\n\n"
+                f"Customer: {customer_email}\n"
+                f"Artist: {artist}\n"
+                f"Title: {title}\n"
+                f"{job_line_text}"
+                f"Error: {error}\n\n"
+                f"{remediation}"
+            ),
+        )
+        if sent:
+            logger.info(f"Sent made-for-you failure alert to admin for job {job_id}")
+        else:
+            logger.error(
+                f"Made-for-you failure alert to admin was rejected by the email provider (job {job_id})"
+            )
+    except Exception as email_error:
+        logger.error(
+            f"Failed to send made-for-you failure alert (job {job_id}): {email_error}",
+            exc_info=True,
+        )
+
+
+async def _handle_made_for_you_order(
+    session_id: str,
+    metadata: dict,
+    user_service: UserService,
+    email_service: EmailService,
+) -> None:
+    """
+    Handle a completed made-for-you order by creating a job and notifying Andrew.
+
+    The made-for-you flow:
+    1. Job is created with made_for_you=True, owned by admin during processing
+    2. For search orders: audio search runs, results stored, job pauses at AWAITING_AUDIO_SELECTION
+    3. Admin receives notification email with link to select audio source
+    4. Customer receives order confirmation email
+    5. Admin selects audio in UI, job proceeds through normal pipeline
+    6. On completion, ownership transfers to customer
+
+    For orders with a YouTube URL, workers are triggered immediately (no search needed).
+
+    Args:
+        session_id: Stripe checkout session ID
+        metadata: Order metadata from Stripe session
+        user_service: User service for marking session processed
+        email_service: Email service for notifications
+    """
+    from backend.models.job import JobCreate, JobStatus
+    from backend.services.job_manager import JobManager
+    from backend.services.audio_search_service import (
+        get_audio_search_service,
+        NoResultsError,
+        AudioSearchError,
+    )
+    from backend.services.storage_service import StorageService
+    import tempfile
+    import os
+
+    customer_email = metadata.get("customer_email", "")
+    artist = metadata.get("artist", "Unknown Artist")
+    title = metadata.get("title", "Unknown Title")
+    source_type = metadata.get("source_type", "search")
+    youtube_url = metadata.get("youtube_url")
+    notes = metadata.get("notes", "")
+
+    logger.info(
+        f"Processing made-for-you order: {artist} - {title} for {customer_email} "
+        f"(session: {session_id}, source_type: {source_type})"
+    )
+
+    # Defined up-front so the outer failure handler can reference it even if job
+    # creation is what failed (job_id stays None until the job actually exists).
+    job_id = None
+
+    try:
+        job_manager = JobManager()
+        storage_service = StorageService()
+
+        # Apply default theme (Nomad) - same as audio_search endpoint
+        theme_service = get_theme_service()
+        effective_theme_id = theme_service.get_default_theme_id()
+        if effective_theme_id:
+            logger.info(f"Applying default theme '{effective_theme_id}' for made-for-you order")
+
+        # Get distribution defaults using centralized service
+        dist = get_effective_distribution_settings()
+
+        # Resolve CDG/TXT defaults based on theme (uses centralized service)
+        # This ensures made-for-you jobs get the same CDG/TXT defaults as regular jobs
+        resolved_cdg, resolved_txt = resolve_cdg_txt_defaults(effective_theme_id)
+
+        # Create job with admin ownership during processing
+        # CRITICAL: made_for_you=True, user_email=ADMIN_EMAIL, customer_email for delivery
+        # auto_download=False to pause at audio selection for admin to choose
+        job_create = JobCreate(
+            url=youtube_url if youtube_url else None,
+            artist=artist,
+            title=title,
+            user_email=ADMIN_EMAIL,  # Admin owns during processing
+            theme_id=effective_theme_id,  # Apply default theme
+            non_interactive=False,  # Admin will review lyrics/instrumental
+            # Made-for-you specific fields
+            made_for_you=True,  # Flag for ownership transfer on completion
+            customer_email=customer_email,  # Customer email for final delivery
+            customer_notes=notes if notes else None,  # Customer's special requests
+            # Audio search fields for search-based orders
+            audio_search_artist=artist if not youtube_url else None,
+            audio_search_title=title if not youtube_url else None,
+            auto_download=False,  # Pause at audio selection for admin to choose
+            # CDG/TXT settings (resolved via centralized service)
+            enable_cdg=resolved_cdg,
+            enable_txt=resolved_txt,
+            # Distribution settings from centralized defaults
+            enable_youtube_upload=dist.enable_youtube_upload,
+            dropbox_path=dist.dropbox_path,
+            gdrive_folder_id=dist.gdrive_folder_id,
+            brand_prefix=dist.brand_prefix,
+            discord_webhook_url=dist.discord_webhook_url,
+            youtube_description=dist.youtube_description,
+            # UI language the customer ordered in (captured at checkout, admin-only signal)
+            locale=metadata.get("locale") or None,
+        )
+        # Made-for-you jobs are created by admin (via Stripe webhook) - bypass rate limits
+        job = job_manager.create_job(job_create, is_admin=True)
+        job_id = job.job_id
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("job.source", "made_for_you")
+        add_span_attribute("job.is_private", False)
+
+        logger.info(f"Created made-for-you job {job_id} for {_mask_email(customer_email)} (owned by {_mask_email(ADMIN_EMAIL)})")
+
+        # Mark the session processed straight after creating the job, before any await:
+        # if this task is cancelled at an await below, Stripe's retry must find the
+        # session already handled rather than create a second job for the same order.
+        # Note: Using internal method since this isn't a credit transaction
+        user_service._mark_stripe_session_processed(
+            stripe_session_id=session_id,
+            email=customer_email,
+            amount=0  # No credits, just tracking the session
+        )
+
+        # Prepare theme style assets for the job (same as audio_search endpoint)
+        if effective_theme_id:
+            try:
+                style_params_path, theme_style_assets, youtube_desc = await asyncio.to_thread(
+                    _prepare_theme_for_job,
+                    job_id, effective_theme_id, None  # No color overrides for made-for-you
+                )
+                theme_update = {
+                    'style_params_gcs_path': style_params_path,
+                    'style_assets': theme_style_assets,
+                }
+                if youtube_desc:
+                    theme_update['youtube_description_template'] = youtube_desc
+                job_manager.update_job(job_id, theme_update)
+                logger.info(f"Applied theme '{effective_theme_id}' to made-for-you job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to prepare theme for made-for-you job {job_id}: {e}")
+
+        # Initialize search_results for later use in email notification
+        search_results = None
+
+        # Send the customer's order-confirmation email NOW, before attempting audio
+        # acquisition. The order is paid and confirmed regardless of whether the
+        # (fallible) YouTube download / audio search succeeds, so a failure there must
+        # never rob the customer of their confirmation email. Resilient: a delivery
+        # failure is logged but does not abort order processing.
+        confirmation_ok = False
+        try:
+            # Providers return False (not an exception) when the send is rejected, so
+            # check the result rather than assuming success.
+            # Off the event loop: a slow Postmark send (retries + SMTP fallback)
+            # stalled every request on the instance for 22s on 2026-10-22.
+            confirmation_ok = bool(await asyncio.to_thread(
+                email_service.send_made_for_you_order_confirmation,
+                to_email=customer_email,
+                artist=artist,
+                title=title,
+                job_id=job_id,
+                notes=notes,
+            ))
+            if confirmation_ok:
+                logger.info(f"Sent made-for-you customer confirmation for job {job_id}")
+            else:
+                logger.error(
+                    f"Job {job_id}: customer order-confirmation email was rejected by the email provider"
+                )
+        except Exception as confirm_error:
+            logger.error(
+                f"Job {job_id}: Failed to send customer order-confirmation email: {confirm_error}",
+                exc_info=True,
+            )
+
+        if not confirmation_ok:
+            # A paid customer must never silently miss their confirmation. Escalate to
+            # the admin so it can be resent manually. Order processing still continues.
+            _send_mfy_failure_alert(
+                email_service,
+                customer_email=customer_email,
+                artist=artist,
+                title=title,
+                job_id=job_id,
+                error=RuntimeError(
+                    "Customer order-confirmation email failed to send — please resend it manually"
+                ),
+            )
+
+        # Handle based on whether we have a YouTube URL or need to search
+        if youtube_url:
+            # URL provided - download audio first, then trigger workers
+            # CRITICAL: Workers require input_media_gcs_path to be set before they can process
+            # See docs/LESSONS-LEARNED.md "YouTube URL Downloads Must Happen Before Workers"
+            logger.info(f"Job {job_id}: YouTube URL provided, downloading audio first")
+
+            try:
+                youtube_service = get_youtube_download_service()
+                audio_gcs_path = await youtube_service.download(
+                    url=youtube_url,
+                    job_id=job_id,
+                    artist=artist,
+                    title=title,
+                )
+
+                # Update job with the downloaded audio path BEFORE triggering workers
+                job_manager.update_job(job_id, {
+                    'input_media_gcs_path': audio_gcs_path,
+                    'filename': os.path.basename(audio_gcs_path),
+                })
+
+                logger.info(f"Job {job_id}: YouTube audio downloaded to {audio_gcs_path}")
+
+                # Use centralized helper that handles transition + worker triggers
+                # This ensures consistent state machine flow and raises on invalid transitions
+                try:
+                    await job_manager.start_job_processing(job_id)
+                except InvalidStateTransitionError as e:
+                    logger.error(f"Job {job_id}: Failed to start processing - invalid state transition: {e}")
+                    job_manager.transition_to_state(
+                        job_id=job_id,
+                        new_status=JobStatus.FAILED,
+                        progress=0,
+                        message=f"Failed to start processing: {str(e)}",
+                        raise_on_invalid=False  # Don't raise if already failed
+                    )
+                    raise
+
+            except YouTubeDownloadError as e:
+                logger.error(f"Job {job_id}: YouTube download failed: {e}")
+                job_manager.transition_to_state(
+                    job_id=job_id,
+                    new_status=JobStatus.FAILED,
+                    progress=0,
+                    message=f"YouTube download failed: {str(e)}"
+                )
+                raise
+        else:
+            # No URL - use audio search flow, pause for admin selection
+            # Made-for-you jobs require admin to select audio source
+            logger.info(f"Job {job_id}: No URL, using audio search for '{artist} - {title}'")
+
+            # Update job with audio search fields
+            job_manager.update_job(job_id, {
+                'audio_search_artist': artist,
+                'audio_search_title': title,
+                'auto_download': False,  # Admin must select
+            })
+
+            # Transition to searching state
+            job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.SEARCHING_AUDIO,
+                progress=5,
+                message=f"Searching for audio: {artist} - {title}"
+            )
+
+            # Perform audio search
+            audio_search_service = get_audio_search_service()
+
+            try:
+                search_results = audio_search_service.search(artist, title)
+            except NoResultsError as e:
+                # No results found - still transition to AWAITING_AUDIO_SELECTION
+                # Admin can manually provide audio
+                logger.warning(f"Job {job_id}: No audio sources found for '{artist} - {title}'")
+                job_manager.transition_to_state(
+                    job_id=job_id,
+                    new_status=JobStatus.AWAITING_AUDIO_SELECTION,
+                    progress=10,
+                    message=f"No automatic audio sources found. Manual intervention required."
+                )
+                search_results = None
+            except AudioSearchError as e:
+                logger.error(f"Job {job_id}: Audio search failed: {e}")
+                job_manager.transition_to_state(
+                    job_id=job_id,
+                    new_status=JobStatus.AWAITING_AUDIO_SELECTION,
+                    progress=10,
+                    message=f"Audio search error. Manual intervention required."
+                )
+                search_results = None
+
+            if search_results:
+                # Store search results in state_data for admin to review
+                results_dicts = [r.to_dict() for r in search_results]
+                # Dotted paths MERGE into state_data (keeps create_job's
+                # payment_bypassed flag so reconcile never bills an MFY job).
+                state_data_update = {
+                    'state_data.audio_search_results': results_dicts,
+                    'state_data.audio_search_count': len(results_dicts),
+                }
+                if audio_search_service.last_remote_search_id:
+                    state_data_update['state_data.remote_search_id'] = audio_search_service.last_remote_search_id
+                job_manager.update_job(job_id, state_data_update)
+
+                # Transition to AWAITING_AUDIO_SELECTION for admin to choose
+                # Do NOT auto-select or download - admin must review and select
+                logger.info(f"Job {job_id}: Found {len(results_dicts)} audio sources, awaiting admin selection")
+
+                # Transition to AWAITING_AUDIO_SELECTION for admin to choose
+                # Admin will select from results in the UI, then job proceeds
+                job_manager.transition_to_state(
+                    job_id=job_id,
+                    new_status=JobStatus.AWAITING_AUDIO_SELECTION,
+                    progress=10,
+                    message=f"Found {len(results_dicts)} audio sources. Awaiting admin selection."
+                )
+
+        # Get audio source count for admin notification
+        # (search_results may be set from the search flow above, or None for YouTube URL orders)
+        audio_source_count = len(search_results) if search_results else 0
+
+        # Send notification email to admin using professional template.
+        # Resilient: an email delivery error here must not turn a successfully-created
+        # order into a "[FAILED]" alert — it's logged and swallowed instead.
+        try:
+            # Generate admin login token for one-click email access (24hr expiry)
+            admin_login = user_service.create_admin_login_token(
+                email=ADMIN_EMAIL,
+                expiry_hours=24,
+            )
+            admin_notified = bool(await asyncio.to_thread(
+                email_service.send_made_for_you_admin_notification,
+                to_email=ADMIN_EMAIL,
+                customer_email=customer_email,
+                artist=artist,
+                title=title,
+                job_id=job_id,
+                admin_login_token=admin_login.token,
+                notes=notes,
+                audio_source_count=audio_source_count,
+            ))
+            if admin_notified:
+                logger.info(f"Sent made-for-you admin notification for job {job_id}")
+            else:
+                logger.error(
+                    f"Job {job_id}: admin order notification was rejected by the email provider"
+                )
+        except Exception as admin_email_error:
+            logger.error(
+                f"Job {job_id}: Failed to send admin order notification: {admin_email_error}",
+                exc_info=True,
+            )
+
+    except Exception as e:
+        # A hard failure in order processing (e.g. job creation, or audio acquisition
+        # raising after transitioning the job to FAILED). The customer confirmation is
+        # sent earlier and independently, so it is unaffected by failures here. Alert
+        # the admin so they can intervene manually.
+        logger.error(f"Error processing made-for-you order: {e}", exc_info=True)
+        _send_mfy_failure_alert(
+            email_service,
+            customer_email=customer_email,
+            artist=artist,
+            title=title,
+            job_id=job_id,
+            error=e,
+        )
+        # If we failed before the job was even created, no job exists and the Stripe
+        # session was never marked processed — re-raise so the webhook returns non-2xx
+        # and Stripe retries the (likely transient) failure rather than silently
+        # dropping a paid order. Post-creation failures keep job_id set: those return
+        # normally (job exists, session marked processed, admin already alerted), so a
+        # retry would be a no-op / risk a duplicate job.
+        if job_id is None:
+            raise
+
+
+@router.post("/webhooks/stripe")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="stripe-signature"),
+    stripe_service: StripeService = Depends(get_stripe_service),
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Handle Stripe webhook events.
+
+    This endpoint receives events from Stripe about payment status.
+    It verifies the webhook signature and processes the event.
+    """
+    from backend.services.stripe_admin_service import get_stripe_admin_service
+
+    if not stripe_signature:
+        raise HTTPException(status_code=400, detail="Missing Stripe signature")
+
+    # Get raw body for signature verification
+    payload = await request.body()
+
+    # Verify signature
+    valid, event, message = stripe_service.verify_webhook_signature(payload, stripe_signature)
+
+    if not valid:
+        logger.warning(f"Invalid Stripe webhook signature: {message}")
+        raise HTTPException(status_code=400, detail=message)
+
+    # Handle the event
+    event_type = event.get("type")
+    event_id = event.get("id", "")
+    logger.info(f"Received Stripe webhook: {event_type}")
+
+    # Log webhook event for audit trail
+    admin_service = get_stripe_admin_service()
+    admin_service.log_webhook_event(
+        event_id=event_id,
+        event_type=event_type,
+        status="processing",
+    )
+
+    try:
+        if event_type == "checkout.session.completed":
+            session = event["data"]["object"]
+            session_id = session.get("id")
+            metadata = session.get("metadata") or {}
+            customer_email = (
+                metadata.get("user_email")
+                or metadata.get("customer_email")
+                or session.get("customer_email")
+                # Payment Link checkouts only carry the email here
+                or (session.get("customer_details") or {}).get("email")
+                or ""
+            )
+
+            # Idempotency check: Skip if this session was already processed
+            if session_id and user_service.is_stripe_session_processed(session_id):
+                logger.info(f"Skipping already processed session: {session_id}")
+                admin_service.log_webhook_event(
+                    event_id=event_id,
+                    event_type=event_type,
+                    status="skipped",
+                    session_id=session_id,
+                    customer_email=customer_email,
+                    summary="Already processed (idempotency check)",
+                )
+                return {"status": "received", "type": event_type, "note": "already_processed"}
+
+            # Check if this is a made-for-you order
+            if not StripeService.is_gen_checkout(session):
+                # Not created by gen (e.g. a Stripe Payment Link tip): nothing to
+                # fulfil, but the payment is still stored below for revenue.
+                logger.info(
+                    f"non-gen checkout (payment link {session.get('payment_link') or 'none'}) "
+                    f"session {session_id}: ${(session.get('amount_total') or 0) / 100:.2f}; "
+                    f"recording payment only, no credits granted"
+                )
+                # Record the session so a redelivered event is skipped by the
+                # idempotency check (otherwise total_spent below double-counts).
+                user_service._mark_stripe_session_processed(
+                    stripe_session_id=session_id,
+                    email=customer_email,
+                    amount=0,
+                )
+            elif metadata.get("order_type") == "made_for_you":
+                # Handle made-for-you order - create a job
+                await _handle_made_for_you_order(
+                    session_id=session_id,
+                    metadata=metadata,
+                    user_service=user_service,
+                    email_service=email_service,
+                )
+            else:
+                # Handle regular credit purchase
+                success, user_email, credits, _ = stripe_service.handle_checkout_completed(session)
+
+                if success and user_email and credits > 0:
+                    # Add credits to user account
+                    ok, new_balance, credit_msg = user_service.add_credits(
+                        email=user_email,
+                        amount=credits,
+                        reason="stripe_purchase",
+                        stripe_session_id=session_id,
+                    )
+
+                    if ok:
+                        # Send confirmation email
+                        email_service.send_credits_added(user_email, credits, new_balance)
+                        logger.info(f"Added {credits} credits to {user_email}, new balance: {new_balance}")
+
+                        # Record referral earning if applicable
+                        try:
+                            from backend.services.referral_service import get_referral_service
+                            referral_svc = get_referral_service()
+                            # Referrers earn on the credit purchase, not on a tip
+                            amount_charged = stripe_service.referral_base_cents(session)
+                            if amount_charged > 0:
+                                earning_result = referral_svc.record_earning(
+                                    referred_email=user_email,
+                                    source_key=session_id,
+                                    purchase_amount_cents=amount_charged,
+                                )
+                                if earning_result:
+                                    logger.info(
+                                        f"Referral earning: ${earning_result['earning_amount_cents'] / 100:.2f} "
+                                        f"for {earning_result['referrer_email']}"
+                                    )
+                        except Exception as ref_err:
+                            logger.warning(f"Referral earning recording failed: {ref_err}")
+                    else:
+                        logger.error(f"Failed to add credits: {credit_msg}")
+
+            # Update user's cached total_spent (non-blocking)
+            amount_total = session.get("amount_total") or 0
+            if amount_total > 0 and customer_email:
+                try:
+                    from google.cloud.firestore_v1 import Increment
+                    user_doc_ref = user_service.get_user_doc_ref(customer_email)
+                    if user_doc_ref:
+                        user_doc_ref.update({"total_spent": Increment(amount_total)})
+                    else:
+                        logger.warning(f"No user doc found for {customer_email} to update total_spent")
+                except Exception as spend_err:
+                    logger.warning(f"Failed to update total_spent for {customer_email}: {spend_err}")
+
+            # Store enriched payment data (non-blocking - failure won't break credit granting)
+            try:
+                import stripe as stripe_lib
+                expanded_session = stripe_lib.checkout.Session.retrieve(
+                    session_id,
+                    expand=["payment_intent.latest_charge.balance_transaction", "line_items"],
+                )
+                admin_service.store_payment(dict(expanded_session))
+            except Exception as store_err:
+                logger.warning(f"Failed to store payment data for {session_id}: {store_err}")
+
+            admin_service.log_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="success",
+                session_id=session_id,
+                customer_email=customer_email,
+                summary=f"Payment ${session.get('amount_total', 0) / 100:.2f} processed",
+            )
+
+        elif event_type == "charge.refunded":
+            charge = event["data"]["object"]
+            payment_intent_id = charge.get("payment_intent")
+            refund_amount = charge.get("amount_refunded", 0)
+            original_amount = charge.get("amount", 0)
+
+            # Find the payment by payment_intent_id
+            try:
+                collection = admin_service.db.collection("stripe_payments")
+                docs = list(
+                    collection.where("payment_intent_id", "==", payment_intent_id)
+                    .limit(1)
+                    .stream()
+                )
+                if docs:
+                    doc = docs[0]
+                    status = "refunded" if refund_amount >= original_amount else "partially_refunded"
+                    admin_service.update_payment_status(doc.id, {
+                        "status": status,
+                        "refund_amount": refund_amount,
+                        "refunded_at": datetime.utcnow(),
+                    })
+                    logger.info(f"Updated payment {doc.id} to {status} (refund: ${refund_amount / 100:.2f})")
+            except Exception as e:
+                logger.warning(f"Failed to update refund status: {e}")
+
+            admin_service.log_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="success",
+                summary=f"Refund ${refund_amount / 100:.2f} on {payment_intent_id}",
+            )
+
+        elif event_type in ("charge.dispute.created", "charge.dispute.closed"):
+            dispute = event["data"]["object"]
+            payment_intent_id = dispute.get("payment_intent")
+            dispute_status = dispute.get("status")
+            dispute_amount = dispute.get("amount", 0)
+
+            try:
+                collection = admin_service.db.collection("stripe_payments")
+                docs = list(
+                    collection.where("payment_intent_id", "==", payment_intent_id)
+                    .limit(1)
+                    .stream()
+                )
+                if docs:
+                    doc = docs[0]
+                    new_status = "disputed" if event_type == "charge.dispute.created" else doc.to_dict().get("status", "succeeded")
+                    if event_type == "charge.dispute.closed" and dispute_status == "won":
+                        new_status = "succeeded"
+                    admin_service.update_payment_status(doc.id, {"status": new_status})
+            except Exception as e:
+                logger.warning(f"Failed to update dispute status: {e}")
+
+            admin_service.log_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="success",
+                summary=f"Dispute {dispute_status}: ${dispute_amount / 100:.2f}",
+            )
+
+        elif event_type == "checkout.session.expired":
+            logger.info(f"Checkout session expired: {event['data']['object'].get('id')}")
+            admin_service.log_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="success",
+                session_id=event["data"]["object"].get("id"),
+                summary="Checkout session expired",
+            )
+
+        elif event_type == "payment_intent.payment_failed":
+            logger.warning(f"Payment failed: {event['data']['object'].get('id')}")
+            admin_service.log_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="success",
+                summary=f"Payment failed: {event['data']['object'].get('id')}",
+            )
+
+        else:
+            admin_service.log_webhook_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="success",
+                summary=f"Unhandled event type: {event_type}",
+            )
+
+    except Exception as e:
+        admin_service.log_webhook_event(
+            event_id=event_id,
+            event_type=event_type,
+            status="error",
+            error_message=str(e),
+        )
+        raise
+
+    # Return 200 to acknowledge receipt (Stripe will retry on non-2xx)
+    return {"status": "received", "type": event_type}
+
+
+@router.post("/webhooks/revenuecat")
+async def revenuecat_webhook(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    iap: IapService = Depends(get_iap_service),
+):
+    """RevenueCat events for mobile in-app credit packs (see backend/services/iap_service.py).
+
+    Authenticated by the Authorization header configured in the RevenueCat
+    dashboard (REVENUECAT_WEBHOOK_AUTH; 503 while unset). Every handled outcome,
+    including duplicates and unmatched users, is a 200 so RevenueCat stops
+    retrying; a Firestore failure is a 5xx so it retries.
+    """
+    secret = get_settings().revenuecat_webhook_auth
+    if not secret:
+        raise HTTPException(status_code=503, detail="not configured")
+    if not hmac.compare_digest((authorization or "").encode(), secret.encode()):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+    event = body.get("event") if isinstance(body, dict) else None
+    if not isinstance(event, dict):
+        raise HTTPException(status_code=400, detail="missing event")
+
+    try:
+        result = await asyncio.to_thread(iap.handle_event, event)
+    except TransactionContention:
+        raise HTTPException(status_code=503, detail="busy, retry")
+    logger.info(
+        f"RevenueCat webhook {event.get('type')} {event.get('store')}:{event.get('transaction_id')} "
+        f"-> {result.action}"
+    )
+    return {"status": "received", "action": result.action}
+
+
+# =============================================================================
+# User Feedback-for-Credits Endpoints
+# =============================================================================
+
+@router.get("/feedback/eligibility", response_model=FeedbackEligibilityResponse)
+def check_feedback_eligibility(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Check if the current user is eligible to submit feedback for credits.
+
+    Eligible if: total_jobs_completed >= 2 AND has not already submitted feedback.
+    """
+    locale = get_locale_from_request(request)
+    if not authorization:
+        raise HTTPException(status_code=401, detail=t(locale, "users.userNotFound"))
+
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+
+    # Try auth service first (admin tokens, auth_tokens)
+    from backend.services.auth_service import get_auth_service
+    auth_service = get_auth_service()
+    auth_result = auth_service.validate_token_full(token)
+
+    user = None
+    if auth_result.is_valid and auth_result.user_email:
+        user = user_service.get_or_create_user(auth_result.user_email)
+    else:
+        valid, user, message = user_service.validate_session(token)
+        if not valid or not user:
+            raise HTTPException(status_code=401, detail=t(locale, "users.userNotFound"))
+
+    eligible = user.total_jobs_completed >= 2 and not user.has_submitted_feedback
+
+    return FeedbackEligibilityResponse(
+        eligible=eligible,
+        has_submitted=user.has_submitted_feedback,
+        jobs_completed=user.total_jobs_completed,
+        credits_reward=1,
+    )
+
+
+@router.post("/feedback", response_model=UserFeedbackResponse)
+def submit_user_feedback(
+    http_request: Request,
+    request: UserFeedbackRequest,
+    authorization: Optional[str] = Header(None),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Submit product feedback to earn 1 free credit.
+
+    Requires authentication. Users must have completed 2+ jobs and
+    not have already submitted feedback. At least one text field
+    must have >50 characters.
+    """
+    locale = get_locale_from_request(http_request)
+    if not authorization:
+        raise HTTPException(status_code=401, detail=t(locale, "users.userNotFound"))
+
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+
+    # Try auth service first (admin tokens, auth_tokens)
+    from backend.services.auth_service import get_auth_service
+    auth_service = get_auth_service()
+    auth_result = auth_service.validate_token_full(token)
+
+    user = None
+    if auth_result.is_valid and auth_result.user_email:
+        user = user_service.get_or_create_user(auth_result.user_email)
+    else:
+        valid, user, message = user_service.validate_session(token)
+        if not valid or not user:
+            raise HTTPException(status_code=401, detail=t(locale, "users.userNotFound"))
+
+    # Check eligibility: must have completed 2+ jobs
+    if user.total_jobs_completed < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "users.feedbackNotEligible")
+        )
+
+    # Check if already submitted
+    if user.has_submitted_feedback:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "users.feedbackNotEligible")
+        )
+
+    # Validate: at least one text field has >50 characters
+    has_detailed_feedback = (
+        (request.what_went_well and len(request.what_went_well) > 50) or
+        (request.what_could_improve and len(request.what_could_improve) > 50) or
+        (request.additional_comments and len(request.additional_comments) > 50)
+    )
+    if not has_detailed_feedback:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide detailed feedback in at least one text field (more than 50 characters)."
+        )
+
+    # Save feedback to Firestore
+    import uuid
+
+    feedback = UserFeedback(
+        id=str(uuid.uuid4()),
+        user_email=user.email,
+        overall_rating=request.overall_rating,
+        ease_of_use_rating=request.ease_of_use_rating,
+        lyrics_accuracy_rating=request.lyrics_accuracy_rating,
+        correction_experience_rating=request.correction_experience_rating,
+        what_went_well=request.what_went_well,
+        what_could_improve=request.what_could_improve,
+        additional_comments=request.additional_comments,
+        would_recommend=request.would_recommend,
+        would_use_again=request.would_use_again,
+        submitted_via="web",
+    )
+
+    user_service.db.collection("user_feedback").document(feedback.id).set(
+        feedback.model_dump(mode='json')
+    )
+
+    # Mark user as having submitted feedback
+    user_service.update_user(
+        user.email,
+        has_submitted_feedback=True,
+    )
+
+    # AI evaluation before granting feedback credits
+    credits_granted = 0
+    feedback_content = {
+        "overall_rating": request.overall_rating,
+        "what_went_well": request.what_went_well,
+        "what_could_improve": request.what_could_improve,
+        "additional_comments": request.additional_comments,
+    }
+    try:
+        from backend.services.credit_evaluation_service import get_credit_evaluation_service
+        eval_service = get_credit_evaluation_service()
+        evaluation = eval_service.evaluate(user.email, "feedback", feedback_content)
+
+        if evaluation.decision == "deny":
+            logger.info(f"Feedback credits denied for {_mask_email(user.email)}: {evaluation.reasoning}")
+            try:
+                from backend.services.email_service import get_email_service
+                get_email_service().send_credit_denied_email(user.email, "feedback")
+            except Exception:
+                logger.exception(f"Failed to send credit denied email to {_mask_email(user.email)}")
+            return UserFeedbackResponse(
+                status="success",
+                message="Thank you for your feedback! We appreciate your input.",
+                credits_granted=0,
+            )
+
+        if evaluation.decision == "pending_review":
+            logger.info(f"Feedback credits pending review for {_mask_email(user.email)}: {evaluation.reasoning}")
+            try:
+                from backend.services.email_service import get_email_service
+                get_email_service().send_credit_review_needed_email(user.email, "feedback", evaluation.reasoning)
+            except Exception:
+                logger.exception(f"Failed to send review needed email for {_mask_email(user.email)}")
+            return UserFeedbackResponse(
+                status="success",
+                message="Thank you for your feedback! Our team will review your account shortly.",
+                credits_granted=0,
+            )
+    except Exception:
+        logger.exception(f"Credit evaluation failed for {_mask_email(user.email)} — pending review (fail-closed)")
+        try:
+            from backend.services.email_service import get_email_service
+            get_email_service().send_credit_review_needed_email(user.email, "feedback", "Evaluation error")
+        except Exception:
+            pass
+        return UserFeedbackResponse(
+            status="success",
+            message="Thank you for your feedback! Our team will review your account shortly.",
+            credits_granted=0,
+        )
+
+    # Grant 1 credit (passed evaluation)
+    credits_granted = 1
+    user_service.add_credits(
+        email=user.email,
+        amount=credits_granted,
+        reason="feedback_bonus",
+    )
+
+    logger.info(
+        f"User feedback received from {_mask_email(user.email)}, "
+        f"credits granted: {credits_granted}"
+    )
+
+    # Send admin notification email (fire-and-forget)
+    try:
+        from backend.services.email_service import get_email_service
+        email_service = get_email_service()
+        email_service.send_feedback_notification(
+            user_email=user.email,
+            overall_rating=request.overall_rating,
+            ease_of_use_rating=request.ease_of_use_rating,
+            lyrics_accuracy_rating=request.lyrics_accuracy_rating,
+            correction_experience_rating=request.correction_experience_rating,
+            what_went_well=request.what_went_well,
+            what_could_improve=request.what_could_improve,
+            additional_comments=request.additional_comments,
+            would_recommend=request.would_recommend,
+            would_use_again=request.would_use_again,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send feedback notification email: {e}")
+
+    return UserFeedbackResponse(
+        status="success",
+        message=f"Thank you for your feedback! You earned {credits_granted} free credits.",
+        credits_granted=credits_granted,
+    )
+
+
+# =============================================================================
+# Admin Endpoints
+# =============================================================================
+
+class UserListResponsePaginated(BaseModel):
+    """Paginated response for user list."""
+    users: list[UserPublic]
+    total: int
+    offset: int
+    limit: int
+    has_more: bool
+
+
+class UserDetailResponse(BaseModel):
+    """Detailed user information for admin view."""
+    email: str
+    role: UserRole
+    credits: int
+    display_name: Optional[str] = None
+    is_active: bool = True
+    email_verified: bool = False
+    # Language: `locale` is the email locale (en/es/de); `ui_locale` is the full UI
+    # language (any of 33) the user browses in — what admins should communicate in.
+    locale: Optional[str] = None
+    ui_locale: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    last_login_at: Optional[str] = None
+    total_jobs_created: int = 0
+    total_jobs_completed: int = 0
+    total_spent: int = 0
+    credit_transactions: list[dict] = []
+    recent_jobs: list[dict] = []
+    active_sessions_count: int = 0
+    # Anti-abuse / identity info
+    signup_ip: Optional[str] = None
+    device_fingerprint: Optional[str] = None
+    welcome_credits_granted: bool = False
+    has_submitted_feedback: bool = False
+    # Referral fields
+    referred_by_code: Optional[str] = None
+    referral_discount_expires_at: Optional[str] = None
+    referral_code: Optional[str] = None
+    # Acquisition: channel label + first-touch UTM/referrer detail
+    signup_source: Optional[str] = None
+    signup_venue: Optional[str] = None
+    signup_attribution: Optional[dict] = None
+    # Recent session details (IP, user agent, fingerprint)
+    recent_sessions: list[dict] = []
+
+
+class AttributionSourceRow(BaseModel):
+    """Funnel counts for one acquisition channel."""
+    source: str
+    signups: int = 0
+    verified: int = 0
+    made_job: int = 0
+    paid: int = 0
+    revenue_cents: int = 0
+
+
+class AttributionSummaryResponse(BaseModel):
+    days: int
+    total_signups: int
+    sources: list[AttributionSourceRow]
+
+
+def _as_datetime(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    # Compare as naive UTC (model_dump stores utcnow() ISO strings without an offset)
+    if parsed.tzinfo:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+@router.get("/admin/attribution-summary", response_model=AttributionSummaryResponse)
+def attribution_summary(
+    days: int = 90,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """Signups -> verified -> made a job -> paid, grouped by signup_source (admin only).
+
+    Covers consumer accounts created in the last ``days`` (test and tenant users
+    excluded). Users without a recorded source show as "direct / unknown"; all
+    accounts created before attribution capture shipped (2026-10) land there.
+    """
+    from datetime import timedelta
+
+    days = max(1, min(days, 3650))
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    fields = [
+        "email", "created_at", "signup_source", "email_verified",
+        "total_jobs_created", "total_spent", "tenant_id",
+    ]
+    rows: dict[str, AttributionSourceRow] = {}
+    total = 0
+    for doc in user_service.db.collection(USERS_COLLECTION).select(fields).stream():
+        data = doc.to_dict() or {}
+        if data.get("tenant_id") or is_test_email(data.get("email", "")):
+            continue
+        created = _as_datetime(data.get("created_at"))
+        if not created or created < cutoff:
+            continue
+        source = data.get("signup_source") or "direct / unknown"
+        row = rows.setdefault(source, AttributionSourceRow(source=source))
+        row.signups += 1
+        total += 1
+        if data.get("email_verified"):
+            row.verified += 1
+        if (data.get("total_jobs_created") or 0) > 0:
+            row.made_job += 1
+        spent = data.get("total_spent") or 0
+        if spent > 0:
+            row.paid += 1
+            row.revenue_cents += spent
+    sources = sorted(rows.values(), key=lambda r: (-r.paid, -r.signups, r.source))
+    return AttributionSummaryResponse(days=days, total_signups=total, sources=sources)
+
+
+@router.get("/admin/users", response_model=UserListResponsePaginated)
+def list_users(
+    limit: int = 50,
+    offset: int = 0,
+    search: Optional[str] = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+    include_inactive: bool = False,
+    exclude_test: bool = True,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    List all users with search, pagination, and sorting (admin only).
+
+    Args:
+        limit: Maximum users to return (default 50, max 100)
+        offset: Number of users to skip for pagination
+        search: Search by email (case-insensitive prefix match)
+        sort_by: Field to sort by (created_at, last_login_at, credits, email)
+        sort_order: Sort direction (asc, desc)
+        include_inactive: Include disabled users
+        exclude_test: If True (default), exclude test users (e.g., @inbox.testmail.app)
+    """
+    from google.cloud import firestore
+    from google.cloud.firestore_v1 import FieldFilter
+
+    # Validate and cap limit
+    limit = min(limit, 100)
+
+    db = user_service.db
+    query = db.collection(USERS_COLLECTION)
+
+    # Filter inactive users
+    if not include_inactive:
+        query = query.where(filter=FieldFilter('is_active', '==', True))
+
+    # Search by email prefix (case-insensitive via range query)
+    search = search.strip() if search else None
+    if search:
+        search_lower = search.lower()
+        # Use range query for prefix matching
+        query = query.where(filter=FieldFilter('email', '>=', search_lower))
+        query = query.where(filter=FieldFilter('email', '<', search_lower + '\uffff'))
+
+    # Sorting
+    # When search is active, Firestore range filters on 'email' conflict with
+    # order_by on a different field (requires composite index). Since we already
+    # fetch all docs and paginate in Python, just sort in Python when searching.
+    sort_field = sort_by if sort_by in ["created_at", "last_login_at", "credits", "email"] else "created_at"
+    if not search:
+        direction = firestore.Query.DESCENDING if sort_order == "desc" else firestore.Query.ASCENDING
+        query = query.order_by(sort_field, direction=direction)
+
+    # Get all docs and filter in Python
+    # Note: This is expensive for large datasets, consider caching
+    all_docs = list(query.stream())
+
+    # Sort in Python when search is active (can't use Firestore order_by with range filter)
+    if search:
+        reverse = sort_order == "desc"
+        all_docs.sort(key=lambda d: (d.to_dict().get(sort_field) is None, d.to_dict().get(sort_field)), reverse=reverse)
+
+    # Filter out test users if exclude_test is True
+    if exclude_test:
+        all_docs = [d for d in all_docs if not is_test_email(d.to_dict().get('email', ''))]
+
+    total_count = len(all_docs)
+
+    # Apply pagination manually (Firestore doesn't support offset well)
+    paginated_docs = all_docs[offset:offset + limit]
+
+    users_public = []
+    for doc in paginated_docs:
+        data = doc.to_dict()
+        created_at_val = data.get("created_at")
+        last_login_val = data.get("last_login_at")
+        users_public.append(UserPublic(
+            email=data.get("email", ""),
+            role=data.get("role", UserRole.USER),
+            credits=data.get("credits", 0),
+            display_name=data.get("display_name"),
+            total_jobs_created=data.get("total_jobs_created", 0),
+            total_jobs_completed=data.get("total_jobs_completed", 0),
+            total_spent=data.get("total_spent", 0),
+            created_at=created_at_val.isoformat() if hasattr(created_at_val, 'isoformat') else str(created_at_val) if created_at_val else None,
+            last_login_at=last_login_val.isoformat() if hasattr(last_login_val, 'isoformat') else str(last_login_val) if last_login_val else None,
+        ))
+
+    return UserListResponsePaginated(
+        users=users_public,
+        total=total_count,
+        offset=offset,
+        limit=limit,
+        has_more=(offset + limit) < total_count,
+    )
+
+
+@router.get("/admin/users/{email}/detail", response_model=UserDetailResponse)
+def get_user_detail(
+    email: str,
+    request: Request,
+    auth_data: Tuple[str, UserType, int] = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Get detailed user information including credit history and recent jobs (admin only).
+    """
+    locale = get_locale_from_request(request)
+    from google.cloud import firestore
+    from google.cloud.firestore_v1 import FieldFilter
+    from urllib.parse import unquote
+
+    # URL decode the email (handles @ and other special chars)
+    email = unquote(email).lower()
+
+    user = user_service.get_user(email)
+    if not user:
+        raise HTTPException(status_code=404, detail=t(locale, "users.userNotFound"))
+
+    db = user_service.db
+
+    # Get recent jobs for this user
+    jobs_query = db.collection("jobs").where(
+        filter=FieldFilter("user_email", "==", email)
+    ).order_by("created_at", direction=firestore.Query.DESCENDING).limit(10)
+
+    recent_jobs = []
+    for job_doc in jobs_query.stream():
+        job_data = job_doc.to_dict()
+        created_at = job_data.get("created_at")
+        # Handle both datetime objects and ISO strings
+        if created_at:
+            created_at_str = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
+        else:
+            created_at_str = None
+        recent_jobs.append({
+            "job_id": job_data.get("job_id"),
+            "status": job_data.get("status"),
+            "artist": job_data.get("artist"),
+            "title": job_data.get("title"),
+            "created_at": created_at_str,
+            "locale": job_data.get("locale"),
+        })
+
+    # Get active sessions with details
+    sessions_query = db.collection("sessions").where(
+        filter=FieldFilter("user_email", "==", email)
+    ).where(
+        filter=FieldFilter("is_active", "==", True)
+    )
+    active_sessions = []
+    for session_doc in sessions_query.stream():
+        sd = session_doc.to_dict()
+        created = sd.get("created_at")
+        active_sessions.append({
+            "ip_address": sd.get("ip_address"),
+            "user_agent": sd.get("user_agent"),
+            "device_fingerprint": sd.get("device_fingerprint"),
+            "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            "last_activity_at": str(sd.get("last_activity_at", "")),
+        })
+    active_sessions_count = len(active_sessions)
+
+    # Format credit transactions
+    credit_transactions = []
+    for txn in user.credit_transactions[-20:]:  # Last 20 transactions
+        if hasattr(txn, 'model_dump'):
+            credit_transactions.append(txn.model_dump(mode='json'))
+        elif isinstance(txn, dict):
+            credit_transactions.append(txn)
+
+    return UserDetailResponse(
+        email=user.email,
+        role=user.role,
+        credits=user.credits,
+        display_name=user.display_name,
+        is_active=user.is_active,
+        email_verified=user.email_verified,
+        locale=user.locale,
+        ui_locale=user.ui_locale,
+        created_at=user.created_at.isoformat() if user.created_at else None,
+        updated_at=user.updated_at.isoformat() if user.updated_at else None,
+        last_login_at=user.last_login_at.isoformat() if user.last_login_at else None,
+        total_jobs_created=user.total_jobs_created,
+        total_jobs_completed=user.total_jobs_completed,
+        total_spent=user.total_spent,
+        credit_transactions=credit_transactions,
+        recent_jobs=recent_jobs,
+        active_sessions_count=active_sessions_count,
+        signup_ip=user.signup_ip,
+        device_fingerprint=user.device_fingerprint,
+        welcome_credits_granted=user.welcome_credits_granted,
+        has_submitted_feedback=user.has_submitted_feedback,
+        referred_by_code=user.referred_by_code,
+        referral_discount_expires_at=user.referral_discount_expires_at.isoformat() if user.referral_discount_expires_at and hasattr(user.referral_discount_expires_at, 'isoformat') else str(user.referral_discount_expires_at) if user.referral_discount_expires_at else None,
+        referral_code=user.referral_code,
+        signup_source=user.signup_source,
+        signup_venue=user.signup_venue,
+        signup_attribution=user.signup_attribution,
+        recent_sessions=active_sessions,
+    )
+
+
+@router.post("/admin/users", response_model=AdminCreateUserResponse, status_code=201)
+def admin_create_user(
+    request: AdminCreateUserRequest,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Create a user account directly (admin only).
+
+    Use this to set up an account for someone who has never logged in, so you can
+    grant them credits, submit jobs on their behalf, or impersonate them. The user
+    can later log in normally via magic link with the same email.
+
+    Users created this way with initial credits do NOT receive the automatic
+    welcome credit on first login (welcome_credits_granted is set to prevent
+    double-granting).
+    """
+    admin_id = auth_data.user_email or "admin:unknown"
+    email = request.email.strip().lower()
+
+    if request.initial_credits < 0 or request.initial_credits > 1000:
+        raise HTTPException(status_code=400, detail="initial_credits must be between 0 and 1000")
+
+    if user_service.get_user(email):
+        raise HTTPException(status_code=409, detail=f"User {email} already exists")
+
+    user = user_service.get_or_create_user(email)
+
+    extra_updates = {}
+    if request.display_name and request.display_name.strip():
+        extra_updates["display_name"] = request.display_name.strip()
+
+    if request.initial_credits > 0:
+        success, new_balance, message = user_service.add_credits(
+            email=email,
+            amount=request.initial_credits,
+            reason=request.credit_reason,
+            admin_email=admin_id,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail=f"User created but adding credits failed: {message}")
+        user.credits = new_balance
+        # Admin-granted starter credits replace the automatic welcome credit
+        extra_updates["welcome_credits_granted"] = True
+
+    if extra_updates:
+        user_service.update_user(email, **extra_updates)
+
+    logger.info(
+        f"Admin {admin_id} created user {_mask_email(email)} "
+        f"(initial_credits={request.initial_credits})"
+    )
+
+    return AdminCreateUserResponse(
+        status="success",
+        email=email,
+        credits=user.credits,
+        message=f"Created user {email}"
+        + (f" with {request.initial_credits} credit(s)" if request.initial_credits > 0 else ""),
+    )
+
+
+@router.post("/admin/credits", response_model=AddCreditsResponse)
+def add_credits_to_user(
+    request: AddCreditsRequest,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+    email_service: EmailService = Depends(get_email_service),
+):
+    """
+    Add credits to a user's account (admin only).
+
+    Use this to grant free credits to users, e.g., for beta testers or promotions.
+    """
+    admin_id = auth_data.user_email or "admin:unknown"
+
+    success, new_balance, message = user_service.add_credits(
+        email=request.email,
+        amount=request.amount,
+        reason=request.reason,
+        admin_email=admin_id,
+    )
+
+    if not success:
+        raise HTTPException(status_code=400, detail=message)
+
+    # Send notification email
+    if request.amount > 0:
+        email_service.send_credits_added(request.email, request.amount, new_balance)
+
+    return AddCreditsResponse(
+        status="success",
+        email=request.email,
+        credits_added=request.amount,
+        new_balance=new_balance,
+        message=message,
+    )
+
+
+@router.post("/admin/users/{email}/disable")
+def disable_user(
+    email: str,
+    request: Request,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Disable a user account (admin only).
+    """
+    locale = get_locale_from_request(request)
+    admin_id = auth_data.user_email or "admin:unknown"
+
+    success = user_service.disable_user(email, admin_email=admin_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=t(locale, "users.userNotFound"))
+
+    return {"status": "success", "message": f"User {email} has been disabled"}
+
+
+@router.post("/admin/users/{email}/enable")
+def enable_user(
+    email: str,
+    request: Request,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Enable a user account (admin only).
+    """
+    locale = get_locale_from_request(request)
+    admin_id = auth_data.user_email or "admin:unknown"
+
+    success = user_service.enable_user(email, admin_email=admin_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=t(locale, "users.userNotFound"))
+
+    return {"status": "success", "message": f"User {email} has been enabled"}
+
+
+@router.delete("/admin/users/{email}")
+def delete_user(
+    email: str,
+    request: Request,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Permanently delete a user and all associated data (admin only).
+
+    Jobs are NOT deleted - they remain as historical records.
+    """
+    locale = get_locale_from_request(request)
+    admin_id = auth_data.user_email or "admin:unknown"
+
+    try:
+        success = user_service.delete_user(email, admin_email=admin_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not success:
+        raise HTTPException(status_code=404, detail=t(locale, "users.userNotFound"))
+
+    return {"status": "success", "message": f"User {email} has been deleted"}
+
+
+@router.post("/admin/users/{email}/role")
+def set_user_role(
+    email: str,
+    role: UserRole,
+    request: Request,
+    auth_data: AuthResult = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
+):
+    """
+    Set a user's role (admin only).
+    """
+    locale = get_locale_from_request(request)
+    admin_id = auth_data.user_email or "admin:unknown"
+
+    success = user_service.set_user_role(email, role, admin_email=admin_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=t(locale, "users.userNotFound"))
+
+    return {"status": "success", "message": f"User {email} role set to {role.value}"}
+
+

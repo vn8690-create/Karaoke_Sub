@@ -1,0 +1,8 @@
+functions-framework==3.*
+google-cloud-firestore==2.*
+google-cloud-bigquery==3.*
+google-cloud-storage==2.*
+google-cloud-secret-manager==2.*
+boto3==1.*
+requests==2.*
+pynacl==1.5.*

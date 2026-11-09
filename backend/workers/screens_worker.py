@@ -1,0 +1,895 @@
+"""
+Title and end screen generation worker.
+
+Handles screen generation after parallel processing completes:
+1. Generate title screen with artist/song info
+2. Generate end screen ("Thank you for singing!")
+3. Upload both screens to GCS
+4. Analyze backing vocals for instrumental selection
+5. Transition to AWAITING_REVIEW (combined lyrics + instrumental review)
+
+After review:
+6. Render video worker generates with_vocals.mkv
+7. Then INSTRUMENTAL_SELECTED (user selected during review)
+
+This worker is triggered automatically when both audio and lyrics
+processing complete (via mark_audio_complete/mark_lyrics_complete coordination).
+
+Integrates with karaoke_gen.video_generator.VideoGenerator.
+
+Observability:
+- All operations wrapped in tracing spans for Cloud Trace visibility
+- Logs include [job:ID] prefix for easy filtering in Cloud Logging
+- Worker start/end timing logged with WORKER_START/WORKER_END markers
+"""
+import asyncio
+import logging
+import os
+import shutil
+import tempfile
+import time
+from typing import Optional, Dict, Any
+from pathlib import Path
+
+from backend.models.job import JobStatus
+from backend.services.job_manager import JobManager
+from backend.services.input_persistence import ensure_job_inputs_persisted
+from backend.services.storage_service import StorageService
+from backend.services.job_health_service import validate_worker_can_run
+from backend.config import get_settings
+from backend.workers.style_helper import SCREENS_INCLUDED_KEY, load_style_config, StyleConfig
+from backend.workers.worker_logging import create_job_logger, setup_job_logging, job_logging_context
+from backend.services.tracing import job_span, add_span_event, add_span_attribute
+
+# Import from karaoke_gen package
+from karaoke_gen.video_generator import VideoGenerator
+from karaoke_gen.utils import sanitize_filename
+
+
+logger = logging.getLogger(__name__)
+
+
+# Loggers to capture for screens worker
+SCREENS_WORKER_LOGGERS = [
+    "karaoke_gen.video_generator",
+    "backend.workers.style_helper",
+]
+
+# Statuses from which screen generation may legitimately start. The screens
+# worker can be dispatched more than once — the lyrics worker (primary) and the
+# audio worker (fallback) may both trigger it, and Cloud Tasks may redeliver — so
+# a dispatch that arrives when the job has already advanced past these states is a
+# duplicate and must no-op (see generate_screens).
+_SCREENS_ENTRY_STATUSES = frozenset({
+    JobStatus.DOWNLOADING,
+    JobStatus.AUDIO_EDIT_COMPLETE,
+    JobStatus.AUDIO_COMPLETE,
+    JobStatus.LYRICS_COMPLETE,
+})
+
+
+async def generate_screens(job_id: str) -> bool:
+    """
+    Generate title and end screen videos for a job.
+    
+    This is the main entry point for the screens worker.
+    Called automatically when both audio and lyrics processing complete.
+    
+    Args:
+        job_id: Job ID to process
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    start_time = time.time()
+    job_manager = JobManager()
+    storage = StorageService()
+    settings = get_settings()
+    
+    # Create job logger for remote debugging
+    job_log = create_job_logger(job_id, "screens")
+    
+    # Log with structured markers for easy Cloud Logging queries
+    logger.info(f"[job:{job_id}] WORKER_START worker=screens")
+    
+    # Resolve the job and run the cheap guards BEFORE attaching the job-log handler,
+    # so an early return (not-found / duplicate dispatch / prerequisites) cannot leak
+    # a JobLogHandler — each leaked handler re-appends log records to Firestore and
+    # retains memory.
+    job = job_manager.get_job(job_id)
+    if not job:
+        logger.error(f"[job:{job_id}] Job not found")
+        return False
+
+    # Copy uploads/{job_id}/** into jobs/{job_id}/input/ (uploads/ expires) and repoint the job.
+    await asyncio.to_thread(ensure_job_inputs_persisted, job, storage, job_manager, "screens")
+
+    # Idempotency guard: this worker may be dispatched twice (lyrics primary +
+    # audio fallback triggers, or a Cloud Tasks redelivery). Once the job has
+    # advanced past the pre-screens stage, a second dispatch is a duplicate — no-op
+    # rather than re-running the (invalid) GENERATING_SCREENS transition and
+    # regenerating screens.
+    if job.status not in _SCREENS_ENTRY_STATUSES:
+        logger.info(
+            f"[job:{job_id}] Screens already triggered/advanced "
+            f"(status={job.status}); skipping duplicate dispatch"
+        )
+        return True
+
+    # Validate both audio and lyrics are complete
+    if not _validate_prerequisites(job):
+        logger.error(f"[job:{job_id}] Prerequisites not met for screen generation")
+        return False
+
+    # Storage retention purged this job's separated stems: re-run audio
+    # separation first (the audio worker re-triggers this worker when done), so
+    # review / render / encode find the stems where they always were.
+    from backend.services.stems_restore import NOT_NEEDED, FAILED as RESTORE_FAILED, maybe_start_stems_restore
+    restore = await maybe_start_stems_restore(job, job_manager, job_log)
+    if restore != NOT_NEEDED:
+        return restore != RESTORE_FAILED
+
+    # Set up log capture for VideoGenerator and style_helper (after the guards above
+    # so their early returns don't leak handlers).
+    log_handler = setup_job_logging(job_id, "screens", *SCREENS_WORKER_LOGGERS)
+
+    # Create temporary working directory
+    temp_dir = tempfile.mkdtemp(prefix=f"karaoke_screens_{job_id}_")
+    
+    try:
+        # Wrap entire worker in a tracing span
+        with job_span("screens-worker", job_id, {"artist": job.artist, "title": job.title}) as root_span:
+            # Use job_logging_context for proper log isolation when multiple jobs run concurrently
+            with job_logging_context(job_id):
+                job_log.info(f"Starting screen generation for {job.artist} - {job.title}")
+                logger.info(f"[job:{job_id}] Starting screen generation for {job.artist} - {job.title}")
+                
+                # Claim the job for screen generation via the status transition
+                # itself. If a concurrent duplicate dispatch already advanced it,
+                # the transition is invalid and (raise_on_invalid=False) returns
+                # False — bail out cleanly instead of regenerating screens. Together
+                # with the entry-status guard above this narrows the concurrent
+                # lyrics+audio double-trigger window to near zero. (A fully
+                # transactional compare-and-set on the status field would close the
+                # residual sub-millisecond window; deferred as the worker is
+                # otherwise idempotent — worst case is duplicated work, not
+                # corruption.)
+                claimed = job_manager.transition_to_state(
+                    job_id=job_id,
+                    new_status=JobStatus.GENERATING_SCREENS,
+                    progress=50,
+                    message="Generating title and end screens",
+                    raise_on_invalid=False,
+                )
+                if not claimed:
+                    logger.info(
+                        f"[job:{job_id}] Screens already claimed by another dispatch "
+                        "(transition rejected); skipping duplicate"
+                    )
+                    return True
+                
+                # Log style assets info
+                style_assets = getattr(job, 'style_assets', {}) or {}
+                job_log.info(f"Style assets from job: {list(style_assets.keys()) if style_assets else 'None'}")
+                if style_assets:
+                    for key, path in style_assets.items():
+                        job_log.info(f"  {key}: {path}")
+                
+                # Load style configuration (downloads assets from GCS if available)
+                with job_span("load-style-config", job_id):
+                    job_log.info("Loading style configuration from GCS...")
+                    style_config = await load_style_config(job, storage, temp_dir)
+                    if style_config.has_custom_styles():
+                        job_log.info("Using CUSTOM style configuration")
+                        logger.info(f"[job:{job_id}] Using custom style configuration")
+                        add_span_attribute("style_type", "custom")
+                    else:
+                        job_log.warning("Using DEFAULT style configuration (no custom styles found)")
+                        logger.info(f"[job:{job_id}] Using default style configuration")
+                        add_span_attribute("style_type", "default")
+                
+                # Initialize video generator
+                video_generator = _create_video_generator(temp_dir)
+                
+                # A theme may leave either screen out of its videos (intro/end.enabled=false).
+                include_title = style_config.include_title_screen
+                include_end = style_config.include_end_screen
+                title_screen_path = end_screen_path = None
+
+                # Generate title screen with style config
+                if include_title:
+                    with job_span("generate-title-screen", job_id):
+                        job_log.info("Generating title screen...")
+                        title_screen_path = await _generate_title_screen(
+                            job_id=job_id,
+                            job=job,
+                            video_generator=video_generator,
+                            style_config=style_config,
+                            temp_dir=temp_dir,
+                            job_log=job_log
+                        )
+
+                        if not title_screen_path:
+                            raise Exception("Title screen generation failed")
+                        job_log.info(f"Title screen generated: {title_screen_path}")
+                else:
+                    job_log.info("Theme omits the title screen — skipping it")
+
+                # Generate end screen with style config
+                if include_end:
+                    with job_span("generate-end-screen", job_id):
+                        job_log.info("Generating end screen...")
+                        end_screen_path = await _generate_end_screen(
+                            job_id=job_id,
+                            job=job,
+                            video_generator=video_generator,
+                            style_config=style_config,
+                            temp_dir=temp_dir,
+                            job_log=job_log
+                        )
+
+                        if not end_screen_path:
+                            raise Exception("End screen generation failed")
+                        job_log.info(f"End screen generated: {end_screen_path}")
+                else:
+                    job_log.info("Theme omits the end screen — skipping it")
+
+                # Upload screens to GCS
+                with job_span("upload-screens", job_id):
+                    await _upload_screens(
+                        job_id=job_id,
+                        job_manager=job_manager,
+                        storage=storage,
+                        title_screen_path=title_screen_path,
+                        end_screen_path=end_screen_path
+                    )
+                # Read by the render/encode stages (which run before the style is
+                # loaded) so an omitted screen isn't treated as missing.
+                job_manager.update_state_data(
+                    job_id, SCREENS_INCLUDED_KEY, {"title": include_title, "end": include_end}
+                )
+
+                # Apply countdown padding if needed
+                await _apply_countdown_padding_if_needed(job_id, job_manager, job)
+
+                # Note: backing vocals analysis now runs in audio_worker after stems are uploaded,
+                # since screens_worker triggers on lyrics completion and audio may not be done yet.
+
+                # Transcode review audio to OGG Opus for fast browser playback
+                # This runs BEFORE review so all files are cached when the user opens the UI
+                with job_span("transcode-review-audio", job_id):
+                    job_log.info("Transcoding review audio to OGG Opus...")
+                    await _transcode_review_audio(job_id, job_manager, job_log)
+
+                # Check if this is an admin screen regeneration (restore original status)
+                state_data = job_manager.get_job(job_id).state_data or {}
+                regen_restore_status = state_data.get('regen_restore_status')
+
+                if regen_restore_status:
+                    # Admin/visibility-change regen: restore target status instead of going to review
+                    logger.info(f"[job:{job_id}] Screen regen complete, restoring status to {regen_restore_status}")
+                    from google.cloud.firestore_v1 import DELETE_FIELD as _DEL
+                    db = job_manager.firestore.db
+                    db.collection("jobs").document(job_id).update({
+                        "status": regen_restore_status,
+                        "state_data.regen_restore_status": _DEL,
+                    })
+
+                    # If restoring to review_complete, trigger render worker to continue pipeline
+                    # (used by visibility change: private -> public)
+                    if regen_restore_status == JobStatus.REVIEW_COMPLETE.value:
+                        logger.info(f"[job:{job_id}] Triggering render worker for visibility change pipeline")
+                        from backend.services.worker_service import get_worker_service
+                        worker_service = get_worker_service()
+                        await worker_service.trigger_render_video_worker(job_id)
+                else:
+                    # Auto-approval: score the job (verdict always recorded in
+                    # processing_metadata.auto_approval) and, when fully confident
+                    # and eligible, complete the review here — skipping the
+                    # AWAITING_REVIEW state (and its notifications) entirely.
+                    # Fail-safe: anything short of confident falls through to
+                    # normal human review.
+                    from backend.services.auto_approval.executor import maybe_auto_complete_review
+                    with job_span("auto-approval", job_id):
+                        auto_result = await maybe_auto_complete_review(job_id, trigger="screens_worker")
+
+                    if auto_result.get("outcome") == "auto_completed":
+                        job_log.info("Auto-approved: review screens skipped, render triggered")
+                        logger.info(f"[job:{job_id}] Auto-approved — review skipped")
+                    else:
+                        # Lyrics-confident jobs whose stems are still separating
+                        # are held out of review for the audio-worker re-score;
+                        # everything else opens review now (with server-side
+                        # pre-applied AI corrections). See review_gate.py.
+                        from backend.services.auto_approval.review_gate import route_after_scoring
+                        with job_span("review-gate", job_id):
+                            await route_after_scoring(job_id, auto_result, job_log, job_manager)
+
+                duration = time.time() - start_time
+                # Store worker-level timing
+                job_manager.update_processing_metadata(job_id, "timing.screens_worker_seconds", round(duration, 1))
+                root_span.set_attribute("duration_seconds", duration)
+                logger.info(f"[job:{job_id}] WORKER_END worker=screens status=success duration={duration:.1f}s")
+
+                # Mark screens progress as complete for idempotency
+                # This allows the worker to be re-triggered after admin reset
+                job_manager.update_state_data(job_id, 'screens_progress', {'stage': 'complete'})
+                return True
+
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"[job:{job_id}] WORKER_END worker=screens status=error duration={duration:.1f}s error={e}")
+        job_manager.mark_job_failed(
+            job_id=job_id,
+            error_message=f"Screen generation failed: {str(e)}",
+            error_details={"stage": "screen_generation", "error": str(e)}
+        )
+        return False
+        
+    finally:
+        # Remove log handler to avoid duplicate logging on future runs
+        for logger_name in SCREENS_WORKER_LOGGERS:
+            try:
+                logging.getLogger(logger_name).removeHandler(log_handler)
+            except Exception:
+                pass
+        
+        # Cleanup temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logger.debug(f"[job:{job_id}] Cleaned up temp directory: {temp_dir}")
+
+
+def _validate_prerequisites(job) -> bool:
+    """
+    Validate that lyrics processing is complete (audio is no longer required).
+
+    Single Responsibility: Validation logic separated from main flow.
+
+    Args:
+        job: Job object
+
+    Returns:
+        True if prerequisites met, False otherwise
+    """
+    # Validate job status is appropriate for screens worker
+    # This helps catch bugs where the worker is triggered incorrectly
+    status_error = validate_worker_can_run("screens_worker", job)
+    if status_error:
+        logger.warning(f"Job {job.job_id}: {status_error}")
+        # Log warning but don't fail - status validation is a safety net,
+        # the state_data flags below are the authoritative check
+
+    # SAFETY NET: Enforce theme requirement at processing time
+    # This catches any jobs that somehow bypassed JobManager.create_job() validation
+    if not job.theme_id:
+        logger.error(
+            f"Job {job.job_id}: CRITICAL - No theme_id configured. "
+            "All jobs must have a theme to generate styled videos. "
+            "This job should have been rejected at creation time."
+        )
+        return False
+
+    lyrics_complete = job.state_data.get('lyrics_complete', False)
+    audio_complete = job.state_data.get('audio_complete', False)
+
+    if not lyrics_complete:
+        logger.error(f"Job {job.job_id}: Lyrics processing not complete")
+        return False
+
+    # Audio separation is no longer a prerequisite for screens.
+    # Users can start lyrics review while separation runs in the background.
+    # The instrumental review page handles waiting for audio_complete.
+    if not audio_complete:
+        logger.info(f"Job {job.job_id}: Audio separation still in progress (not blocking screens)")
+
+    if not job.artist or not job.title:
+        logger.error(f"Job {job.job_id}: Missing artist or title")
+        return False
+
+    return True
+
+
+def _create_video_generator(temp_dir: str) -> VideoGenerator:
+    """
+    Create video generator with appropriate parameters.
+    
+    Dependency Inversion: Depends on VideoGenerator abstraction.
+    
+    Args:
+        temp_dir: Temporary directory for output
+        
+    Returns:
+        Configured VideoGenerator instance
+    """
+    # FFmpeg base command (same as in audio_worker)
+    ffmpeg_base_command = "ffmpeg -hide_banner -loglevel error -nostats -y"
+    
+    return VideoGenerator(
+        logger=logger,
+        ffmpeg_base_command=ffmpeg_base_command,
+        render_bounding_boxes=False,
+        output_png=True,
+        output_jpg=True
+    )
+
+
+async def _generate_title_screen(
+    job_id: str,
+    job,
+    video_generator: VideoGenerator,
+    style_config: StyleConfig,
+    temp_dir: str,
+    job_log = None
+) -> Optional[str]:
+    """
+    Generate title screen video with custom style configuration.
+    
+    Single Responsibility: Only handles title screen generation.
+    
+    Args:
+        job_id: Job ID
+        job: Job object with artist/title
+        video_generator: Video generator instance
+        style_config: Style configuration with formats and assets
+        temp_dir: Temporary directory
+        job_log: Optional JobLogger for remote debugging
+        
+    Returns:
+        Path to generated title screen, or None if failed
+    """
+    try:
+        logger.info(f"Job {job_id}: Generating title screen")
+
+        # Set up output paths
+        # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+        safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+        safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+        artist_title = f"{safe_artist} - {safe_title}"
+        output_image_filepath_noext = os.path.join(temp_dir, f"{artist_title} (Title)")
+        output_video_filepath = os.path.join(temp_dir, f"{artist_title} (Title).mov")
+        
+        # Get title format settings from style config
+        title_format = style_config.get_intro_format()
+        intro_duration = style_config.intro_video_duration
+        
+        # Log detailed style info for debugging
+        if job_log:
+            job_log.info("Title screen format configuration:")
+            job_log.info(f"  background_image: {title_format.get('background_image')}")
+            job_log.info(f"  background_color: {title_format.get('background_color')}")
+            job_log.info(f"  font: {title_format.get('font')}")
+            job_log.info(f"  title_color: {title_format.get('title_color')}")
+            job_log.info(f"  artist_color: {title_format.get('artist_color')}")
+            job_log.info(f"  duration: {intro_duration}s")
+            
+            # Check if background image exists
+            bg_image = title_format.get('background_image')
+            if bg_image and os.path.exists(bg_image):
+                job_log.info(f"  background_image file EXISTS: {os.path.getsize(bg_image)} bytes")
+            elif bg_image:
+                job_log.warning(f"  background_image file NOT FOUND: {bg_image}")
+        
+        logger.info(f"Job {job_id}: Title format - bg_image: {title_format.get('background_image')}, font: {title_format.get('font')}")
+        
+        # Generate title screen images only (MOV video is generated on GCE encoding worker)
+        # Pass duration=0 to skip FFmpeg video creation — Cloud Run doesn't have enough
+        # memory for 4K H.264 encoding after right-sizing to 2Gi (PR #640).
+        # 4K PIL render + PNG/JPG encode is seconds of CPU — keep it off the
+        # event loop (it froze every request on the instance; 2026-10-03).
+        await asyncio.to_thread(
+            video_generator.create_title_video,
+            artist=job.artist,
+            title=job.title,
+            format=title_format,
+            output_image_filepath_noext=output_image_filepath_noext,
+            output_video_filepath=output_video_filepath,
+            existing_title_image=title_format.get('existing_image'),
+            intro_video_duration=0,
+        )
+
+        output_png = f"{output_image_filepath_noext}.png"
+        if os.path.exists(output_png):
+            logger.info(f"Job {job_id}: Title screen image generated at {output_png}")
+            return output_png
+        else:
+            logger.error(f"Job {job_id}: Title screen generation returned no file")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Job {job_id}: Title screen generation error: {e}", exc_info=True)
+        return None
+
+
+async def _generate_end_screen(
+    job_id: str,
+    job,
+    video_generator: VideoGenerator,
+    style_config: StyleConfig,
+    temp_dir: str,
+    job_log = None
+) -> Optional[str]:
+    """
+    Generate end screen video with custom style configuration.
+    
+    Single Responsibility: Only handles end screen generation.
+    
+    Args:
+        job_id: Job ID
+        job: Job object with artist/title
+        video_generator: Video generator instance
+        style_config: Style configuration with formats and assets
+        temp_dir: Temporary directory
+        job_log: Optional JobLogger for remote debugging
+        
+    Returns:
+        Path to generated end screen, or None if failed
+    """
+    try:
+        logger.info(f"Job {job_id}: Generating end screen")
+
+        # Set up output paths
+        # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+        safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+        safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+        artist_title = f"{safe_artist} - {safe_title}"
+        output_image_filepath_noext = os.path.join(temp_dir, f"{artist_title} (End)")
+        output_video_filepath = os.path.join(temp_dir, f"{artist_title} (End).mov")
+        
+        # Get end format settings from style config
+        end_format = style_config.get_end_format()
+        end_duration = style_config.end_video_duration
+        
+        # Log detailed style info for debugging
+        if job_log:
+            job_log.info("End screen format configuration:")
+            job_log.info(f"  background_image: {end_format.get('background_image')}")
+            job_log.info(f"  background_color: {end_format.get('background_color')}")
+            job_log.info(f"  font: {end_format.get('font')}")
+            job_log.info(f"  duration: {end_duration}s")
+        
+        logger.info(f"Job {job_id}: End format - bg_image: {end_format.get('background_image')}, font: {end_format.get('font')}")
+        
+        # Generate end screen images only (MOV video is generated on GCE encoding worker)
+        # Pass duration=0 to skip FFmpeg video creation — Cloud Run doesn't have enough
+        # memory for 4K H.264 encoding after right-sizing to 2Gi (PR #640).
+        # 4K PIL render + PNG/JPG encode is seconds of CPU — keep it off the
+        # event loop (it froze every request on the instance; 2026-10-03).
+        await asyncio.to_thread(
+            video_generator.create_end_video,
+            artist=job.artist,
+            title=job.title,
+            format=end_format,
+            output_image_filepath_noext=output_image_filepath_noext,
+            output_video_filepath=output_video_filepath,
+            existing_end_image=end_format.get('existing_image'),
+            end_video_duration=0,
+        )
+
+        output_png = f"{output_image_filepath_noext}.png"
+        if os.path.exists(output_png):
+            logger.info(f"Job {job_id}: End screen image generated at {output_png}")
+            return output_png
+        else:
+            logger.error(f"Job {job_id}: End screen generation returned no file")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Job {job_id}: End screen generation error: {e}", exc_info=True)
+        return None
+
+
+async def _upload_screens(
+    job_id: str,
+    job_manager: JobManager,
+    storage: StorageService,
+    title_screen_path: Optional[str],
+    end_screen_path: Optional[str]
+) -> None:
+    """
+    Upload title and end screen images to GCS (None = screen omitted by the theme).
+
+    Single Responsibility: Only handles uploads.
+
+    VideoGenerator creates .jpg and .png files when configured with
+    output_png=True and output_jpg=True. MOV video generation is handled
+    by the GCE encoding worker (not Cloud Run) to avoid OOM with 4K H.264.
+
+    Args:
+        job_id: Job ID
+        job_manager: Job manager instance
+        storage: Storage service instance
+        title_screen_path: Path to title screen image (.png)
+        end_screen_path: Path to end screen image (.png)
+    """
+    # Sync GCS uploads (multi-MB 4K PNGs) + Firestore writes — off the loop.
+    await asyncio.to_thread(
+        _upload_screens_sync, job_id, job_manager, storage, title_screen_path, end_screen_path
+    )
+
+
+def _upload_screens_sync(
+    job_id: str,
+    job_manager: JobManager,
+    storage: StorageService,
+    title_screen_path: Optional[str],
+    end_screen_path: Optional[str]
+) -> None:
+    for screen, path in (("title", title_screen_path), ("end", end_screen_path)):
+        if not path:
+            continue
+        # Upload the screen's images (.png and .jpg)
+        base = path.replace('.png', '')
+        for ext in ('.png', '.jpg'):
+            image_path = f"{base}{ext}"
+            if os.path.exists(image_path):
+                gcs_path = f"jobs/{job_id}/screens/{screen}{ext}"
+                url = storage.upload_file(image_path, gcs_path)
+                job_manager.update_file_url(job_id, 'screens', f"{screen}_{ext[1:]}", url)
+                logger.info(f"Job {job_id}: Uploaded {screen} screen image ({ext})")
+
+
+async def _analyze_backing_vocals(
+    job_id: str,
+    job_manager: JobManager,
+    storage: StorageService,
+    job_log: logging.Logger,
+) -> None:
+    """
+    Analyze backing vocals to help with intelligent instrumental selection.
+
+    This function:
+    1. Downloads the backing vocals stem from GCS
+    2. Runs audio analysis to detect audible content
+    3. Generates a waveform visualization image
+    4. Stores analysis results and waveform URL in job state
+
+    The analysis data is used by the combined review UI to help users
+    make an informed instrumental selection.
+
+    Note: This runs BEFORE the review phase so data is available when
+    the user opens the combined lyrics + instrumental review page.
+    """
+    from backend.services.audio_analysis_service import AudioAnalysisService
+
+    try:
+        # Get the job to access file URLs
+        job = job_manager.get_job(job_id)
+        if not job:
+            job_log.warning(f"Could not get job {job_id} for backing vocals analysis")
+            return
+
+        # Get backing vocals path
+        stems = job.file_urls.get('stems', {})
+        backing_vocals_path = stems.get('backing_vocals')
+        if not backing_vocals_path:
+            # The stem may exist in GCS but be missing from file_urls if a
+            # concurrent write dropped its registration (the lost-update race
+            # this change also fixes at the source). Recover by checking the
+            # conventional path and re-registering it so the review UI can load
+            # the preview and the analysis below can run.
+            conventional_path = f"jobs/{job_id}/stems/backing_vocals.flac"
+            if storage.file_exists(conventional_path):
+                backing_vocals_path = conventional_path
+                stems['backing_vocals'] = conventional_path
+                job_manager.update_file_url(job_id, 'stems', 'backing_vocals', conventional_path)
+                job_log.warning(
+                    "backing_vocals missing from file_urls but present in GCS "
+                    "— re-registered from the conventional path"
+                )
+            else:
+                job_log.warning("No backing vocals file found - skipping analysis")
+                # Record that analysis was attempted with no stem, so the review
+                # UI can distinguish "genuinely no backing vocals" from "analysis
+                # never ran" instead of silently implying 0% backing.
+                job_manager.update_state_data(job_id, 'backing_vocals_analysis', {
+                    'has_audible_content': None,
+                    'analysis_error': 'backing_vocals stem not found',
+                    'recommended_selection': 'clean',
+                })
+                return
+
+        job_log.info(f"Analyzing backing vocals: {backing_vocals_path}")
+
+        # Create analysis service and run analysis
+        analysis_service = AudioAnalysisService()
+
+        # Define output path for waveform
+        waveform_gcs_path = f"jobs/{job_id}/analysis/backing_vocals_waveform.png"
+
+        # Run analysis and generate waveform. Passing the lead + full-vocals
+        # stems as well enables the 3-stem comparison the backing-vocals
+        # decider uses to tell genuine harmonies from lead bleed / a
+        # misclassified lead / flat noise (best-effort — None when missing).
+        result, waveform_path, stem_comparison = analysis_service.analyze_and_generate_waveform(
+            gcs_audio_path=backing_vocals_path,
+            job_id=job_id,
+            gcs_waveform_destination=waveform_gcs_path,
+            gcs_lead_vocals_path=stems.get('lead_vocals'),
+            gcs_vocals_path=stems.get('vocals_clean'),
+        )
+
+        # Store analysis results in job state_data
+        analysis_data = {
+            'has_audible_content': result.has_audible_content,
+            'total_duration_seconds': result.total_duration_seconds,
+            'audible_segments': [
+                {
+                    'start_seconds': seg.start_seconds,
+                    'end_seconds': seg.end_seconds,
+                    'duration_seconds': seg.duration_seconds,
+                    'avg_amplitude_db': seg.avg_amplitude_db,
+                    'peak_amplitude_db': seg.peak_amplitude_db,
+                }
+                for seg in result.audible_segments
+            ],
+            'recommended_selection': result.recommended_selection.value,
+            'total_audible_duration_seconds': result.total_audible_duration_seconds,
+            'audible_percentage': result.audible_percentage,
+            'silence_threshold_db': result.silence_threshold_db,
+        }
+        if stem_comparison is not None:
+            analysis_data['stem_comparison'] = stem_comparison
+        # One recommendation everywhere: the 3-stem scorer's confident verdict
+        # overrides the analyzer heuristic (kept as heuristic_recommended_selection).
+        from backend.services.auto_approval.instrumental import with_unified_recommendation
+        analysis_data = with_unified_recommendation(analysis_data)
+
+        job_manager.update_state_data(job_id, 'backing_vocals_analysis', analysis_data)
+
+        # Store waveform URL
+        job_manager.update_file_url(job_id, 'analysis', 'backing_vocals_waveform', waveform_path)
+
+        job_log.info(
+            f"Backing vocals analysis complete: "
+            f"has_audible={result.has_audible_content}, "
+            f"segments={result.segment_count}, "
+            f"recommendation={analysis_data['recommended_selection']} "
+            f"(heuristic={result.recommended_selection.value})"
+        )
+
+        # Log segment details if there are any
+        if result.audible_segments:
+            job_log.info(f"Audible segments ({len(result.audible_segments)}):")
+            for i, seg in enumerate(result.audible_segments[:5]):  # Log first 5
+                job_log.info(
+                    f"  [{i+1}] {seg.start_seconds:.1f}s - {seg.end_seconds:.1f}s "
+                    f"({seg.duration_seconds:.1f}s, avg: {seg.avg_amplitude_db:.1f}dB)"
+                )
+            if len(result.audible_segments) > 5:
+                job_log.info(f"  ... and {len(result.audible_segments) - 5} more")
+
+    except Exception as e:
+        # Log the error but don't fail the job - analysis is a nice-to-have
+        job_log.warning(f"Backing vocals analysis failed (non-fatal): {e}")
+        logger.warning(f"Job {job_id}: Backing vocals analysis failed: {e}")
+
+        # Store empty analysis so the frontend knows analysis was attempted
+        job_manager.update_state_data(job_id, 'backing_vocals_analysis', {
+            'has_audible_content': None,
+            'analysis_error': str(e),
+            'recommended_selection': 'clean',
+        })
+
+
+async def _transcode_review_audio(
+    job_id: str,
+    job_manager: JobManager,
+    job_log: logging.Logger,
+) -> None:
+    """
+    Transcode all review audio files to OGG Opus for fast browser playback.
+
+    This eagerly transcodes input audio + stems so the review UI serves
+    ~3 MB OGG files instead of 35+ MB FLACs. Non-fatal: if transcoding
+    fails, the review UI falls back to original FLAC signed URLs.
+    """
+    from backend.services.audio_transcoding_service import AudioTranscodingService
+
+    try:
+        job = await asyncio.to_thread(job_manager.get_job, job_id)
+        if not job:
+            job_log.warning(f"Could not get job {job_id} for review audio transcoding")
+            return
+
+        # GCS download of up to 4 ~35MB FLACs + an ffmpeg transcode each (7-15s
+        # apiece) — this ran ON the event loop and froze the whole instance for
+        # 10-45s per job (2026-10-03 analysis). Run it in a worker thread.
+        transcoding = AudioTranscodingService()
+        transcoded = await asyncio.to_thread(transcoding.prepare_review_audio_for_job, job)
+
+        job_log.info(f"Review audio transcoding complete: {len(transcoded)} files")
+
+        # Pre-compute the review-page waveform JSON while we're here, so the
+        # /waveform-data endpoint is a pure GCS-cache read when the user opens
+        # review (a miss there decodes a whole stem — seconds of CPU on the
+        # API instance, which is what wedged it under concurrent load).
+        # The first import pulls in numpy/pydub/matplotlib (seconds of CPU on a
+        # fresh instance) — import it in a worker thread, not on the loop.
+        def _import_audio_analysis():
+            from backend.services.audio_analysis_service import AudioAnalysisService
+            return AudioAnalysisService
+
+        AudioAnalysisService = await asyncio.to_thread(_import_audio_analysis)
+
+        stems = job.file_urls.get("stems", {}) if job.file_urls else {}
+        waveform_source = stems.get("backing_vocals") or job.input_media_gcs_path
+        if waveform_source:
+            try:
+                await asyncio.to_thread(
+                    AudioAnalysisService().get_review_waveform,
+                    waveform_source, job_id, 1000, transcoding,
+                )
+                job_log.info("Review waveform data pre-computed")
+            except Exception as e:
+                # Non-fatal: /waveform-data computes + caches lazily on first open
+                job_log.warning(f"Review waveform pre-compute failed (non-fatal): {e}")
+
+        # Pre-compute the vocals peak envelope too (Waveforms review mode) so
+        # /vocals-peaks is a pure cache read and the per-segment strips paint
+        # sub-second on first open.
+        from backend.utils.stems import vocals_stem_path
+
+        vocals_source = vocals_stem_path(job)
+        if vocals_source:
+            try:
+                await asyncio.to_thread(
+                    AudioAnalysisService().get_vocals_peaks,
+                    vocals_source, job_id, 400, transcoding,
+                )
+                job_log.info("Vocals peak envelope pre-computed")
+            except Exception as e:
+                # Non-fatal: /vocals-peaks computes + caches lazily on first open
+                job_log.warning(f"Vocals peaks pre-compute failed (non-fatal): {e}")
+
+    except Exception as e:
+        # Non-fatal: review UI will fall back to FLAC signed URLs
+        job_log.warning(f"Review audio transcoding failed (non-fatal): {e}")
+        logger.warning(f"Job {job_id}: Review audio transcoding failed: {e}")
+
+
+async def _apply_countdown_padding_if_needed(
+    job_id: str,
+    job_manager: JobManager,
+    job
+) -> None:
+    """
+    Apply countdown padding to instrumentals if needed.
+    
+    If lyrics start very early (within 3 seconds), LyricsTranscriber
+    adds a countdown intro ("3... 2... 1...") to the vocal audio.
+    We need to pad the instrumentals to match.
+    
+    Single Responsibility: Only handles padding logic.
+    
+    Args:
+        job_id: Job ID
+        job_manager: Job manager instance
+        job: Job object with lyrics metadata
+    """
+    # Check if countdown padding was added
+    lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+    has_countdown = lyrics_metadata.get('has_countdown_padding', False)
+    
+    if has_countdown:
+        logger.info(f"Job {job_id}: Countdown padding detected, applying to instrumentals")
+        
+        # Transition to APPLYING_PADDING state
+        job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.APPLYING_PADDING,
+            progress=52,
+            message="Synchronizing countdown padding"
+        )
+        
+        # TODO: Implement padding application
+        # This requires:
+        # 1. Download instrumental stems from GCS
+        # 2. Add silence to beginning
+        # 3. Re-upload padded versions
+        # For now, we'll skip this and just transition back
+        
+        logger.info(f"Job {job_id}: Padding applied (TODO: implement actual padding)")
+    else:
+        logger.info(f"Job {job_id}: No countdown padding needed")
+

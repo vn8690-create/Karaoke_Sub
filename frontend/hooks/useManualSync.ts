@@ -1,0 +1,597 @@
+'use client'
+
+import { useState, useCallback, useEffect, useRef } from 'react'
+import { LyricsSegment, Word } from '@/lib/lyrics-review/types'
+
+interface UseManualSyncProps {
+  editedSegment: LyricsSegment | null
+  currentTime: number
+  onPlaySegment?: (startTime: number) => void
+  updateSegment: (words: Word[]) => void
+  onTimingClamped?: (wordText: string, snappedTo: number) => void
+}
+
+// Manual sync plays this many seconds before the segment starts, so the user can hear the
+// run-up and tap the very first word on time. Taps anywhere in that lead-in are legitimate.
+const LEAD_IN_SECONDS = 3
+// Symmetric window AFTER the segment end: the user may tap/hold the last word past the old end
+// (extending the segment). Taps within this lead-out are legitimate and grow the segment.
+const LEAD_OUT_SECONDS = 3
+
+/**
+ * Clamp a manual-sync tap time into the segment's *playback* window `[segStart - leadIn, segEnd + leadOut]`.
+ *
+ * A tap should land within the window Tap To Sync actually plays/allows. Playback starts `leadIn`
+ * seconds BEFORE the segment (see LEAD_IN_SECONDS) because the user hears the run-up and often taps
+ * the first word just before the old segment start (especially when re-syncing to move it earlier).
+ * Symmetrically, `leadOut` lets the last word be tapped/held just past the old end to extend the
+ * segment. Only values outside that widened window (e.g. the playhead stuck at 0 for a mid-song
+ * segment) are sync glitches worth clamping. Clamping to the tight `[segStart, segEnd]` instead
+ * would (a) shove every legitimate lead-in tap up to segStart, (b) ratchet the segment start forward
+ * so it could never be re-synced earlier, and (c) hard-cut the last word at the old end. The lower
+ * bound is floored at 0. `leadIn`/`leadOut` default to 0 for back-compat; pass the constants from
+ * the sync handlers. Null start/end => that bound is skipped.
+ */
+export function clampSyncTime(
+  time: number,
+  segStart: number | null,
+  segEnd: number | null,
+  leadIn: number = 0,
+  leadOut: number = 0
+): number {
+  let t = time
+  if (typeof segStart === 'number' && Number.isFinite(segStart)) {
+    t = Math.max(t, Math.max(0, segStart - leadIn))
+  }
+  if (typeof segEnd === 'number' && Number.isFinite(segEnd)) t = Math.min(t, segEnd + leadOut)
+  return t
+}
+
+// Constants for tap detection
+const TAP_THRESHOLD_MS = 200 // If spacebar is pressed for less than this time, it's considered a tap
+const DEFAULT_WORD_DURATION = 0.5 // Default duration in seconds when tapping (500ms)
+const OVERLAP_BUFFER = 0.01 // Buffer to prevent word overlap (10ms)
+// A *tapped* word only marks its onset — the user expects it to hold until the next word starts
+// (the natural karaoke feel), so we grow its end to fill the gap up to the next onset. This caps
+// the resulting word duration so a long gap before the next word can't stretch a word absurdly.
+const MAX_TAP_GAP_FILL_SECONDS = 1.0
+
+/**
+ * Set the previous word's end_time once the *next* word's onset (`nextStart`) is known.
+ *
+ * - If the previous word was a **tap** (the user only marked its onset), grow its end to fill the
+ *   gap up to `nextStart − OVERLAP_BUFFER`, capped at `start + MAX_TAP_GAP_FILL_SECONDS` so a long
+ *   gap can't create an absurdly long word. This replaces the old "> 1.0s gap ⇒ keep it 0.5s" cap,
+ *   which left a dead gap after tapped words.
+ * - If it was a **hold** (deliberate release), keep that duration and only pull the end back if it
+ *   would overlap the next word.
+ *
+ * Mutates `previousWord` in place. `previousWord.start_time` must be non-null (callers guard this).
+ * Never lets the end fall below the word's own start.
+ */
+export function adjustPreviousWordEnd(previousWord: Word, nextStart: number, wasTap: boolean): void {
+  const start = previousWord.start_time as number
+  if (wasTap) {
+    const gapFillEnd = Math.min(nextStart - OVERLAP_BUFFER, start + MAX_TAP_GAP_FILL_SECONDS)
+    previousWord.end_time = Math.max(gapFillEnd, start)
+  } else if (previousWord.end_time === null || previousWord.end_time > nextStart) {
+    previousWord.end_time = Math.max(nextStart - OVERLAP_BUFFER, start)
+  }
+}
+
+/**
+ * Close out a Tap To Sync pass that stopped before the last word (auto-stop after the line, or the
+ * user pressing Stop mid-line). The untapped words after the last tapped one still carry their OLD
+ * timings, which can now start BEFORE the last tapped word (gen's fake fixture: taps at 16.0, 17.2,
+ * 18.4, 19.6 leave "ever" at 19.6 but "transcribed" at a stale 18.74) and would render out of order.
+ *
+ * - Every untapped word after the last tapped one whose start is before the last tapped word's
+ *   start is cleared (null start/end), so the untimed-lyrics guard blocks finishing and points the
+ *   user at it, instead of saving words that highlight out of order.
+ * - The last tapped word's end is then capped before the next still-timed word in the line.
+ *
+ * Mirrors nomad-mobile's review-core `commitTapSync`. Returns a new words array, or null when
+ * nothing changed. Pure; `synced` is the set of word indices tapped this pass.
+ */
+export function commitPartialSyncPass(words: Word[], synced: Set<number>): Word[] | null {
+  if (synced.size === 0) return null
+  const last = Math.max(...synced)
+  const lastWord = words[last]
+  if (!lastWord || lastWord.start_time === null || lastWord.end_time === null) return null
+  const tappedStart = lastWord.start_time
+
+  let changed = false
+  const next = words.map((word, j) => {
+    if (j > last && word.start_time !== null && word.start_time < tappedStart) {
+      changed = true
+      return { ...word, start_time: null, end_time: null }
+    }
+    return word
+  })
+
+  const nextTimed = next.slice(last + 1).find((word) => word.start_time !== null)
+  if (nextTimed && nextTimed.start_time !== null) {
+    const cappedEnd = Math.max(
+      Math.min(lastWord.end_time, nextTimed.start_time - OVERLAP_BUFFER),
+      tappedStart
+    )
+    if (cappedEnd !== lastWord.end_time) {
+      changed = true
+      next[last] = { ...lastWord, end_time: cappedEnd }
+    }
+  }
+  return changed ? next : null
+}
+
+export default function useManualSync({
+  editedSegment,
+  currentTime,
+  onPlaySegment,
+  updateSegment,
+  onTimingClamped,
+}: UseManualSyncProps) {
+  const [isManualSyncing, setIsManualSyncing] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
+  const [syncWordIndex, setSyncWordIndex] = useState<number>(-1)
+  const currentTimeRef = useRef(currentTime)
+  const [isSpacebarPressed, setIsSpacebarPressed] = useState(false)
+  const wordStartTimeRef = useRef<number | null>(null)
+  const wordsRef = useRef<Word[]>([])
+  const spacebarPressTimeRef = useRef<number | null>(null)
+  // Whether the word we just finished syncing was a *tap* (vs a hold). Read when the NEXT word's
+  // start becomes known so we know whether to gap-fill the previous word (taps) or respect its
+  // deliberate release (holds). Set at keyup/tapEnd; only read for syncWordIndex > 0.
+  const previousWordWasTapRef = useRef(false)
+  // Word indices that have received a FRESH start_time in the current manual-sync pass. The overlap
+  // safety-net must only compare against a next word that's actually been re-synced this pass —
+  // otherwise it pulls the just-tapped word's end back to the next word's STALE (old) start,
+  // crushing it (e.g. "call" → 0.01s before "seems" was re-tapped). Reset on start/cleanup.
+  const syncedIndicesRef = useRef<Set<number>>(new Set())
+
+  // Use ref to track if we need to update segment to avoid calling it too frequently
+  const needsSegmentUpdateRef = useRef(false)
+
+  // Keep currentTimeRef up to date
+  useEffect(() => {
+    currentTimeRef.current = currentTime
+  }, [currentTime])
+
+  // Mirror isSpacebarPressed into a ref so the auto-stop interval can read the live value
+  // (its closure would otherwise capture a stale state snapshot) without restarting the interval.
+  const isSpacebarPressedRef = useRef(isSpacebarPressed)
+  useEffect(() => {
+    isSpacebarPressedRef.current = isSpacebarPressed
+  }, [isSpacebarPressed])
+
+  // Keep wordsRef up to date
+  useEffect(() => {
+    if (editedSegment) {
+      wordsRef.current = [...editedSegment.words]
+    }
+  }, [editedSegment])
+
+  // Debounced segment update to batch multiple word changes
+  useEffect(() => {
+    if (needsSegmentUpdateRef.current) {
+      needsSegmentUpdateRef.current = false
+      updateSegment(wordsRef.current)
+    }
+  }, [updateSegment, syncWordIndex]) // Only update when syncWordIndex changes
+
+  // Latest updateSegment, so the stable cleanupManualSync can commit the pass with it.
+  const updateSegmentRef = useRef(updateSegment)
+  useEffect(() => {
+    updateSegmentRef.current = updateSegment
+  }, [updateSegment])
+
+  const cleanupManualSync = useCallback(() => {
+    // A pass stopped mid-line (auto-stop or Stop): clear stale untapped words that now start before
+    // the last tapped one, and cap that word before the next timed word (see commitPartialSyncPass).
+    const committed = commitPartialSyncPass(wordsRef.current, syncedIndicesRef.current)
+    if (committed) {
+      wordsRef.current = committed
+      updateSegmentRef.current(committed)
+    }
+
+    setIsManualSyncing(false)
+    setIsPaused(false)
+    setSyncWordIndex(-1)
+    setIsSpacebarPressed(false)
+    wordStartTimeRef.current = null
+    spacebarPressTimeRef.current = null
+    previousWordWasTapRef.current = false
+    syncedIndicesRef.current = new Set()
+    needsSegmentUpdateRef.current = false
+
+    // Stop audio playback when cleaning up manual sync
+    if (window.toggleAudioPlayback && window.isAudioPlaying) {
+      window.toggleAudioPlayback()
+    }
+  }, [])
+
+  const pauseManualSync = useCallback(() => {
+    if (isManualSyncing && !isPaused) {
+      setIsPaused(true)
+      // Pause audio playback
+      if (window.toggleAudioPlayback && window.isAudioPlaying) {
+        window.toggleAudioPlayback()
+      }
+    }
+  }, [isManualSyncing, isPaused])
+
+  const resumeManualSync = useCallback(() => {
+    if (isManualSyncing && isPaused) {
+      setIsPaused(false)
+
+      // Find the first unsynced word and resume from there
+      if (editedSegment) {
+        const firstUnsyncedIndex = editedSegment.words.findIndex(
+          (word) => word.start_time === null || word.end_time === null
+        )
+
+        if (firstUnsyncedIndex !== -1 && firstUnsyncedIndex !== syncWordIndex) {
+          setSyncWordIndex(firstUnsyncedIndex)
+        }
+      }
+
+      // Resume audio playback if we have an onPlaySegment function
+      if (onPlaySegment && currentTimeRef.current !== undefined) {
+        onPlaySegment(currentTimeRef.current)
+      }
+    }
+  }, [isManualSyncing, isPaused, onPlaySegment, editedSegment, syncWordIndex])
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return
+
+      e.preventDefault()
+      e.stopPropagation()
+
+      if (isManualSyncing && editedSegment && !isSpacebarPressed && !isPaused) {
+        setIsSpacebarPressed(true)
+
+        // Record the start time of the current word
+        wordStartTimeRef.current = currentTimeRef.current
+
+        // Record when the spacebar was pressed (for tap detection)
+        spacebarPressTimeRef.current = Date.now()
+
+        // Update the word's start time immediately
+        if (syncWordIndex < editedSegment.words.length) {
+          const newWords = [...wordsRef.current]
+          const currentWord = newWords[syncWordIndex]
+          const rawStartTime = currentTimeRef.current
+          // Keep this clamp+callback block in sync with the other sync path
+          const currentStartTime = clampSyncTime(
+            rawStartTime,
+            editedSegment?.start_time ?? null,
+            editedSegment?.end_time ?? null,
+            LEAD_IN_SECONDS,
+            LEAD_OUT_SECONDS
+          )
+          if (currentStartTime !== rawStartTime) {
+            onTimingClamped?.(newWords[syncWordIndex]?.text ?? '', currentStartTime)
+          }
+
+          // Set the start time for the current word
+          currentWord.start_time = currentStartTime
+          syncedIndicesRef.current.add(syncWordIndex)
+
+          // Handle the end time of the previous word (if it exists). A tapped previous word
+          // grows to fill the gap up to this word's onset; a held one keeps its release.
+          if (syncWordIndex > 0) {
+            const previousWord = newWords[syncWordIndex - 1]
+            if (previousWord.start_time !== null) {
+              adjustPreviousWordEnd(previousWord, currentStartTime, previousWordWasTapRef.current)
+            }
+          }
+
+          // Update our ref
+          wordsRef.current = newWords
+
+          // Mark that we need to update the segment
+          needsSegmentUpdateRef.current = true
+        }
+      } else if (!isManualSyncing && editedSegment && onPlaySegment) {
+        // For global replacement segments, don't handle general playback
+        if (editedSegment.id === 'global-replacement') {
+          return
+        }
+
+        // Toggle segment playback when not in manual sync mode
+        const startTime = editedSegment.start_time ?? 0
+        const endTime = editedSegment.end_time ?? 0
+
+        if (currentTimeRef.current >= startTime && currentTimeRef.current <= endTime) {
+          if (window.toggleAudioPlayback) {
+            window.toggleAudioPlayback()
+          }
+        } else {
+          onPlaySegment(startTime)
+        }
+      }
+    },
+    [isManualSyncing, editedSegment, syncWordIndex, onPlaySegment, isSpacebarPressed, isPaused, onTimingClamped]
+  )
+
+  const handleKeyUp = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.code !== 'Space') return
+
+      e.preventDefault()
+      e.stopPropagation()
+
+      if (isManualSyncing && editedSegment && isSpacebarPressed && !isPaused) {
+        const pressDuration = spacebarPressTimeRef.current
+          ? Date.now() - spacebarPressTimeRef.current
+          : 0
+        const isTap = pressDuration < TAP_THRESHOLD_MS
+        // Remember tap-vs-hold so the NEXT word's keydown can decide whether to gap-fill this word.
+        previousWordWasTapRef.current = isTap
+
+        setIsSpacebarPressed(false)
+
+        if (syncWordIndex < editedSegment.words.length) {
+          const newWords = [...wordsRef.current]
+          const currentWord = newWords[syncWordIndex]
+
+          // Set the end time for the current word based on whether it was a tap or hold
+          if (isTap) {
+            // For a tap, set a default duration
+            const defaultEndTime =
+              (wordStartTimeRef.current || currentTimeRef.current) + DEFAULT_WORD_DURATION
+            currentWord.end_time = Math.max(defaultEndTime, currentWord.start_time ?? defaultEndTime)
+          } else {
+            // For a hold, use the current time as the end time
+            const rawEndTime = currentTimeRef.current
+            currentWord.end_time = Math.max(rawEndTime, currentWord.start_time ?? rawEndTime)
+          }
+
+          // Update our ref
+          wordsRef.current = newWords
+
+          // Move to the next word
+          if (syncWordIndex === editedSegment.words.length - 1) {
+            // If this was the last word, finish manual sync
+            setIsManualSyncing(false)
+            setSyncWordIndex(-1)
+            wordStartTimeRef.current = null
+            spacebarPressTimeRef.current = null
+          } else {
+            // Otherwise, move to the next word
+            setSyncWordIndex(syncWordIndex + 1)
+          }
+
+          // Mark that we need to update the segment
+          needsSegmentUpdateRef.current = true
+        }
+      }
+    },
+    [isManualSyncing, editedSegment, syncWordIndex, isSpacebarPressed, isPaused]
+  )
+
+  // Safety net for when we advance to the next word: if the word we just synced ends
+  // after the *next* word's start, pull its end back so they don't overlap.
+  //
+  // Critically, this must only act when the next word (`currentWord`) has ALREADY been
+  // re-synced in this pass (`syncedIndicesRef` holds its index). During a normal forward
+  // pass the next word still carries its OLD start_time when we advance to it, and comparing
+  // against that stale value crushes the just-tapped word's end down to the old (often very
+  // close) next-word start — e.g. "call" collapsing to 0.01s because "seems" hadn't been
+  // re-tapped yet. The forward correction is handled properly at the next word's keydown
+  // (adjustPreviousWordEnd, using its REAL start). We also keep the original guards: only act
+  // when the next start is genuinely later than the previous word's start, and clamp the new
+  // end to never fall below the previous word's own start_time (no negative durations).
+  useEffect(() => {
+    if (isManualSyncing && editedSegment && syncWordIndex > 0) {
+      const newWords = [...wordsRef.current]
+      const prevWord = newWords[syncWordIndex - 1]
+      const currentWord = newWords[syncWordIndex]
+
+      if (
+        prevWord &&
+        currentWord &&
+        syncedIndicesRef.current.has(syncWordIndex) &&
+        prevWord.end_time !== null &&
+        prevWord.start_time !== null &&
+        currentWord.start_time !== null &&
+        currentWord.start_time > prevWord.start_time &&
+        prevWord.end_time > currentWord.start_time
+      ) {
+        prevWord.end_time = Math.max(currentWord.start_time - OVERLAP_BUFFER, prevWord.start_time)
+
+        // Update our ref
+        wordsRef.current = newWords
+
+        // Mark that we need to update the segment
+        needsSegmentUpdateRef.current = true
+      }
+    }
+  }, [syncWordIndex, isManualSyncing, editedSegment])
+
+  // Combine the key handlers into a single function for external use
+  const handleSpacebar = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.type === 'keydown') {
+        handleKeyDown(e)
+      } else if (e.type === 'keyup') {
+        handleKeyUp(e)
+      }
+    },
+    [handleKeyDown, handleKeyUp]
+  )
+
+  // Touch-friendly handlers for mobile (simulates spacebar press/release)
+  const handleTapStart = useCallback(() => {
+    if (!isManualSyncing || !editedSegment || isSpacebarPressed || isPaused) return
+
+    setIsSpacebarPressed(true)
+
+    // Record the start time of the current word
+    wordStartTimeRef.current = currentTimeRef.current
+
+    // Record when the tap started (for tap detection)
+    spacebarPressTimeRef.current = Date.now()
+
+    // Update the word's start time immediately
+    if (syncWordIndex < editedSegment.words.length) {
+      const newWords = [...wordsRef.current]
+      const currentWord = newWords[syncWordIndex]
+      const rawStartTime = currentTimeRef.current
+      // Keep this clamp+callback block in sync with the other sync path
+      const currentStartTime = clampSyncTime(
+        rawStartTime,
+        editedSegment?.start_time ?? null,
+        editedSegment?.end_time ?? null,
+        LEAD_IN_SECONDS,
+        LEAD_OUT_SECONDS
+      )
+      if (currentStartTime !== rawStartTime) {
+        onTimingClamped?.(newWords[syncWordIndex]?.text ?? '', currentStartTime)
+      }
+
+      // Set the start time for the current word
+      currentWord.start_time = currentStartTime
+      syncedIndicesRef.current.add(syncWordIndex)
+
+      // Handle the end time of the previous word (if it exists). A tapped previous word
+      // grows to fill the gap up to this word's onset; a held one keeps its release.
+      if (syncWordIndex > 0) {
+        const previousWord = newWords[syncWordIndex - 1]
+        if (previousWord.start_time !== null) {
+          adjustPreviousWordEnd(previousWord, currentStartTime, previousWordWasTapRef.current)
+        }
+      }
+
+      // Update our ref
+      wordsRef.current = newWords
+
+      // Mark that we need to update the segment
+      needsSegmentUpdateRef.current = true
+    }
+  }, [isManualSyncing, editedSegment, syncWordIndex, isSpacebarPressed, isPaused, onTimingClamped])
+
+  const handleTapEnd = useCallback(() => {
+    if (!isManualSyncing || !editedSegment || !isSpacebarPressed || isPaused) return
+
+    const pressDuration = spacebarPressTimeRef.current
+      ? Date.now() - spacebarPressTimeRef.current
+      : 0
+    const isTap = pressDuration < TAP_THRESHOLD_MS
+    // Remember tap-vs-hold so the NEXT word's tap can decide whether to gap-fill this word.
+    previousWordWasTapRef.current = isTap
+
+    setIsSpacebarPressed(false)
+
+    if (syncWordIndex < editedSegment.words.length) {
+      const newWords = [...wordsRef.current]
+      const currentWord = newWords[syncWordIndex]
+
+      // Set the end time for the current word based on whether it was a tap or hold
+      if (isTap) {
+        const defaultEndTime =
+          (wordStartTimeRef.current || currentTimeRef.current) + DEFAULT_WORD_DURATION
+        currentWord.end_time = Math.max(defaultEndTime, currentWord.start_time ?? defaultEndTime)
+      } else {
+        const rawEndTime = currentTimeRef.current
+        currentWord.end_time = Math.max(rawEndTime, currentWord.start_time ?? rawEndTime)
+      }
+
+      // Update our ref
+      wordsRef.current = newWords
+
+      // Move to the next word
+      if (syncWordIndex === editedSegment.words.length - 1) {
+        // If this was the last word, finish manual sync
+        setIsManualSyncing(false)
+        setSyncWordIndex(-1)
+        wordStartTimeRef.current = null
+        spacebarPressTimeRef.current = null
+      } else {
+        // Otherwise, move to the next word
+        setSyncWordIndex(syncWordIndex + 1)
+      }
+
+      // Mark that we need to update the segment
+      needsSegmentUpdateRef.current = true
+    }
+  }, [isManualSyncing, editedSegment, syncWordIndex, isSpacebarPressed, isPaused])
+
+  const startManualSync = useCallback(() => {
+    if (isManualSyncing) {
+      cleanupManualSync()
+      return
+    }
+
+    if (!editedSegment || !onPlaySegment) return
+
+    // Make sure we have the latest words
+    wordsRef.current = [...editedSegment.words]
+
+    // Find the first unsynced word to start from
+    const firstUnsyncedIndex = editedSegment.words.findIndex(
+      (word) => word.start_time === null || word.end_time === null
+    )
+
+    const startIndex = firstUnsyncedIndex !== -1 ? firstUnsyncedIndex : 0
+
+    setIsManualSyncing(true)
+    setSyncWordIndex(startIndex)
+    setIsSpacebarPressed(false)
+    wordStartTimeRef.current = null
+    spacebarPressTimeRef.current = null
+    previousWordWasTapRef.current = false
+    syncedIndicesRef.current = new Set()
+    needsSegmentUpdateRef.current = false
+    // Start playing 3 seconds before segment start
+    onPlaySegment((editedSegment.start_time ?? 0) - LEAD_IN_SECONDS)
+  }, [isManualSyncing, editedSegment, onPlaySegment, cleanupManualSync])
+
+  // Auto-stop sync if we go past the end time (but not for global replacement segments)
+  useEffect(() => {
+    if (!editedSegment || !isManualSyncing) return
+
+    // Don't auto-stop for global replacement segments - let user manually finish
+    if (editedSegment.id === 'global-replacement') {
+      return
+    }
+
+    // Set up an interval to check if we should auto-stop
+    const checkAutoStop = () => {
+      const endTime = editedSegment.end_time ?? 0
+
+      // Never cut the user off mid-tap/hold: they may be holding the LAST word past the old
+      // segment end to extend it (updateSegment grows end_time once the word lands). Only stop
+      // once playback is a full lead-out past the end AND the spacebar isn't currently down.
+      if (isSpacebarPressedRef.current) return
+
+      if (window.isAudioPlaying && currentTimeRef.current > endTime + LEAD_OUT_SECONDS) {
+        window.toggleAudioPlayback?.()
+        cleanupManualSync()
+      }
+    }
+
+    // Check immediately and then every 100ms
+    checkAutoStop()
+    const intervalId = setInterval(checkAutoStop, 100)
+
+    return () => {
+      clearInterval(intervalId)
+    }
+  }, [isManualSyncing, editedSegment, cleanupManualSync])
+
+  return {
+    isManualSyncing,
+    isPaused,
+    syncWordIndex,
+    startManualSync,
+    pauseManualSync,
+    resumeManualSync,
+    cleanupManualSync,
+    handleSpacebar,
+    isSpacebarPressed,
+    handleTapStart,
+    handleTapEnd,
+  }
+}

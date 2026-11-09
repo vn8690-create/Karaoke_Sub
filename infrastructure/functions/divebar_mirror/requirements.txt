@@ -1,0 +1,15 @@
+# Google Drive API
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+
+# BigQuery
+google-cloud-bigquery>=3.13.0
+
+# GCS (catalog snapshot export for the kjbox local mirror)
+google-cloud-storage>=2.10.0
+
+# Cloud Scheduler (chain index-dependent jobs on completion)
+google-cloud-scheduler>=2.13.0
+
+# Cloud Functions framework
+functions-framework>=3.0.0

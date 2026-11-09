@@ -1,0 +1,704 @@
+"""
+Exact previews of a (draft) theme: the real title card, one karaoke-video frame and
+the real end screen.
+
+Used by the tenant theme editor. Both images come from the SAME renderers production
+uses, fed the draft ``style_params`` exactly the way a render job would see them:
+
+- **Title card**: ``karaoke_gen.video_generator.VideoGenerator.create_title_video``
+  with ``intro_video_duration=0`` (PNG only — what ``screens_worker`` does on Cloud Run).
+- **End screen**: ``VideoGenerator.create_end_video`` the same way (``end_video_duration=0``).
+- **Karaoke frame**: ``SegmentResizer`` → ``SubtitlesGenerator.generate_ass`` (the
+  generator's 4K layout: ``font_size`` default 250, ``line_height = font_size``,
+  ``max_line_length`` default 36) → one frame burned with the same ffmpeg ``ass``
+  filter + background handling as ``lyrics_transcriber.output.video.VideoGenerator``,
+  at a moment when the second line is part-way sung (sung = primary colour).
+
+- **CD+G** (on request): the real ``CDGGenerator`` composes a short CDG from the
+  theme's ``cdg`` section and sample lyrics; ``cdg_decoder`` renders the up card and a
+  lyrics page from the packets (300x216, shown upscaled with hard pixels).
+
+Theme assets are resolved like ``style_loader.update_asset_paths``: background images
+per section, and the single ``font`` asset (``intro.font``) applied to
+intro.font / karaoke.font_path / end.font / cdg.font_path (+ cdg.title_font_path) —
+except a distinct CDG lyrics font (``cdg.font_path``), which the render pipeline ships
+as its own ``cdg_font`` asset.
+"""
+
+import base64
+import copy
+import hashlib
+import io
+import logging
+import os
+import subprocess
+import tempfile
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from PIL import Image
+
+from backend.services.storage_service import StorageService
+from backend.services.theme_service import THEMES_PREFIX
+
+logger = logging.getLogger(__name__)
+
+PREVIEW_WIDTH = 1280  # output thumbnails are 1280x720 JPEGs
+VIDEO_RES = (3840, 2160)  # production karaoke render resolution ("4k")
+DEFAULT_FONT_SIZE = 250  # OutputGenerator._get_video_params default for 4k
+DEFAULT_MAX_LINE_LENGTH = 36  # OutputConfig.default_max_line_length
+FFMPEG_TIMEOUT_S = 30
+
+# Required ASS style keys build_karaoke_styles reads without defaults.
+_REQUIRED_KARAOKE_KEYS = ("underline", "strike_out", "angle", "encoding", "ass_name")
+
+BUNDLED_FONTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "karaoke_gen",
+    "resources",
+)
+FONT_EXTENSIONS = (".ttf", ".otf")
+
+MP4_PREVIEW_KINDS = ("title_card", "karaoke_frame", "end_screen")
+
+DEFAULT_SAMPLE_LYRICS = [
+    "Every night I sing along",
+    "Lights go down and here's my song",
+    "Hold the mic and take the stage",
+    "Turn the page, turn the page",
+]
+
+
+class ThemePreviewError(RuntimeError):
+    """A preview couldn't be rendered (bad theme, missing asset, ffmpeg failure)."""
+
+
+def bundled_fonts() -> List[str]:
+    """Font files shipped with karaoke_gen (usable by any theme)."""
+    try:
+        return sorted(f for f in os.listdir(BUNDLED_FONTS_DIR) if f.lower().endswith(FONT_EXTENSIONS))
+    except OSError:
+        return []
+
+
+def font_family_name(font_file: str) -> str:
+    """The name libass matches for a font file (e.g. 'Avenir Next Bold')."""
+    from PIL import ImageFont
+
+    family, style = ImageFont.truetype(font_file, 20).getname()
+    family = (family or "").strip()
+    style = (style or "").strip()
+    if style and style.lower() not in ("regular", "normal", "book", "roman"):
+        return f"{family} {style}"
+    return family
+
+
+@dataclass
+class PreviewImages:
+    # JPEGs. A screen the theme omits from videos (``enabled: false``) isn't rendered.
+    title_card: Optional[bytes]
+    karaoke_frame: Optional[bytes]
+    end_screen: Optional[bytes] = None
+    # PNGs (CD+G frames, upscaled with hard pixels). Only rendered on request.
+    cdg_title_card: Optional[bytes] = None
+    cdg_lyrics: Optional[bytes] = None
+    cdg_instrumental: Optional[bytes] = None
+    cdg_outro: Optional[bytes] = None
+
+    def as_data_urls(self) -> Dict[str, Optional[str]]:
+        enc = lambda b: "data:image/jpeg;base64," + base64.b64encode(b).decode() if b else None  # noqa: E731
+        png = lambda b: "data:image/png;base64," + base64.b64encode(b).decode() if b else None  # noqa: E731
+        return {
+            "title_card": enc(self.title_card),
+            "karaoke_frame": enc(self.karaoke_frame),
+            "end_screen": enc(self.end_screen),
+            "cdg_title_card": png(self.cdg_title_card),
+            "cdg_lyrics": png(self.cdg_lyrics),
+            "cdg_instrumental": png(self.cdg_instrumental),
+            "cdg_outro": png(self.cdg_outro),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Asset resolution (mirrors theme_service.prepare_job_style + style_loader)
+# ---------------------------------------------------------------------------
+
+_BG_FIELDS = (("intro", "background_image"), ("karaoke", "background_image"), ("end", "background_image"))
+CDG_IMAGE_FIELDS = (
+    ("cdg", "title_screen_background"), ("cdg", "outro_background"), ("cdg", "instrumental_background"),
+)
+_FONT_TARGETS = (("intro", "font"), ("karaoke", "font_path"), ("end", "font"), ("cdg", "font_path"))
+
+_download_lock = threading.Lock()
+
+# Cloud Run's /tmp is in-memory: keep both on-disk caches bounded.
+ASSET_CACHE_ROOT = os.path.join(tempfile.gettempdir(), "theme-preview-assets")
+BG_CACHE_ROOT = os.path.join(tempfile.gettempdir(), "theme-preview-bg")
+ASSET_CACHE_MAX_BYTES = 300 * 1024 * 1024
+BG_CACHE_MAX_BYTES = 300 * 1024 * 1024
+
+
+def _cache_dir(theme_id: str) -> str:
+    path = os.path.join(ASSET_CACHE_ROOT, theme_id)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _evict(root: str, max_bytes: int, keep: str = "") -> None:
+    """Delete least-recently-used files under root until it fits in max_bytes."""
+    files = []
+    for dirpath, _dirs, names in os.walk(root):
+        for name in names:
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            files.append((st.st_atime, st.st_size, path))
+    total = sum(size for _t, size, _p in files)
+    for _atime, size, path in sorted(files):
+        if total <= max_bytes:
+            break
+        if path == keep:
+            continue
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
+def _local_theme_asset(storage: StorageService, theme_id: str, basename: str) -> Optional[str]:
+    """Download themes/<id>/assets/<basename> into a per-generation cache; None if absent."""
+    blob = storage.bucket.get_blob(f"{THEMES_PREFIX}/{theme_id}/assets/{basename}")
+    if blob is None:
+        return None
+    gen_dir = os.path.join(_cache_dir(theme_id), str(blob.generation))
+    local = os.path.join(gen_dir, basename)
+    with _download_lock:
+        if not os.path.isfile(local):
+            os.makedirs(gen_dir, exist_ok=True)
+            # Download to a temp name + atomic rename: a failed download must
+            # never leave a partial file that later looks cached.
+            partial = f"{local}.part-{os.getpid()}-{threading.get_ident()}"
+            try:
+                blob.download_to_filename(partial)
+                os.replace(partial, local)
+            finally:
+                if os.path.exists(partial):
+                    os.remove(partial)
+            _evict(ASSET_CACHE_ROOT, ASSET_CACHE_MAX_BYTES, keep=local)
+    return local
+
+
+def _resolve_font(storage: StorageService, theme_id: str, font: str) -> Optional[str]:
+    base = os.path.basename(font)
+    local = _local_theme_asset(storage, theme_id, base)
+    if not local and base in bundled_fonts():
+        local = os.path.join(BUNDLED_FONTS_DIR, base)
+    return local
+
+
+def resolve_assets(
+    style_params: Dict, theme_id: str, storage: Optional[StorageService] = None, *, include_cdg: bool = False
+) -> Dict:
+    """Return a deep copy of style_params with asset basenames replaced by local paths.
+
+    Backgrounds resolve from the theme's GCS assets. The font resolves from the
+    theme's assets, else from bundled fonts (a bundled font is copied into the
+    theme on save, so production resolves it the same way).
+    """
+    storage = storage or StorageService()
+    styles = copy.deepcopy(style_params)
+
+    for section, field in _BG_FIELDS:
+        value = (styles.get(section) or {}).get(field)
+        if not value:
+            continue
+        local = _local_theme_asset(storage, theme_id, os.path.basename(value))
+        if not local:
+            raise ThemePreviewError(f"Background image '{value}' ({section}) was not found in the theme's assets.")
+        styles[section][field] = local
+
+    if include_cdg and isinstance(styles.get("cdg"), dict):
+        for section, field in CDG_IMAGE_FIELDS:
+            value = styles["cdg"].get(field)
+            if not value:
+                continue
+            local = _local_theme_asset(storage, theme_id, os.path.basename(value))
+            if not local:
+                raise ThemePreviewError(f"CD+G image '{value}' was not found in the theme's assets.")
+            styles["cdg"][field] = local
+
+    # A distinct CDG lyrics font travels as its own "cdg_font" asset in real renders.
+    cdg_font = (styles.get("cdg") or {}).get("font_path") if isinstance(styles.get("cdg"), dict) else None
+    font = (styles.get("intro") or {}).get("font")
+    if font:
+        local = _resolve_font(storage, theme_id, font)
+        if not local:
+            raise ThemePreviewError(f"Font '{font}' was not found in the theme's assets.")
+        for section, field in _FONT_TARGETS:
+            if isinstance(styles.get(section), dict):
+                styles[section][field] = local
+        if isinstance(styles.get("cdg"), dict):
+            styles["cdg"]["title_font_path"] = local
+            if include_cdg and cdg_font and os.path.basename(cdg_font) != os.path.basename(font):
+                cdg_local = _resolve_font(storage, theme_id, cdg_font)
+                if not cdg_local:
+                    raise ThemePreviewError(f"CD+G font '{cdg_font}' was not found in the theme's assets.")
+                styles["cdg"]["font_path"] = cdg_local
+        # libass selects by family name — same value save_tenant_theme persists.
+        if isinstance(styles.get("karaoke"), dict):
+            try:
+                styles["karaoke"]["font"] = font_family_name(local)
+            except Exception as exc:
+                raise ThemePreviewError(f"Font '{font}' couldn't be read.") from exc
+    return styles
+
+
+# ---------------------------------------------------------------------------
+# Renderers
+# ---------------------------------------------------------------------------
+
+
+def _to_jpeg(png_path: str) -> bytes:
+    with Image.open(png_path) as img:
+        img = img.convert("RGB")
+        height = round(img.height * PREVIEW_WIDTH / img.width)
+        img = img.resize((PREVIEW_WIDTH, height), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85)
+        return buf.getvalue()
+
+
+def _screen_generator():
+    from karaoke_gen.video_generator import VideoGenerator
+
+    return VideoGenerator(
+        logger=logger,
+        ffmpeg_base_command="ffmpeg -hide_banner -nostats -loglevel error",
+        render_bounding_boxes=False,
+        output_png=True,
+        output_jpg=False,
+    )
+
+
+def render_title_card(styles: Dict, artist: str, title: str, workdir: str) -> bytes:
+    """Title card exactly as screens_worker renders it (PNG via PIL, no video)."""
+    from karaoke_gen.style_loader import DEFAULT_INTRO_STYLE
+
+    fmt = {**DEFAULT_INTRO_STYLE, **(styles.get("intro") or {})}
+    noext = os.path.join(workdir, "title")
+    try:
+        _screen_generator().create_title_video(
+            artist=artist,
+            title=title,
+            format=fmt,
+            output_image_filepath_noext=noext,
+            output_video_filepath=os.path.join(workdir, "title.mov"),
+            existing_title_image=fmt.get("existing_image"),
+            intro_video_duration=0,
+        )
+    except Exception as exc:
+        raise ThemePreviewError(f"Title card render failed: {exc}") from exc
+    return _to_jpeg(f"{noext}.png")
+
+
+def render_end_screen(styles: Dict, artist: str, title: str, workdir: str) -> bytes:
+    """End screen exactly as screens_worker renders it (PNG via PIL, no video)."""
+    from karaoke_gen.style_loader import DEFAULT_END_STYLE
+
+    fmt = {**DEFAULT_END_STYLE, **(styles.get("end") or {})}
+    noext = os.path.join(workdir, "end")
+    try:
+        _screen_generator().create_end_video(
+            artist=artist,
+            title=title,
+            format=fmt,
+            output_image_filepath_noext=noext,
+            output_video_filepath=os.path.join(workdir, "end.mov"),
+            existing_end_image=fmt.get("existing_image"),
+            end_video_duration=0,
+        )
+    except Exception as exc:
+        raise ThemePreviewError(f"End screen render failed: {exc}") from exc
+    return _to_jpeg(f"{noext}.png")
+
+
+def _sample_segments(lines: List[str], translations: Optional[List[str]] = None):
+    """Evenly-timed segments: line i starts at 2+3i s, words spread over 2.5 s.
+
+    Starts < 10 s and gaps < 10 s so SectionDetector adds no intro/instrumental.
+    """
+    from karaoke_gen.lyrics_transcriber.types import LyricsSegment, Word
+
+    segments = []
+    for i, text in enumerate(lines):
+        words_text = text.split() or ["…"]
+        start = 2.0 + 3.0 * i
+        step = 2.5 / len(words_text)
+        words = [
+            Word(id=f"w{i}-{j}", text=w, start_time=start + j * step, end_time=start + (j + 1) * step - 0.05)
+            for j, w in enumerate(words_text)
+        ]
+        segments.append(
+            LyricsSegment(
+                id=f"s{i}",
+                text=" ".join(words_text),
+                words=words,
+                start_time=start,
+                end_time=start + 2.5,
+                translation=(translations[i] if translations and i < len(translations) else None) or None,
+            )
+        )
+    return segments
+
+
+class _FrameRenderer:
+    """Borrow lyrics VideoGenerator's background + ASS filter handling without its
+    __init__ (which probes for NVENC via nvidia-smi — pointless for one frame)."""
+
+    def __init__(self, styles: Dict, cache_dir: str):
+        from karaoke_gen.lyrics_transcriber.output.video import VideoGenerator as LyricsVideoGenerator
+
+        gen = LyricsVideoGenerator.__new__(LyricsVideoGenerator)
+        gen.output_dir = cache_dir
+        gen.cache_dir = cache_dir
+        gen.video_resolution = VIDEO_RES
+        gen.styles = styles
+        gen.logger = logger
+        karaoke = styles.get("karaoke", {})
+        gen.background_image = karaoke.get("background_image")
+        gen.background_color = karaoke.get("background_color", "black")
+        if gen.background_image and not os.path.isfile(gen.background_image):
+            raise ThemePreviewError(f"Karaoke background image not found: {gen.background_image}")
+        self.gen = gen
+
+    def _resized_background(self, path: str) -> str:
+        """Production's 4K scale+pad of the background, cached per source file."""
+        st = os.stat(path)
+        key = hashlib.sha1(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:16]
+        cached = os.path.join(BG_CACHE_ROOT, f"{key}.png")
+        if os.path.isfile(cached):
+            return cached
+        os.makedirs(BG_CACHE_ROOT, exist_ok=True)
+        resized = self.gen._resize_background_image(path)
+        if resized == path:
+            return path
+        os.replace(resized, cached)
+        _evict(BG_CACHE_ROOT, BG_CACHE_MAX_BYTES, keep=cached)
+        return cached
+
+    def frame(self, ass_path: str, at_seconds: float, out_png: str) -> None:
+        w, h = VIDEO_RES
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-r", "30"]
+        if self.gen.background_image:
+            cmd += ["-loop", "1", "-i", self._resized_background(self.gen.background_image)]
+        else:
+            cmd += ["-f", "lavfi", "-i", f"color=c={self.gen.background_color}:s={w}x{h}:r=30"]
+        try:
+            ass_filter = self.gen._build_ass_filter(ass_path)
+        except FileNotFoundError as exc:
+            raise ThemePreviewError(str(exc)) from exc
+        # Shift the single input frame's timestamp to `at_seconds` so libass renders
+        # that moment directly (output-side -ss would render every 4K frame up to it).
+        # Downscale inside the same pass (encoding a 4K PNG is most of the cost).
+        vf = f"setpts=PTS+{at_seconds:.3f}/TB,{ass_filter},scale={PREVIEW_WIDTH}:-2:flags=lanczos"
+        cmd += ["-vf", vf, "-frames:v", "1", "-y", out_png]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
+        except subprocess.CalledProcessError as exc:
+            raise ThemePreviewError(f"Karaoke frame render failed: {exc.stderr[-500:]}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ThemePreviewError("Karaoke frame render timed out") from exc
+
+
+def render_karaoke_frame(
+    styles: Dict, lines: List[str], workdir: str, translations: Optional[List[str]] = None
+) -> bytes:
+    """One frame of the karaoke video with the first line about half sung.
+
+    ``translations`` (one per line) renders the translated-lyrics layout.
+    """
+    from karaoke_gen.lyrics_transcriber.output.segment_resizer import SegmentResizer
+    from karaoke_gen.lyrics_transcriber.output.subtitles import SubtitlesGenerator
+    from karaoke_gen.style_loader import DEFAULT_KARAOKE_STYLE
+
+    karaoke = dict(styles.get("karaoke") or {})
+    # build_karaoke_styles reads these without defaults; fill so a sparse theme previews.
+    for key in _REQUIRED_KARAOKE_KEYS:
+        karaoke.setdefault(key, DEFAULT_KARAOKE_STYLE[key])
+    styles = {**styles, "karaoke": karaoke}
+
+    font_size = karaoke.get("font_size", DEFAULT_FONT_SIZE)
+    max_line_length = karaoke.get("max_line_length", DEFAULT_MAX_LINE_LENGTH)
+    segments = SegmentResizer(max_line_length=max_line_length, logger=logger).resize_segments(
+        _sample_segments(lines, translations)
+    )
+    subtitles = SubtitlesGenerator(
+        output_dir=workdir,
+        video_resolution=VIDEO_RES,
+        font_size=font_size,
+        line_height=font_size,
+        styles=styles,
+        logger=logger,
+    )
+    try:
+        ass_path = subtitles.generate_ass(segments, "preview", None)  # no audio: duration from segments
+    except Exception as exc:
+        raise ThemePreviewError(f"Lyrics layout failed: {exc}") from exc
+
+    first = segments[0]
+    at = first.start_time + (first.end_time - first.start_time) * 0.5
+    out_png = os.path.join(workdir, "karaoke.png")
+    _FrameRenderer(styles, workdir).frame(ass_path, at, out_png)
+    return _to_jpeg(out_png)
+
+
+CDG_COLOR_LIMIT = 300 * 216
+CDG_PREVIEW_SCALE = 3  # 300x216 -> 900x648, nearest-neighbour (keeps the pixel look)
+CDG_TIMEOUT_S = 60
+
+
+def _cdg_png(frame: Image.Image) -> bytes:
+    big = frame.resize((frame.width * CDG_PREVIEW_SCALE, frame.height * CDG_PREVIEW_SCALE), Image.NEAREST)
+    buf = io.BytesIO()
+    big.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _lrc_timestamp(seconds: float) -> str:
+    minutes, secs = divmod(seconds, 60)
+    return f"[{int(minutes):02d}:{secs:06.3f}]"
+
+
+def _pick_lyrics_frame(frames: List[Image.Image], cdg_styles: Dict, with_index: bool = False):
+    """The first frame showing both sung and unsung lyrics (else the busiest one)."""
+    from karaoke_gen.lyrics_transcriber.output.cdg_decoder import cdg_color
+
+    try:
+        sung = cdg_color(cdg_styles.get("active_fill") or "#000000")
+        unsung = cdg_color(cdg_styles.get("inactive_fill") or "#000000")
+    except (ValueError, TypeError):
+        sung = unsung = None
+    best, best_i, best_score = frames[-1], len(frames) - 1, -1
+    for i, frame in enumerate(frames):
+        counts = {rgb: n for n, rgb in (frame.getcolors(CDG_COLOR_LIMIT) or [])}
+        if sung and unsung and sung != unsung:
+            s, u = counts.get(sung, 0), counts.get(unsung, 0)
+            if s > 150 and u > 150:
+                return (frame, i) if with_index else frame
+        background = _dominant(counts)
+        lit = sum(n for rgb, n in counts.items() if rgb != background)
+        if lit > best_score:
+            best, best_i, best_score = frame, i, lit
+    return (best, best_i) if with_index else best
+
+
+def _pick_instrumental_frame(frames: List[Image.Image], cdg_styles: Dict) -> Image.Image:
+    """The fully drawn instrumental screen: most pixels that aren't lyrics or background
+    (its image + text), else the busiest frame without the sung colour."""
+    from karaoke_gen.lyrics_transcriber.output.cdg_decoder import cdg_color
+
+    def colour(key: str):
+        try:
+            return cdg_color(cdg_styles.get(key) or "#000000")
+        except (ValueError, TypeError):
+            return None
+
+    sung, unsung, screen = colour("active_fill"), colour("inactive_fill"), colour("background_color")
+    best, best_score, fallback, fallback_lit = None, 0, frames[len(frames) // 2], -1
+    for frame in frames:
+        counts = {rgb: n for n, rgb in (frame.getcolors(CDG_COLOR_LIMIT) or [])}
+        score = sum(n for rgb, n in counts.items() if rgb not in (sung, unsung, screen))
+        if score > best_score:
+            best, best_score = frame, score
+        if counts.get(sung, 0) == 0 or sung == unsung:
+            lit = sum(n for rgb, n in counts.items() if rgb != screen)
+            if lit > fallback_lit:
+                fallback, fallback_lit = frame, lit
+    return best if best is not None and best_score > 200 else fallback
+
+
+def _dominant(counts: Dict) -> tuple:
+    return max(counts, key=counts.get) if counts else (0, 0, 0)
+
+
+CDG_TRANSITIONS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "karaoke_gen", "lyrics_transcriber", "output", "cdgmaker", "transitions",
+)
+# Preview-only: a short instrumental gap is enough to show the instrumental screen.
+PREVIEW_INSTRUMENTAL_THRESHOLD_CS = 600
+PREVIEW_INSTRUMENTAL_GAP_S = 15.0
+
+
+def cdg_transitions() -> List[str]:
+    """Names of the built-in CD+G reveal transitions (greyscale draw-order masks)."""
+    try:
+        return sorted(f[:-4] for f in os.listdir(CDG_TRANSITIONS_DIR) if f.endswith(".png"))
+    except OSError:
+        return []
+
+
+@dataclass
+class CdgPreviewFrames:
+    title_card: bytes
+    lyrics: bytes
+    instrumental: bytes
+    outro: bytes
+
+
+def render_cdg_previews(
+    styles: Dict, artist: str, title: str, lines: List[str], workdir: str
+) -> CdgPreviewFrames:
+    """Up card, lyrics page, instrumental break and closing screen (PNGs) from one
+    real CDG composed with the theme's cdg styles and sample lyrics."""
+    from karaoke_gen.lyrics_transcriber.output.cdg import CDGGenerator
+    from karaoke_gen.lyrics_transcriber.output.cdg_decoder import cdg_duration_seconds, decode_cdg_frames
+
+    cdg_styles = dict(styles.get("cdg") or {})
+    if not cdg_styles.get("font_path"):
+        raise ThemePreviewError("CD+G styles need a font.")
+    threshold_cs = min(
+        int(cdg_styles.get("instrumental_gap_threshold") or PREVIEW_INSTRUMENTAL_THRESHOLD_CS),
+        PREVIEW_INSTRUMENTAL_THRESHOLD_CS,
+    )
+    cdg_styles["instrumental_gap_threshold"] = threshold_cs
+
+    intro = float(cdg_styles.get("intro_duration_seconds") or 5.0)
+    buffer = float(cdg_styles.get("first_syllable_buffer_seconds") or 0.0)
+    start = intro + buffer + 1.0  # first sung syllable, after the up card
+    line_gap = 2.0
+    lines = [ln for ln in lines if ln] or DEFAULT_SAMPLE_LYRICS
+    lines = (list(lines) * 4)[:4]  # two lines, the gap, two more lines
+    # Two lines, an instrumental break, then two more lines.
+    line_starts = [start, start + line_gap]
+    gap_start = line_starts[-1] + line_gap * 0.8
+    line_starts += [gap_start + PREVIEW_INSTRUMENTAL_GAP_S, gap_start + PREVIEW_INSTRUMENTAL_GAP_S + line_gap]
+
+    lrc_lines = []
+    for t, line in zip(line_starts, lines):
+        words = line.upper().split() or ["LA"]
+        step = (line_gap * 0.8) / len(words)
+        for j, word in enumerate(words):
+            prefix = "/" if j == 0 else ""
+            lrc_lines.append(f"{_lrc_timestamp(t + j * step)}1:{prefix}{word} ")
+    lrc = os.path.join(workdir, "preview.lrc")
+    with open(lrc, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lrc_lines) + "\n")
+
+    audio = os.path.join(workdir, "silence.mp3")
+    duration = line_starts[-1] + line_gap + 2.0
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+             "-t", f"{duration:.1f}", "-q:a", "9", audio],
+            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ThemePreviewError("CD+G preview audio timed out.") from exc
+    if result.returncode != 0:
+        raise ThemePreviewError(f"CD+G preview audio failed: {result.stderr.strip()[:200]}")
+
+    out_dir = os.path.join(workdir, "cdg")
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        cdg_file, _mp3, _zip = CDGGenerator(output_dir=out_dir, logger=logger).generate_cdg_from_lrc(
+            lrc, audio, title, artist, cdg_styles
+        )
+    except Exception as exc:
+        raise ThemePreviewError(f"CD+G preview failed: {exc}") from exc
+
+    with open(cdg_file, "rb") as fh:
+        data = fh.read()
+    total = cdg_duration_seconds(data)
+
+    # The up card is fully drawn well before the intro ends. The composer offsets
+    # lyrics by the intro and lead-in, so find the first part-sung frame and derive
+    # that offset to time the instrumental break.
+    step = 0.25
+    candidates = [start + intro + i * step for i in range(int(line_gap * 3 / step))]
+    frames = decode_cdg_frames(data, [max(intro - 0.5, 1.0)] + candidates)
+    title_card, lyric_frames = frames[0], frames[1:]
+    lyrics, picked = _pick_lyrics_frame(lyric_frames, cdg_styles, with_index=True)
+    offset = candidates[picked] - start
+    # The instrumental screen appears a few seconds into the gap and is cleared
+    # ~3s before the next line: search the gap for its fully drawn frame.
+    gap_times = [offset + gap_start + i * 0.5 for i in range(int(PREVIEW_INSTRUMENTAL_GAP_S * 2))]
+    gap_times = [t for t in gap_times if t < total]
+    gap_frames = decode_cdg_frames(data, gap_times) if gap_times else [lyrics]
+    instrumental = _pick_instrumental_frame(gap_frames, cdg_styles)
+    outro = decode_cdg_frames(data, [max(total - 0.05, 0.0)])[0]
+    return CdgPreviewFrames(
+        title_card=_cdg_png(title_card), lyrics=_cdg_png(lyrics),
+        instrumental=_cdg_png(instrumental), outro=_cdg_png(outro),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public entry point (+ small cache for identical drafts)
+# ---------------------------------------------------------------------------
+
+_CACHE: "OrderedDict[str, PreviewImages]" = OrderedDict()
+_CACHE_MAX = 32
+_cache_lock = threading.Lock()
+
+
+def render_theme_preview(
+    theme_id: str,
+    style_params: Dict,
+    *,
+    artist: str = "Artist Name",
+    title: str = "Song Title",
+    lyrics: Optional[List[str]] = None,
+    storage: Optional[StorageService] = None,
+    include_cdg: bool = False,
+    kinds: Optional[Sequence[str]] = None,
+) -> PreviewImages:
+    """Render the requested previews. ``kinds`` limits the MP4 screens rendered
+    (title_card / karaoke_frame / end_screen; default all); ``include_cdg`` adds
+    the four CD+G frames."""
+    wanted = set(MP4_PREVIEW_KINDS if kinds is None else kinds) & set(MP4_PREVIEW_KINDS)
+    lines = [ln.strip() for ln in (lyrics or DEFAULT_SAMPLE_LYRICS) if ln and ln.strip()][:4] or DEFAULT_SAMPLE_LYRICS
+    key = hashlib.sha256(
+        repr((theme_id, sorted_repr(style_params), artist, title, lines, include_cdg, sorted(wanted))).encode()
+    ).hexdigest()
+    with _cache_lock:
+        if key in _CACHE:
+            _CACHE.move_to_end(key)
+            return _CACHE[key]
+
+    from karaoke_gen.style_loader import screen_enabled
+
+    styles = resolve_assets(style_params, theme_id, storage, include_cdg=include_cdg)
+    with tempfile.TemporaryDirectory(prefix="theme-preview-") as workdir:
+        result = PreviewImages(
+            title_card=(
+                render_title_card(styles, artist, title, workdir)
+                if "title_card" in wanted and screen_enabled(styles, "intro") else None
+            ),
+            karaoke_frame=render_karaoke_frame(styles, lines, workdir) if "karaoke_frame" in wanted else None,
+            end_screen=(
+                render_end_screen(styles, artist, title, workdir)
+                if "end_screen" in wanted and screen_enabled(styles, "end") else None
+            ),
+        )
+        if include_cdg:
+            cdg = render_cdg_previews(styles, artist, title, lines, workdir)
+            result.cdg_title_card, result.cdg_lyrics = cdg.title_card, cdg.lyrics
+            result.cdg_instrumental, result.cdg_outro = cdg.instrumental, cdg.outro
+    with _cache_lock:
+        _CACHE[key] = result
+        while len(_CACHE) > _CACHE_MAX:
+            _CACHE.popitem(last=False)
+    return result
+
+
+def sorted_repr(value) -> str:
+    """Stable repr for hashing nested dicts."""
+    import json
+
+    return json.dumps(value, sort_keys=True, default=str)

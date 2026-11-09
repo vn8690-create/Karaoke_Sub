@@ -1,0 +1,228 @@
+# Karaoke-Gen AI Assistant Guidelines
+
+## Project Overview
+
+**Karaoke video generation platform** - CLI tool and web service that creates professional karaoke videos with synchronized lyrics.
+
+- **Production**: <https://gen.nomadkaraoke.com> (frontend), <https://api.nomadkaraoke.com> (backend)
+- **CLI**: `karaoke-gen` (local), `karaoke-gen-remote` (cloud)
+- **Repo**: <https://github.com/nomadkaraoke/karaoke-gen>
+
+## Quick Reference
+
+| What | Where |
+|------|-------|
+| Product vision & goals | `docs/PRODUCT-VISION.md` |
+| Current status | `docs/README.md` |
+| Architecture | `docs/ARCHITECTURE.md` |
+| Dev setup & testing | `docs/DEVELOPMENT.md` |
+| **Testing & code quality** | `docs/TESTING.md` |
+| API reference | `docs/API.md` |
+| Past learnings | `docs/LESSONS-LEARNED.md` |
+| **Operational runbooks** | `docs/TROUBLESHOOTING.md` |
+| GDrive validator & gaps | `docs/GDRIVE-VALIDATOR.md` |
+| **Product communication** | `docs/PRODUCT-COMMUNICATION-GUIDE.md` |
+| Brand style guide | `docs/BRAND-STYLE-GUIDE.md` |
+| **Making medleys** (multi-song karaoke) | `docs/MEDLEYS.md` + `scripts/medley/make_medley.py` |
+
+## Tech Stack
+
+- **Backend**: FastAPI on Cloud Run, Firestore, GCS, Secret Manager
+- **Frontend**: Next.js on Cloudflare Pages
+- **Processing**: Cloud Run GPU (L4 audio separation), AudioShake/Whisper (transcription)
+- **Infra**: Pulumi IaC, GitHub Actions CI/CD
+
+## Essential Rules
+
+### Git Workflow
+- **Never commit directly to `main`** - use `/new-worktree <description>` to start
+- **Follow global workflow** - see `~/.claude/CLAUDE.md` for command sequence
+- Create PR with summary, changes, testing info
+- Merge only after CI passes
+
+### Testing (Required)
+**Before planning any implementation work**, read `docs/TESTING.md` and ensure your plan includes a thorough testing strategy that follows the guidance there. This includes:
+- Which test types are needed (unit, integration, E2E)
+- Where tests should be placed
+- What mocking approach to use
+- Coverage expectations
+- **Production E2E tests for user-facing features** - see below
+
+**Critical:** If your plan includes "Manual Testing" steps, convert them to automated Playwright E2E tests. Production E2E tests (in `frontend/e2e/production/`) are valuable even if only run once after deployment - they codify expected behavior and verify the deployed code works. See `docs/TESTING.md` for details.
+
+**Before committing**, run all tests:
+```bash
+make test 2>&1 | tail -n 500
+```
+
+This single command:
+- Installs dependencies automatically (backend + frontend)
+- Runs all backend tests (unit, integration, emulator)
+- Runs all frontend tests (Jest unit + Playwright E2E)
+- Takes ~5-10 minutes
+
+**All tests must pass.** Don't dismiss failures as "pre-existing" - investigate and fix them.
+
+### Testing in Production (for Agents)
+
+When asked to "test it yourself in prod" or verify a fix in production:
+
+```bash
+# Get admin token
+export KARAOKE_ADMIN_TOKEN=$(gcloud secrets versions access latest --secret=admin-tokens --project=nomadkaraoke | cut -d',' -f1)
+
+# Option 1: Use the debug template directly
+cd frontend && node e2e/helpers/debug-prod-template.mjs
+
+# Option 2: Copy template for customization (gitignored)
+cp frontend/e2e/helpers/debug-prod-template.mjs frontend/test-my-issue.local.mjs
+# Edit the script, then run it
+node test-my-issue.local.mjs
+
+# Option 3: Run existing production E2E tests
+KARAOKE_ADMIN_TOKEN=$KARAOKE_ADMIN_TOKEN npx playwright test e2e/production/admin-dashboard.spec.ts
+```
+
+Files matching `test-*.local.*` and `debug-*.local.*` are gitignored - you can hardcode tokens in them safely.
+
+See `docs/TESTING.md` § "Ad-Hoc Production Debugging" for full details.
+
+### Version Bumping
+- Bump `tool.poetry.version` in `pyproject.toml` for code changes
+- Skip for docs-only changes
+
+### Infrastructure
+- **All GCP changes via Pulumi PRs** - but CI does **not** run Pulumi (see the note in `.github/workflows/ci.yml`): a merged `infrastructure/` change is not live until someone runs `pulumi up` locally. Claude sessions have read-only ADC, so they need Andrew's `/gcp-admin` grant to apply. Ask for it early, and vet with a targeted `pulumi preview --diff` first
+- **`infrastructure/` is the shared platform IaC home**: the GCP project (`infrastructure/`) and the Nomad Karaoke Cloudflare account (`infrastructure/cloudflare/`, own Pulumi project + stack, see its README). Never hand-edit Cloudflare config that stack manages; app repos keep only app-specific stacks
+- **Run `pulumi up` locally BEFORE merging infra PRs** - CI only validates; it never applies. If you merge first, main and the live state drift until someone applies
+- Never modify GCP resources directly via console or `gcloud` CLI
+- `gcloud` CLI for reading/debugging only (e.g., checking logs, SSH to VMs)
+- Stop and notify user on auth issues
+- **GCS ops on macOS: never use `gsutil -m`** — its fork-based multiprocessing segfaults
+  on macOS (crash-report popups + the parent process hangs forever). Use `gcloud storage`
+  instead (`gcloud storage cp/rm/rsync …`) — no fork, and faster. Plain `gsutil` (no `-m`)
+  is safe but slower. `~/.boto` pins `parallel_process_count=1` as a safety net; don't remove it.
+
+### Internationalization (i18n)
+
+- All user-facing strings live in `frontend/messages/{locale}.json` (33 locales), NOT in components
+- Backend strings live in `backend/translations/{locale}.json` (currently 3 locales: en, es, de)
+- Components use `useTranslations('namespace')` from next-intl
+- Pages are under `frontend/app/[locale]/` — locale-aware routing (customer-facing: `/`, `/app/*`, `/order/*`, `/auth/*`, `/payment/*`, `/r/*`)
+- Non-locale routes at those same paths (e.g. `frontend/app/app/jobs/[[...slug]]/page.tsx`) are `<LocaleRedirect />` shims that redirect into `[locale]` — they are NOT English-only surfaces
+- The `/app/jobs/#/{id}/review`, `/instrumental`, and `/audio-edit` review UIs are fully multilingual (components under `components/lyrics-review/`, `components/instrumental-review/`, `components/audio-editor/` use `useTranslations` heavily)
+- Only `/admin/*` is English-only — it has no `[locale]/admin` counterpart and inherits `DefaultIntlProvider` from the root layout
+- Internal links use `Link` from `@/i18n/routing` (locale-aware)
+- After adding/changing English strings: `python frontend/scripts/translate.py --messages-dir frontend/messages --target all`
+- Translation uses Gemini 3.8 Flash via the **Gemini Developer API** (key: `GEMINI_API_KEY`, else Secret Manager `gemini-api-key` via your gcloud login — `frontend/scripts/gemini_client.py`) with GCS cache for efficiency. **Vertex AI is disabled in the GCP project — never use `vertexai=True`; backend code uses `backend/services/gemini_client.get_genai_client()`.**
+- CI validates all locale files have matching keys — **PR will fail if translations are missing**
+- Pre-commit hook auto-translates when en.json changes (enable: `git config core.hooksPath .githooks`)
+- Don't hardcode user-facing strings — add to `messages/en.json` and use `t('key')`
+
+## API Authentication (for Agents)
+
+When you need to call backend APIs programmatically:
+
+### Internal Worker Endpoints
+Use the `X-Admin-Token` header with the token from Secret Manager:
+```bash
+# Trigger video worker
+curl -X POST "https://api.nomadkaraoke.com/api/internal/workers/video" \
+  -H "X-Admin-Token: $(gcloud secrets versions access latest --secret=admin-tokens --project=nomadkaraoke)" \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "YOUR_JOB_ID"}'
+
+# Other internal endpoints follow the same pattern
+```
+
+### Firestore Direct Access
+```bash
+# Set the correct project
+export GOOGLE_CLOUD_PROJECT=nomadkaraoke
+
+# Use Python with google-cloud-firestore
+python3 << 'EOF'
+import os
+os.environ['GOOGLE_CLOUD_PROJECT'] = 'nomadkaraoke'
+from google.cloud import firestore
+db = firestore.Client(project='nomadkaraoke')
+# Query/update documents...
+EOF
+```
+
+### GCE Encoding Worker
+Since 2026-11 the only GCE encoding VM is the stopped on-demand fallback
+`encoding-worker-fallback-c2df` (c2d-highcpu-16, us-central1-f); the c4d Spot pair
+(`encoding-worker-a`/`-b`) was retired and deleted, and `primary_vm`/`secondary_vm` in
+`config/encoding-worker` are empty. The serving worker is `active_override_vm` (normally the
+AWS box below). Idle VMs stop after 5 min. CI's "blue-green" deploy now only runs when worker
+code changed (`infrastructure/encoding-worker/worker_code_paths.txt`, diffed against
+`validated_version`): it boots c2df, runs a test encode, records `validated_version` and stops
+it again, leaving the AWS override serving. Force it via Actions → CI → Run workflow →
+"Force a blue-green redeploy of the GCE encoding worker".
+```bash
+# Check health (includes wheel_version) on the GCE fallback.
+gcloud compute ssh encoding-worker-fallback-c2df --zone=us-central1-f --project=nomadkaraoke \
+  --command="curl -s http://localhost:8080/health"
+
+# Restart the service (pick up new worker-side code after a deploy)
+gcloud compute ssh encoding-worker-fallback-c2df --zone=us-central1-f --project=nomadkaraoke \
+  --command="sudo systemctl restart encoding-worker"
+```
+
+For job stuck at `encoding` status, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+**AWS encoding worker** (`aws-encoding-worker-1`, EC2 c7a.4xlarge on-demand, us-east-2) is a pool
+candidate too (`provider: aws` in `encoding-worker-fallback-vms`): last resort by default,
+preferred when Firestore `config/encoding-worker.speed_rank_overrides = {"c7a": 5}`. Not
+blue-green deployed, idle-stops itself, shell via SSM, logs are on the box (journald). See
+`infrastructure/aws/README.md`.
+
+### What Doesn't Work
+- `gcloud auth print-identity-token` - Wrong token type for internal endpoints
+- Cloud Tasks without proper service account - Gets 401 from Cloud Run
+
+## Documentation Maintenance
+
+### Structure
+```text
+docs/
+├── README.md          # Current status + navigation (UPDATE THIS)
+├── ARCHITECTURE.md    # System design
+├── DEVELOPMENT.md     # Dev setup, testing, deployment
+├── API.md             # Backend API reference
+├── LESSONS-LEARNED.md # Key insights for future agents
+└── archive/           # Historical docs (YYYY-MM-DD-topic.md)
+```
+
+### Rules
+1. **Before merging PRs**: Run `/docs-review` to check if docs need updating
+2. **Periodically**: Run `/docs-maintain` to verify docs are organized
+3. **For significant work**: Create `docs/archive/YYYY-MM-DD-topic.md`
+4. **Add learnings**: Update `docs/LESSONS-LEARNED.md` with insights
+5. **Keep status current**: Update `docs/README.md` when project state changes
+
+### What Goes Where
+- **README.md**: Current status, known issues, quick links
+- **ARCHITECTURE.md**: System design, data flow, tech decisions
+- **DEVELOPMENT.md**: Setup, testing, deployment, CI/CD
+- **API.md**: Endpoints, request/response formats
+- **LESSONS-LEARNED.md**: What worked, what didn't, gotchas
+- **archive/**: Completed work, session summaries, old plans
+
+## Related Projects
+
+### flacfetch
+Location: `/Users/andrew/Projects/flacfetch`
+
+Workflow: Make changes on `main`, bump version, push, wait for CI, then `poetry update flacfetch` in karaoke-gen.
+
+## Pre-PR Checklist
+
+Follow global workflow (`~/.claude/CLAUDE.md`):
+
+- [ ] Tests pass: `/test` (or `make test` / `npm run test:all`)
+- [ ] Version bumped (if code changed)
+- [ ] Docs checked: `/docs-review`
+- [ ] Code reviewed: `/review` (CodeRabbit CLI)
+- [ ] PR created: `/pr` (adds @coderabbitai ignore)

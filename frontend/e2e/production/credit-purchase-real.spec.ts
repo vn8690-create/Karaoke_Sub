@@ -1,0 +1,375 @@
+// frontend/e2e/production/credit-purchase-real.spec.ts
+import { test, expect } from '@playwright/test';
+import type { APIRequestContext } from '@playwright/test';
+import { createEmailHelper, isEmailTestingAvailable } from '../helpers/email-testing';
+import { completeStripeCheckout, SELF_HEAL_ARTIFACT_DIR } from '../helpers/stripe-checkout';
+import { getPageAuthToken, clickCompleteSignInGate } from '../helpers/auth';
+import { URLS, TIMEOUTS } from '../helpers/constants';
+import * as fs from 'fs';
+import * as path from 'path';
+
+/**
+ * Read a user's current credit balance via the read-only admin detail endpoint.
+ * This is the server-side source of truth for whether a purchase landed —
+ * independent of any browser redirect. Returns null if the lookup fails.
+ */
+async function getCreditsViaAdmin(
+  request: APIRequestContext,
+  apiBase: string,
+  adminToken: string,
+  email: string
+): Promise<number | null> {
+  try {
+    const res = await request.get(
+      `${apiBase}/api/users/admin/users/${encodeURIComponent(email)}/detail`,
+      { headers: { 'X-Admin-Token': adminToken } }
+    );
+    if (!res.ok()) return null;
+    const data = await res.json();
+    return typeof data.credits === 'number' ? data.credits : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Poll the admin detail endpoint until the user's credit balance rises above
+ * `baseline` — the Stripe webhook grants the purchased credit asynchronously,
+ * so this can lag the payment by a few seconds. Returns the increased balance,
+ * or null if it never rose within the timeout.
+ */
+async function waitForCreditIncrease(
+  request: APIRequestContext,
+  apiBase: string,
+  adminToken: string,
+  email: string,
+  baseline: number,
+  timeoutMs = 90_000
+): Promise<number | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const latest = await getCreditsViaAdmin(request, apiBase, adminToken, email);
+    if (latest !== null && latest > baseline) return latest;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return null;
+}
+
+/**
+ * E2E Test: Real Credit Purchase via Stripe Checkout
+ *
+ * Tests the REAL payment flow that customers use:
+ * 1. Sign up with referral code e2etest95 (95% discount)
+ * 2. Open Buy Credits dialog
+ * 3. Purchase 1 credit via real Stripe Checkout (~$0.50 after 95% discount — Stripe's USD minimum)
+ * 4. Verify credits allocated and confirmation email received
+ *
+ * This test uses a REAL card and processes a REAL charge, but only ~$0.50/run:
+ * base credit is $10, the 95% e2etest95 referral code drops it to $0.50 — the
+ * floor, since Stripe rejects USD charges under $0.50. Point the
+ * E2E_STRIPE_CARD_* secrets at the Nomad debit card (not a personal card).
+ *
+ * Prerequisites:
+ *   - E2E_STRIPE_CARD_NUMBER, E2E_STRIPE_CARD_EXPIRY, E2E_STRIPE_CARD_CVC
+ *   - TESTMAIL_API_KEY + TESTMAIL_NAMESPACE
+ *   - E2E_ADMIN_TOKEN (for credit verification + cleanup)
+ *
+ * Output:
+ *   - Writes session token to test-results/e2e-session-token.txt
+ *     for Stage 2 (happy path) to consume
+ */
+
+/**
+ * E2E_PAYMENT_MODE:
+ *   'real' (default)  — pay with the E2E_STRIPE_CARD_* card and verify the credit grant.
+ *   'checkout-only'   — no charge: everything up to Stripe's Pay button (session
+ *                        creation, referral price, card form) with Stripe's public test
+ *                        card, then hand the new user's signup credit to Stage 2.
+ */
+const CHECKOUT_ONLY = process.env.E2E_PAYMENT_MODE === 'checkout-only';
+
+const PROD_URL = URLS.production.frontend;
+const API_URL = URLS.production.api;
+
+// The real card is typed into Stripe's page: traces (every typed value +
+// X-Admin-Token headers), videos and Playwright's automatic screenshots would
+// all capture it, and test-results/ is uploaded from a PUBLIC repo. The
+// checkout helper takes its own input-masked screenshots instead.
+// (Must be top-level: these options force a new worker, so describe-level use() fails to load.)
+test.use({ trace: 'off', video: 'off', screenshot: 'off' });
+
+test.describe('Real Credit Purchase Flow', () => {
+  test('purchase 1 credit via Stripe Checkout with referral discount', async ({ page, request }) => {
+    // ===== PREREQUISITES =====
+    test.skip(!CHECKOUT_ONLY && !process.env.E2E_STRIPE_CARD_NUMBER, 'E2E_STRIPE_CARD_NUMBER not set');
+    test.skip(!isEmailTestingAvailable(), 'Testmail credentials not set');
+
+    const adminToken = process.env.E2E_ADMIN_TOKEN;
+    test.skip(!adminToken, 'E2E_ADMIN_TOKEN not set');
+
+    const emailHelper = await createEmailHelper();
+    const inbox = await emailHelper.createInbox();
+    console.log(`Test email: ${inbox.emailAddress}`);
+
+    try {
+      // ===== STEP 1: Navigate with referral code =====
+      console.log('\n=== STEP 1: Navigate with referral code ===');
+      await page.goto(`${PROD_URL}/?ref=e2etest95`);
+      await page.waitForLoadState('networkidle');
+      await page.screenshot({ path: 'test-results/01-landing-with-referral.png' });
+      console.log('  Landed with ?ref=e2etest95');
+
+      // ===== STEP 2: Sign up via magic link =====
+      console.log('\n=== STEP 2: Sign up via magic link ===');
+
+      // Click Sign Up Free
+      const signUpButton = page.getByRole('button', { name: /sign up free/i });
+      await expect(signUpButton).toBeVisible({ timeout: TIMEOUTS.action });
+      await signUpButton.click();
+
+      // Fill email in AuthDialog
+      const authDialog = page.getByRole('dialog');
+      await expect(authDialog).toBeVisible({ timeout: TIMEOUTS.action });
+      const emailInput = authDialog.getByPlaceholder('you@example.com');
+      await emailInput.fill(inbox.emailAddress!);
+      await page.screenshot({ path: 'test-results/02-auth-dialog.png' });
+
+      // Send magic link
+      const sendButton = page.getByRole('button', { name: /send sign-in link/i });
+      await sendButton.click();
+      await expect(page.getByText(/check your email/i)).toBeVisible({ timeout: 15000 });
+      console.log('  Magic link sent');
+
+      // Wait for email and extract link
+      const magicEmail = await emailHelper.waitForEmail(inbox.id!, 60000);
+      const magicLink = emailHelper.extractMagicLink(magicEmail);
+      if (!magicLink) throw new Error('Could not extract magic link from email');
+      console.log(`  Magic link received`);
+
+      // Navigate to magic link
+      await page.goto(magicLink);
+
+      // Click the "Complete Sign-In" gate (verify page no longer auto-consumes
+      // the token on mount — see #870). This spends the single-use token.
+      await clickCompleteSignInGate(page);
+      console.log('  Clicked "Complete Sign-In" gate');
+
+      // Handle verification result (new user interstitial or direct success)
+      const verifyResult = await Promise.race([
+        page.getByText(/successfully signed in/i).waitFor({ state: 'visible', timeout: 30000 }).then(() => 'success'),
+        page.getByText(/welcome to nomad karaoke/i).waitFor({ state: 'visible', timeout: 30000 }).then(() => 'credits_interstitial'),
+      ]);
+      console.log(`  Verification: ${verifyResult}`);
+
+      if (verifyResult === 'credits_interstitial') {
+        const startButton = page.getByRole('button', { name: /start creating|go to dashboard|explore the app/i });
+        await expect(startButton).toBeVisible({ timeout: 5000 });
+        await startButton.click();
+      }
+
+      await page.waitForURL(/\/app/, { timeout: 15000 });
+      await page.screenshot({ path: 'test-results/03-authenticated.png' });
+      console.log('  Authenticated and on /app');
+
+      // Extract session token for Stage 2
+      const sessionToken = await getPageAuthToken(page);
+      if (!sessionToken) throw new Error('No session token after auth');
+
+      // ===== STEP 3: Open Buy Credits and verify discount =====
+      console.log('\n=== STEP 3: Open Buy Credits dialog ===');
+
+      // "Buy More Credits" is inside the user dropdown menu in the header.
+      // Open the dropdown by clicking the button containing "credits available",
+      // then click the "Buy More Credits" menu item.
+      const userDropdownButton = page.locator('button').filter({ hasText: /credits?\s+available/i }).first();
+      await expect(userDropdownButton).toBeVisible({ timeout: TIMEOUTS.action });
+      await userDropdownButton.click();
+      console.log('  Opened user dropdown');
+
+      // Wait for dropdown menu and click "Buy More Credits"
+      const buyMenuItem = page.getByRole('menuitem', { name: /buy more credits/i });
+      await expect(buyMenuItem).toBeVisible({ timeout: 5000 });
+      console.log('  Found Buy More Credits menu item');
+      await buyMenuItem.click();
+
+      // Wait for BuyCreditsDialog
+      const creditsDialog = page.getByRole('dialog');
+      await expect(creditsDialog).toBeVisible({ timeout: TIMEOUTS.action });
+      await page.screenshot({ path: 'test-results/04-buy-credits-dialog.png' });
+
+      // Check for referral discount badge (may say "95% referral discount")
+      // This is informational — don't fail the test if the badge isn't visible,
+      // as the discount is applied server-side regardless of the UI badge
+      const discountBadge = creditsDialog.getByText(/95%/i).first();
+      if (await discountBadge.isVisible({ timeout: 5000 }).catch(() => false)) {
+        console.log('  Referral discount badge visible');
+      } else {
+        console.log('  WARNING: Referral discount badge not visible — discount may still apply at checkout');
+      }
+
+      // ===== STEP 4: Select 1-credit package =====
+      console.log('\n=== STEP 4: Select 1-credit package ===');
+
+      // The packages grid has buttons with large credit-count numbers.
+      // Find all package buttons and log them for debugging.
+      const packageButtons = creditsDialog.locator('button').filter({ hasText: /credit/i });
+      const btnCount = await packageButtons.count();
+      console.log(`  Found ${btnCount} package buttons`);
+      for (let i = 0; i < Math.min(btnCount, 4); i++) {
+        const txt = await packageButtons.nth(i).textContent();
+        console.log(`    Button ${i}: "${txt?.replace(/\s+/g, ' ').trim().substring(0, 80)}"`);
+      }
+
+      // Select the 1-credit package — first button in the 2-column grid
+      const oneCredit = packageButtons.first();
+      await oneCredit.click();
+      await page.screenshot({ path: 'test-results/05-package-selected.png' });
+      console.log('  Selected 1-credit package');
+
+      // Verify the discounted price (~$0.50) is shown
+      // The checkout button should show the price
+      const checkoutButton = creditsDialog.getByRole('button', { name: /continue|checkout|pay/i }).last();
+      await expect(checkoutButton).toBeVisible({ timeout: TIMEOUTS.action });
+      const buttonText = await checkoutButton.textContent();
+      console.log(`  Checkout button: "${buttonText}"`);
+
+      // Record the credit balance BEFORE paying, so we can assert the purchase
+      // actually landed server-side (baseline + 1) regardless of the browser
+      // redirect. Falls back to 0 if the admin lookup is unavailable.
+      const baselineCredits = (await getCreditsViaAdmin(request, API_URL, adminToken!, inbox.emailAddress)) ?? 0;
+      console.log(`  Baseline credits before purchase: ${baselineCredits}`);
+
+      // ===== STEP 5: Proceed to Stripe Checkout =====
+      console.log('\n=== STEP 5: Stripe Checkout ===');
+      await checkoutButton.click();
+
+      if (CHECKOUT_ONLY) {
+        console.log('  💳 E2E_PAYMENT_MODE=checkout-only — filling with Stripe test card, NOT paying');
+        await completeStripeCheckout(page, { stopBeforeSubmit: true });
+        // The discounted price must be what Stripe will charge.
+        await expect(page.getByText('$0.50').first()).toBeVisible({ timeout: TIMEOUTS.action });
+        console.log('  ✅ Checkout session shows the $0.50 referral price and is ready to pay');
+
+        // Stage 2 spends one credit; the new account's signup credit covers it.
+        expect(
+          baselineCredits,
+          'No-charge mode hands the signup credit to Stage 2, but the new account has 0 credits'
+        ).toBeGreaterThanOrEqual(1);
+
+        const outputDir = path.join(process.cwd(), 'test-results');
+        fs.mkdirSync(outputDir, { recursive: true });
+        fs.writeFileSync(path.join(outputDir, 'e2e-session-token.txt'), sessionToken);
+        console.log(`  Token saved for Stage 2 (user has ${baselineCredits} signup credit(s))`);
+        console.log('\n✅ CHECKOUT-ONLY TEST PASSED (no payment made)');
+        return;
+      }
+
+      // Complete Stripe Checkout with real card. The redirect back to our site
+      // is best-effort — the authoritative signal is the server-side credit grant.
+      // verifyPaid lets the submit step confirm success server-side when the
+      // redirect is slow, so the self-healing fallback never re-submits.
+      const checkout = await completeStripeCheckout(page, {
+        verifyPaid: async () => {
+          const latest = await getCreditsViaAdmin(request, API_URL, adminToken!, inbox.emailAddress);
+          return latest !== null && latest > baselineCredits;
+        },
+      });
+
+      // ===== STEP 6: Verify the purchase landed (server-side source of truth) =====
+      console.log('\n=== STEP 6: Verify credit grant (server-side) ===');
+      // Stripe's webhook grants the purchased credit asynchronously; poll for it.
+      // This is the real pass/fail gate — a slow or dropped browser redirect must
+      // NOT fail a purchase that actually succeeded (the historical E2E flake).
+      const newBalance = await waitForCreditIncrease(
+        request, API_URL, adminToken!, inbox.emailAddress, baselineCredits
+      );
+      expect(
+        newBalance,
+        `Credit balance did not increase above ${baselineCredits} within 90s after payment — ` +
+        `the Stripe webhook / credit grant did not complete (this IS a real failure, ` +
+        `unlike a slow browser redirect)`
+      ).not.toBeNull();
+      console.log(`  ✅ Server-side credit grant confirmed: ${baselineCredits} → ${newBalance}`);
+
+      // The purchase is proven end-to-end, so any step the LLM fallback healed
+      // is trustworthy: emit the merged learned-variants.json for the workflow
+      // to commit via an auto-merging PR.
+      const runUrl = process.env.GITHUB_RUN_ID
+        ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+        : undefined;
+      const { learnedWritten } = checkout.selfHeal.writeArtifacts(SELF_HEAL_ARTIFACT_DIR, { flowVerified: true, runUrl });
+      if (learnedWritten) {
+        console.log('  🩹 Self-healing: LLM-healed step(s) recorded — the workflow will open an auto-merge PR');
+      }
+
+      // Best-effort UX check: if the browser redirected to the success page,
+      // confirm it renders the expected confirmation. A missing redirect is only
+      // a UX nicety here (the charge + grant are already proven above), so don't
+      // fail the test on it.
+      if (checkout.redirected) {
+        const onSuccessPage = await page
+          .waitForURL(/payment\/success/, { timeout: 30000 })
+          .then(() => true)
+          .catch(() => false);
+        if (onSuccessPage) {
+          const successText = page.getByText(/payment successful/i);
+          await expect(successText).toBeVisible({ timeout: TIMEOUTS.action });
+          const creditsAvailableText = page.getByText(/credits?\s+available/i);
+          await expect(creditsAvailableText).toBeVisible({ timeout: TIMEOUTS.action });
+          await page.screenshot({ path: 'test-results/06-payment-success.png' });
+          console.log('  Payment success page confirmed with credits');
+        }
+      } else {
+        console.log('  ⚠️ No browser redirect observed — skipping success-page UX assertions (grant already verified above)');
+      }
+
+      // ===== STEP 7: Verify via API =====
+      console.log('\n=== STEP 7: Verify credits via API ===');
+      try {
+        const userResponse = await request.get(`${API_URL}/api/users/me`, {
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+            'X-Session-Token': sessionToken,
+          },
+        });
+        if (userResponse.ok()) {
+          const userData = await userResponse.json();
+          console.log(`  API response keys: ${Object.keys(userData).join(', ')}`);
+          console.log(`  API credits: ${userData.credits ?? userData.credit_balance ?? 'N/A'}`);
+        } else {
+          console.log(`  API returned ${userResponse.status()} — session token may use different auth`);
+        }
+      } catch (e) {
+        console.log(`  API check skipped: ${e}`);
+      }
+      // The success page already confirmed credits — API check is informational
+
+      // ===== STEP 8: Verify confirmation email =====
+      console.log('\n=== STEP 8: Verify confirmation email ===');
+      try {
+        // Wait for the second email (first was magic link, second is payment confirmation)
+        const confirmEmail = await emailHelper.waitForEmail(inbox.id!, 30000);
+        console.log(`  Confirmation email: "${confirmEmail.subject}"`);
+        const emailText = ((confirmEmail.subject || '') + ' ' + (confirmEmail.body || '')).toLowerCase();
+        expect(emailText).toContain('credit');
+      } catch (e) {
+        // Email verification is best-effort — don't fail the payment test for email issues
+        console.log(`  Email verification skipped: ${e}`);
+      }
+
+      // ===== OUTPUT: Save token for Stage 2 =====
+      console.log('\n=== OUTPUT: Saving session token for Stage 2 ===');
+      const outputDir = path.join(process.cwd(), 'test-results');
+      fs.mkdirSync(outputDir, { recursive: true });
+      fs.writeFileSync(path.join(outputDir, 'e2e-session-token.txt'), sessionToken);
+      console.log('  Token saved to test-results/e2e-session-token.txt');
+
+      console.log('\n✅ CREDIT PURCHASE TEST PASSED');
+
+    } finally {
+      if (inbox?.id) {
+        await emailHelper.deleteInbox(inbox.id);
+      }
+    }
+  });
+});

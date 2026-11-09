@@ -1,0 +1,1017 @@
+# Architecture
+
+## System Overview
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  Frontend (Cloudflare Pages)                                    │
+│  Next.js + TypeScript                                           │
+│  https://gen.nomadkaraoke.com                                   │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ HTTPS
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Cloudflare edge  (api.nomadkaraoke.com proxied — orange-cloud) │
+│  WAF (exploit-path block) + rate limit + injects X-Edge-Auth    │
+│  header. See § Edge Security (Cloudflare).                      │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ HTTPS (SSL "full")
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Backend API (Cloud Run)                                        │
+│  FastAPI + Python 3.12                                          │
+│  https://api.nomadkaraoke.com  (origin lock: rejects direct-    │
+│  to-origin requests lacking X-Edge-Auth, health/root exempt)    │
+│                                                                 │
+│  Workers:                                                       │
+│  • Audio Worker    - Stem separation via Cloud Run GPU (L4)              │
+│  • Lyrics Worker   - Transcription via AudioShake               │
+│  • Screens Worker  - Title/end screen generation                │
+│  • Render Worker   - Karaoke video with lyrics                  │
+│  • Video Worker    - Final assembly and encoding                │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+              ┌─────────────┼─────────────┬───────────────┐
+              ▼             ▼             ▼               ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────────┐ ┌──────────────┐
+        │ Firestore│  │   GCS    │  │Secret Manager│ │GCE Encoding  │
+        │ (jobs)   │  │ (files)  │  │  (API keys)  │ │  Worker (*)  │
+        └──────────┘  └──────────┘  └──────────────┘ └──────────────┘
+
+(*) Encoding Worker: since 2026-11 the AWS EC2 worker (aws-encoding-worker-1,
+    c7a.4xlarge, preferred via speed_rank_overrides) plus ONE on-demand GCE
+    c2d-highcpu-16 fallback (encoding-worker-fallback-c2df). The c4d Spot
+    blue-green pair was retired. Candidates are selected fastest-first with a
+    capacity cooldown.
+    Used for both final video encoding and preview video generation.
+    Uses immutable deployment pattern - see infrastructure/encoding-worker/README.md
+    and the "Encoding Worker" section below.
+```
+
+### Error Monitor
+
+```text
+Cloud Logging (all services) ──→ Error Monitor (Cloud Run Job, hourly)
+Frontend clients ───────────────→ POST /api/client-errors ──→ Firestore
+                                    │
+                                    ├─ Normalize & deduplicate
+                                    ├─ LLM incident grouping (Gemini Flash)
+                                    ├─ Discord #alerts (new patterns, spikes, incidents)
+                                    ├─ Discord #noise (auto-resolved summary, daily digest)
+                                    ├─ Firestore: error_patterns, error_incidents
+                                    └─ Auto-resolve silent patterns
+
+Entry point: python -m backend.services.error_monitor.monitor
+Design spec: docs/archive/2026-04-12-error-monitor-design.md
+Frontend crash reporting: docs/archive/2026-04-19-frontend-crash-reporting-plan.md
+```
+
+#### Discord channels: #alerts = signal, #noise = everything else
+
+`#alerts` is reserved for **actual problems someone should look at**. Anything
+routine/informational goes to `#noise`. When adding a new Discord post, pick the
+channel by asking "does this need a human?" — if not, it's noise.
+
+| Message | Channel | Source |
+|---------|---------|--------|
+| 🔴 New Error Pattern / ⚠️ Spike / incident | #alerts | error monitor `send_message` |
+| ✅ Patterns Auto-Resolved, 📊 Daily Error Digest | #noise | error monitor `send_noise_message` |
+| 🔴 Job failed, 🟠 Audio download stalled, 🟠 Publish completeness SHADOW, 🟠 Gemini unavailable | #alerts | `backend/services/ops_alerts.py` |
+| OAuth credential invalid/expired (startup check, `/test-alert`) | #alerts | `backend/main.py`, `auth.py` |
+| Nightly Backup Report (clean run) | #noise | `infrastructure/functions/backup_to_aws` |
+| 🚨 Nightly Backup FAILED (any step errored) | #alerts | same |
+| 📋 Quarterly DR restore drill due | #alerts | same (`?mode=drill_reminder`, actionable) |
+| 🚨 DR backup is stale / monitor failed | `DR_MONITOR_DISCORD_WEBHOOK` | `.github/workflows/dr-backup-freshness.yml` (failures only) |
+| ✅ E2E Daily Test PASSED, 🩹 E2E self-healed (auto-merge PR opened) | #noise | `.github/workflows/e2e-daily.yml` |
+| 🚨 E2E Daily FAILED, 🩹 self-heal PR needs a CI approval click / could not open, ❌ Tenant E2E FAILED | #alerts | `e2e-daily.yml`, `e2e-tenant-daily.yml` |
+| GitHub PR opened/closed (org webhook) | #noise | GitHub org settings |
+| New YouTube video | #releases | `DEFAULT_DISCORD_WEBHOOK_URL` ← `discord-releases-webhook` |
+
+How the webhooks resolve:
+
+- **#alerts**: Secret Manager `discord-alert-webhook` (error monitor gets it as
+  `DISCORD_WEBHOOK_URL` from Pulumi; the backup function likewise; GitHub Actions
+  secret `DISCORD_ALERT_WEBHOOK_URL`).
+- **#noise**: Secret Manager `discord-noise-webhook`, read **at runtime** (env
+  `DISCORD_NOISE_WEBHOOK_URL` overrides; secret name overridable with
+  `DISCORD_NOISE_WEBHOOK_SECRET_NAME`) — no Pulumi env wiring needed. GitHub
+  Actions secret `DISCORD_NOISE_WEBHOOK_URL`.
+- **Never silently dropped**: if the noise webhook can't be resolved, or a post
+  to it fails, the message falls back to #alerts. The error monitor rate-limits
+  each channel separately (10/run each), so noise can't consume the alert budget.
+
+Keeping #alerts readable (one root cause → one message):
+
+- **Burst collapse**: when a run has more than 3 new patterns for one service
+  (counting leftover un-alerted ones), the monitor sends ONE "N new error patterns
+  from <service>" message with the top 5 by count, first/last seen and a
+  `scripts/query-error-patterns.py --service <svc>` pointer, and marks them all
+  alerted (`BURST_COLLAPSE_MIN_PATTERNS` in `error_monitor/config.py`). It's
+  deterministic; LLM grouping is off in prod. The 10/run cap still applies.
+- **No link previews**: every error-monitor and `ops_alerts` post sets Discord
+  `flags: 4` (SUPPRESS_EMBEDS), so quoted GCP docs URLs don't unfurl into cards.
+- **Gated patterns**: a pattern with `alert_min_hourly_count` stays un-alerted
+  until more than that many occurrences land within an hour
+  (`firestore_adapter.is_below_alert_threshold`). Used for frontend chunk-load errors.
+- **Watchdog**: `EVENT_LOOP_STALL in progress` samples are WARNING. Only the
+  `ended` line is ERROR (≥10s blocked with a request affected), so one freeze is
+  one pattern. The `backend/event_loop_stalls` metric keys on that line too.
+- **Known noise** (`known_issues.py`) can be service-scoped, e.g.
+  github-runner-manager's scale-up "no available instance" aborts, and scoped to a
+  request path too (decide-search's `/api/search/health` aborts).
+- **Unhandled exceptions**: `Exception in ASGI application` and `request_audit_error`
+  become one `Unhandled exception: <Type: message>` pattern per cause, read from the
+  entry's `exception` field; the path goes in the sample only.
+- **One alert per job failure**: `ops_alerts` sends it from the status write, so
+  `Job <id> failed` and the download-failure lines before it are not ERROR patterns.
+  YouTube video ids are normalized out of signatures.
+
+Frontend crashes are captured via `window.onerror`, `unhandledrejection`, Next.js
+`error.tsx`, and a `CrashReportBoundary` around the review UIs. They POST to
+`/api/client-errors`, which normalises and upserts into the same `error_patterns`
+collection with `service="frontend"` so they flow through the existing
+Discord-alerting pipeline. `ChunkLoadError` after deploy triggers an automatic
+hard reload; the `CrashReport` card also checks `/version.json` and shows an
+"Update now" CTA when the running bundle is stale. Because the client recovers,
+chunk-load reports (`is_chunk_load_error`, mirrors `isChunkLoadError` in
+`frontend/lib/version-check.ts`) collapse into one pattern **per build** that
+alerts only above 10 in an hour, which means a broken deploy. Safari/Firefox
+stacks have no `Name: message` header, so ingestion prepends the message before
+hashing. Otherwise every error from one frame shared a pattern named
+`@https://gen.nomadkaraoke.com`.
+
+Noise is dropped before alerting: benign messages (media `AbortError`, ResizeObserver
+loop) and opaque cross-origin `Script error.` events (no error object — thrown by
+third-party/extension scripts) are skipped client-side, and `/api/client-errors`
+accepts-but-ignores reports from bot user agents and `Script error.` window errors
+with a blank filename/lineno
+(covers older cached bundles).
+
+## Edge Security (Cloudflare)
+
+`api.nomadkaraoke.com` is proxied through Cloudflare (orange-cloud) — the same
+zone that already fronts the marketing site, `gen`, `decide`, and the tenant
+portals (zone `2324a342622e93343cf4e08227d82c02` in the dedicated Nomad Karaoke
+Cloudflare account `4585249dcf5d2f9fb4e075c5382cd071` since 2026-10-14; previously
+in Andrew's personal account). Cut over 2026-07-20 after a vuln-scanner hammered the previously
+directly-exposed Cloud Run origin. Managed as IaC in
+`infrastructure/modules/edge_security.py` (`pulumi_cloudflare`).
+Everything else in that Cloudflare account (all zones' DNS, other rulesets, email routing,
+tunnels, Zero Trust Access, Pages/Worker domains) is the separate `nomad-cloudflare` Pulumi
+project in `infrastructure/cloudflare/`; its README lists which phases/records each stack owns.
+
+**Request path:** client → Cloudflare edge → Cloud Run. At the edge:
+- **WAF** (`http_request_firewall_custom`) blocks exploit/secret-exposure paths
+  (`/.env`, `/.git/`, `/.ssh/`, `wp-config`, `/etc/passwd`, …) — uses the
+  `contains` operator (regex `matches` needs a Business plan; zone is Free).
+- **Rate limiting** (`http_ratelimit`) — per-IP flood control (Free-plan limits:
+  `period=10s`, characteristics must include `cf.colo.id`). Excludes
+  `/api/internal/*` (scheduler/Cloud-Tasks cron).
+- **Origin lock** — a Transform Rule injects a secret `X-Edge-Auth` header
+  (`http_request_late_transform`); the backend's `EdgeAuthMiddleware`
+  (`backend/middleware/edge_auth.py`, `EDGE_AUTH_MODE=enforce`) rejects public
+  requests lacking it, so hitting the raw `*.run.app` origin directly is blocked
+  (health/root exempt for Cloud Run probes). Internal callers reach the backend
+  via `api.nomadkaraoke.com` (Cloud Tasks use `CLOUD_RUN_SERVICE_URL`), so they
+  traverse the edge and carry the header.
+
+**SSL:** zone TLS mode is **"full"** (not strict). The Cloud Run domain-mapping
+managed cert cannot provision behind Cloudflare (ACME challenge not visible), but
+"full" mode doesn't validate the origin cert, so the edge works and is
+**renewal-safe** — no run.app Origin Rule or load balancer needed. **Never switch
+the zone to "full (strict)".** Full rationale + cutover runbook:
+`docs/archive/2026-07-20-edge-security-hardening-plan.md` and
+`docs/archive/2026-07-20-edge-security-cutover-runbook.md`.
+
+## Processing Pipeline
+
+```text
+1. UPLOAD
+   POST /api/jobs/upload
+   • Save audio to GCS
+   • Create job in Firestore
+   • Trigger parallel workers
+
+2. PARALLEL PROCESSING (with Worker Registry coordination)
+   ┌─────────────────┐    ┌─────────────────┐
+   │  Audio Worker   │    │  Lyrics Worker  │
+   │  Cloud Run GPU      │    │  AudioShake     │
+   │  2-stage sep    │    │  Auto-correct   │
+   │  ↓ register()   │    │  ↓ register()   │
+   │  ↓ unregister() │    │  ↓ unregister() │
+   └────────┬────────┘    └────────┬────────┘
+            └──────────┬───────────┘
+                       ▼
+3. SCREENS GENERATION + BACKING VOCALS ANALYSIS + AUDIO TRANSCODING
+   • Title screen (5s video)
+   • End screen (5s video)
+   • Analyze backing vocals track (for instrumental selection)
+   • Transcode audio to OGG Opus for review UI (~3 MB vs 35 MB FLAC)
+                       ▼
+4. COMBINED HUMAN REVIEW (AWAITING_REVIEW)
+   • React UI for lyrics correction
+   • Preview video generation (optionally via GCE for speed)
+   • Instrumental track selection (clean vs with_backing)
+   • Single submit saves both lyrics + instrumental choice
+                       ▼
+5. VIDEO RENDERING (optionally via GCE for speed + memory)
+   • Merge corrections with original data
+   • Generate karaoke video with lyrics (OutputGenerator + ffmpeg/libass)
+   • Style assets cached on GCE worker disk between jobs
+                       ▼
+6. FINAL VIDEO (INSTRUMENTAL_SELECTED, via GCE)
+   • Remux with selected instrumental
+   • Concatenate: title + karaoke + end
+   • Encode to 4 formats
+                       ▼
+7. COMPLETE
+   • User downloads via signed URLs
+```
+
+**Note**: As of 2026-01, instrumental selection is combined with lyrics review. Users complete both in a single session rather than in separate steps.
+
+## Job States
+
+| State | Description | Human Action |
+|-------|-------------|--------------|
+| `pending` | Job created | - |
+| `downloading` | Processing audio | - |
+| `awaiting_duration_confirm` | **Waiting for human** — duration-based credit cost confirmation before separation/transcription (see [Duration-Based Pricing](API.md#duration-based-pricing)) | Confirm credit charge (or buy more credits) |
+| `separating_stage1` | Audio separation stage 1 | - |
+| `separating_stage2` | Audio separation stage 2 | - |
+| `transcribing` | Lyrics transcription | - |
+| `generating_screens` | Creating title/end screens + backing vocals analysis | - |
+| `awaiting_review` | **Waiting for human** | Review lyrics + select instrumental |
+| `in_review` | Human actively reviewing | Edit lyrics + select instrumental |
+| `review_complete` | Review submitted with instrumental selection | - |
+| `rendering_video` | Generating karaoke video | - |
+| `instrumental_selected` | Instrumental confirmed, ready for final video | - |
+| `generating_video` | Final encoding | - |
+| `complete` | All done | Download files |
+| `failed` | Error occurred | - |
+
+**Note**: `awaiting_instrumental_selection` exists for backwards compatibility with historical jobs but is no longer used. Instrumental selection is now part of the combined review (`awaiting_review` → `in_review` → `review_complete`).
+
+**`awaiting_duration_confirm` details**: This state is a blocking human checkpoint inserted before
+`separating_stage1`. It is entered when the actual measured duration costs more than was already
+charged (stored in `state_data.duration_confirm_reason` as `"reconcile"`). This applies to all
+job types (URL, upload, search): 1 credit is charged at creation; ffprobe measures the actual audio
+via a signed URL just before workers start; if the true cost exceeds the hold,
+`state_data.pending_additional_credits` records the delta owed and the job pauses here.
+
+`POST /api/jobs/{id}/confirm-duration` deducts the owed credits and triggers workers.
+If the actual duration exceeds 60 min all charged credits are refunded and the job is cancelled.
+If it costs less than charged an auto-refund is issued silently. Admin/made-for-you jobs bypass
+this state entirely. See `docs/archive/2026-06-04-long-duration-input-handling-design.md`.
+
+**`state_data.credits_charged`** is the authoritative running total of consumer credits debited
+for a job (written by `create_job`, updated by audio selection, reconcile and confirm-duration;
+`0` + `payment_bypassed=True` for admin/tenant/no-email jobs). Every reader — reconcile,
+confirm-duration, `/select`, bulk auto-select, `_refund_credit_for_job`, the 48h stale expiry —
+must use `backend/services/job_credits.get_credits_charged()`. For legacy jobs missing the field it
+returns what `create_job` actually debited: `0` for admin/tenant/no-email/bypassed jobs, else `1`.
+Never replace the whole `state_data` map after `create_job` (use dotted `state_data.<key>` updates;
+resets must keep `preserve_billing_state()`): before v0.278.2 create-from-search did, wiping the
+charge so reconcile (missing=1) and confirm-duration (missing=0) disagreed.
+
+**State Machine Robustness (Feb 2026)**: State transitions are enforced by `STATE_TRANSITIONS` in `models/job.py`. Invalid transitions raise `InvalidStateTransitionError` by default. Use `scripts/generate_state_diagram.py` to generate a Mermaid diagram of valid transitions. The `/health/job-consistency` endpoint detects jobs stuck in invalid states. See `docs/archive/2026-02-02-state-machine-robustness-plan.md` for implementation details.
+
+## GCS File Structure
+
+```text
+jobs/{job_id}/
+├── input/
+│   └── original.flac              # Uploaded audio
+├── stems/
+│   ├── vocals.flac
+│   ├── instrumental_clean.flac
+│   ├── instrumental_with_backing.flac
+│   └── ...
+├── lyrics/
+│   ├── corrections.json           # Auto-corrected
+│   ├── corrections_updated.json   # After human review
+│   ├── edit_log_{session}.json    # User edit log with feedback
+│   ├── annotations.json           # Correction annotations
+│   └── karaoke.ass
+├── screens/
+│   ├── title.mov
+│   └── end.mov
+├── videos/
+│   └── with_vocals.mkv            # Raw karaoke video (FLAC audio, large)
+└── finals/
+    ├── with_vocals_mp4.mp4        # Encoded with-vocals (H264/AAC, ~3x smaller)
+    ├── lossless_4k.mp4
+    ├── lossless_4k.mkv
+    ├── lossy_4k.mp4
+    └── lossy_720p.mp4
+```
+
+## Storage Retention
+
+Approved plan: `docs/archive/2026-10-03-gen-storage-retention-plan.md` (workspace repo). Generated files
+are regenerable, so a daily Cloud Scheduler job (`storage-retention-daily`, 10:30 UTC) →
+`POST /api/internal/storage-retention/run` → Cloud Run Job `storage-retention-job` (us-east4,
+`backend/workers/storage_retention_worker.py`; the API throttles CPU outside requests and Cloudflare
+cuts requests at 100s) → `backend/services/storage_retention.py` purges them from
+jobs completed (newest `complete` timeline entry) more than `STORAGE_RETENTION_MIN_AGE_DAYS` (30) ago.
+
+- **Kept forever:** `input/*` (incl. `edited.flac`), `lyrics/`, `style/`, `review_sessions/`,
+  `audio_edit*/`, `uploads/`, `packages/`, `analysis/`, `screens/*.png|jpg`, the 720p final (both the
+  descriptive and `lossy_720p_mp4.mp4` copies), `stems/custom_instrumental.*`, `stems/vocals_derived.*`, `stems/lead_vocals.*` (word-timing training data, since v0.287.1)
+  and the job-root `custom_instrumental.*` / `existing_instrumental.*`. Unknown files are kept.
+- **Purged:** other `finals/*`, `videos/*`, `previews/*`, `encoded/*`, `quick/*.mp4`, `screens/*.mov`,
+  `review-audio/*`, and separated `stems/*` (only when the input audio is in `jobs/{id}/input/`).
+- **Never touched:** finalise-only jobs, jobs whose input audio is gone, jobs mid edit/re-render/
+  visibility change/regenerate, pending deferred YouTube uploads, `STORAGE_RETENTION_EXCLUDED_TENANTS`.
+- **DRY-RUN by default** (`STORAGE_RETENTION_DRY_RUN`, default true): writes a report to
+  `gs://<bucket>/storage-retention/reports/<ts>-dry-run.json`. Real runs purge
+  `STORAGE_RETENTION_MAX_JOBS_PER_RUN` jobs per pass (cursor in `storage_retention/state`), atomically
+  re-check eligibility (`state_data.storage_purge_in_progress` claim), drop the purged `file_urls`
+  entries and record `renders_purged_at`, `stems_purged_at` and a `storage_purge` manifest.
+  `?job_ids=a,b&dry_run=false&min_age_days=0` runs a scoped real pass (testing); a global real purge
+  only happens via the setting.
+- **Regenerate** (`backend/services/regenerate_service.py`): customer button / admin / kjbox →
+  GCS-only re-run (see docs/API.md § Regenerate Video). Every flow that rebuilds a completed job
+  (regenerate, admin/theme re-render, private→public, Edit, retry) passes the screens worker, whose
+  **stems gate** (`backend/services/stems_restore.py`) re-runs the audio-separation job in restore mode
+  when `stems_purged_at` is set; the audio worker re-triggers screens when the stems are back.
+- Bucket: versioning on, noncurrent (overwritten or deleted) versions kept 7 days, soft delete 7 days —
+  purged bytes remain recoverable for about two weeks.
+- Every deleted object is logged (path, size, generation) under
+  `storage-retention/deletion-logs/`; review/restore commands and the one-off orphan-folder cleanup are in
+  `docs/STORAGE-RETENTION.md`.
+
+## LyricsTranscriber Integration
+
+**Key Design Decision**: We use LyricsTranscriber as a **library**, not a server.
+
+```text
+CLI Mode (Original):              Cloud Mode (Our Approach):
+────────────────────              ──────────────────────────
+LyricsTranscriber                 LyricsTranscriber
+├── transcribe()                  ├── transcribe()    ✅
+├── correct()                     ├── correct()       ✅
+├── ReviewServer.start()          │
+│   └── BLOCKS (waits)            │  (Skip server, save JSON)
+│                                 │  ... ASYNC GAP ...
+│                                 │  (Human reviews via React)
+└── OutputGenerator               │
+                                  └── OutputGenerator  ✅
+                                      (called after review)
+```
+
+**Use**: `LyricsTranscriber`, `CorrectionResult`, `OutputGenerator`, `OutputConfig`
+**Don't use**: `ReviewServer`, blocking waits
+
+## External Services
+
+| Service | Purpose | Required |
+|---------|---------|----------|
+| Cloud Run GPU Job (L4, us-east4) | Audio stem separation — `Separator` runs directly in the audio worker Job (no HTTP hop) | Yes |
+| AudioShake | Lyrics transcription | Yes |
+| Gemini Developer API (`gemini-api-key`) | Agentic AI correction (Gemini 3.8 Flash) | Default off (SKIP_CORRECTION=false to enable) |
+| Genius | Reference lyrics | Yes |
+| Flacfetch | Audio downloads (YouTube, torrents) | Recommended* |
+| YouTube API | Video upload | Optional |
+| Postmark | Email notifications | Optional |
+| Cloud Tasks | Delayed task scheduling (idle reminders, YouTube queue) | Optional |
+| Cloud Scheduler | Hourly YouTube upload queue processing | Optional |
+| Cloud Monitoring | Cross-reference YouTube API quota consumption from GCP metrics | Optional |
+| karaoke-decide | Song catalog (MusicBrainz + Spotify) for autocomplete | Optional |
+| KaraokeNerds | Community karaoke version detection | Optional |
+
+*Flacfetch runs on a dedicated server (Netcup VPS, reached over public HTTPS) with YouTube cookies and tracker access. Without it, YouTube downloads will fail due to bot detection on Cloud Run IPs.
+
+### Data Pipeline Cloud Functions
+
+Three Cloud Functions manage the community karaoke data pipeline, running daily on automated schedules:
+
+| Function | Schedule | Purpose |
+|----------|----------|---------|
+| `divebar-mirror` | Daily 2:00 AM ET | Indexes 48K+ files from [diveBar Karaoke Google Drive](https://drive.google.com/drive/folders/1zxnSZcE03gzy0YVGOdnTrEIi8It_3Wu8) into BigQuery `divebar_catalog` |
+| `kn-data-sync` | Daily 3:05 AM + 4:30 AM ET | Fetches KaraokeNerds catalog (281K songs) and community tracks (58K with YouTube URLs) to BigQuery + GCS. `full` mode then exports the **kjbox song-identification index** (≈6.6M rows: MusicBrainz songs scored/kept by Spotify track popularity and **ListenBrainz** listeners (`lb_*` tables from karaoke-decide's `lb-refresh`), the Spotify snapshot ≥ 30, and all KN; ~8 GB scanned, ~25 s; `EXPORT DATA` → `gs://nomadkaraoke-kn-data/song-id/<run>/songs-*.tsv.gz`, manifest `song-id/latest.json`, last 3 runs kept), which the NomadPC downloads. Design: kjbox `docs/SONG-IDENTIFICATION.md` |
+| `divebar-lookup` | Daily 6:00 AM ET + on-demand API | Public search/lookup API for KJ Controller; rebuilds KN↔Divebar cross-reference index |
+
+**Infrastructure** (Pulumi-managed in `infrastructure/`):
+- Service accounts: `divebar-mirror@`, `kn-data-sync@`, `divebar-lookup@` (least-privilege IAM)
+- GCS: `nomadkaraoke-kn-data` (raw exports), 3 source buckets for function code
+- BigQuery tables: `divebar_catalog`, `karaokenerds_community`, `kn_divebar_xref` (in `karaoke_decide` dataset)
+- Secret: `karaokenerds-api-key` (KN API access)
+
+**Source code:** `infrastructure/functions/{divebar_mirror,kn_data_sync,divebar_lookup}/`
+
+## Mobile app sign-in
+
+The Nomad Karaoke mobile app (nomad-mobile) signs in three ways, all ending in the same user/session code as the
+web (`backend/api/routes/login_code.py`, see [API.md § User Authentication](API.md#user-authentication)):
+email code (`send-code` / `verify-code`), Google ID token (`/auth/google`) and Apple ID token (`/auth/apple`).
+It opens the web review with a 2-minute single-use handoff link (`/auth/handoff-token`) and returns from Stripe
+through the `/credits/app-return` bounce to the `nomadkaraoke://` scheme.
+A Google or Apple identity with a verified email links to the existing account with that email (same credits, no
+second welcome credit); an Apple "Hide My Email" relay address is its own account.
+
+Config (all public, non-secret; env vars override the defaults in `backend/config.py`):
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `GOOGLE_OAUTH_CLIENT_IDS` | Web + iOS client IDs below | Accepted `aud` of Google ID tokens |
+| `APPLE_SIGNIN_AUDIENCES` | `com.nomadkaraoke.mobile,com.nomadkaraoke.sing` | Accepted `aud` of Apple ID tokens: the app's bundle ID + the kjbox singer page's web Services ID |
+| `MOBILE_APP_SCHEME` | `nomadkaraoke` | Scheme the checkout bounce redirects to |
+
+Google OAuth clients (GCP project `nomadkaraoke`, Google Auth Platform, consent screen "Nomad Karaoke"):
+
+| Name / type | Client ID | Notes |
+|-------------|-----------|-------|
+| Web application ("Nomad Karaoke Mobile App (server audience)") | `718638054799-fush0smd1e4icq9pt0immp8n59jjlebh.apps.googleusercontent.com` | The audience: Android Credential Manager and iOS (with `serverClientId` / `webClientId`) issue tokens for it. Authorized JavaScript origins: `https://decide.nomadkaraoke.com`, `https://sing.nomadkaraoke.com` (added 2026-10-28 for the kjbox singer page's Sign in with Google button) |
+| iOS | `718638054799-hre535n83p8i85tsqf6ai759nlubhd2o.apps.googleusercontent.com` | Also accepted as an audience (iOS SDK tokens can carry it) |
+| Android | `718638054799-q0f65m68a31du5nn9h5accsauad232ku.apps.googleusercontent.com` | Device-only, never an audience. Package `com.nomadkaraoke.mobile`, SHA-1 `5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25` (the RN/Expo template debug keystore); add the release key's SHA-1 before store builds |
+
+### kjbox singer page (sing.nomadkaraoke.com)
+
+The kjbox singer page signs singers in to their gen account for make-its through the partner endpoints
+`POST /api/kjbox/auth/google|apple` ([API.md](API.md)), with the same token checks as above. Console setup,
+done 2026-10-28 (no IaC covers these):
+
+- **Google:** `https://sing.nomadkaraoke.com` added as an Authorized JavaScript origin on the Web application client above
+  (Google Identity Services button, ID token straight to JS).
+- **Apple** (developer team 55B76HN73D, Andrew's Apple ID):
+  - Services ID **`com.nomadkaraoke.sing`** ("Nomad Karaoke Singer Web"), with Sign in with Apple enabled.
+    Its primary App ID is `com.nomadkaraoke.mobile`, its domain `sing.nomadkaraoke.com` and its return URL
+    `https://sing.nomadkaraoke.com/`. Sign in with Apple JS runs in popup mode.
+  - **Private email relay:** the domain `nomadkaraoke.com` is registered as an email source (SPF ✓). Without it,
+    Apple drops mail from gen to any `@privaterelay.appleid.com` user, which affects the mobile app's Apple sign-ins too.
+
+## Session lifetime
+
+`SESSION_EXPIRY_DAYS = 30` (inactivity) and `SESSION_ABSOLUTE_EXPIRY_DAYS = 365` (from sign-in) in
+`backend/services/user_service.py`. Both changed on 2026-10-28: they were 7 and 30, which signed out singers who come
+to weekly shows between visits.
+
+## Firestore Collections
+
+karaoke-gen shares a GCP project (`nomadkaraoke`) with karaoke-decide, but uses separate Firestore collections:
+
+| Collection | Purpose | Key Fields |
+|------------|---------|------------|
+| `gen_users` | karaoke-gen user accounts | email, credits, role, is_active |
+| `jobs` | Karaoke generation jobs | job_id, user_email, status, state_data, processing_metadata |
+| `jobs/{job_id}/logs` | Worker log entries (subcollection) | timestamp, level, worker, message, ttl_expiry |
+| `sessions` | Magic link auth sessions | user_email, token, expires_at |
+| `magic_links` | Passwordless auth tokens | email, token, expires_at, used |
+| `user_feedback` | User feedback for credits (all users) | user_email, ratings, comments, created_at |
+| `beta_feedback` | Beta program feedback (deprecated) | user_email, ratings, comments |
+| `youtube_quota_pending` | Pending YouTube API quota buffer (~7min GCP delay) | pending_units, pending_uploads[], updated_at |
+| `youtube_upload_queue` | Deferred YouTube uploads | job_id, status, user_email, queued_at, youtube_url |
+
+**Note**: The `users` collection in the same Firestore instance belongs to karaoke-decide (different schema: user_id, is_guest, quiz_* fields). Don't use it for karaoke-gen.
+
+**Worker Logs**: Stored in subcollection (`jobs/{job_id}/logs`) instead of embedded array to avoid Firestore's 1MB document size limit. TTL policy auto-deletes logs after 30 days. Feature flag: `USE_LOG_SUBCOLLECTION` (default: true). See [LESSONS-LEARNED.md](LESSONS-LEARNED.md#firestore-document-1mb-limit-with-embedded-arrays).
+
+## Encoding Worker: blue-green primary pair + multi-family fallback pool
+
+> **2026-11 update:** the c4d Spot pair (`encoding-worker-a`/`-b`) is **retired and deleted**. The preferred encoder (and distribution worker) is the AWS EC2 box `aws-encoding-worker-1`; the only GCE VM is the on-demand fallback `encoding-worker-fallback-c2df` (us-central1-f). `config/encoding-worker` keeps `primary_vm`/`secondary_vm` empty, so every selection path routes to a fallback and records it as `active_override_*`. CI blue-green deploys now just validate the new wheel on c2df and stop it again (the AWS override keeps serving); the worker-change gate diffs against `validated_version`. The pair-specific text below is historical.
+
+The GCE encoding worker is a **blue-green primary pair** (`encoding-worker-a`/`-b`,
+both **Spot** c4d-highcpu-16 in us-central1-c) plus **one on-demand fallback**
+(`encoding-worker-fallback-c2df`, c2d-highcpu-16, us-central1-f). **3 VMs total**
+(cut from 10 on 2026-09-26 — docs/archive/2026-09-26-encoding-cost-cuts.md), all
+TERMINATED by default, started on demand, and idle-stopped after 5 min.
+
+**Spot preemption:** the pair uses `instance_termination_action=STOP`, so a
+preempted worker is just a TERMINATED VM that the next request restarts. An
+encode in flight when the VM is preempted is detected by
+`EncodingService.wait_for_completion` (the pinned worker VM is no longer RUNNING)
+and raised as `EncodingJobLostError`, which `run_with_lost_job_resubmit` resubmits
+— the resubmit's connection failure then starts the Spot VM again, or the
+on-demand fallback if Spot capacity is gone.
+
+### AWS encoding worker (EC2, provider "aws")
+
+**`aws-encoding-worker-1`** is a c7a.4xlarge on-demand instance in us-east-2. It runs the same `gce_encoding` service and is one more entry in the `encoding-worker-fallback-vms` pool (`"provider": "aws"`, plus `instance_id` and `region`). It is paid for by AWS Activate credits. IaC lives in `infrastructure/aws/` (its own Pulumi stack; see its README).
+
+- **Control:**
+  - The manager routes AWS VMs to `backend/services/aws_encoding_compute.py`, an EC2 adapter that mimics the compute client. EC2 states map to GCE statuses, and EC2 capacity errors join `CAPACITY_ERROR_CODES`.
+  - So failover, overrides, lost-job detection and stockout cooldowns apply unchanged.
+  - The override records `active_override_provider: "aws"`. The CI blue-green deploy and the idle Cloud Function both ignore the AWS worker.
+- **Ranking:**
+  - It is a last resort by default (`SPEED_RANK["c7a"] = 90`).
+  - Firestore `config/encoding-worker.speed_rank_overrides = {"c7a": 5}` makes it preferred with no deploy.
+  - Both warmups (`ensure_preferred_running`) follow the same ranking, so they warm the worker requests are routed to.
+- **Distribution on AWS (Phase 2, off by default):** with `config/encoding-worker.aws_video_worker = true` and the AWS worker ranked first, `trigger_video_worker` runs the video worker on the box (`POST /run-worker`, env mirrored from the live `video-encoding-job`, identity `karaoke-backend@` via WIF). Uploads leave from AWS, and finals are handed over locally (`local_encoded_outputs`) instead of downloaded back from GCS. Any failure falls back to the Cloud Run job.
+- **Auth and lifecycle:**
+  - GCP access is Workload Identity Federation as `encoding-worker@`: no keys.
+  - It stops itself when idle (`infrastructure/encoding-worker/aws/idle-watchdog.py`).
+  - It gets new code at boot and per job, with no blue-green deploy.
+
+### Architecture
+
+```text
+Frontend → Backend (Cloud Run) → Firestore config → active worker (primary, or a
+                                                   ↑  capacity-fallback "override")
+Cloud Scheduler (2 min) → Cloud Function → checks idle (5 min) + stops VMs
+                                                   ↑
+CI (GitHub Actions) → selects a fresh "green" (ranked pool) → health + encode test
+                       → promote (swap primary OR set active_override) → stop old
+```
+
+### Multi-instance-type pool (stockout resilience, v0.195.0)
+
+A single machine family can hit a region-wide `ZONE_RESOURCE_POOL_EXHAUSTED`
+stockout across every zone at once. To survive that, the fallback lives in a
+different family AND zone from the c4d pair: `encoding-worker-fallback-c2df`
+(c2d-highcpu-16, on-demand, us-central1-f). The pool was 8 fallbacks across 6
+families (v0.195.0) until the 2026-09-26 cost cut; the selection machinery below
+still handles any number of fallbacks — re-add entries to
+`EncodingWorkerConfig.FALLBACKS` + the `encoding-worker-fallback-vms` secret if
+stockouts become a problem again.
+
+**Candidate ordering is one shared pure module**,
+`backend/services/encoding_worker_preference.py::ordered_candidates(pool, capacity_state)`,
+used by BOTH runtime selection and deploy green selection so they can't drift:
+- **Fastest-first** by `SPEED_RANK` (c4d preferred whenever it can start).
+- **Availability-aware**: a family that recently hit a capacity/stockout error is
+  recorded in the Firestore `capacity_state` map and **demoted for a 15-min
+  cooldown**, then re-probed — so we stop wasting ~2 min probing a dead family but
+  snap back to c4d the moment capacity returns.
+
+The fallback fleet is defined in `infrastructure/config.py::EncodingWorkerConfig.FALLBACKS`
+and published to the backend/idle-fn via the `encoding-worker-fallback-vms` secret
+(entries: `{vm, zone, ip, machine_type}`).
+
+### Key Components
+
+**Primary pair + fallback fleet**: All VMs TERMINATED by default. The primary pair
+(a/b) does blue-green deploys; the 8 fallbacks absorb capacity stockouts. Runtime
+warmup (`encoding_worker_manager.ensure_any_running`) tries the ranked candidates
+in order, falling through on stockout and recording an `active_override` when it
+lands on a fallback.
+
+**Firestore config doc** (`config/encoding-worker`): source of truth for routing.
+Fields: `primary_vm`/`primary_ip`/`primary_version`, `secondary_vm`/…, the
+capacity-fallback pointer `active_override_vm`/`_ip`/`_zone`/`_version` (set when a
+fallback is serving), `deploy_in_progress`, `last_activity_at`, and the
+`capacity_state` map (`{"<machine_type>@<zone>": last_stockout_iso}`). `active_url`
+= override IP if set, else primary IP.
+
+**Backend routing** (`encoding_interface.py`): reads the active worker IP from the
+config doc with a 30-second TTL cache.
+
+**JIT startup**: entering the lyrics-review page starts the worker on demand
+(~60 s natural warmup), avoiding 24/7 cost and cold-start latency.
+
+**Idle auto-shutdown**: a Cloud Function (every 5 min) stops idle VMs (primary,
+secondary, and every fallback in the secret) based on Firestore activity — external
+to the VM so a sick worker still gets stopped.
+
+**Capacity-aware deploys**: CI selects a FRESH "green" from the ranked pool via
+`deploy_promote.select_green_candidates` (the same preference module) — the c4d
+secondary if it can start, else a fallback family, never the currently-serving
+override. After a real encode test on the green, it promotes: a c4d-secondary green
+does the classic primary swap (and clears any stale override); a fallback green
+becomes the `active_override`. The retired VM is drained + stopped; a failed health
+check never promotes. Override routing keys off an explicit `is_primary` flag, not
+list position. See `infrastructure/encoding-worker/deploy_promote.py`.
+
+**Self-sufficient image**: the Packer image (`infrastructure/packer/scripts/provision.sh`)
+bakes the full karaoke-gen dependency tree with **CPU-only torch**, so a fresh VM of
+any family boots ready to encode (no first-job dependency install).
+
+### Seeding the Config
+
+Initial setup or reset:
+```bash
+python scripts/seed-encoding-worker-config.py <ip-a> <ip-b>
+```
+
+### Deploy Flow (capacity-aware, v0.194.2+)
+
+```text
+1. CI builds new karaoke-gen wheel + pushes to GCS
+2. CI picks a FRESH "green" from the ranked pool (select_green_candidates →
+   ordered_candidates): the c4d secondary if it can start, else the fastest
+   available fallback family — never the currently-serving active_override.
+3. CI starts the green, waits for /health, runs a real encode test against it.
+4. If the test FAILS: CI stops the green; primary/override unchanged (no promote).
+5. If the test PASSES: CI promotes the green:
+   - green is the c4d secondary  → swap it to `primary_vm` (classic blue-green)
+                                    AND clear any stale `active_override_*` so
+                                    traffic returns to the fresh c4d primary.
+   - green is a fallback family   → set it as `active_override_*` (the serving
+                                    worker); leave primary/secondary so c4d
+                                    resumes as primary when its capacity returns.
+6. CI drains (waits active_jobs==0, bounded) + stops the retired VM — never the
+   promoted green.
+7. Last resort (no separate green can start, e.g. deep stockout): in-place restart
+   of the current serving override — a brief blip, covered by client auto-resubmit.
+```
+
+Override routing keys off an explicit `is_primary` flag (not list position), so a
+fallback ranked ahead of a stocked-out primary is still routed correctly. Pure
+decision logic + unit tests: `infrastructure/encoding-worker/deploy_promote.py`.
+
+## Video Worker Orchestrator
+
+The Video Worker uses an orchestrator pattern to ensure all features work regardless of encoding backend (local Cloud Run or GCE VM).
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                 VideoWorkerOrchestrator                      │
+│                                                             │
+│  Stage 1: PACKAGING        Stage 2: ENCODING                │
+│  ├─ CDG file generation    ├─ Local (FFmpeg)               │
+│  └─ TXT lyrics export      └─ GCE (remote VM)              │
+│                                                             │
+│  Stage 3: ORGANIZATION     Stage 4: DISTRIBUTION           │
+│  ├─ Final path setup       ├─ Dropbox upload               │
+│  └─ File organization      ├─ Google Drive upload          │
+│                            └─ YouTube upload               │
+│                                                             │
+│  Stage 5: NOTIFICATIONS                                     │
+│  ├─ Discord webhooks                                        │
+│  └─ Email notifications (completion, reminders)             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Design Decision**: The orchestrator coordinates stages rather than embedding logic in monolithic functions. This:
+- Ensures all features work with both local and GCE encoding
+- Makes each stage independently testable (139 new tests)
+- Allows feature flag rollback via `USE_NEW_ORCHESTRATOR` env var
+
+**Service Modules**:
+| Module | Purpose |
+|--------|---------|
+| `youtube_download_service.py` | YouTube audio downloads (TornadoAPI first, then remote flacfetch) |
+| `tornado_client.py` | Client for TornadoAPI (hosted YouTube downloads) |
+| `flacfetch_client.py` | Client for remote flacfetch HTTP API |
+| `audio_search_service.py` | Audio source search (YouTube, RED, OPS, Spotify) |
+| `youtube_upload_service.py` | YouTube OAuth flow and upload |
+| `discord_service.py` | Discord webhook notifications |
+| `packaging_service.py` | CDG/TXT package generation |
+| `local_encoding_service.py` | FFmpeg encoding (Cloud Run) |
+| `encoding_interface.py` | Abstract interface + GCE backend |
+| `video_worker_orchestrator.py` | Stage coordination |
+| `email_service.py` | Postmark email delivery with CC support |
+| `template_service.py` | GCS-backed email templates |
+| `job_notification_service.py` | Email orchestration (completion, reminders) |
+| `audio_transcoding_service.py` | Transcode FLAC → OGG Opus for review UI playback |
+| `youtube_quota_service.py` | Track YouTube API quota (GCP Cloud Monitoring + Firestore pending buffer) |
+| `email_validation_service.py` | Email validation, tiered disposable domain detection (static list + DeBounce + verifymail.io APIs), blocklist management |
+| `youtube_upload_queue_service.py` | Deferred YouTube upload queue management |
+| `catalog_proxy_service.py` | Proxy to karaoke-decide catalog API (artist/track search) |
+| `karaokenerds_service.py` | Scrape karaokenerds.com for community karaoke versions |
+
+## Audio Source Download Flow
+
+Audio can come from file upload or remote search (YouTube, torrents). All YouTube downloads route through `YouTubeDownloadService` to ensure consistent handling:
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│                     Audio Source Entry Points                         │
+│                                                                      │
+│  1. File Upload (/api/jobs/upload)                                   │
+│     └─ Direct to GCS → triggers workers                              │
+│                                                                      │
+│  2. YouTube URL (/api/jobs/create-from-url)                          │
+│     └─ YouTubeDownloadService → GCS → triggers workers               │
+│                                                                      │
+│  3. Audio Search + Select (/api/audio-search/...)                    │
+│     ├─ YouTube  → YouTubeDownloadService → GCS → triggers workers    │
+│     ├─ RED/OPS  → FlacfetchClient (torrent) → GCS → triggers workers │
+│     └─ Spotify  → FlacfetchClient (spotify) → GCS → triggers workers │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                    YouTubeDownloadService                             │
+│                                                                      │
+│  • Single entry point for ALL YouTube downloads in cloud             │
+│  • Uses remote flacfetch when FLACFETCH_API_URL is set (recommended) │
+│  • Falls back to local yt_dlp with warning (usually fails on CR)     │
+│  • Handles all URL formats (watch, youtu.be, shorts, embed)          │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│              Flacfetch server (Netcup VPS, off-GCP)                   │
+│                                                                      │
+│  • Has YouTube cookies (avoids bot detection)                        │
+│  • Has tracker credentials (RED, OPS private trackers)               │
+│  • Runs BitTorrent client for seeding                                │
+│  • Uploads directly to GCS (no data transfer through Cloud Run)      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Key environment variables**:
+- `FLACFETCH_API_URL` - public HTTPS URL of the flacfetch server (secret `flacfetch-api-url`). The
+  serverless VPC connector that once let Cloud Run reach the old GCE VM's private IP was deleted
+  2026-09-26; the backend and `audio-download-job` / `bulk-search-job` have no VPC egress, so every
+  dependency they call must be reachable on a public address.
+- `FLACFETCH_API_KEY` - API key for authentication
+- `TORNADO_API_KEY` - TornadoAPI key (secret `tornado-api-key`). When set, YouTube downloads and availability checks try Tornado first and fall back to flacfetch: WARNING per failed download, ERROR if the account is rejected. The secret was created by hand (not in `secrets.py`). CI wires it on the API service once it has a version; Pulumi wires it on `audio-download-job`, which does most YouTube downloads. It covers downloads only, so YouTube search still uses flacfetch's cookies.
+- `YOUTUBE_DOWNLOAD_PROVIDER` - set to `flacfetch` to switch Tornado off, e.g. `gcloud run services update karaoke-backend --update-env-vars YOUTUBE_DOWNLOAD_PROVIDER=flacfetch` (default `tornado`; the next CI deploy resets it, so also change the workflow to make it permanent).
+
+## Worker Execution
+
+Workers run via two mechanisms depending on their processing duration:
+
+### Cloud Run Jobs (Long-Running Workers)
+
+Audio and lyrics workers run as **Cloud Run Jobs** - standalone batch containers that run to completion without HTTP request lifecycle concerns. This eliminates the instance termination issue where Cloud Run would shut down instances mid-processing.
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  Cloud Run Jobs (via WorkerService)                             │
+│                                                                 │
+│  audio-download-job          - 30s-5 min typical; torrent waits ≤20/60 min │
+│  lyrics-transcription-job    - 5-15 min (AudioShake + correction, us-east4)│
+│  bulk-search-job             - batch audio search (us-east4)    │
+│  audio-separation-job        - 10-20 min (L4 GPU, us-east4, direct) │
+│  video-encoding-job          - up to 60 min (us-east4)          │
+│                                                                 │
+│  Triggered via: google.cloud.run_v2.JobsClient.run_job()        │
+│  Job ID passed as: --job-id argument                            │
+│  (bulk-search-job takes --batch-id instead)                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Job regions**: the CPU jobs a customer waits on (download, lyrics, bulk search, video/render) run in
+`us-east4` (`CPU_JOBS_REGION`), because Cloud Run Jobs in `us-central1` wait 2-5 min before the
+container starts. The bucket and GCE encoding VMs stay in `us-central1`. See TROUBLESHOOTING.md, "Cloud Run Jobs
+take 2-5 minutes to start".
+
+**Why Cloud Run Jobs**: When using FastAPI BackgroundTasks, Cloud Run would terminate instances when HTTP requests completed, even if background work was still running. Cloud Run Jobs solve this by running workers as standalone processes that complete naturally. This applies to audio downloads (jobs 51b8231d, 89e497b1 were killed mid-download), lyrics transcription (job c94cc9d6 killed mid-processing), and audio separation.
+
+**CLI Entry Points**: Each worker has a `main()` function for Cloud Run Job execution:
+- `python -m backend.workers.audio_download_worker --job-id abc123`
+- `python -m backend.workers.lyrics_worker --job-id abc123`
+- `python -m backend.workers.audio_worker --job-id abc123`
+- `python -m backend.workers.video_worker --job-id abc123`
+
+### HTTP Workers (Fast Workers)
+
+Screens and render workers run via internal HTTP endpoints with BackgroundTasks, as they complete quickly (~30 seconds). They still use the WorkerRegistry for coordination:
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                       WorkerRegistry                             │
+│                                                                 │
+│  register(job_id, "screens")   unregister(job_id, "screens")   │
+│  register(job_id, "render")    unregister(job_id, "render")    │
+│                                                                 │
+│  has_active_workers() → bool                                    │
+│  wait_for_completion(timeout) → bool                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Shutdown Handler** (in `main.py` lifespan):
+- On shutdown signal, checks `worker_registry.has_active_workers()`
+- If workers active, calls `wait_for_completion(timeout=600)` (10 min max)
+- Logs which workers are still running for debugging
+
+## Audio Separation Architecture
+
+Audio stem separation runs **directly inside the audio worker Cloud Run Job** — the `Separator` class from `audio-separator` is imported and called in-process. There is no separate GPU microservice.
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  audio-separation-job  (Cloud Run Job, L4 GPU, us-east4)         │
+│                                                                  │
+│  AudioWorker                                                     │
+│  ├── download audio from GCS                                     │
+│  ├── create_audio_processor()  ← Separator(model_file_dir=...)   │
+│  ├── Stage 1: instrumental_clean preset                          │
+│  │   └── produces: vocals.flac, instrumental_clean.flac          │
+│  ├── Stage 2: karaoke preset                                     │
+│  │   └── produces: instrumental_with_backing.flac                │
+│  └── upload stems to GCS                                         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Key decisions:**
+- **Direct GPU** — No HTTP hop to a separate service. Jobs can run up to 24h; no timeout concerns.
+- **Two-stage ensemble preset** — `instrumental_clean` (stage 1) + `karaoke` (stage 2).
+- **Model cache** — Models are downloaded to `model_file_dir` (GCS-backed or local) and reused across executions.
+
+**The `audio-separator` Cloud Run GPU service** (us-east4) was **shut down on 2026-10-01**
+(GCP cost cut, ~$22/mo). Prod gen jobs never used it; its only callers were Andrew's own
+remote-separation clients (`audio-separator-remote` / local `karaoke-gen` CLI with
+`AUDIO_SEPARATOR_API_URL`). Leave `AUDIO_SEPARATOR_API_URL` unset to separate locally. It
+is still defined in Pulumi behind the `audioSeparatorServiceEnabled` flag — see
+[GCP-COST-OPTIMIZATION.md](GCP-COST-OPTIMIZATION.md#audio-separator-service-shut-down-on-demand-redeploy)
+to bring it back on demand.
+
+### Voice-pool separate-only job
+
+`voice-pool-separate-job` (Cloud Run Job, L4 GPU, us-east4, same GPU image) serves karaoke-decide's
+voice session. decide writes a JSONL manifest (`voice-pool/manifests/<run>.jsonl`, lines
+`{"id", "audio": "gs://…/voice-pool/audio/<id>/original.flac"}`) and starts the job with a per-run
+`task_count`. Each task (`CLOUD_RUN_TASK_INDEX`/`COUNT`, round-robin over manifest order) loads one
+`instrumental_clean` Separator, writes `voice-pool/stems/<id>/vocals.flac` (skipped if present) and
+`<manifest>.results/part-<task>.jsonl` (`{id, ok, vocals, seconds, error}`, flushed every 10 songs).
+No Firestore or gen job state. gen's Pulumi only creates the job; decide's Pulumi creates the `voice-pool` SA and grants it `roles/run.jobsExecutorWithOverrides` on it. The job has `parallelism=1` (decide cannot override it), so tasks run one after another and a pool run never uses more than one L4, leaving GPU capacity to customers' `audio-separation-job`. Task timeout is 3600s (Cloud Run's GPU maximum), so each task must finish in under 1h: decide chunks manifests accordingly and treats a timed-out execution as "re-run" (re-runs skip finished songs). URIs outside the gen bucket fail as `wrong_bucket`. A model-load failure or an all-songs-failed task exits non-zero with one ERROR. Code: `backend/workers/voice_pool_separate_worker.py`.
+
+### Quick version (kjbox make-it jobs)
+
+For jobs created by kjbox on behalf of a singer (`request_metadata.client_id` starts with
+`kjbox`), the audio worker also produces a rough **scrolling-lyrics draft video** within a few
+minutes of the audio landing, so the singer can sing now instead of waiting ~30 min for the
+full NOMAD version. Code: `backend/services/quick_version/` (a port of kjbox `fastgen/`).
+
+1. **Before the ensemble**, one fast single-model pass (`UVR-MDX-NET-Inst_HQ_4.onnx`, fastgen's model;
+   baked by `download_models.py` `EXTRA_MODELS`, downloaded on load until the next GPU base rebuild;
+   falls back to the always-baked `mel_band_roformer_instrumental_fv7z_gabox.ckpt`, which took
+   14 s load + 124 s for a 3:15 song on the L4; override with `QUICK_VERSION_MODEL`) → quick
+   instrumental + vocals.
+2. A **background thread** renders the video while the GPU runs the ensemble: LRCLIB lyrics
+   (line-synced → time-anchored scroll; plain → constant crawl; none → title card), PIL-rasterised
+   crawl PNG + one ffmpeg `overlay` pass, 854×480, vocals mixed back in at 30% as a guide. Every
+   ffmpeg input and the output are bounded with `-t <duration>`: the GPU image's ffmpeg 4.4 never
+   ends on `-shortest` alone once `amix` is involved (first prod job ran into the 300 s join timeout).
+   LRCLIB is searched with the job's `lyrics_artist`/`lyrics_title` overrides (else artist + title
+   without a tempo label). If the exact title finds nothing, it retries once with the title's
+   decorations stripped (`clean_title`: trailing `(…)`/`[…]`, `- Live …`/`- Remaster` suffixes). A
+   synced hit from that retry keeps its timing only when its length is within 4 s of the audio
+   (otherwise it is likely another recording, e.g. studio vs live), and anything else becomes a constant
+   crawl. Added after a "… (Orchestral Version Live From Sound City)" draft rendered with no lyrics
+   (2026-11-06). kjbox can also add lyrics to a lyric-less draft on the box (kjbox v0.150.0).
+3. Uploads `jobs/{id}/quick/quick.mp4` → `file_urls.quick.video_mp4`, and records
+   `state_data.quick_version = {status: separating|rendering|ready|failed, lyrics_tier, ready_at, …}`.
+4. The worker joins the render (≤300 s) before cleaning up its temp dir — even when the ensemble
+   fails. Quick-version failures never fail the job. Skipped when `quick_version.status == ready`
+   (job retries), in remote-API separation mode, or with `KJBOX_QUICK_VERSION_ENABLED=false`.
+
+kjbox's GenPoller reads `state_data.quick_version` from `GET /api/jobs/{id}` and downloads the file
+via `/api/jobs/{id}/download/quick/video_mp4`.
+
+## Multitenancy
+
+The platform supports white-label B2B portals where business customers get their own branded karaoke generation experience.
+
+### Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  Tenant Detection Flow                                          │
+│                                                                 │
+│  Request arrives at vocalstar.nomadkaraoke.com                  │
+│         │                                                       │
+│         ▼                                                       │
+│  Frontend: detectTenantFromUrl()                                │
+│  - Extracts subdomain from hostname                             │
+│  - Calls GET /api/tenant/config?tenant=vocalstar                │
+│         │                                                       │
+│         ▼                                                       │
+│  Backend: TenantMiddleware                                      │
+│  1. X-Tenant-ID header (from frontend)                          │
+│  2. Query param (dev only, disabled in production)              │
+│  3. Host header subdomain detection                             │
+│         │                                                       │
+│         ▼                                                       │
+│  TenantService.get_tenant_config()                              │
+│  - Loads from GCS: tenants/{tenant_id}/config.json              │
+│  - Caches in memory (5 min TTL)                                 │
+│         │                                                       │
+│         ▼                                                       │
+│  Request proceeds with tenant context                           │
+│  - request.state.tenant_id                                      │
+│  - request.state.tenant_config                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### GCS Storage Layout
+
+```text
+tenants/{tenant_id}/
+├── config.json          # TenantConfig with branding, features, defaults
+└── logo.jpg             # Tenant logo (optional)
+
+themes/{theme_id}/
+├── style_params.json    # Full theme configuration
+└── assets/
+    ├── intro_background.png
+    ├── karaoke_background.jpg
+    ├── end_background.png
+    ├── font.ttf
+    └── cdg_*.gif
+```
+
+### Tenant Config Schema
+
+```python
+TenantConfig:
+  id: str                    # e.g., "vocalstar"
+  name: str                  # Display name: "Vocal Star"
+  subdomain: str             # e.g., "vocalstar.nomadkaraoke.com"
+  is_active: bool            # Enable/disable tenant
+  branding:
+    logo_url: str | None     # GCS path to logo
+    logo_height: int         # Pixels
+    primary_color: str       # Hex color
+    secondary_color: str
+    accent_color: str | None
+    background_color: str | None
+    favicon_url: str | None
+    site_title: str
+    tagline: str | None
+  features:
+    audio_search: bool       # Enable audio search (vs file upload only)
+    file_upload: bool
+    youtube_url: bool
+    youtube_upload: bool     # YouTube distribution
+    dropbox_upload: bool
+    gdrive_upload: bool
+    theme_selection: bool    # Allow user to pick theme
+    color_overrides: bool
+    enable_cdg: bool
+    enable_4k: bool
+    admin_access: bool
+  defaults:
+    theme_id: str | None     # Default theme if not locked
+    locked_theme: str | None # Force this theme (user cannot change)
+    distribution_mode: str   # "all", "download_only", etc.
+  auth:
+    allowed_email_domains: list[str]  # e.g., ["vocal-star.com"]
+    require_email_domain: bool
+    sender_email: str | None  # Override email sender
+```
+
+### Feature Enforcement
+
+**Frontend**: The `useTenant()` hook provides `features` object. UI components conditionally render based on enabled features:
+
+```typescript
+const { features } = useTenant()
+if (!features.audio_search) {
+  // Hide audio search tab
+}
+```
+
+**Backend**: Routes check tenant config from request state:
+
+```python
+tenant_config = get_tenant_config_from_request(request)
+if tenant_config and not tenant_config.features.audio_search:
+    raise HTTPException(403, "Audio search not enabled for this tenant")
+```
+
+### Active Tenants
+
+**Vocal Star** (`vocalstar.nomadkaraoke.com`)
+- Features: File upload only (no audio search, no YouTube URL), streamlined 4-field form (Artist, Title, Mixed Audio, Instrumental Audio)
+- Distribution: Cloud only (Dropbox + Google Drive to tenant-specific folders, no YouTube)
+- Theme: Locked to "vocalstar" theme (yellow/blue)
+- Auth: Restricted to `@vocal-star.com` and `@vocalstarmusic.com` emails
+- All jobs automatically private with VSTAR brand prefix
+- Setup: `python scripts/setup-vocalstar-tenant.py`
+
+**Singa** (`singa.nomadkaraoke.com`)
+- Features: File upload only (no audio search, no YouTube URL)
+- Distribution: Download only
+- Theme: Locked to "singa" theme (green/black)
+- Auth: Restricted to `@singa.com` emails
+- Setup: `python scripts/setup-singa-tenant.py`
+
+### Tenant Portal Frontend (B2B Deployment)
+
+B2B tenants are served from a **separate Cloudflare Pages project** (`karaoke-gen-tenant`) built with `NEXT_PUBLIC_TENANT_PORTAL=true`. This build flag enables tree-shaking of consumer-only content (landing page, pricing) at build time, keeping the bundle lean for white-label deployments.
+
+**Runtime tenant injection**: A Cloudflare Pages edge function intercepts HTML responses and injects tenant-specific configuration before the page reaches the browser:
+
+```javascript
+// Injected by edge function into <head>
+window.__TENANT_CONFIG__ = { id: "vocalstar", branding: { ... }, features: { ... } }
+// CSS variables for dynamic theming
+--tenant-primary-color: #ffd700;
+--tenant-background-color: #1a1a2e;
+```
+
+The frontend's `TenantProvider` reads `window.__TENANT_CONFIG__` on startup (no API round-trip needed for initial render). This approach works for both custom domains (`vocalstar.nomadkaraoke.com`) and the shared tenant portal domain.
+
+**Edge config cache** (`frontend/lib/edge/tenantConfigCache.ts`, v0.268.6). The edge cache works as stale-while-revalidate:
+- A config fetched under 5 minutes ago is served as is.
+- An older copy is still served, and a background refresh runs via `waitUntil`. Copies are kept up to 7 days.
+- A colo that has never cached the tenant waits on `/api/tenant/config` for at most 3s. On timeout or error the HTML goes out without injection, and `TenantProvider` fetches the config itself.
+- Concurrent misses in one isolate share a single backend fetch.
+
+Before this, a crawler loading 17 portal pages at once caused 17 simultaneous cache misses. Cloud Run spawned 5 cold instances, and the HTML waited 15-17s (2026-10-13). Branding changes still reach the edge within about 5 minutes, plus one page view to trigger the refresh.
+
+**Magic link emails**: When a tenant user requests a magic link, the email uses the tenant-specific URL (e.g., `https://vocalstar.nomadkaraoke.com/auth/verify?token=...`) rather than the main app URL. The `job_notification_service.py` resolves the correct base URL from the tenant config's `subdomain` field.
+
+**Admin preview**: Admins can preview any tenant's branding in the main app by appending `?preview_tenant=<tenant_id>` to any URL. This bypasses subdomain detection and loads the specified tenant config, useful for verifying branding before DNS cutover.
+
+**Tenant subdomains are automatic** (v0.246.0): `/admin/tenants` create provisions `{id}.nomadkaraoke.com` via the Cloudflare API (`services/tenant_domain_service.py`, secret `cloudflare-tenant-domains-token` = account-owned token scoped to Pages Read/Write + DNS Read/Write on the nomadkaraoke.com zone only), and delete removes it. Cloudflare Pages has no wildcard custom domains, so each tenant gets: (1) a Pages custom domain on `karaoke-gen-tenant`, (2) a proxied `CNAME <id>` → `karaoke-gen-tenant-x0h.pages.dev` (the project's pages.dev name since it was recreated in the Nomad Karaoke account on 2026-10-14; records pointing at the old `karaoke-gen-tenant.pages.dev` are still recognised as ours for deprovisioning). Existing non-tenant DNS records are never taken over or deleted. **Token blast radius (accepted risk):** Cloudflare can't scope Pages permissions to one project, so this token can modify any Pages project in the account (incl. the consumer `karaoke-gen` site) — it lives only in Secret Manager, readable by the backend SA; rotate it if the backend is ever compromised. DNS access is limited to the nomadkaraoke.com zone. No GCS CORS change is needed (bucket CORS allows any origin — safe because the bucket is private and signed URLs are the auth). Tenants created before this can be backfilled with **Manage → Set up domain** (`POST /api/admin/tenants/{id}/domain`). The subdomain is immutable (derived from the id). After a delete, other backend instances may still serve the tenant's cached config for up to 5 minutes (per-instance `TenantService` TTL).
+
+**Theme/tenant edits take effect immediately**: while the storage bucket was publicly readable (until 2026-09-28), GCS served objects with the default `Cache-Control: public, max-age=3600` and even the backend's own reads could return a stale copy for up to an hour after an overwrite. The bucket is now private (`public_access_prevention=enforced`), and as defence in depth `StorageService.upload_json` writes `no-store`, theme asset/logo uploads pass `cache_control=no-store`, and `download_json` resolves the live generation before downloading (bypassing any cached copy of objects written before this).
+
+## Tech Stack
+
+- **Backend**: FastAPI, Python 3.12, Cloud Run
+- **Frontend**: Next.js, TypeScript, Cloudflare Pages
+- **Database**: Firestore
+- **Storage**: Google Cloud Storage
+- **Secrets**: Google Secret Manager
+- **Task Queues**: Cloud Tasks (idle reminders, YouTube upload queue)
+- **Scheduling**: Cloud Scheduler (hourly YouTube queue processing)
+- **Email**: Postmark
+- **IaC**: Pulumi
+- **CI/CD**: GitHub Actions

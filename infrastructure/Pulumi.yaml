@@ -1,0 +1,7 @@
+name: karaoke-gen-infrastructure
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+description: Infrastructure for Karaoke Generator backend on Google Cloud Platform
+

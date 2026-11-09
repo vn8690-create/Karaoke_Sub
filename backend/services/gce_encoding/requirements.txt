@@ -1,0 +1,20 @@
+# GCE Encoding Worker dependencies
+# These are installed in the VM's Python virtual environment
+
+# Web framework
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# GCS client
+google-cloud-storage>=2.14.0
+
+# Firestore client - persists job state across systemd restarts so polls
+# survive a worker restart instead of returning 404. See persistence.py.
+google-cloud-firestore>=2.14.0
+
+# Async utilities (optional, for future improvements)
+aiofiles>=23.2.0
+aiohttp>=3.9.0
+
+# Note: The karaoke-gen wheel is installed separately from GCS.
+# It provides LocalEncodingService which does the actual encoding.

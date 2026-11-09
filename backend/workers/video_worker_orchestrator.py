@@ -1,0 +1,1384 @@
+"""
+Video Worker Orchestrator.
+
+Coordinates the video generation pipeline stages in a unified way,
+regardless of whether encoding happens locally or on GCE.
+
+This resolves the code path divergence where GCE encoding bypassed
+features like YouTube upload, Discord notifications, and CDG/TXT packaging.
+
+Pipeline stages:
+1. Setup - Download files, prepare directories
+2. Packaging - CDG/TXT generation (if enabled)
+3. Encoding - GCE or Local via EncodingBackend interface
+4. Organization - Brand code, folder structure
+5. Distribution - YouTube, Dropbox, Google Drive uploads
+6. Notification - Discord notifications
+"""
+
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
+from pathlib import Path
+
+from backend.models.job import JobStatus
+from backend.services.job_manager import JobManager
+from backend.services.storage_service import StorageService
+from backend.services.youtube_description import translated_language_name
+from backend.services.tracing import job_span, add_span_event
+from backend.workers.supersede import capture_generation, encoding_worker_job_id
+from backend.services.theme_rerender_service import rerender_brand_code
+from backend.services.admin_rerender_service import suppress_customer_notifications
+from backend.services.regenerate_service import is_gcs_only_run
+from backend.services.original_audio import (
+    original_audio_gcs_path,
+    original_audio_output_filename,
+)
+from karaoke_gen.utils import sanitize_filename
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OrchestratorConfig:
+    """Configuration for the video worker orchestrator."""
+    job_id: str
+    artist: str
+    title: str
+
+    # Input file paths (in temp_dir). None = the theme leaves that screen out.
+    title_video_path: Optional[str]
+    karaoke_video_path: str
+    instrumental_audio_path: str
+    end_video_path: Optional[str] = None
+    lrc_file_path: Optional[str] = None
+    title_jpg_path: Optional[str] = None
+
+    # Whether the theme includes the title / end screen (state_data.screens_included)
+    include_title_screen: bool = True
+    include_end_screen: bool = True
+
+    # Output directory
+    output_dir: str = ""
+
+    # Feature flags
+    enable_cdg: bool = False
+    enable_txt: bool = False
+    enable_youtube_upload: bool = False
+
+    # Service configurations
+    brand_prefix: Optional[str] = None
+    discord_webhook_url: Optional[str] = None
+    youtube_credentials: Optional[Dict[str, Any]] = None
+    youtube_description_template: Optional[str] = None
+    # Set when the video shows translated lyrics (labels the YouTube title/description)
+    translation_language_name: Optional[str] = None
+    cdg_styles: Optional[Dict[str, Any]] = None
+
+    # Dropbox/GDrive configuration
+    dropbox_path: Optional[str] = None
+    gdrive_folder_id: Optional[str] = None
+
+    # Original input audio to include in the uploaded folder (the archival master,
+    # e.g. "<artist> - <title> (flacfetch).flac"). GCS blob path + target filename.
+    original_audio_gcs_path: Optional[str] = None
+    original_audio_filename: Optional[str] = None
+
+    # Keep existing brand code (for re-processing)
+    keep_brand_code: Optional[str] = None
+    # Tenant track code prefix for delivered file names (e.g. "VS6588 - "), so a
+    # tenant's own catalogue code starts every file, not just the folder.
+    output_filename_prefix: str = ""
+
+    # Whether this run may be announced (False for an admin re-render the admin
+    # didn't opt into announcing). Gates the Discord "new video" post and the
+    # follow-up email of a quota-deferred YouTube upload.
+    notify_customer: bool = True
+
+    # Instrumental selection (clean, with_backing, or custom)
+    instrumental_selection: str = "clean"
+
+    # User-supplied instrumental (GCS blob path under uploads/), e.g. tenant jobs
+    # and private "bring your own instrumental" jobs. Passed to the GCE encoder
+    # so it downloads the file itself and uses its any-extension lookup.
+    existing_instrumental_gcs_path: Optional[str] = None
+
+    # Audio synchronization - pad instrumental to match countdown-padded vocals
+    countdown_padding_seconds: Optional[float] = None
+
+    # CDG sync fix: track if LRC already has countdown timestamps
+    # When True, CDG generation will strip the countdown segment and adjust timestamps
+    lrc_has_countdown_padding: bool = False
+
+    # Multi-singer / duet rendering for CDG. When True + duet_corrections_json_path
+    # resolves to a readable JSON, CDG generation uses the segment-based path
+    # (with per-line N|singer tags and the 3-singer palette) instead of the
+    # solo LRC-based path. Segments live in corrections_updated.json; timings
+    # are shifted back by countdown_padding_seconds to align with the unpadded
+    # CDG instrumental.
+    is_duet: bool = False
+    duet_corrections_json_path: Optional[str] = None
+
+    # Encoding backend preference
+    encoding_backend: str = "auto"  # "auto", "local", "gce"
+
+    # state_data.worker_generation at config time; keys the encoding-worker job
+    # id so a re-run never gets the previous run's cached encode back.
+    worker_generation: int = 0
+
+    # Additional options
+    dry_run: bool = False
+    non_interactive: bool = True
+
+    # Redistribution mode: when True, this orchestrator run is redistributing the
+    # finals of an already-`complete` job (e.g. a public->private visibility change)
+    # rather than driving a fresh job through its lifecycle. In this mode
+    # _update_progress must NOT attempt job status transitions — the job is (and
+    # stays) `complete`, and `complete -> packaging`/`encoding` are illegal
+    # transitions that would otherwise abort the redistribution.
+    redistribute_mode: bool = False
+
+    # GCS-only regenerate (storage retention, backend/services/regenerate_service.py):
+    # rebuild the finals/packages in GCS but skip brand-code allocation, every
+    # distribution upload (YouTube/Dropbox/GDrive), the Discord post and the
+    # GDrive validation — the published outputs are left exactly as they are.
+    gcs_only: bool = False
+
+
+@dataclass
+class OrchestratorResult:
+    """Result from the video worker orchestrator."""
+    success: bool
+    error_message: Optional[str] = None
+
+    # Generated files
+    final_video: Optional[str] = None  # Lossless 4K MP4
+    final_video_mkv: Optional[str] = None  # Lossless 4K MKV
+    final_video_lossy: Optional[str] = None  # Lossy 4K MP4
+    final_video_720p: Optional[str] = None  # Lossy 720p MP4
+    final_with_vocals_mp4: Optional[str] = None  # With Vocals MP4 (encoded from raw MKV)
+    final_karaoke_cdg_zip: Optional[str] = None
+    final_karaoke_txt_zip: Optional[str] = None
+
+    # Standalone 5-second screen videos (downloaded from GCE finals so they land in
+    # the Dropbox folder). Not used downstream — kept for archival/upload only.
+    title_mov: Optional[str] = None
+    end_mov: Optional[str] = None
+
+    # Portrait (9:16) karaoke video. Downloaded so it lands in the Dropbox folder;
+    # intentionally excluded from YouTube/Drive uploads. Best-effort — may be None.
+    portrait_video: Optional[str] = None
+
+    # Organization
+    brand_code: Optional[str] = None
+
+    # Distribution results
+    youtube_url: Optional[str] = None
+    youtube_upload_queued: bool = False  # True if upload was deferred due to quota
+    dropbox_link: Optional[str] = None
+    gdrive_files: Optional[Dict[str, str]] = field(default_factory=dict)
+    # Padded original-vocals guide built for public NOMAD releases (kept so the
+    # worker's fallback Drive pass can ship it too if this pass's upload fails).
+    original_vocals_guide: Optional[str] = None
+
+    # Distribution warnings (non-fatal upload failures)
+    distribution_warnings: List[str] = field(default_factory=list)
+
+    # Timing
+    encoding_time_seconds: Optional[float] = None
+    total_time_seconds: Optional[float] = None
+
+
+class VideoWorkerOrchestrator:
+    """
+    Orchestrates the video generation pipeline.
+
+    This class coordinates all stages of video generation in a unified way,
+    ensuring that features like YouTube upload and Discord notifications
+    work regardless of whether GCE or local encoding is used.
+    """
+
+    def __init__(
+        self,
+        config: OrchestratorConfig,
+        job_manager: Optional[JobManager] = None,
+        storage: Optional[StorageService] = None,
+        job_logger: Optional[logging.Logger] = None,
+    ):
+        """
+        Initialize the orchestrator.
+
+        Args:
+            config: Orchestrator configuration
+            job_manager: Job manager for state updates (optional)
+            storage: Storage service for file downloads (optional)
+            job_logger: Job-specific logger (optional)
+        """
+        self.config = config
+        self.job_manager = job_manager
+        self.storage = storage
+        self.job_log = job_logger or logging.getLogger(__name__)
+
+        # When True, _run_distribution() skips the publish-completeness check and
+        # the caller runs check_publish_completeness() after its own fallback pass.
+        self.defer_publish_completeness_check = False
+
+        # Services (lazy-loaded)
+        self._encoding_backend = None
+        self._packaging_service = None
+        self._youtube_service = None
+        self._discord_service = None
+
+        # State
+        self.result = OrchestratorResult(success=False)
+
+    def _get_encoding_backend(self):
+        """Lazy-load the encoding backend."""
+        if self._encoding_backend is None:
+            from backend.services.encoding_interface import get_encoding_backend
+            self._encoding_backend = get_encoding_backend(
+                backend_type=self.config.encoding_backend,
+                dry_run=self.config.dry_run,
+                logger=self.job_log,
+            )
+        return self._encoding_backend
+
+    def _get_packaging_service(self):
+        """Lazy-load the packaging service."""
+        if self._packaging_service is None:
+            from backend.services.packaging_service import PackagingService
+            self._packaging_service = PackagingService(
+                cdg_styles=self.config.cdg_styles,
+                dry_run=self.config.dry_run,
+                non_interactive=self.config.non_interactive,
+                logger=self.job_log,
+            )
+        return self._packaging_service
+
+    def _get_youtube_service(self):
+        """Lazy-load the YouTube upload service."""
+        if self._youtube_service is None:
+            from backend.services.youtube_upload_service import YouTubeUploadService
+            self._youtube_service = YouTubeUploadService(
+                credentials=self.config.youtube_credentials,
+                non_interactive=self.config.non_interactive,
+                server_side_mode=True,
+                dry_run=self.config.dry_run,
+                logger=self.job_log,
+            )
+        return self._youtube_service
+
+    def _get_discord_service(self):
+        """Lazy-load the Discord notification service."""
+        if self._discord_service is None:
+            from backend.services.discord_service import DiscordNotificationService
+            self._discord_service = DiscordNotificationService(
+                webhook_url=self.config.discord_webhook_url,
+                dry_run=self.config.dry_run,
+                logger=self.job_log,
+            )
+        return self._discord_service
+
+    def _update_progress(self, status: JobStatus, progress: int, message: str):
+        """Update job progress if job_manager is available.
+
+        In redistribute_mode the job is already `complete` and must stay that way,
+        so we update only the progress percentage/message and skip the (illegal)
+        status transition. Outside redistribute_mode this drives the normal
+        lifecycle transition with validation.
+        """
+        if not self.job_manager:
+            return
+        if self.config.redistribute_mode:
+            # Progress-only update; do not transition status (job stays `complete`).
+            self.job_manager.update_job(
+                self.config.job_id,
+                {"progress": progress},
+            )
+            return
+        self.job_manager.transition_to_state(
+            job_id=self.config.job_id,
+            new_status=status,
+            progress=progress,
+            message=message
+        )
+
+    async def run(self) -> OrchestratorResult:
+        """
+        Run the full video generation pipeline.
+
+        Returns:
+            OrchestratorResult with generated files and metadata
+        """
+        start_time = time.time()
+
+        try:
+            with job_span("orchestrator", self.config.job_id) as span:
+                self.job_log.info(f"Starting orchestrated video generation for {self.config.artist} - {self.config.title}")
+
+                # Stage 1: Packaging (CDG/TXT) - runs BEFORE encoding
+                # This depends on LRC file, not on encoded videos
+                if self.config.enable_cdg or self.config.enable_txt:
+                    await self._run_packaging()
+
+                # Validate required packaging outputs before expensive encoding
+                # If LRC has no lyrics content (e.g. input audio had no vocals),
+                # skip CDG/TXT gracefully instead of failing the entire job
+                lrc_has_content = self._lrc_has_lyrics_content()
+                if self.config.enable_cdg and not self.result.final_karaoke_cdg_zip:
+                    if lrc_has_content:
+                        raise RuntimeError(
+                            "CDG generation was enabled but failed. "
+                            "Check worker logs for CDG-related errors."
+                        )
+                    else:
+                        self.job_log.warning(
+                            "CDG generation skipped: LRC file has no lyrics content. "
+                            "Video will be generated without CDG package."
+                        )
+                if self.config.enable_txt and not self.result.final_karaoke_txt_zip:
+                    if lrc_has_content:
+                        raise RuntimeError(
+                            "TXT generation was enabled but failed. "
+                            "Check worker logs for TXT-related errors."
+                        )
+                    else:
+                        self.job_log.warning(
+                            "TXT generation skipped: LRC file has no lyrics content. "
+                            "Video will be generated without TXT package."
+                        )
+
+                # Stage 2: Encoding
+                await self._run_encoding()
+
+                if self.config.gcs_only:
+                    # Regenerate: GCS outputs only. Keep the existing brand code
+                    # (never allocate one) and publish nowhere.
+                    self.result.brand_code = self.config.keep_brand_code
+                    self.job_log.info(
+                        "GCS-only regenerate: skipping organization, distribution and notifications"
+                    )
+                else:
+                    # Stage 3: Organization (brand code)
+                    await self._run_organization()
+
+                    # Stage 4: Distribution (YouTube, Dropbox, GDrive)
+                    await self._run_distribution()
+
+                    # Stage 5: Notifications (Discord)
+                    await self._run_notifications()
+
+                    # Stage 6: Post-distribution GDrive validation
+                    # Only for jobs that uploaded to the public share (non-private)
+                    if self.config.gdrive_folder_id:
+                        await self._trigger_gdrive_validation()
+
+                self.result.success = True
+                self.result.total_time_seconds = time.time() - start_time
+
+                self.job_log.info(f"Orchestrated video generation complete in {self.result.total_time_seconds:.1f}s")
+
+        except Exception as e:
+            self.result.success = False
+            self.result.error_message = str(e)
+            self.result.total_time_seconds = time.time() - start_time
+            self.job_log.error(f"Orchestrated video generation failed: {e}")
+            logger.error(f"[job:{self.config.job_id}] Orchestration failed: {e}")
+
+        return self.result
+
+    def _lrc_has_lyrics_content(self) -> bool:
+        """Check if the LRC file has actual lyrics content (timestamp lines), not just metadata."""
+        if not self.config.lrc_file_path or not os.path.isfile(self.config.lrc_file_path):
+            return False
+        try:
+            with open(self.config.lrc_file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Match LRC timestamp lines: [MM:SS.xx] or [MM:SS.xxx] or [M:SS.xx]
+            return bool(re.search(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", content))
+        except Exception:
+            return False
+
+    async def _run_packaging(self):
+        """Run the packaging stage (CDG/TXT generation)."""
+        self.job_log.info("Starting packaging stage (CDG/TXT)")
+
+        if not self.config.lrc_file_path or not os.path.isfile(self.config.lrc_file_path):
+            if self.config.enable_cdg or self.config.enable_txt:
+                raise RuntimeError(
+                    f"CDG/TXT generation enabled but LRC file not available: {self.config.lrc_file_path}"
+                )
+            self.job_log.warning("No LRC file available, skipping CDG/TXT packaging")
+            return
+
+        safe_artist = sanitize_filename(self.config.artist) if self.config.artist else "Unknown"
+        safe_title = sanitize_filename(self.config.title) if self.config.title else "Unknown"
+        base_name = f"{safe_artist} - {safe_title}"
+        packaging_service = self._get_packaging_service()
+
+        # Track the actual MP3 path from CDG generation for use by TXT
+        cdg_mp3_path = None
+
+        # Generate CDG package
+        if self.config.enable_cdg:
+            if self.config.lrc_has_countdown_padding:
+                self.job_log.info(
+                    f"Generating CDG package (compensating for {self.config.countdown_padding_seconds}s countdown in LRC)"
+                )
+            else:
+                self.job_log.info("Generating CDG package")
+            try:
+                cdg_zip_path = os.path.join(
+                    self.config.output_dir,
+                    f"{base_name} (Final Karaoke CDG).zip"
+                )
+                mp3_path = os.path.join(
+                    self.config.output_dir,
+                    f"{base_name} (Karaoke).mp3"
+                )
+                cdg_path = os.path.join(
+                    self.config.output_dir,
+                    f"{base_name} (Karaoke).cdg"
+                )
+
+                # Pass sanitized artist/title to ensure filenames inside the ZIP
+                # match what we expect (the CDG generator has its own sanitization
+                # that may differ, e.g. not stripping trailing periods)
+                zip_file, mp3_file, cdg_file = packaging_service.create_cdg_package(
+                    lrc_file=self.config.lrc_file_path,
+                    audio_file=self.config.instrumental_audio_path,
+                    output_zip_path=cdg_zip_path,
+                    artist=safe_artist,
+                    title=safe_title,
+                    output_mp3_path=mp3_path,
+                    output_cdg_path=cdg_path,
+                    lrc_has_countdown_padding=self.config.lrc_has_countdown_padding,
+                    countdown_padding_seconds=self.config.countdown_padding_seconds or 3.0,
+                    is_duet=self.config.is_duet,
+                    duet_corrections_json_path=self.config.duet_corrections_json_path,
+                )
+
+                self.result.final_karaoke_cdg_zip = zip_file
+                cdg_mp3_path = mp3_file
+                self.job_log.info(f"CDG package created: {zip_file}")
+
+            except Exception as e:
+                self.job_log.error(f"CDG generation failed: {e}")
+                # Don't fail the pipeline, CDG is optional
+
+        # Generate TXT package
+        if self.config.enable_txt:
+            self.job_log.info("Generating TXT package")
+            try:
+                # TXT package needs MP3 file from CDG generation.
+                # Prefer the actual path returned by CDG, fall back to constructed path.
+                mp3_path = cdg_mp3_path or os.path.join(
+                    self.config.output_dir,
+                    f"{base_name} (Karaoke).mp3"
+                )
+
+                if not os.path.isfile(mp3_path):
+                    self.job_log.info("MP3 not found, CDG must be enabled first for TXT")
+                    return
+
+                txt_zip_path = os.path.join(
+                    self.config.output_dir,
+                    f"{base_name} (Final Karaoke TXT).zip"
+                )
+
+                zip_file, txt_file = packaging_service.create_txt_package(
+                    lrc_file=self.config.lrc_file_path,
+                    mp3_file=mp3_path,
+                    output_zip_path=txt_zip_path,
+                )
+
+                self.result.final_karaoke_txt_zip = zip_file
+                self.job_log.info(f"TXT package created: {zip_file}")
+
+            except Exception as e:
+                self.job_log.error(f"TXT generation failed: {e}")
+                # Don't fail the pipeline, TXT is optional
+
+    async def _run_encoding(self):
+        """Run the encoding stage."""
+        self.job_log.info("Starting encoding stage")
+        self._update_progress(JobStatus.ENCODING, 75, "Encoding videos")
+
+        encoding_backend = self._get_encoding_backend()
+        self.job_log.info(f"Using encoding backend: {encoding_backend.name}")
+
+        # Build encoding input
+        from backend.services.encoding_interface import EncodingInput
+        from backend.config import settings
+
+        # For GCE encoding, we need to provide GCS paths
+        gcs_bucket = settings.gcs_bucket_name
+        input_gcs_path = f"gs://{gcs_bucket}/jobs/{self.config.job_id}/"
+        output_gcs_path = f"gs://{gcs_bucket}/jobs/{self.config.job_id}/finals/"
+
+        encoding_input = EncodingInput(
+            title_video_path=self.config.title_video_path,
+            karaoke_video_path=self.config.karaoke_video_path,
+            instrumental_audio_path=self.config.instrumental_audio_path,
+            end_video_path=self.config.end_video_path,
+            artist=self.config.artist,
+            title=self.config.title,
+            brand_code=self.config.keep_brand_code,
+            output_dir=self.config.output_dir,
+            instrumental_selection=self.config.instrumental_selection,
+            options={
+                "job_id": self.config.job_id,
+                "input_gcs_path": input_gcs_path,
+                "output_gcs_path": output_gcs_path,
+                "countdown_padding_seconds": self.config.countdown_padding_seconds,
+                "existing_instrumental": self.config.existing_instrumental_gcs_path,
+                "include_title_screen": self.config.include_title_screen,
+                "include_end_screen": self.config.include_end_screen,
+            },
+        )
+
+        # Log countdown info for debugging
+        if self.config.countdown_padding_seconds:
+            self.job_log.info(f"Countdown padding: {self.config.countdown_padding_seconds}s - instrumental will be padded")
+
+        # The GCE encoder downloads its inputs from input_gcs_path (jobs/{job_id}/) and resolves
+        # the instrumental via find_file. For jobs that supply their own instrumental
+        # (existing_instrumental flow, e.g. tenant submissions), the file lives under
+        # uploads/{job_id}/audio/existing_instrumental.* — which is NOT under jobs/{job_id}/ and
+        # is NOT a name the encoder's 'custom' branch looks for. The encoder's 'custom' branch
+        # globs for "*custom_instrumental*.{flac,mp3}" / "*Instrumental Custom*", so copy the
+        # supplied instrumental into jobs/{job_id}/custom_instrumental.<ext> (server-side, from
+        # the authoritative GCS source — no dependency on local temp files). Without this,
+        # existing-instrumental jobs fail at the encoder with "No instrumental audio found".
+        if encoding_backend.name == "gce" and self.storage:
+            try:
+                # Prefer the job's recorded path: it points at the conformed copy
+                # (uploads/{job_id}/conformed/) when the upload was lined up with the mix.
+                src = self.config.existing_instrumental_gcs_path
+                if not src:
+                    srcs = self.storage.list_files(f"uploads/{self.config.job_id}/audio/existing_instrumental")
+                    src = srcs[0] if srcs else None
+                if src:
+                    ext = os.path.splitext(src)[1].lower() or ".mp3"
+                    dest = f"jobs/{self.config.job_id}/custom_instrumental{ext}"
+                    if src != dest:
+                        self.storage.copy_blob(src, dest)
+                        self.job_log.info(f"Staged custom instrumental for GCE encoder: {dest}")
+                        # uploads/ expires (bucket lifecycle): point the job at the
+                        # kept job-root copy for future re-renders/regenerates.
+                        if src.startswith("uploads/") and self.job_manager:
+                            self.job_manager.update_job(
+                                self.config.job_id, {"existing_instrumental_gcs_path": dest}
+                            )
+                            self.config.existing_instrumental_gcs_path = dest
+            except Exception as e:
+                self.job_log.warning(f"Failed to stage custom instrumental for GCE encoder: {e}")
+
+        # Submit the encode under `encode_job_id`, resubmitting under a fresh id
+        # if the worker loses the job mid-run (OOM/deploy restart wipes its
+        # in-memory registry — the original id can never complete). See
+        # run_with_lost_job_resubmit.
+        from backend.services.encoding_service import run_with_lost_job_resubmit
+
+        async def _submit_encode(encode_job_id: str):
+            encoding_input.options["job_id"] = encode_job_id
+            return await encoding_backend.encode(encoding_input)
+
+        # Run encoding
+        with job_span("encoding", self.config.job_id) as span:
+            add_span_event("encoding_started", {"backend": encoding_backend.name})
+
+            output = await run_with_lost_job_resubmit(
+                _submit_encode,
+                encoding_worker_job_id(self.config.job_id, self.config.worker_generation),
+                log=self.job_log,
+            )
+
+            add_span_event("encoding_completed", {
+                "success": output.success,
+                "duration": output.encoding_time_seconds or 0
+            })
+
+        if not output.success:
+            raise Exception(f"Encoding failed: {output.error_message}")
+
+        # Store results - for GCE backend, these are GCS blob paths that need to be downloaded
+        self.result.final_video = output.lossless_4k_mp4_path
+        self.result.final_video_mkv = output.lossless_mkv_path
+        self.result.final_video_lossy = output.lossy_4k_mp4_path
+        self.result.final_video_720p = output.lossy_720p_mp4_path
+        self.result.final_with_vocals_mp4 = output.with_vocals_mp4_path
+        self.result.encoding_time_seconds = output.encoding_time_seconds
+
+        # For GCE encoding, download the encoded files from GCS to local directory
+        # This is required for YouTube upload and other local file operations
+        if encoding_backend.name == "gce" and self.storage:
+            try:
+                await self._download_gce_encoded_files(output)
+            except RuntimeError as e:
+                if "stale" in str(e).lower():
+                    # GCE worker returned cached result but files were deleted from GCS.
+                    # Re-encode with a suffixed job ID so GCE treats it as a new job.
+                    import uuid
+                    retry_suffix = uuid.uuid4().hex[:8]
+                    retry_job_id = f"{self.config.job_id}_retry_{retry_suffix}"
+                    self.job_log.warning(
+                        f"Stale GCE cache detected, re-encoding as {retry_job_id}: {e}"
+                    )
+
+                    # Re-encode under the fresh id, still resubmitting if the worker
+                    # loses the job mid-run.
+                    output = await run_with_lost_job_resubmit(
+                        _submit_encode, retry_job_id, log=self.job_log
+                    )
+                    if not output.success:
+                        raise Exception(f"Encoding failed on retry: {output.error_message}")
+
+                    self.result.final_video = output.lossless_4k_mp4_path
+                    self.result.final_video_mkv = output.lossless_mkv_path
+                    self.result.final_video_lossy = output.lossy_4k_mp4_path
+                    self.result.final_video_720p = output.lossy_720p_mp4_path
+                    self.result.final_with_vocals_mp4 = output.with_vocals_mp4_path
+                    self.result.encoding_time_seconds = output.encoding_time_seconds
+
+                    await self._download_gce_encoded_files(output)
+                else:
+                    raise
+
+        self.job_log.info(f"Encoding complete ({encoding_backend.name}) in {output.encoding_time_seconds:.1f}s")
+
+    async def _download_gce_encoded_files(self, output):
+        """
+        Download GCE-encoded files from GCS to the local output directory.
+
+        GCE encoding stores files in GCS and returns blob paths like:
+        'jobs/{job_id}/finals/Artist - Title (Final Karaoke Lossless 4k).mp4'
+
+        This method downloads those files locally so that subsequent stages
+        (YouTube upload, etc.) can access them as local files.
+
+        Args:
+            output: EncodingOutput from the GCE backend with GCS blob paths
+        """
+        self.job_log.info("Downloading GCE-encoded files from GCS")
+
+        # Map of result attributes to download
+        file_mappings = [
+            ('lossless_4k_mp4_path', 'final_video'),
+            ('lossless_mkv_path', 'final_video_mkv'),
+            ('lossy_4k_mp4_path', 'final_video_lossy'),
+            ('lossy_720p_mp4_path', 'final_video_720p'),
+            ('with_vocals_mp4_path', 'final_with_vocals_mp4'),
+            # Standalone screen videos — pulled back so they reach the Dropbox folder
+            ('title_mov_path', 'title_mov'),
+            ('end_mov_path', 'end_mov'),
+            # Portrait karaoke — pulled back so it reaches the Dropbox folder (upload_folder
+            # sweeps the whole output dir); excluded from YouTube/Drive by design.
+            ('portrait_mp4_path', 'portrait_video'),
+        ]
+
+        downloaded_count = 0
+        for output_attr, result_attr in file_mappings:
+            gcs_path = getattr(output, output_attr, None)
+            if not gcs_path:
+                continue
+
+            # Extract filename from GCS path
+            filename = os.path.basename(gcs_path)
+            local_path = os.path.join(self.config.output_dir, filename)
+
+            try:
+                # On the AWS encoding box the encoder left a local copy: take it
+                # instead of downloading back out of GCS (see local_encoded_outputs).
+                from backend.services import local_encoded_outputs
+                if local_encoded_outputs.take(gcs_path, local_path):
+                    self.job_log.info(f"Took {filename} from the co-located encoder (no GCS download)")
+                else:
+                    self.job_log.info(f"Downloading {filename} from GCS")
+                    self.storage.download_file(gcs_path, local_path)
+
+                # Update the result to point to local file
+                setattr(self.result, result_attr, local_path)
+                downloaded_count += 1
+                self.job_log.info(f"Downloaded {filename} to {local_path}")
+
+            except Exception as e:
+                self.job_log.error(f"Failed to download {filename}: {e}")
+                # Clear the result attribute so downstream doesn't try to use invalid GCS path
+                setattr(self.result, result_attr, None)
+                # Don't fail - some formats might not be generated
+
+        self.job_log.info(f"Downloaded {downloaded_count} encoded files from GCS")
+
+        # If zero files were downloaded, the GCE cache was stale (files deleted from GCS
+        # but GCE worker still reports job as "complete"). This happens when admin deletes
+        # outputs then re-runs the video worker. Raise to trigger re-encoding.
+        if downloaded_count == 0:
+            raise RuntimeError(
+                "GCE encoding returned cached result but all output files are missing from GCS. "
+                "The GCE worker's job cache is stale — clearing it and retrying."
+            )
+
+    async def _run_organization(self):
+        """Run the organization stage (brand code generation)."""
+        self.job_log.info("Starting organization stage")
+
+        # Use existing brand code if provided
+        if self.config.keep_brand_code:
+            self.result.brand_code = self.config.keep_brand_code
+            self.job_log.info(f"Using preserved brand code: {self.result.brand_code}")
+            return
+
+        # Generate brand code from Dropbox if configured
+        if self.config.dropbox_path and self.config.brand_prefix:
+            try:
+                from backend.services.brand_code_service import get_brand_code_service
+
+                brand_code_service = get_brand_code_service()
+                brand_code = brand_code_service.allocate_brand_code(
+                    self.config.brand_prefix,
+                    self.config.dropbox_path
+                )
+                self.result.brand_code = brand_code
+                self.job_log.info(f"Generated brand code: {brand_code}")
+
+            except Exception as e:
+                self.job_log.error(f"Brand code generation failed: {e}")
+                # Don't fail - brand code is optional
+
+    async def _run_distribution(self):
+        """Run the distribution stage (YouTube, Dropbox, GDrive uploads)."""
+        self.job_log.info("Starting distribution stage")
+        self._update_progress(JobStatus.PACKAGING, 90, "Uploading files")
+
+        # Stage the original input audio into output_dir before any folder upload
+        # (Dropbox/GDrive upload the whole directory). Only worth the GCS fetch when
+        # such an upload will actually happen.
+        will_upload_folder = (
+            (self.config.dropbox_path and self.config.brand_prefix)
+            or self.config.gdrive_folder_id
+        )
+        if will_upload_folder:
+            self._stage_original_audio_for_upload()
+
+        # YouTube upload
+        if self.config.enable_youtube_upload and self.config.youtube_credentials:
+            await self._upload_to_youtube()
+
+        # Dropbox upload
+        if self.config.dropbox_path and self.config.brand_prefix:
+            await self._upload_to_dropbox()
+
+        # Google Drive upload
+        if self.config.gdrive_folder_id:
+            await self._upload_to_gdrive()
+
+        # Incident-hardening G1 (SHADOW): before a public release is considered
+        # done, assert the outputs it *should* have shipped (lossy 4K + 720p, plus
+        # CDG when enabled) actually landed on the public GDrive share. This closes
+        # the residual silent-partial hole — e.g. a per-file download failure in
+        # _download_gce_encoded_files clears one result attr, so the upload skips a
+        # None path and publishes a partial release without the encode() guard ever
+        # tripping (exactly the NOMAD-1632 class). Shadow-first: log + alert only,
+        # never fail the job, until a clean shadow window justifies enforcing.
+        # A caller with its own fallback Drive pass (generate_video_orchestrated)
+        # defers the check until after that pass, so a recovered upload doesn't alert.
+        if not self.defer_publish_completeness_check:
+            self.check_publish_completeness()
+
+    def check_publish_completeness(self):
+        """SHADOW check that a public-share release shipped all expected outputs."""
+        try:
+            from backend.services.publish_completeness import compute_publish_shortfall
+
+            missing = compute_publish_shortfall(self.config, self.result)
+            if not missing:
+                return
+
+            missing_str = ", ".join(missing)
+            self.job_log.error(
+                f"PUBLISH_COMPLETENESS shortfall (SHADOW) for job {self.config.job_id}: "
+                f"public release is missing {missing_str}. gdrive_files="
+                f"{self.result.gdrive_files}"
+            )
+            try:
+                from backend.services.ops_alerts import send_ops_alert
+
+                brand = self.result.brand_code or "(no brand)"
+                track = f"{self.config.artist} - {self.config.title}"
+                send_ops_alert(
+                    "🟠 **Publish completeness SHADOW** — partial public release detected\n"
+                    f"**Job:** `{self.config.job_id}`  ({brand})\n"
+                    f"**Track:** {track}\n"
+                    f"**Missing:** {missing_str}\n"
+                    "_Shadow mode: the job was NOT failed. Investigate the "
+                    "encode→publish path (silent-partial class, NOMAD-1632)._"
+                )
+            except Exception as alert_exc:  # noqa: BLE001
+                self.job_log.warning(f"Publish-completeness alert did not send: {alert_exc}")
+        except Exception as e:  # noqa: BLE001 - shadow check must never break distribution
+            self.job_log.warning(f"Publish-completeness check skipped (non-fatal): {e}")
+
+    async def _upload_to_youtube(self):
+        """Upload video to YouTube."""
+        self.job_log.info("Uploading to YouTube")
+
+        # Get user_email from job
+        user_email = "unknown"
+        if self.job_manager:
+            job = self.job_manager.get_job(self.config.job_id)
+            if job and job.user_email:
+                user_email = job.user_email
+
+        # Check YouTube quota availability (unit-based tracking)
+        try:
+            from backend.services.youtube_quota_service import get_youtube_quota_service
+            quota_service = get_youtube_quota_service()
+            allowed, remaining, message = quota_service.check_quota_available()
+            if not allowed:
+                self.job_log.warning(f"YouTube quota insufficient, queueing upload: {message}")
+                self._queue_youtube_upload(user_email, reason="quota_exceeded")
+                return
+        except Exception as e:
+            self.job_log.warning(f"Quota check failed, proceeding with upload: {e}")
+
+        # Find the best video file to upload (prefer MKV for FLAC audio, then lossless MP4)
+        video_to_upload = None
+        if self.result.final_video_mkv and os.path.isfile(self.result.final_video_mkv):
+            video_to_upload = self.result.final_video_mkv
+        elif self.result.final_video and os.path.isfile(self.result.final_video):
+            video_to_upload = self.result.final_video
+        elif self.result.final_video_lossy and os.path.isfile(self.result.final_video_lossy):
+            video_to_upload = self.result.final_video_lossy
+
+        if not video_to_upload:
+            warning = "YouTube upload skipped: no video file available on disk"
+            self.job_log.warning(warning)
+            self.result.distribution_warnings.append(warning)
+            return
+
+        try:
+            youtube_service = self._get_youtube_service()
+
+            # Build title + description + tags via the shared renderer (single
+            # source of truth, also used by the queue processor + bulk-rewrite tool).
+            from backend.services.youtube_description import (
+                build_youtube_tags,
+                build_youtube_title,
+                render_youtube_description,
+            )
+
+            title = build_youtube_title(
+                self.config.artist, self.config.title, self.config.translation_language_name
+            )
+
+            description = render_youtube_description(
+                artist=self.config.artist,
+                title=self.config.title,
+                brand_code=self.result.brand_code,
+                template=self.config.youtube_description_template or None,
+                translation_language_name=self.config.translation_language_name,
+            )
+
+            # Upload
+            video_id, video_url = youtube_service.upload_video(
+                video_path=video_to_upload,
+                title=title,
+                description=description,
+                thumbnail_path=self.config.title_jpg_path,
+                tags=build_youtube_tags(self.config.artist, self.config.title),
+                replace_existing=True,  # Server-side always replaces
+            )
+
+            if video_url:
+                self.result.youtube_url = video_url
+                self.job_log.info(f"Uploaded to YouTube: {video_url} (video_id={video_id})")
+
+                # Record upload in pending buffer (bridges ~7min GCP monitoring delay)
+                try:
+                    quota_service = get_youtube_quota_service()
+                    quota_service.record_upload(self.config.job_id)
+                except Exception as e:
+                    self.job_log.warning(f"Failed to record YouTube quota usage: {e}")
+
+            else:
+                self.job_log.warning("YouTube upload did not return a URL")
+
+        except Exception as e:
+            error_str = str(e)
+            # Check for YouTube quota exceeded error (HTTP 403 with quotaExceeded reason)
+            if "quotaExceeded" in error_str or (
+                hasattr(e, 'resp') and hasattr(e.resp, 'status') and e.resp.status == 403
+            ):
+                self.job_log.warning(f"YouTube quota exceeded during upload, queueing: {e}")
+                self._queue_youtube_upload(user_email, reason="quota_exceeded_api")
+                return
+
+            # Transient failures (e.g. a dropped resumable session that outlived the
+            # in-process restarts) must not lose the upload: hand it to the deferred
+            # queue, which retries from the GCS finals (bounded by max_attempts).
+            self.job_log.error(f"YouTube upload failed, queueing for retry: {e}")
+            self._queue_youtube_upload(user_email, reason="upload_error", error=error_str)
+            if self.result.youtube_upload_queued:
+                self.result.distribution_warnings.append(
+                    f"YouTube upload failed, queued for automatic retry: {e}"
+                )
+            # Don't fail the pipeline - YouTube is optional
+
+    def _queue_youtube_upload(self, user_email: str, reason: str = "quota_exceeded", error: Optional[str] = None):
+        """Queue a YouTube upload for later processing (insufficient quota or a failed upload)."""
+        try:
+            from backend.services.youtube_upload_queue_service import get_youtube_upload_queue_service
+            queue_service = get_youtube_upload_queue_service()
+            queue_service.queue_upload(
+                job_id=self.config.job_id,
+                user_email=user_email,
+                artist=self.config.artist,
+                title=self.config.title,
+                brand_code=self.result.brand_code,
+                reason=reason,
+                notify_user=self.config.notify_customer,
+            )
+            self.result.youtube_upload_queued = True
+            self.job_log.info(f"YouTube upload queued for later processing (reason: {reason})")
+        except Exception as e:
+            self.job_log.error(f"Failed to queue YouTube upload: {e}")
+            cause = f"upload failed: {error}" if error else "quota exceeded"
+            self.result.distribution_warnings.append(
+                f"YouTube upload skipped ({cause}) and failed to queue: {e}"
+            )
+
+    def _stage_original_audio_for_upload(self):
+        """Copy the original input audio into output_dir so uploads include it.
+
+        The source audio (e.g. "<artist> - <title> (flacfetch).flac" /
+        "(uploaded).mp3") is the archival master used for separation/transcription.
+        The distributed pipeline otherwise leaves it in GCS only, so it stopped
+        appearing in the Dropbox track folder. Best-effort: never fail the pipeline.
+        """
+        gcs_path = self.config.original_audio_gcs_path
+        filename = self.config.original_audio_filename
+        if not gcs_path or not filename:
+            return
+
+        dest = os.path.join(self.config.output_dir, filename)
+        if os.path.exists(dest):
+            self.job_log.info(f"Original audio already present, skipping: {filename}")
+            return
+
+        try:
+            self.job_log.info(f"Staging original audio for upload: {filename}")
+            self.storage.download_file(gcs_path, dest)
+            self.job_log.info(f"Staged original audio: {dest}")
+        except Exception as e:
+            self.job_log.warning(f"Failed to stage original audio ({filename}): {e}")
+            self.result.distribution_warnings.append(f"Original audio not included: {e}")
+
+    async def _upload_to_dropbox(self):
+        """Upload files to Dropbox."""
+        self.job_log.info("Uploading to Dropbox")
+
+        try:
+            from backend.services.dropbox_service import get_dropbox_service
+
+            dropbox = get_dropbox_service()
+            if not dropbox.is_configured:
+                self.job_log.warning("Dropbox not configured, skipping upload")
+                return
+
+            # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+            safe_artist = sanitize_filename(self.config.artist) if self.config.artist else "Unknown"
+            safe_title = sanitize_filename(self.config.title) if self.config.title else "Unknown"
+            base_name = f"{safe_artist} - {safe_title}"
+            folder_name = f"{self.result.brand_code or 'TRACK-0000'} - {base_name}"
+            remote_folder = f"{self.config.dropbox_path}/{folder_name}"
+
+            # Upload the output directory, minus files Nomad's own Dropbox archive
+            # doesn't need (lossless 4K MP4 by default — it stays in GCS). Tenant
+            # folders get everything. See dropbox_skip_suffixes_for.
+            from backend.services.dropbox_service import dropbox_skip_suffixes_for
+
+            skip = dropbox_skip_suffixes_for(self.config.dropbox_path)
+            if skip:
+                self.job_log.info(f"Excluding from Dropbox upload (kept in GCS): {list(skip)}")
+            dropbox.upload_folder(
+                self.config.output_dir,
+                remote_folder,
+                exclude_suffixes=skip,
+                filename_prefix=self.config.output_filename_prefix,
+            )
+
+            # Create sharing link
+            try:
+                sharing_link = dropbox.create_shared_link(remote_folder)
+                self.result.dropbox_link = sharing_link
+                self.job_log.info(f"Dropbox sharing link: {sharing_link}")
+            except Exception as e:
+                self.job_log.warning(f"Failed to create Dropbox sharing link: {e}")
+
+            self.job_log.info(f"Dropbox upload complete: {remote_folder}")
+
+        except Exception as e:
+            # WARNING, not ERROR: the customer-impacting outcome (held completion
+            # email) gets its own actionable #alerts message from delivery_guard.
+            self.job_log.warning(f"Dropbox upload failed: {e}")
+            self.result.distribution_warnings.append(f"Dropbox upload failed: {e}")
+            # Don't fail the pipeline - Dropbox is optional
+
+    async def _upload_to_gdrive(self):
+        """Upload files to Google Drive."""
+        self.job_log.info("Uploading to Google Drive")
+
+        try:
+            from backend.services.gdrive_service import get_gdrive_service
+
+            gdrive = get_gdrive_service()
+            if not gdrive.is_configured:
+                self.job_log.warning("Google Drive not configured, skipping upload")
+                return
+
+            base_name = f"{self.config.artist} - {self.config.title}"
+            brand_code = self.result.brand_code or f"{self.config.brand_prefix or 'TRACK'}-0000"
+
+            # Map result files to expected keys
+            output_files = {
+                'final_karaoke_lossy_mp4': self.result.final_video_lossy,
+                'final_karaoke_lossy_720p_mp4': self.result.final_video_720p,
+                'final_karaoke_cdg_zip': self.result.final_karaoke_cdg_zip,
+            }
+
+            # Emit the padded original-vocals guide for public NOMAD releases so kjbox can
+            # layer it under the master at the "Original Vocals" slider. Best-effort: a
+            # failure just omits the guide (the upload layer pushes it if present).
+            guide_path = await self._emit_original_vocals_guide(brand_code)
+            if guide_path:
+                output_files['original_vocals_guide'] = guide_path
+                self.result.original_vocals_guide = guide_path
+
+            uploaded = gdrive.upload_to_public_share(
+                root_folder_id=self.config.gdrive_folder_id,
+                brand_code=brand_code,
+                base_name=base_name,
+                output_files=output_files,
+                warnings=self.result.distribution_warnings,
+            )
+
+            self.result.gdrive_files = uploaded
+            self.job_log.info(f"Google Drive upload complete: {len(uploaded)} files (ids={uploaded})")
+
+        except Exception as e:
+            self.job_log.error(f"Google Drive upload failed: {e}")
+            self.result.distribution_warnings.append(f"Google Drive upload failed: {e}")
+            # Don't fail the pipeline - GDrive is optional
+
+    async def _emit_original_vocals_guide(self, brand_code) -> Optional[str]:
+        """Build the padded original-vocals guide (silence[intro] + mixed_vocals, capped to
+        the master's duration) for a public NOMAD release, and return its local path.
+
+        The mixed-vocals stem is a byproduct of the karaoke separation (uploaded to
+        ``jobs/{job_id}/stems/vocals_clean.flac``) and the intro offset is the job's own
+        style ``intro_video_duration`` — so no correlation/review is needed. Best-effort:
+        returns ``None`` (and never raises) for non-NOMAD brands, a missing stem, or any
+        build failure — the guide simply won't be distributed.
+        """
+        try:
+            from backend.services.nomad_master_mirror import is_nomad_public_brand
+            if not is_nomad_public_brand(brand_code):
+                return None
+            master_720p = self.result.final_video_720p
+            if not master_720p or not os.path.exists(master_720p):
+                return None
+            if not self.storage:
+                return None
+
+            import tempfile
+            from backend.services.original_vocals_guide import (
+                build_original_vocals_guide,
+                probe_duration,
+            )
+
+            work_dir = tempfile.mkdtemp(prefix="vocals_guide_")
+            stem_gcs = f"jobs/{self.config.job_id}/stems/vocals_clean.flac"
+            local_stem = os.path.join(work_dir, "vocals_clean.flac")
+            try:
+                self.storage.download_file(stem_gcs, local_stem)
+            except Exception as e:  # noqa: BLE001
+                self.job_log.warning(
+                    f"Original-vocals guide: mixed-vocals stem unavailable ({stem_gcs}): {e}"
+                )
+                return None
+
+            intro_seconds = await self._resolve_intro_seconds()
+            master_duration = probe_duration(master_720p)
+            dest = os.path.join(work_dir, "original_vocals_guide.flac")
+            guide = build_original_vocals_guide(
+                local_stem, intro_seconds, dest, master_duration=master_duration
+            )
+            if guide:
+                self.job_log.info(
+                    f"Built original-vocals guide for {brand_code} (intro={intro_seconds}s)"
+                )
+            return guide
+        except Exception as e:  # noqa: BLE001 - never fatal to the pipeline
+            self.job_log.warning(f"Original-vocals guide emit skipped: {e}")
+            return None
+
+    async def _resolve_intro_seconds(self) -> float:
+        """The master's silent title-card length = the job's style intro ``video_duration``
+        (default 5s). Read the *actual* value — long-intro styles exist. Falls back to 5s
+        (``get_intro_format`` raises when no theme is loaded — that's the fallback path).
+        0 when the theme leaves the title card out (the master starts with the song)."""
+        if not self.config.include_title_screen:
+            return 0.0
+        try:
+            from backend.workers.style_helper import load_style_config
+            import tempfile
+
+            job = self.job_manager.get_job(self.config.job_id) if self.job_manager else None
+            if job is None:
+                return 5.0
+            style = await load_style_config(job, self.storage, tempfile.mkdtemp(prefix="style_"))
+            # Preserve an intentional 0 (a style with no title card); only None/absent
+            # falls back to the 5s default. A truthiness check would misalign the guide.
+            intro = style.get_intro_format().get("video_duration", 5)
+            return float(intro) if intro is not None else 5.0
+        except Exception as e:  # noqa: BLE001
+            self.job_log.warning(f"Original-vocals guide: intro-duration lookup fell back to 5s: {e}")
+            return 5.0
+
+    async def _run_notifications(self):
+        """Run the notifications stage (Discord)."""
+        self.job_log.info("Starting notifications stage")
+
+        if not self.config.discord_webhook_url:
+            self.job_log.debug("No Discord webhook configured, skipping notification")
+            return
+
+        if not self.config.notify_customer:
+            self.job_log.info("Admin re-render without notification: skipping Discord post")
+            return
+
+        if not self.result.youtube_url:
+            self.job_log.info("No YouTube URL available, skipping Discord notification")
+            return
+
+        try:
+            discord_service = self._get_discord_service()
+            discord_service.post_video_notification(self.result.youtube_url)
+            self.job_log.info("Discord notification sent")
+        except Exception as e:
+            self.job_log.error(f"Discord notification failed: {e}")
+            # Don't fail the pipeline - notifications are optional
+
+    async def _trigger_gdrive_validation(self):
+        """Schedule delayed GDrive validation after uploading to the public share.
+
+        Uses Cloud Tasks to delay the validation by 5 minutes, giving E2E tests
+        time to verify output and clean up (delete test files) before the validator
+        checks for sequence gaps. Falls back to immediate trigger if scheduling fails.
+        """
+        try:
+            from backend.services.worker_service import get_worker_service
+            worker_service = get_worker_service()
+            # Name the just-published track so the validator can check *its own*
+            # completeness same-run (incident-hardening D2), not just global gaps.
+            # Only require CDG when this job actually produced one (video-only /
+            # lyric-less releases legitimately ship no CDG).
+            brand_code = self.result.brand_code
+            expect_cdg = bool(self.result.final_karaoke_cdg_zip)
+            success = await worker_service.schedule_gdrive_validation(
+                brand_code=brand_code, expect_cdg=expect_cdg
+            )
+            if success:
+                self.job_log.info("Scheduled delayed GDrive validation (5 min)")
+            else:
+                # Fallback: trigger immediately if scheduling failed
+                self.job_log.warning("Cloud Tasks scheduling failed, triggering validation immediately")
+                from backend.services.gdrive_validator_client import trigger_gdrive_validation
+                trigger_gdrive_validation(brand_code=brand_code, expect_cdg=expect_cdg)
+        except Exception as e:
+            self.job_log.warning(f"GDrive validation trigger failed (non-fatal): {e}")
+            # Never fail the pipeline for validation
+
+
+def _screen_ext(job, screen_type: str) -> str:
+    """Get the file extension for a screen (title/end) based on what's in GCS.
+
+    New jobs have only PNG (MOV is generated by GCE encoding worker).
+    Legacy jobs may still have MOV uploaded by the old screens_worker.
+    """
+    screens = job.file_urls.get('screens', {})
+    # Check for MOV first (legacy), then fall back to PNG (new)
+    url = screens.get(screen_type) or screens.get(f'{screen_type}_png')
+    if url:
+        ext = os.path.splitext(url)[1]
+        if ext:
+            return ext
+    return '.png'
+
+
+def tenant_track_code_prefix(job) -> str:
+    """"<CODE> - " for a tenant job that carries its own catalogue code, else "".
+
+    Only tenant jobs: keep_brand_code is also used by Nomad's finalise-only /
+    re-render flows, whose files must keep the plain "Artist - Title" names.
+    """
+    code = getattr(job, "keep_brand_code", None)
+    if code and getattr(job, "tenant_id", None):
+        # Validated at job creation; sanitize again since it becomes a path segment.
+        safe_code = sanitize_filename(str(code)).replace("/", "").replace("\\", "").strip(" .")
+        return f"{safe_code} - " if safe_code else ""
+    return ""
+
+
+def create_orchestrator_config_from_job(
+    job,
+    temp_dir: str,
+    youtube_credentials: Optional[Dict[str, Any]] = None,
+    cdg_styles: Optional[Dict[str, Any]] = None,
+) -> OrchestratorConfig:
+    """
+    Create an OrchestratorConfig from a job object.
+
+    This is a helper function to bridge the existing job structure
+    with the new orchestrator configuration.
+
+    Args:
+        job: Job object from Firestore
+        temp_dir: Temporary directory with downloaded files
+        youtube_credentials: Pre-loaded YouTube credentials
+        cdg_styles: CDG style configuration
+
+    Returns:
+        OrchestratorConfig for the orchestrator
+    """
+    # Sanitize artist/title to handle Unicode characters (curly quotes, em dashes, etc.)
+    safe_artist = sanitize_filename(job.artist) if job.artist else "Unknown"
+    safe_title = sanitize_filename(job.title) if job.title else "Unknown"
+    base_name = f"{safe_artist} - {safe_title}"
+
+    # Determine instrumental file path
+    instrumental_selection = job.state_data.get('instrumental_selection', 'clean')
+    existing_instrumental = getattr(job, 'existing_instrumental_gcs_path', None)
+
+    # Get countdown padding info from lyrics metadata
+    # This ensures instrumental is padded to match vocals if countdown was added
+    # Also tracks if LRC has countdown padding so CDG can compensate
+    lyrics_metadata = job.state_data.get('lyrics_metadata', {})
+    countdown_padding_seconds = None
+    lrc_has_countdown_padding = lyrics_metadata.get('has_countdown_padding', False)
+    if lrc_has_countdown_padding:
+        countdown_padding_seconds = lyrics_metadata.get('countdown_padding_seconds', 3.0)
+
+    if existing_instrumental:
+        ext = Path(existing_instrumental).suffix.lower()
+        instrumental_path = os.path.join(temp_dir, f"{base_name} (Instrumental User){ext}")
+    elif instrumental_selection == 'custom':
+        instrumental_path = os.path.join(temp_dir, f"{base_name} (Instrumental Custom).flac")
+    else:
+        instrumental_suffix = "Clean" if instrumental_selection == 'clean' else "Backing"
+        instrumental_path = os.path.join(temp_dir, f"{base_name} (Instrumental {instrumental_suffix}).flac")
+
+    # Get effective distribution settings (applies private track overrides if is_private=True)
+    from backend.services.job_defaults_service import get_effective_distribution_for_job
+    dist = get_effective_distribution_for_job(job)
+
+    # Duet CDG rendering: when is_duet is latched True on the job, the CDG
+    # path needs access to the reviewed segments so it can emit per-line
+    # singer tags. The orchestrator runs after _setup_working_directory,
+    # which downloads corrections_updated.json locally if the file_url exists.
+    is_duet = bool(job.state_data.get("is_duet", False))
+    duet_corrections_json_path = None
+    if is_duet:
+        # Prefer corrections_updated.json (post-review) over corrections.json
+        candidates = [
+            os.path.join(temp_dir, "corrections_updated.json"),
+            os.path.join(temp_dir, f"{base_name} (Lyrics Corrections).json"),
+            os.path.join(temp_dir, "corrections.json"),
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                duet_corrections_json_path = candidate
+                break
+
+    # Screens the theme leaves out (recorded by the screens worker).
+    from backend.workers.style_helper import screen_included
+
+    include_title = screen_included(job.state_data, "title")
+    include_end = screen_included(job.state_data, "end")
+
+    return OrchestratorConfig(
+        worker_generation=capture_generation(job),
+        job_id=job.job_id,
+        artist=job.artist,
+        title=job.title,
+
+        # Input files — use actual extension from GCS (PNG for new jobs, MOV for legacy)
+        title_video_path=(
+            os.path.join(temp_dir, f"{base_name} (Title){_screen_ext(job, 'title')}") if include_title else None
+        ),
+        # Use actual extension from GCS path (typically .mkv) instead of hardcoding .mov
+        karaoke_video_path=os.path.join(temp_dir, f"{base_name} (With Vocals){os.path.splitext(job.file_urls.get('videos', {}).get('with_vocals', '.mkv'))[1] or '.mkv'}"),
+        instrumental_audio_path=instrumental_path,
+        end_video_path=os.path.join(temp_dir, f"{base_name} (End){_screen_ext(job, 'end')}") if include_end else None,
+        include_title_screen=include_title,
+        include_end_screen=include_end,
+        lrc_file_path=os.path.join(temp_dir, f"{base_name} (Karaoke).lrc"),
+        title_jpg_path=os.path.join(temp_dir, f"{base_name} (Title).jpg"),
+
+        # Output directory
+        output_dir=temp_dir,
+
+        # Feature flags
+        enable_cdg=getattr(job, 'enable_cdg', False),
+        enable_txt=getattr(job, 'enable_txt', False),
+        enable_youtube_upload=dist.enable_youtube_upload,
+
+        # Service configurations (distribution settings from helper, respects is_private)
+        brand_prefix=dist.brand_prefix,
+        discord_webhook_url=dist.discord_webhook_url,
+        youtube_credentials=youtube_credentials,
+        youtube_description_template=dist.youtube_description,
+        translation_language_name=translated_language_name(job.state_data),
+        cdg_styles=cdg_styles,
+
+        # Dropbox/GDrive (overridden for private tracks)
+        dropbox_path=dist.dropbox_path,
+        gdrive_folder_id=dist.gdrive_folder_id,
+
+        # Original input audio to include in the uploaded folder (archival master)
+        original_audio_gcs_path=original_audio_gcs_path(job),
+        original_audio_filename=original_audio_output_filename(job, base_name),
+
+        # Keep existing brand code
+        keep_brand_code=getattr(job, 'keep_brand_code', None) or rerender_brand_code(job),
+        output_filename_prefix=tenant_track_code_prefix(job),
+        notify_customer=not suppress_customer_notifications(job),
+
+        # Instrumental selection (for GCE encoding)
+        instrumental_selection=instrumental_selection,
+        existing_instrumental_gcs_path=existing_instrumental,
+
+        # Audio synchronization - pad instrumental to match countdown-padded vocals
+        countdown_padding_seconds=countdown_padding_seconds,
+
+        # CDG sync fix: track if LRC already has countdown timestamps
+        lrc_has_countdown_padding=lrc_has_countdown_padding,
+
+        # Duet CDG rendering
+        is_duet=is_duet,
+        duet_corrections_json_path=duet_corrections_json_path,
+
+        # GCS-only regenerate (storage retention): no distribution at all
+        gcs_only=is_gcs_only_run(job),
+
+        # Encoding backend - auto selects GCE if available
+        encoding_backend="auto",
+
+        # Server-side defaults
+        dry_run=False,
+        non_interactive=True,
+    )

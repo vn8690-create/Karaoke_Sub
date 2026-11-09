@@ -1,0 +1,847 @@
+"use client"
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useTranslations } from "next-intl"
+import { AlertTriangle, CheckCircle2, ImageIcon, Loader2, Palette, RefreshCw, Upload } from "lucide-react"
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { useToast } from "@/hooks/use-toast"
+import { tenantThemeApi, type ThemePreviewImages, type ThemeStyleParams } from "@/lib/api"
+import { useTenant } from "@/lib/tenant"
+import { clearOutdatedThemeJobs, setOutdatedThemeJobs } from "@/lib/tenant-theme-outdated"
+import {
+  KARAOKE_DEFAULTS, copyTitleCardLayoutToEnd, formatRegion, getField, hexToRgba, parseRegion, rgbaToHex, setField, stableStringify,
+  type Region,
+} from "./theme-utils"
+
+const PREVIEW_DEBOUNCE_MS = 700
+// End-screen text positions used when a theme has none (matches the stock end screen).
+const END_EXTRA_FALLBACK: Region = { x: 370, y: 400, w: 3100, h: 400 }
+const END_TITLE_FALLBACK: Region = { x: 370, y: 900, w: 3100, h: 350 }
+const END_ARTIST_FALLBACK: Region = { x: 370, y: 1450, w: 3100, h: 200 }
+const selectClass =
+  "h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+
+interface Props {
+  open: boolean
+  onClose: () => void
+}
+
+type Tab = "titleCard" | "karaoke" | "endScreen" | "cdg" | "advanced"
+type Mp4Kind = "title_card" | "karaoke_frame" | "end_screen"
+// The video screens each tab previews (the CD+G tab previews CD+G screens only).
+const TAB_KINDS: Record<Tab, Mp4Kind[]> = {
+  titleCard: ["title_card"],
+  karaoke: ["karaoke_frame"],
+  endScreen: ["end_screen"],
+  cdg: [],
+  advanced: ["title_card", "karaoke_frame", "end_screen"],
+}
+// CD+G screens are 300x216.
+const CDG_ASPECT = "300 / 216"
+
+// --- small field components ---------------------------------------------------
+
+function ColorInput({ id, label, value, onChange }: {
+  id: string; label: string; value: string; onChange: (hex: string) => void
+}) {
+  return (
+    <div className="space-y-1">
+      <Label htmlFor={id} className="text-xs text-muted-foreground">{label}</Label>
+      <div className="flex items-center gap-2">
+        <input
+          type="color"
+          aria-label={label}
+          value={/^#[0-9a-f]{6}$/i.test(value) ? value : "#000000"}
+          onChange={(e) => onChange(e.target.value)}
+          className="h-9 w-9 shrink-0 cursor-pointer rounded border border-input bg-transparent p-0.5"
+        />
+        <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} className="font-mono" />
+      </div>
+    </div>
+  )
+}
+
+function RangeInput({ id, label, value, min, max, step = 1, onChange }: {
+  id: string; label: string; value: number; min: number; max: number; step?: number; onChange: (n: number) => void
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <Label htmlFor={id} className="text-xs text-muted-foreground">{label}</Label>
+        <span className="text-xs font-mono text-muted-foreground">{value}</span>
+      </div>
+      <input
+        id={id}
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-[var(--brand-pink,#ff5bb8)]"
+      />
+    </div>
+  )
+}
+
+// --- main dialog ----------------------------------------------------------------
+
+export function TenantThemeEditorDialog({ open, onClose }: Props) {
+  const t = useTranslations("tenantTheme")
+  const { toast } = useToast()
+  const { tenant, features } = useTenant()
+
+  const [loading, setLoading] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [saved, setSaved] = useState<ThemeStyleParams | null>(null)
+  const [draft, setDraft] = useState<ThemeStyleParams | null>(null)
+  const [images, setImages] = useState<string[]>([])
+  const [fonts, setFonts] = useState<string[]>([])
+  const [cdgImages, setCdgImages] = useState<string[]>([])
+  const [cdgTransitions, setCdgTransitions] = useState<string[]>([])
+  const [tab, setTab] = useState<Tab>("titleCard")
+  const [jsonText, setJsonText] = useState("")
+  const [jsonError, setJsonError] = useState<string | null>(null)
+  const [sampleArtist, setSampleArtist] = useState("")
+  const [sampleTitle, setSampleTitle] = useState("")
+  const [preview, setPreview] = useState<ThemePreviewImages | null>(null)
+  const [previewing, setPreviewing] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [uploading, setUploading] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  // What the last save did to existing tracks (shown until the next save).
+  const [saveResult, setSaveResult] = useState<{ refreshed: number; outdated: string[] } | null>(null)
+  const [rerenderingAll, setRerenderingAll] = useState(false)
+  const [rerenderStarted, setRerenderStarted] = useState<number | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+
+  // Load the current theme each time the dialog opens.
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setLoading(true)
+    setLoadError(null)
+    setSampleArtist(tenant?.name || t("sampleArtistDefault"))
+    setSampleTitle(t("sampleTitleDefault"))
+    tenantThemeApi
+      .get()
+      .then((data) => {
+        if (cancelled) return
+        setSaved(data.style_params)
+        setDraft(data.style_params)
+        setJsonText(JSON.stringify(data.style_params, null, 2))
+        setImages(data.images)
+        setFonts(data.fonts)
+        setCdgImages(data.cdg_images ?? [])
+        setCdgTransitions(data.cdg_transitions ?? [])
+      })
+      .catch((err: any) => !cancelled && setLoadError(err?.message || t("loadFailed")))
+      .finally(() => !cancelled && setLoading(false))
+    return () => { cancelled = true }
+  }, [open]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Invalid Advanced JSON is unsaved work too (the draft keeps its last valid value).
+  const dirty = useMemo(
+    () => !!jsonError || (!!draft && !!saved && stableStringify(draft) !== stableStringify(saved)),
+    [draft, saved, jsonError],
+  )
+
+  // Debounced exact server preview; stale requests are aborted.
+  useEffect(() => {
+    if (!open || !draft) return
+    // A render of an older draft is now stale — cancel it immediately so its image
+    // can't flash in while the debounce waits.
+    abortRef.current?.abort()
+    setPreviewing(true)
+    const handle = setTimeout(async () => {
+      const controller = new AbortController()
+      abortRef.current = controller
+      setPreviewing(true)
+      setPreviewError(null)
+      try {
+        const result = await tenantThemeApi.preview(
+          draft,
+          { artist: sampleArtist || undefined, title: sampleTitle || undefined },
+          controller.signal,
+          { includeCdg: tab === "cdg", kinds: TAB_KINDS[tab] },
+        )
+        if (!controller.signal.aborted) setPreview(result)
+      } catch (err: any) {
+        if (!controller.signal.aborted && err?.name !== "AbortError") {
+          setPreviewError(err?.message || t("previewFailed"))
+        }
+      } finally {
+        if (!controller.signal.aborted) setPreviewing(false)
+      }
+    }, PREVIEW_DEBOUNCE_MS)
+    return () => clearTimeout(handle)
+  }, [open, draft, sampleArtist, sampleTitle, tab]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => abortRef.current?.abort(), [])
+
+  const update = useCallback((section: string, field: string, value: unknown) => {
+    setDraft((d) => (d ? setField(d, section, field, value) : d))
+  }, [])
+
+  const switchTab = (next: Tab) => {
+    if (tab === "advanced" && next !== "advanced") {
+      // Leaving the JSON tab applies it (only if valid).
+      try {
+        const parsed = JSON.parse(jsonText)
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(t("jsonMustBeObject"))
+        setDraft(parsed)
+        setJsonError(null)
+      } catch (e: any) {
+        setJsonError(e?.message || t("jsonInvalid"))
+        return
+      }
+    }
+    if (next === "advanced" && draft) setJsonText(JSON.stringify(draft, null, 2))
+    setTab(next)
+  }
+
+  const onJsonChange = (text: string) => {
+    setJsonText(text)
+    try {
+      const parsed = JSON.parse(text)
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(t("jsonMustBeObject"))
+      setJsonError(null)
+      setDraft(parsed)
+    } catch (e: any) {
+      setJsonError(e?.message || t("jsonInvalid"))
+    }
+  }
+
+  const uploadAsset = async (file: File, apply: (name: string) => void, key: string, purpose?: "cdg") => {
+    setUploading(key)
+    try {
+      const { name } = purpose ? await tenantThemeApi.uploadAsset(file, purpose) : await tenantThemeApi.uploadAsset(file)
+      if (/\.(ttf|otf)$/i.test(name)) setFonts((f) => Array.from(new Set([...f, name])).sort())
+      else setImages((imgs) => Array.from(new Set([...imgs, name])).sort())
+      // CD+G uploads are fitted to 300x216 by the server.
+      if (purpose === "cdg") setCdgImages((imgs) => Array.from(new Set([...imgs, name])).sort())
+      apply(name)
+    } catch (err: any) {
+      toast({ title: t("uploadFailed"), description: err?.message, variant: "destructive" })
+    } finally {
+      setUploading(null)
+    }
+  }
+
+  const handleSave = async () => {
+    if (!draft || jsonError) return
+    setSaving(true)
+    const requested = draft
+    try {
+      const data = await tenantThemeApi.save(requested)
+      setSaved(data.style_params)
+      // Keep edits made while the save was in flight; only adopt the server's
+      // normalised theme if the draft is still the one we sent.
+      setDraft((current) =>
+        current && stableStringify(current) !== stableStringify(requested) ? current : data.style_params,
+      )
+      setImages(data.images)
+      setFonts(data.fonts)
+      setCdgImages(data.cdg_images ?? [])
+      setSaveResult({ refreshed: data.refreshed_jobs ?? 0, outdated: data.outdated_job_ids ?? [] })
+      setRerenderStarted(null)
+      setOutdatedThemeJobs(data.outdated_job_ids ?? [])
+      toast({ title: t("savedTitle"), description: t("savedBodyInProgress") })
+    } catch (err: any) {
+      toast({ title: t("saveFailed"), description: err?.message, variant: "destructive" })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleRerenderAll = async () => {
+    setRerenderingAll(true)
+    try {
+      const result = await tenantThemeApi.rerenderOutdated()
+      clearOutdatedThemeJobs(result.started)
+      setRerenderStarted((n) => (n ?? 0) + result.started.length)
+      // Still outdated: failures, plus any beyond the server's per-call cap.
+      setSaveResult((r) => r && { ...r, outdated: [...Object.keys(result.failed), ...(result.remaining ?? [])] })
+      if (Object.keys(result.failed).length) {
+        toast({
+          title: t("rerenderAllSomeFailed", { count: Object.keys(result.failed).length }),
+          description: Object.values(result.failed)[0],
+          variant: "destructive",
+        })
+      }
+    } catch (err: any) {
+      toast({ title: t("rerenderAllFailed"), description: err?.message, variant: "destructive" })
+    } finally {
+      setRerenderingAll(false)
+    }
+  }
+
+  const handleClose = () => {
+    if (dirty && !window.confirm(t("discardConfirm"))) return
+    abortRef.current?.abort()
+    onClose()
+  }
+
+  // --- guided-form helpers ------------------------------------------------------
+
+  const bgField = (section: "intro" | "karaoke" | "end") => {
+    const image = getField<string | null>(draft!, section, "background_image") || ""
+    const color = getField<string>(draft!, section, "background_color") || "#000000"
+    const key = `${section}-bg`
+    return (
+      <div className="space-y-2 rounded-md border p-3">
+        <Label className="flex items-center gap-1.5"><ImageIcon className="h-3.5 w-3.5" /> {t("background")}</Label>
+        <select
+          aria-label={t("backgroundImage")}
+          className={selectClass}
+          value={image}
+          onChange={(e) => update(section, "background_image", e.target.value || null)}
+        >
+          <option value="">{t("solidColour")}</option>
+          {images.map((img) => <option key={img} value={img}>{img}</option>)}
+        </select>
+        <div className="flex items-center gap-2">
+          <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+            {uploading === key ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+            {t("uploadImage")}
+            <input
+              type="file"
+              className="sr-only"
+              aria-label={`${t("uploadImage")} (${t(`tabs.${section === "intro" ? "titleCard" : section === "end" ? "endScreen" : "karaoke"}`)})`}
+              accept=".png,.jpg,.jpeg,.gif,.webp"
+              disabled={!!uploading}
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                if (file) uploadAsset(file, (name) => update(section, "background_image", name), key)
+                e.target.value = ""
+              }}
+            />
+          </label>
+        </div>
+        {!image && (
+          <ColorInput id={`${section}-bg-colour`} label={t("backgroundColour")} value={color}
+            onChange={(v) => update(section, "background_color", v)} />
+        )}
+      </div>
+    )
+  }
+
+  const regionSliders = (section: "intro" | "end", field: "title_region" | "artist_region" | "extra_text_region", label: string, fallback: Region) => {
+    const region = parseRegion(getField(draft!, section, field), fallback)
+    return (
+      <div className="grid grid-cols-2 gap-3">
+        <RangeInput id={`${section}-${field}-y`} label={t("positionFromTop", { item: label })} value={region.y} min={0} max={2000} step={10}
+          onChange={(y) => update(section, field, formatRegion({ ...region, y }))} />
+        <RangeInput id={`${section}-${field}-h`} label={t("textSize", { item: label })} value={region.h} min={60} max={1000} step={10}
+          onChange={(h) => update(section, field, formatRegion({ ...region, h }))} />
+      </div>
+    )
+  }
+
+  // A text item on the end screen is hidden when its region is null.
+  const regionToggle = (field: "title_region" | "artist_region", label: string, fallback: Region) => (
+    <label className="flex items-center gap-2 text-sm">
+      <input
+        type="checkbox"
+        checked={!!getField(draft!, "end", field)}
+        onChange={(e) => update("end", field, e.target.checked ? formatRegion(parseRegion(getField(draft!, "intro", field), fallback)) : null)}
+      />
+      {label}
+    </label>
+  )
+
+  // Absent = included (older themes have no "enabled" key).
+  const screenToggle = (section: "intro" | "end", label: string) => (
+    <label className="flex items-center gap-2 rounded-md border p-3 text-sm font-medium">
+      <input
+        type="checkbox"
+        data-testid={`${section}-enabled`}
+        checked={getField(draft!, section, "enabled") !== false}
+        onChange={(e) => update(section, "enabled", e.target.checked)}
+      />
+      {label}
+    </label>
+  )
+
+  // The end screen's song title / artist name take the title card's look.
+  const copyTitleCardLayout = () => {
+    setDraft((d) => (d ? copyTitleCardLayoutToEnd(d, END_EXTRA_FALLBACK) : d))
+  }
+
+  const upperToggle = (section: "intro" | "end", field: string, label: string) => (
+    <label className="flex items-center gap-2 text-sm">
+      <input
+        type="checkbox"
+        checked={getField(draft!, section, field) === "uppercase"}
+        onChange={(e) => update(section, field, e.target.checked ? "uppercase" : null)}
+      />
+      {label}
+    </label>
+  )
+
+  const fontField = () => {
+    const font = getField<string>(draft!, "intro", "font") || ""
+    return (
+      <div className="space-y-2 rounded-md border p-3">
+        <Label htmlFor="theme-font">{t("font")}</Label>
+        <select
+          id="theme-font"
+          className={selectClass}
+          value={font}
+          onChange={(e) => update("intro", "font", e.target.value)}
+        >
+          {!fonts.includes(font) && font && <option value={font}>{font}</option>}
+          {fonts.map((f) => <option key={f} value={f}>{f.replace(/\.(ttf|otf)$/i, "")}</option>)}
+        </select>
+        <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+          {uploading === "font" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+          {t("uploadFont")}
+          <input
+            type="file"
+            className="sr-only"
+            aria-label={t("uploadFont")}
+            accept=".ttf,.otf"
+            disabled={!!uploading}
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) uploadAsset(file, (name) => update("intro", "font", name), "font")
+              e.target.value = ""
+            }}
+          />
+        </label>
+        <p className="text-xs text-muted-foreground">{t("fontHint")}</p>
+      </div>
+    )
+  }
+
+  const karaokeColour = (field: string, label: string) => (
+    <ColorInput
+      id={`karaoke-${field}`}
+      label={label}
+      value={rgbaToHex(getField(draft!, "karaoke", field))}
+      onChange={(hex) => update("karaoke", field, hexToRgba(hex, getField(draft!, "karaoke", field)))}
+    />
+  )
+
+  // --- CD+G helpers (the cdg section's colours are plain hex) ---------------------
+
+  const cdgColour = (field: string, label: string, fallback = "#ffffff") => (
+    <ColorInput id={`cdg-${field}`} label={label} value={getField<string>(draft!, "cdg", field) || fallback}
+      onChange={(v) => update("cdg", field, v)} />
+  )
+
+  const cdgImageField = (field: string, label: string) => {
+    const image = getField<string | null>(draft!, "cdg", field) || ""
+    const key = `cdg-${field}`
+    return (
+      <div className="space-y-1">
+        <Label htmlFor={key} className="text-xs text-muted-foreground">{label}</Label>
+        <select id={key} className={selectClass} value={image}
+          onChange={(e) => update("cdg", field, e.target.value || null)}>
+          <option value="">{t("cdgNoImage")}</option>
+          {!cdgImages.includes(image) && image && <option value={image}>{image}</option>}
+          {cdgImages.map((img) => <option key={img} value={img}>{img}</option>)}
+        </select>
+        <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground">
+          {uploading === key ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+          {t("cdgUploadImage")}
+          <input
+            type="file"
+            className="sr-only"
+            aria-label={`${t("cdgUploadImage")} (${label})`}
+            accept=".png,.jpg,.jpeg,.gif,.webp"
+            disabled={!!uploading}
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) uploadAsset(file, (name) => update("cdg", field, name), key, "cdg")
+              e.target.value = ""
+            }}
+          />
+        </label>
+      </div>
+    )
+  }
+
+  const cdgRange = (field: string, label: string, min: number, max: number, fallback: number) => (
+    <RangeInput id={`cdg-${field}`} label={label} min={min} max={max}
+      value={getField<number>(draft!, "cdg", field) ?? fallback}
+      onChange={(n) => update("cdg", field, n)} />
+  )
+
+  const cdgTransition = (field: string, label: string) => {
+    const value = getField<string>(draft!, "cdg", field) || ""
+    return (
+      <div className="space-y-1">
+        <Label htmlFor={`cdg-${field}`} className="text-xs text-muted-foreground">{label}</Label>
+        <select id={`cdg-${field}`} className={selectClass} value={value}
+          onChange={(e) => update("cdg", field, e.target.value)}>
+          {!value && <option value="" disabled>{t("cdgRevealUnset")}</option>}
+          {!cdgTransitions.includes(value) && value && <option value={value}>{value}</option>}
+          {cdgTransitions.map((name) => (
+            <option key={name} value={name}>{typeof t.has === "function" && t.has(`cdgTransitions.${name}`) ? t(`cdgTransitions.${name}`) : name}</option>
+          ))}
+        </select>
+      </div>
+    )
+  }
+
+  const mainFont = getField<string>(draft!, "intro", "font") || ""
+  const cdgFont = getField<string>(draft!, "cdg", "font_path") || ""
+  const cdgOutline = getField<string>(draft!, "cdg", "active_stroke") || "#000000"
+
+  // Only portals that make CD+G files, with a CD+G section in their theme.
+  const hasCdg = !!features?.enable_cdg && Object.keys((draft as Record<string, any> | null)?.cdg || {}).length > 0
+  const tabs: Tab[] = hasCdg ? ["titleCard", "karaoke", "endScreen", "cdg", "advanced"] : ["titleCard", "karaoke", "endScreen", "advanced"]
+
+  // The screen being edited, then the lyrics frame (Advanced shows all three).
+  type CdgKind = "cdg_title_card" | "cdg_lyrics" | "cdg_instrumental" | "cdg_outro"
+  type PreviewKind = Mp4Kind | CdgKind
+  const CDG_KINDS: CdgKind[] = ["cdg_title_card", "cdg_lyrics", "cdg_instrumental", "cdg_outro"]
+  const previewKinds: PreviewKind[] = tab === "cdg" ? CDG_KINDS : TAB_KINDS[tab]
+  const PREVIEW_LABELS: Record<PreviewKind, string> = {
+    title_card: "previewTitleCard",
+    karaoke_frame: "previewKaraoke",
+    end_screen: "previewEndScreen",
+    cdg_title_card: "previewCdgTitleCard",
+    cdg_lyrics: "previewCdgLyrics",
+    cdg_instrumental: "previewCdgInstrumental",
+    cdg_outro: "previewCdgOutro",
+  }
+  const previewLabel = (kind: PreviewKind) => t(PREVIEW_LABELS[kind])
+  const isCdgKind = (kind: PreviewKind) => kind.startsWith("cdg_")
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => { if (!o) handleClose() }}>
+      <DialogContent className="w-[96vw] max-w-[1800px] max-h-[94vh] overflow-y-auto" data-testid="tenant-theme-editor">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2"><Palette className="h-5 w-5" /> {t("title")}</DialogTitle>
+          <DialogDescription>{t("description")}</DialogDescription>
+        </DialogHeader>
+
+        {loading || (!draft && !loadError) ? (
+          <div className="flex items-center justify-center py-16 text-muted-foreground">
+            <Loader2 className="h-5 w-5 animate-spin mr-2" /> {t("loading")}
+          </div>
+        ) : loadError ? (
+          <p className="py-10 text-center text-destructive">{loadError}</p>
+        ) : (
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+            {/* Editor */}
+            <div className="space-y-4 min-w-0">
+              <div role="tablist" className="flex flex-wrap gap-1 rounded-md bg-secondary/50 p-1">
+                {tabs.map((id) => (
+                  <button
+                    key={id}
+                    role="tab"
+                    type="button"
+                    aria-selected={tab === id}
+                    onClick={() => switchTab(id)}
+                    className={`flex-1 rounded px-3 py-1.5 text-sm transition-colors ${tab === id ? "bg-background shadow text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                  >
+                    {t(`tabs.${id}`)}
+                  </button>
+                ))}
+              </div>
+
+              {tab === "titleCard" && (
+                <div className="space-y-4">
+                  {screenToggle("intro", t("includeTitleCard"))}
+                  {getField(draft!, "intro", "enabled") === false ? (
+                    <p className="text-sm text-muted-foreground">{t("titleCardOff")}</p>
+                  ) : (
+                    <>
+                      {bgField("intro")}
+                      <div className="grid grid-cols-2 gap-3">
+                        <ColorInput id="intro-title-colour" label={t("titleColour")} value={getField<string>(draft!, "intro", "title_color") || "#ffffff"}
+                          onChange={(v) => update("intro", "title_color", v)} />
+                        <ColorInput id="intro-artist-colour" label={t("artistColour")} value={getField<string>(draft!, "intro", "artist_color") || "#ffdf6b"}
+                          onChange={(v) => update("intro", "artist_color", v)} />
+                      </div>
+                      {regionSliders("intro", "title_region", t("songTitle"), { x: 370, y: 980, w: 3100, h: 350 })}
+                      {regionSliders("intro", "artist_region", t("artistName"), { x: 370, y: 1400, w: 3100, h: 450 })}
+                      <div className="flex flex-wrap gap-4">
+                        {upperToggle("intro", "title_text_transform", t("uppercaseTitle"))}
+                        {upperToggle("intro", "artist_text_transform", t("uppercaseArtist"))}
+                      </div>
+                      {fontField()}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {tab === "karaoke" && (
+                <div className="space-y-4">
+                  {bgField("karaoke")}
+                  <div className="grid grid-cols-3 gap-3">
+                    {karaokeColour("primary_color", t("sungColour"))}
+                    {karaokeColour("secondary_color", t("unsungColour"))}
+                    {karaokeColour("outline_color", t("outlineColour"))}
+                  </div>
+                  <RangeInput id="karaoke-font-size" label={t("lyricsSize")} min={60} max={400} step={5}
+                    value={getField<number>(draft!, "karaoke", "font_size") ?? KARAOKE_DEFAULTS.font_size}
+                    onChange={(n) => update("karaoke", "font_size", n)} />
+                  <RangeInput id="karaoke-top-padding" label={t("lyricsPosition")} min={0} max={1500} step={10}
+                    value={getField<number>(draft!, "karaoke", "top_padding") ?? (getField<number>(draft!, "karaoke", "font_size") ?? KARAOKE_DEFAULTS.font_size)}
+                    onChange={(n) => update("karaoke", "top_padding", n)} />
+                  <RangeInput id="karaoke-line-length" label={t("lineLength")} min={15} max={60}
+                    value={getField<number>(draft!, "karaoke", "max_line_length") ?? KARAOKE_DEFAULTS.max_line_length}
+                    onChange={(n) => update("karaoke", "max_line_length", n)} />
+                  {fontField()}
+                </div>
+              )}
+
+              {tab === "endScreen" && (
+                <div className="space-y-4">
+                  {screenToggle("end", t("includeEndScreen"))}
+                  {getField(draft!, "end", "enabled") === false ? (
+                    <p className="text-sm text-muted-foreground">{t("endScreenOff")}</p>
+                  ) : (
+                    <>
+                      {bgField("end")}
+                      <div className="space-y-1">
+                        <Label htmlFor="end-extra-text">{t("closingMessage")}</Label>
+                        <Input id="end-extra-text" value={getField<string>(draft!, "end", "extra_text") || ""}
+                          onChange={(e) => {
+                            update("end", "extra_text", e.target.value || null)
+                            // The renderer skips text without a region — give a new message one.
+                            if (e.target.value && !getField(draft!, "end", "extra_text_region")) {
+                              update("end", "extra_text_region", formatRegion(END_EXTRA_FALLBACK))
+                            }
+                          }} />
+                      </div>
+                      {!!getField(draft!, "end", "extra_text") && (
+                        <>
+                          <ColorInput id="end-extra-colour" label={t("closingMessageColour")} value={getField<string>(draft!, "end", "extra_text_color") || "#ffffff"}
+                            onChange={(v) => update("end", "extra_text_color", v)} />
+                          {regionSliders("end", "extra_text_region", t("closingMessage"), END_EXTRA_FALLBACK)}
+                        </>
+                      )}
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3">
+                        <p className="text-xs text-muted-foreground">{t("copyTitleCardLayoutHint")}</p>
+                        <Button size="sm" variant="secondary" onClick={copyTitleCardLayout} data-testid="end-copy-title-layout">
+                          {t("copyTitleCardLayout")}
+                        </Button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <ColorInput id="end-title-colour" label={t("titleColour")} value={getField<string>(draft!, "end", "title_color") || "#ffffff"}
+                          onChange={(v) => update("end", "title_color", v)} />
+                        <ColorInput id="end-artist-colour" label={t("artistColour")} value={getField<string>(draft!, "end", "artist_color") || "#ffdf6b"}
+                          onChange={(v) => update("end", "artist_color", v)} />
+                      </div>
+                      {regionToggle("title_region", t("showSongTitle"), END_TITLE_FALLBACK)}
+                      {!!getField(draft!, "end", "title_region") &&
+                        regionSliders("end", "title_region", t("songTitle"), END_TITLE_FALLBACK)}
+                      {regionToggle("artist_region", t("showArtistName"), END_ARTIST_FALLBACK)}
+                      {!!getField(draft!, "end", "artist_region") &&
+                        regionSliders("end", "artist_region", t("artistName"), END_ARTIST_FALLBACK)}
+                      <div className="flex flex-wrap gap-4">
+                        {upperToggle("end", "title_text_transform", t("uppercaseTitle"))}
+                        {upperToggle("end", "artist_text_transform", t("uppercaseArtist"))}
+                      </div>
+                      <p className="text-xs text-muted-foreground">{t("endScreenFontHint")}</p>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {tab === "cdg" && (
+                <div className="space-y-4" data-testid="cdg-tab">
+                  <p className="text-xs text-muted-foreground">{t("cdgIntro")}</p>
+                  <p className="text-xs text-muted-foreground">{t("cdgRevealHint")}</p>
+
+                  <div className="space-y-3 rounded-md border p-3">
+                    <Label className="flex items-center gap-1.5"><ImageIcon className="h-3.5 w-3.5" /> {t("cdgUpCard")}</Label>
+                    {cdgImageField("title_screen_background", t("cdgUpCardImage"))}
+                    {cdgTransition("title_screen_transition", t("cdgReveal"))}
+                    <div className="grid grid-cols-2 gap-3">
+                      {cdgColour("title_color", t("titleColour"), "#ffff00")}
+                      {cdgColour("artist_color", t("artistColour"), "#ffff00")}
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor="cdg-separator" className="text-xs text-muted-foreground">{t("cdgSeparatorText")}</Label>
+                      <Input id="cdg-separator" maxLength={40} placeholder={t("cdgSeparatorPlaceholder")}
+                        value={getField<string>(draft!, "cdg", "title_separator_text") || ""}
+                        onChange={(e) => update("cdg", "title_separator_text", e.target.value || null)} />
+                    </div>
+                    {!!getField(draft!, "cdg", "title_separator_text") && cdgColour("title_separator_color", t("cdgSeparatorColour"))}
+                    <div className="grid grid-cols-2 gap-3">
+                      {cdgRange("title_font_size", t("cdgTitleSize"), 12, 48, 24)}
+                      {cdgRange("artist_font_size", t("cdgArtistSize"), 12, 48, 24)}
+                      {cdgRange("title_block_top", t("cdgTextTop"), 0, 150, 0)}
+                      {cdgRange("title_artist_gap", t("cdgTitleArtistGap"), 0, 40, 10)}
+                    </div>
+                  </div>
+
+                  <div className="space-y-3 rounded-md border p-3">
+                    <Label>{t("cdgLyrics")}</Label>
+                    <div className="grid grid-cols-2 gap-3">
+                      {cdgColour("active_fill", t("sungColour"), "#006cf9")}
+                      {cdgColour("inactive_fill", t("unsungColour"), "#ffff00")}
+                      {cdgColour("background_color", t("cdgScreenColour"), "#000000")}
+                      {cdgColour("border_color", t("cdgBorderColour"), "#000000")}
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      {cdgRange("font_size", t("cdgLyricsSize"), 12, 30, 18)}
+                      {cdgRange("stroke_width", t("cdgOutlineWidth"), 0, 4, 0)}
+                    </div>
+                    {(getField<number>(draft!, "cdg", "stroke_width") ?? 0) > 0 && (
+                      <ColorInput id="cdg-outline" label={t("cdgOutlineColour")} value={cdgOutline}
+                        onChange={(v) => { update("cdg", "active_stroke", v); update("cdg", "inactive_stroke", v) }} />
+                    )}
+                    <div className="space-y-1">
+                      <Label htmlFor="cdg-font" className="text-xs text-muted-foreground">{t("cdgLyricsFont")}</Label>
+                      <select id="cdg-font" className={selectClass}
+                        value={cdgFont && cdgFont !== mainFont ? cdgFont : ""}
+                        onChange={(e) => update("cdg", "font_path", e.target.value || mainFont)}>
+                        <option value="">{t("cdgSameAsMainFont")}</option>
+                        {fonts.filter((f) => f !== mainFont).map((f) => <option key={f} value={f}>{f.replace(/\.(ttf|otf)$/i, "")}</option>)}
+                      </select>
+                      <p className="text-xs text-muted-foreground">{t("cdgLyricsFontHint")}</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3 rounded-md border p-3">
+                    <Label>{t("cdgInstrumental")}</Label>
+                    {cdgImageField("instrumental_background", t("cdgInstrumentalImage"))}
+                    {cdgTransition("instrumental_transition", t("cdgReveal"))}
+                    <RangeInput id="cdg-instrumental_gap_threshold" label={t("cdgInstrumentalAfter")} min={3} max={120}
+                      value={Math.round((getField<number>(draft!, "cdg", "instrumental_gap_threshold") ?? 1500) / 100)}
+                      onChange={(n) => update("cdg", "instrumental_gap_threshold", n * 100)} />
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="cdg-instrumental-text" className="text-xs text-muted-foreground">{t("cdgInstrumentalText")}</Label>
+                        <Input id="cdg-instrumental-text" maxLength={40}
+                          value={getField<string>(draft!, "cdg", "instrumental_text") || ""}
+                          onChange={(e) => update("cdg", "instrumental_text", e.target.value)} />
+                      </div>
+                      {cdgColour("instrumental_font_color", t("cdgInstrumentalColour"), "#ffff00")}
+                    </div>
+                  </div>
+
+                  <div className="space-y-3 rounded-md border p-3">
+                    <Label>{t("cdgOutro")}</Label>
+                    {cdgImageField("outro_background", t("cdgOutroImage"))}
+                    {cdgTransition("outro_transition", t("cdgReveal"))}
+                    <div className="grid grid-cols-2 gap-3">
+                      {cdgColour("outro_line1_color", t("cdgOutroLine1Colour"), "#ffff00")}
+                      {cdgColour("outro_line2_color", t("cdgOutroLine2Colour"), "#ffff00")}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {tab === "advanced" && (
+                <div className="space-y-2">
+                  <textarea
+                    aria-label={t("advancedJson")}
+                    value={jsonText}
+                    onChange={(e) => onJsonChange(e.target.value)}
+                    spellCheck={false}
+                    className="h-[420px] w-full rounded-md border border-input bg-transparent p-2 font-mono text-xs"
+                  />
+                  {jsonError
+                    ? <p className="text-xs text-destructive">{jsonError}</p>
+                    : <p className="text-xs text-muted-foreground">{t("advancedHint")}</p>}
+                </div>
+              )}
+            </div>
+
+            {/* Previews */}
+            <div className="space-y-3 min-w-0 lg:sticky lg:top-0 lg:self-start">
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label htmlFor="sample-artist" className="text-xs text-muted-foreground">{t("sampleArtist")}</Label>
+                  <Input id="sample-artist" value={sampleArtist} onChange={(e) => setSampleArtist(e.target.value)} />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="sample-title" className="text-xs text-muted-foreground">{t("sampleTitle")}</Label>
+                  <Input id="sample-title" value={sampleTitle} onChange={(e) => setSampleTitle(e.target.value)} />
+                </div>
+              </div>
+              <div className={tab === "cdg" ? "grid grid-cols-2 gap-3" : "space-y-3"} data-testid="preview-list">
+              {previewKinds.map((kind) => (
+                <figure key={kind} className="space-y-1">
+                  <figcaption className="text-xs font-medium text-muted-foreground">{previewLabel(kind)}</figcaption>
+                  <div className={`relative overflow-hidden rounded-md border bg-black ${isCdgKind(kind) ? "" : "aspect-video"}`}
+                    style={isCdgKind(kind) ? { aspectRatio: CDG_ASPECT } : undefined}>
+                    {preview?.[kind] ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={preview[kind]!} alt={previewLabel(kind)}
+                        data-testid={`preview-${kind}`} className="h-full w-full object-contain"
+                        style={isCdgKind(kind) ? { imageRendering: "pixelated" } : undefined} />
+                    ) : preview && (kind === "title_card" || kind === "end_screen") && !previewing && (
+                      <div className="flex h-full items-center justify-center text-sm text-muted-foreground" data-testid={`preview-${kind}-omitted`}>
+                        {t("screenOmitted")}
+                      </div>
+                    )}
+                    {previewing && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+                        <Loader2 className="h-6 w-6 animate-spin text-white" aria-label={t("rendering")} />
+                      </div>
+                    )}
+                  </div>
+                </figure>
+              ))}
+              </div>
+              {previewError && (
+                <p className="flex items-start gap-1.5 text-xs text-destructive">
+                  <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" /> {previewError}
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground">{t("previewHint")}</p>
+            </div>
+          </div>
+        )}
+
+        {saveResult && (saveResult.refreshed > 0 || saveResult.outdated.length > 0 || rerenderStarted !== null) && (
+          <div className="rounded-md border border-border bg-muted/40 p-3 text-sm space-y-2" data-testid="theme-save-result">
+            {saveResult.refreshed > 0 && (
+              <p className="flex items-start gap-2">
+                <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0 text-green-500" />
+                {t("refreshedInProgress", { count: saveResult.refreshed })}
+              </p>
+            )}
+            {rerenderStarted !== null && rerenderStarted > 0 && (
+              <p className="flex items-start gap-2" data-testid="theme-rerender-started">
+                <RefreshCw className="h-4 w-4 mt-0.5 shrink-0 text-primary" />
+                {t("rerenderAllStarted", { count: rerenderStarted })}
+              </p>
+            )}
+            {saveResult.outdated.length > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="flex items-start gap-2">
+                  <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
+                  {t("outdatedFinished", { count: saveResult.outdated.length })}
+                </p>
+                <Button size="sm" onClick={handleRerenderAll} disabled={rerenderingAll} data-testid="theme-rerender-all">
+                  {rerenderingAll
+                    ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> {t("rerenderAllStarting")}</>
+                    : t("rerenderAll", { count: saveResult.outdated.length })}
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        <DialogFooter className="flex items-center gap-2 sm:justify-between">
+          <p className="text-xs text-muted-foreground">{t("appliesToInProgress")} {t("finishedKeepOldLook")}</p>
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={() => { if (saved) { setDraft(saved); setJsonText(JSON.stringify(saved, null, 2)); setJsonError(null) } }}
+              disabled={!dirty || saving}>
+              {t("discard")}
+            </Button>
+            <Button variant="ghost" onClick={handleClose} disabled={saving}>{t("close")}</Button>
+            <Button onClick={handleSave} disabled={!dirty || saving || !!jsonError || !!uploading}>
+              {saving ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> {t("saving")}</> : t("save")}
+            </Button>
+          </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}

@@ -1,0 +1,709 @@
+"""
+Cloud Monitoring resources.
+
+Manages alert policies for proactive monitoring and incident response. Every
+alert policy attaches the notification channel(s) created by
+``create_notification_channels`` — without that, a firing alert resolves into
+the void (verified on 2026-05-17: three ephemeral-dispatcher create failures
+fired the create-failures alert correctly, but the project had zero
+notification channels attached, so nobody got paged for 14 hours).
+"""
+
+import pulumi
+import pulumi_gcp as gcp
+
+from config import PROJECT_ID
+
+
+# Email address that receives all monitoring alerts. Cloud Monitoring delivers
+# a one-time confirmation link to this address when the channel is created;
+# the channel stays in PENDING state until verified.
+_ALERT_EMAIL = "andrew@beveridge.uk"
+
+
+def create_notification_channels() -> dict[str, gcp.monitoring.NotificationChannel]:
+    """Create the notification channels attached to every alert policy.
+
+    Returns a dict so callers can pass selected channels to specific policies
+    in the future (e.g. critical-only routing). Today every policy uses
+    ``channels["email"]``.
+
+    Swapping email for Discord later: Discord supports Slack-compatible
+    webhooks at ``<discord_webhook_url>/slack``. Add a second channel with
+    ``type_="slack"`` and ``sensitive_labels={"auth_token": <url>}``; reference
+    it in the policies that should page Discord. Keep email as the durable
+    fallback.
+    """
+    channels: dict[str, gcp.monitoring.NotificationChannel] = {}
+    channels["email"] = gcp.monitoring.NotificationChannel(
+        "alerts-email",
+        display_name="Andrew (email)",
+        type="email",
+        labels={"email_address": _ALERT_EMAIL},
+        description="Primary alert channel for Cloud Monitoring policies.",
+        enabled=True,
+    )
+    return channels
+
+
+def _channel_names(channels: dict[str, gcp.monitoring.NotificationChannel]) -> list[pulumi.Output[str]]:
+    """Return the .name Outputs of every channel (the form AlertPolicy wants)."""
+    return [ch.name for ch in channels.values()]
+
+
+def create_alert_policies(
+    channels: dict[str, gcp.monitoring.NotificationChannel],
+) -> dict[str, gcp.monitoring.AlertPolicy]:
+    """
+    Create all Cloud Monitoring alert policies.
+
+    Args:
+        channels: Notification channels to attach (from
+            :func:`create_notification_channels`). All policies get every
+            channel.
+
+    Returns:
+        dict: Dictionary mapping alert names to AlertPolicy resources.
+    """
+    notification_channels = _channel_names(channels)
+    alerts = {}
+
+    # Alert: Sustained server errors (5xx).
+    #
+    # NOTE on semantics: with ALIGN_RATE + REDUCE_SUM the threshold is a request
+    # *rate* (requests/second), NOT a true percentage — the old "Error rate >
+    # 10%" name was a misnomer. It also matched ALL non-2xx codes, so a burst of
+    # 404s from an internet vuln-scanner (2026-07-20: 0.167 req/s of 404s from a
+    # single IP hammering /.env, /.ssh/... ) tripped it despite the service being
+    # perfectly healthy.
+    #
+    # Fix: scope to `response_code_class="5xx"` so only genuine *server* errors
+    # count — client/bot 404s never page us. WAF/rate-limiting at the Cloudflare
+    # edge (see modules/edge_security.py) is the primary defense that keeps that
+    # scan traffic off the metric entirely. Threshold = >0.1 5xx req/s sustained
+    # over 5 min. With COMPARISON_GT the boundary is strict: 6 errors/min
+    # (=0.1/s) does NOT fire; >=7/min sustained for 5 min does → real regression.
+    alerts["error_rate"] = gcp.monitoring.AlertPolicy(
+        "high-error-rate-alert",
+        display_name="Karaoke Backend - High Server-Error Rate (5xx)",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Sustained 5xx server errors > 0.1/s (5 min)",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter='resource.type="cloud_run_revision" AND resource.labels.service_name="karaoke-backend" AND metric.type="run.googleapis.com/request_count" AND metric.labels.response_code_class="5xx"',
+                    comparison="COMPARISON_GT",
+                    threshold_value=0.1,
+                    duration="300s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="60s",
+                            per_series_aligner="ALIGN_RATE",
+                            cross_series_reducer="REDUCE_SUM",
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="3600s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content="Sustained 5xx server errors on karaoke-backend (not client/bot 404s). Check Cloud Run logs for crashes, timeouts, or dependency failures.\n\nDashboard: https://console.cloud.google.com/run/detail/us-central1/karaoke-backend/logs?project=nomadkaraoke",
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+    )
+
+    # Alert: Cloud Tasks Queue Backlog (tasks piling up)
+    alerts["queue_backlog"] = gcp.monitoring.AlertPolicy(
+        "queue-backlog-alert",
+        display_name="Karaoke Backend - Queue Backlog",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Queue depth > 50 tasks",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter='resource.type="cloud_tasks_queue" AND metric.type="cloudtasks.googleapis.com/queue/depth"',
+                    comparison="COMPARISON_GT",
+                    threshold_value=50,
+                    duration="600s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="60s",
+                            per_series_aligner="ALIGN_MEAN",
+                            cross_series_reducer="REDUCE_MAX",
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="1800s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content="Cloud Tasks queue backlog detected. Tasks are piling up faster than workers can process.\n\nPossible causes:\n- Worker errors (check logs)\n- External API issues (Modal, AudioShake)\n- Cloud Run scaling limits\n\nDashboard: https://console.cloud.google.com/cloudtasks?project=nomadkaraoke",
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+    )
+
+    # Alert: High Memory Utilization (workers may be crashing)
+    alerts["memory"] = gcp.monitoring.AlertPolicy(
+        "high-memory-alert",
+        display_name="Karaoke Backend - High Memory Usage",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Memory > 85%",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter='resource.type="cloud_run_revision" AND resource.labels.service_name="karaoke-backend" AND metric.type="run.googleapis.com/container/memory/utilizations"',
+                    comparison="COMPARISON_GT",
+                    threshold_value=0.85,
+                    duration="300s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="60s",
+                            per_series_aligner="ALIGN_PERCENTILE_95",
+                            cross_series_reducer="REDUCE_MAX",
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="1800s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content="High memory utilization on karaoke-backend. Workers may be running out of memory.\n\nActions:\n- Check for memory leaks in worker code\n- Consider increasing Cloud Run memory limits\n- Review temp file cleanup",
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+    )
+
+    # Alert: Cloud Run Service Unavailable
+    #
+    # HISTORY — why this is NOT an instance-count-absence alert anymore:
+    #   The original condition used `condition_absent` on
+    #   `run.googleapis.com/container/instance_count` ("No healthy instances").
+    #   That metric is a *sampled* series: for a min-instances=1, low-traffic
+    #   service it legitimately stops reporting for short stretches even while
+    #   the single instance is alive and serving 200s. On 2026-08-19 03:15 UTC it
+    #   fired + auto-resolved in ~85s while the same instanceId was actively
+    #   answering the scheduled recover-stuck-jobs / retry-pending-render crons
+    #   with HTTP 200 — a pure metric blink, not an outage. Absence of an
+    #   instance-count sample is simply the wrong signal for "is the API down".
+    #
+    #   Fix: measure reachability directly with a Cloud Monitoring uptime check
+    #   against the public health endpoint (through the Cloudflare edge, exactly
+    #   the path real users take), and page only when it FAILS from more than one
+    #   checker location — so a single flaky checker can't page us, but a genuine
+    #   hard-down (every checker failing) does after the retest window (~5-6 min
+    #   with the 300s `duration`; see the HISTORY note on that below).
+    #
+    #   NOTE on granularity: with selected_regions unset the check runs from all
+    #   of Google's checker locations (several are in the USA alone). The
+    #   condition counts failing *checker locations* (REDUCE_COUNT_FALSE grouped
+    #   by host), NOT broad geographic regions — two failed US checkers is enough
+    #   to fire. That is intentional: >1 failing location is a real reachability
+    #   problem worth paging, and requiring >1 filters out single-checker noise.
+    #
+    #   HISTORY — why `duration` is 300s, not 60s:
+    #   The service runs on `--min-instances 1` (a single warm instance). Two
+    #   self-healing failure modes each briefly take health checks down from ALL
+    #   checker locations at once, tripping the >1-location threshold:
+    #     (a) Instance recycle. Cloud Run periodically replaces the lone instance
+    #         (host maintenance / max-lifetime). On 2026-08-22 06:02:30–06:03:50
+    #         UTC the instance was replaced (log: "Starting new instance …
+    #         MIN_INSTANCE" then AUTOSCALING; STARTUP probe ready ~06:03:13),
+    #         leaving ~80s with no warm origin — every uptime checker failed, then
+    #         it self-healed. The alert fired at 06:06 and auto-cleared in ~1m41s.
+    #     (b) Event-loop stall. The single instance can block on synchronous-ish
+    #         work (e.g. orchestrating an encoding-worker fallback cold-start with
+    #         blocking timeouts, seen 2026-08-22 00:11–00:12 UTC where four queued
+    #         health probes all flushed at the same instant), so probes queue past
+    #         the 10s uptime timeout across regions until it frees up.
+    #   Both clear on their own well under 5 minutes. Rather than pay for a second
+    #   always-on instance, we require the >1-location failure to PERSIST for 300s
+    #   before paging: sub-5-min blips are suppressed, a genuine sustained hard-down
+    #   still pages (at ~5–6 min instead of ~1–2). If real outages ever slip
+    #   through undetected, the cheaper-detection lever is `--min-instances 2`
+    #   (ci.yml) — that removes both failure modes at the source.
+    uptime_health = gcp.monitoring.UptimeCheckConfig(
+        "backend-health-uptime-check",
+        display_name="Karaoke Backend - /api/health",
+        timeout="10s",
+        period="60s",
+        monitored_resource=gcp.monitoring.UptimeCheckConfigMonitoredResourceArgs(
+            type="uptime_url",
+            labels={"project_id": PROJECT_ID, "host": "api.nomadkaraoke.com"},
+        ),
+        http_check=gcp.monitoring.UptimeCheckConfigHttpCheckArgs(
+            path="/api/health",
+            port=443,
+            use_ssl=True,
+            validate_ssl=True,
+            request_method="GET",
+            accepted_response_status_codes=[
+                gcp.monitoring.UptimeCheckConfigHttpCheckAcceptedResponseStatusCodeArgs(
+                    status_value=200,
+                ),
+            ],
+        ),
+        # Body must actually contain the health marker — guards against an edge
+        # that returns 200 with an error/placeholder page instead of the app.
+        content_matchers=[
+            gcp.monitoring.UptimeCheckConfigContentMatcherArgs(
+                content="healthy",
+                matcher="CONTAINS_STRING",
+            ),
+        ],
+    )
+    alerts["health_uptime_check"] = uptime_health
+
+    # Build the alert filter once the check id is known. `check_id` in the metric
+    # label is the short id exposed as `.uptime_check_id`.
+    _uptime_filter = uptime_health.uptime_check_id.apply(
+        lambda check_id: (
+            'resource.type="uptime_url" '
+            'AND metric.type="monitoring.googleapis.com/uptime_check/check_passed" '
+            f'AND metric.label.check_id="{check_id}"'
+        )
+    )
+
+    alerts["service_unavailable"] = gcp.monitoring.AlertPolicy(
+        "service-unavailable-alert",
+        display_name="Karaoke Backend - Service Unavailable",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Health check failing from >1 checker location",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter=_uptime_filter,
+                    # Count how many checker locations reported a *failed* check
+                    # over the window; fire when more than one location is failing.
+                    comparison="COMPARISON_GT",
+                    threshold_value=1,
+                    # Require the >1-location failure to persist for 5 minutes
+                    # before paging. Filters out sub-5-min self-healing blips on
+                    # the single min-instance (recycle gap + event-loop stall);
+                    # see the HISTORY note above. A sustained hard-down still fires.
+                    duration="300s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="1200s",
+                            per_series_aligner="ALIGN_NEXT_OLDER",
+                            cross_series_reducer="REDUCE_COUNT_FALSE",
+                            group_by_fields=["resource.label.host"],
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="1800s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content="Karaoke backend health check (https://api.nomadkaraoke.com/api/health) is failing from multiple checker locations - the API is likely unreachable or erroring.\n\nImmediate actions:\n1. Check Cloud Run logs for crash reasons\n2. Verify recent deployments\n3. Check the Cloudflare edge (api.nomadkaraoke.com) and external dependencies (Modal, AudioShake)\n\nService URL: https://api.nomadkaraoke.com/api/health",
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+    )
+
+    return alerts
+
+
+def create_ephemeral_runner_observability(
+    channels: dict[str, gcp.monitoring.NotificationChannel],
+) -> dict:
+    """Log-based metrics + alerts for the ephemeral GHA runner dispatcher.
+
+    Adds two alerts that are useful during the Phase 3 soak and afterward:
+
+    1. Dispatcher VM-create failures (the dispatcher returns 503 + logs
+       ``create_ephemeral_runner failed`` — any occurrence in 10 min fires).
+    2. Long-running ephemeral runner VMs (uptime > 2h30m on instances labelled
+       ``purpose=gha-ephemeral-runner`` — catches hung jobs or cleanup bugs).
+    """
+    notification_channels = _channel_names(channels)
+    resources: dict = {}
+
+    # ---- Log-based metric: dispatch failures -------------------------------
+    resources["dispatch_failure_metric"] = gcp.logging.Metric(
+        "runner-dispatcher-failures",
+        name="runner_dispatcher/create_failures",
+        description="Counts create_ephemeral_runner failures (any zone)",
+        # Function logs include the function name; runner-manager covers both
+        # legacy + ephemeral entry points.
+        filter=(
+            'resource.type="cloud_run_revision" '
+            'AND resource.labels.service_name="github-runner-manager" '
+            'AND textPayload:"create_ephemeral_runner failed"'
+        ),
+        metric_descriptor=gcp.logging.MetricMetricDescriptorArgs(
+            metric_kind="DELTA",
+            value_type="INT64",
+            unit="1",
+            display_name="Runner dispatcher create failures",
+        ),
+    )
+
+    # ---- Log-based metric: orphan kills (visibility, not alerting) ---------
+    resources["orphan_kill_metric"] = gcp.logging.Metric(
+        "runner-dispatcher-orphan-kills",
+        name="runner_dispatcher/orphan_kills",
+        description="Counts orphan VMs deleted by the dispatcher cleanup pass",
+        filter=(
+            'resource.type="cloud_run_revision" '
+            'AND resource.labels.service_name="github-runner-manager" '
+            'AND textPayload:"age=" AND textPayload:"deleting"'
+        ),
+        metric_descriptor=gcp.logging.MetricMetricDescriptorArgs(
+            metric_kind="DELTA",
+            value_type="INT64",
+            unit="1",
+            display_name="Runner dispatcher orphan-VM deletions",
+        ),
+    )
+
+    # ---- Alert: any dispatcher create failure in last 10 minutes -----------
+    resources["dispatch_failure_alert"] = gcp.monitoring.AlertPolicy(
+        "runner-dispatcher-failures-alert",
+        display_name="GHA Runner Dispatcher - Create Failures",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Any create_ephemeral_runner failure",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter=(
+                        'metric.type="logging.googleapis.com/user/runner_dispatcher/create_failures" '
+                        'AND resource.type="cloud_run_revision"'
+                    ),
+                    comparison="COMPARISON_GT",
+                    threshold_value=0,
+                    duration="0s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="600s",
+                            per_series_aligner="ALIGN_SUM",
+                            cross_series_reducer="REDUCE_SUM",
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="3600s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content=(
+                "Ephemeral runner dispatcher failed to create a VM.\n\n"
+                "Likely causes:\n"
+                "- GCE quota exhausted (CPU or NVIDIA_T4_GPUS in us-central1)\n"
+                "- GitHub JIT mint API rate-limited or PAT expired\n"
+                "- Image family deprecated/missing (gha-runner-{general,build,gpu})\n"
+                "- Both primary and fallback zones exhausted\n\n"
+                "Logs: filter `resource.labels.service_name=\"github-runner-manager\"` "
+                "in Cloud Logging for `create_ephemeral_runner failed`.\n\n"
+                "Rollback: not possible from this alert — Phase 4 deleted the "
+                "legacy long-lived VMs (PR #780). Recovery requires either "
+                "fixing the failure mode or recreating the legacy pool from "
+                "git history."
+            ),
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+        opts=pulumi.ResourceOptions(depends_on=[resources["dispatch_failure_metric"]]),
+    )
+
+    # ---- Alert: ephemeral VM uptime > 2h30m --------------------------------
+    # `compute.googleapis.com/instance/uptime_total` is a cumulative count of
+    # seconds the VM has been up. The orphan-cleanup pass kills VMs at
+    # MAX_VM_LIFETIME_MINUTES=120 on a 15-min scheduler tick, so worst-case
+    # lifetime is ~135min. ALIGN_MAX over a 5-min window plus the 300s
+    # duration means a threshold of exactly 7200s fires on every normal
+    # cleanup (the window containing the pre-delete sample still reports
+    # max>threshold for 5min after the VM is gone). Threshold set to 9000s
+    # (150min = worst-case + 15min buffer) so this alert only fires when
+    # cleanup is genuinely broken, not on routine cleanups that land within
+    # the expected window.
+    resources["long_lived_vm_alert"] = gcp.monitoring.AlertPolicy(
+        "runner-dispatcher-long-lived-vm-alert",
+        display_name="GHA Runner Dispatcher - VM Alive > 2h30m",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Ephemeral runner VM uptime > 2h30m",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter=(
+                        'metric.type="compute.googleapis.com/instance/uptime_total" '
+                        'AND resource.type="gce_instance" '
+                        'AND metadata.user_labels.purpose="gha-ephemeral-runner"'
+                    ),
+                    comparison="COMPARISON_GT",
+                    threshold_value=9000,
+                    duration="300s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="300s",
+                            per_series_aligner="ALIGN_MAX",
+                            cross_series_reducer="REDUCE_MAX",
+                            group_by_fields=["resource.labels.instance_id"],
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            # GCP minimum is 30 minutes — anything lower returns 400.
+            auto_close="1800s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content=(
+                "An ephemeral GHA runner VM has been alive for more than 2h30m.\n"
+                "Orphan-cleanup should kill VMs at MAX_VM_LIFETIME_MINUTES (120)\n"
+                "on a 15-min scheduler tick — worst-case lifetime is ~135min.\n"
+                "If this alert fires, the cleanup pass is broken or the VM is\n"
+                "escaping it.\n\n"
+                "Investigate:\n"
+                "1. `gcloud compute instances list --filter=labels.purpose=gha-ephemeral-runner`\n"
+                "2. Check Cloud Function logs for the cleanup pass\n"
+                "3. Manually delete: `gcloud compute instances delete <name> --zone=<zone>`"
+            ),
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+    )
+
+    return resources
+
+
+# Matches a failed Postmark SMTP-fallback send in either service (see
+# create_email_delivery_observability). Kept module-level so it can be
+# sanity-checked with `gcloud logging read` before applying.
+SMTP_FALLBACK_FAILURE_LOG_FILTER = (
+    'resource.type="cloud_run_revision" '
+    'AND resource.labels.service_name=("karaoke-backend" OR "karaoke-decide") '
+    'AND ((jsonPayload.message:"Failed to send email to" '
+    'AND jsonPayload.message:"via Postmark SMTP fallback") '
+    'OR (textPayload:"Failed to send email to" '
+    'AND textPayload:"via Postmark SMTP fallback"))'
+)
+
+
+def create_email_delivery_observability(
+    channels: dict[str, gcp.monitoring.NotificationChannel],
+) -> dict:
+    """Log-based metric + alert for failed Postmark SMTP-fallback sends.
+
+    Since 2026-09-30 Postmark's API edge blocks some shared us-central1 Cloud
+    Run egress IPs (IP-reputation block, confirmed by Postmark ticket
+    #11562402 — they won't lift it). karaoke-backend (v0.263.1+) and
+    karaoke-decide (v0.9.3+) fall back to Postmark SMTP on that HTML 403. If
+    the SMTP fallback *itself* fails, emails (magic links, order
+    confirmations) are being lost again — most likely Postmark has started
+    blocking SMTP from our IPs too. That is the trigger to add a static egress
+    IP (Cloud NAT); see docs/archive/2026-10-02-postmark-ip-block-options.md.
+
+    Apply gotcha: on the very first ``pulumi up`` the AlertPolicy can fail
+    because GCP hasn't propagated the just-created log-based metric yet
+    (``depends_on`` orders creation but can't wait for propagation). Re-run
+    ``pulumi up`` a minute later and it succeeds (happened 2026-10-02).
+
+    Cost: the log-based counter metric is within the free metric allotment;
+    alert policies are free until 2027-09-01, then $0.35/month per metric
+    reference.
+    """
+    notification_channels = _channel_names(channels)
+    resources: dict = {}
+
+    # Both services log "Failed to send email to <addr> via Postmark SMTP
+    # fallback" (logger.exception) when the fallback send raises. NOTE the
+    # payload field differs: karaoke-backend logs structured JSON
+    # (jsonPayload.message) while karaoke-decide logs plain text
+    # (textPayload) — the filter must match both or gen failures go unseen.
+    resources["smtp_fallback_failure_metric"] = gcp.logging.Metric(
+        "postmark-smtp-fallback-failures",
+        name="email/postmark_smtp_fallback_failures",
+        description="Counts Postmark SMTP-fallback send failures (karaoke-backend + karaoke-decide)",
+        filter=SMTP_FALLBACK_FAILURE_LOG_FILTER,
+        metric_descriptor=gcp.logging.MetricMetricDescriptorArgs(
+            metric_kind="DELTA",
+            value_type="INT64",
+            unit="1",
+            display_name="Postmark SMTP fallback failures",
+        ),
+    )
+
+    resources["smtp_fallback_failure_alert"] = gcp.monitoring.AlertPolicy(
+        "postmark-smtp-fallback-failures-alert",
+        display_name="Email - Postmark SMTP fallback failing (emails being lost)",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name="Any SMTP-fallback send failure",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter=(
+                        'metric.type="logging.googleapis.com/user/email/postmark_smtp_fallback_failures" '
+                        'AND resource.type="cloud_run_revision"'
+                    ),
+                    comparison="COMPARISON_GT",
+                    threshold_value=0,
+                    duration="0s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="600s",
+                            per_series_aligner="ALIGN_SUM",
+                            cross_series_reducer="REDUCE_SUM",
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="3600s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content=(
+                "An email failed to send via BOTH the Postmark API (edge-blocked, HTML 403) "
+                "AND the Postmark SMTP fallback. Users are not receiving magic links / "
+                "order emails.\n\n"
+                "1. Logs: `textPayload:\"via Postmark SMTP fallback\"` on karaoke-backend / "
+                "karaoke-decide — check the exception (SMTP 4xx/5xx, connection refused, auth).\n"
+                "2. If Postmark is now blocking SMTP too: add a static egress IP (Cloud NAT). "
+                "Options, costs and Pulumi steps: "
+                "`docs/archive/2026-10-02-postmark-ip-block-options.md` in karaoke-gen.\n"
+                "3. Postmark ticket history: #11562402."
+            ),
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+        opts=pulumi.ResourceOptions(depends_on=[resources["smtp_fallback_failure_metric"]]),
+    )
+
+    return resources
+
+
+# Matches the watchdog's end-of-stall line at ERROR severity (stall >= 10s) on
+# karaoke-backend. backend/services/loop_watchdog.py logs
+# "EVENT_LOOP_STALL ended duration_ms=… culprit=…" — WARNING below 10s, ERROR
+# at/above. Kept module-level so it can be checked with `gcloud logging read`.
+EVENT_LOOP_STALL_LOG_FILTER = (
+    'resource.type="cloud_run_revision" '
+    'AND resource.labels.service_name="karaoke-backend" '
+    'AND severity>=ERROR '
+    'AND jsonPayload.message:"EVENT_LOOP_STALL ended"'
+)
+
+
+def create_event_loop_stall_observability(
+    channels: dict[str, gcp.monitoring.NotificationChannel],
+) -> dict:
+    """Log-based metric + alert for long karaoke-backend event-loop freezes.
+
+    The API runs one event loop per Cloud Run instance; any sync work on it
+    freezes every request (users see the "servers unavailable" banner after
+    ~20s). The watchdog logs each stall with the blocking stack + culprit line.
+    A single 10s stall can happen (e.g. a one-off cold import), so alert on
+    2+ in 30 minutes — that's a recurring blocker worth fixing. The log line's
+    ``culprit`` names the file:line to fix. Context:
+    docs/archive/2026-10-03-backend-loop-freezes-telemetry-plan.md.
+
+    Same first-apply propagation gotcha as the SMTP alert: if the AlertPolicy
+    fails because the new metric isn't visible yet, re-run ``pulumi up``.
+    """
+    notification_channels = _channel_names(channels)
+    resources: dict = {}
+
+    resources["event_loop_stall_metric"] = gcp.logging.Metric(
+        "backend-event-loop-stalls",
+        name="backend/event_loop_stalls",
+        description="karaoke-backend event-loop stalls >= 10s (loop watchdog)",
+        filter=EVENT_LOOP_STALL_LOG_FILTER,
+        metric_descriptor=gcp.logging.MetricMetricDescriptorArgs(
+            metric_kind="DELTA",
+            value_type="INT64",
+            unit="1",
+            display_name="Backend event-loop stalls >= 10s",
+        ),
+    )
+
+    resources["event_loop_stall_alert"] = gcp.monitoring.AlertPolicy(
+        "backend-event-loop-stalls-alert",
+        display_name="Backend - API event loop frozen >=10s (repeatedly)",
+        combiner="OR",
+        conditions=[
+            gcp.monitoring.AlertPolicyConditionArgs(
+                display_name=">=2 event-loop stalls of 10s+ in 30 minutes",
+                condition_threshold=gcp.monitoring.AlertPolicyConditionConditionThresholdArgs(
+                    filter=(
+                        'metric.type="logging.googleapis.com/user/backend/event_loop_stalls" '
+                        'AND resource.type="cloud_run_revision"'
+                    ),
+                    comparison="COMPARISON_GT",
+                    threshold_value=1,
+                    duration="0s",
+                    aggregations=[
+                        gcp.monitoring.AlertPolicyConditionConditionThresholdAggregationArgs(
+                            alignment_period="1800s",
+                            per_series_aligner="ALIGN_SUM",
+                            cross_series_reducer="REDUCE_SUM",
+                        ),
+                    ],
+                    trigger=gcp.monitoring.AlertPolicyConditionConditionThresholdTriggerArgs(
+                        count=1,
+                    ),
+                ),
+            ),
+        ],
+        alert_strategy=gcp.monitoring.AlertPolicyAlertStrategyArgs(
+            auto_close="3600s",
+        ),
+        documentation=gcp.monitoring.AlertPolicyDocumentationArgs(
+            content=(
+                "karaoke-backend's event loop froze for 10s+ more than once in 30 minutes — "
+                "every request on the instance (incl. /api/health) stalls; users see the "
+                "\"servers unavailable\" banner.\n\n"
+                "1. Logs: `jsonPayload.message:\"EVENT_LOOP_STALL\"` on karaoke-backend. The "
+                "`in progress` lines carry the event-loop thread's stack; `culprit=` is the "
+                "innermost backend/karaoke_gen frame — that's the blocking call.\n"
+                "2. Fix: move that sync work off the loop (`await asyncio.to_thread(...)`), or "
+                "make the route a plain `def`.\n"
+                "3. User impact: `python scripts/client_events_report.py --days 1`."
+            ),
+            mime_type="text/markdown",
+        ),
+        enabled=True,
+        notification_channels=notification_channels,
+        opts=pulumi.ResourceOptions(depends_on=[resources["event_loop_stall_metric"]]),
+    )
+
+    return resources

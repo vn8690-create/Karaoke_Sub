@@ -1,0 +1,833 @@
+/**
+ * Unit tests for job-status.ts utility functions
+ */
+
+import { getJobStep, formatStepIndicator, isBlockingStatus, isNotifiableBlockingStatus, getJobProgressPercent, sortJobsByDate, sortJobs, isAutoRetryPending, isWaitingForEncodingCapacity, isVisibilityChangeInProgress, shouldShowJobOnDashboard, JobStep, STATUS_CONFIG } from '../lib/job-status';
+import type { Job } from '../lib/api';
+
+// Helper to create a minimal Job object for testing
+function createJob(status: string, stateData?: Record<string, any>): Job {
+  return {
+    job_id: 'test-job-123',
+    status,
+    progress: 0,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    state_data: stateData,
+  };
+}
+
+describe('getJobStep', () => {
+  describe('Step 1: Setup', () => {
+    it('returns step 1 for pending status', () => {
+      const job = createJob('pending');
+      const result = getJobStep(job);
+      expect(result.step).toBe(1);
+      expect(result.total).toBe(10);
+      expect(result.label).toBe('settingUp');
+      expect(result.isBlocking).toBe(false);
+      expect(result.color).toBe('text-muted-foreground');
+    });
+  });
+
+  describe('Step 2: Audio Search', () => {
+    it('returns step 2 for searching_audio status', () => {
+      const job = createJob('searching_audio');
+      const result = getJobStep(job);
+      expect(result.step).toBe(2);
+      expect(result.label).toBe('searchingForAudio');
+      expect(result.isBlocking).toBe(false);
+    });
+
+    it('returns step 2 with blocking for awaiting_audio_selection', () => {
+      const job = createJob('awaiting_audio_selection');
+      const result = getJobStep(job);
+      expect(result.step).toBe(2);
+      expect(result.label).toBe('selectAudioSource');
+      expect(result.isBlocking).toBe(true);
+      expect(result.color).toBe('text-amber-400');
+    });
+  });
+
+  describe('Step 3: Download', () => {
+    it('returns step 3 for downloading_audio status', () => {
+      const job = createJob('downloading_audio');
+      const result = getJobStep(job);
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('downloadingAudio');
+    });
+
+    it('returns step 3 for downloading status without worker progress', () => {
+      const job = createJob('downloading');
+      const result = getJobStep(job);
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('downloading');
+    });
+
+    it('returns step 3 for downloading with empty state_data', () => {
+      const job = createJob('downloading', {});
+      const result = getJobStep(job);
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('downloading');
+    });
+  });
+
+  describe('Step 3→4 Transition: Downloading with active workers', () => {
+    // When backend status is "downloading" but workers are actively running,
+    // the frontend should show step 4 (Processing) to avoid appearing stuck
+
+    it('returns step 4 when downloading with active audio worker', () => {
+      const job = createJob('downloading', {
+        audio_progress: { stage: 'separating_stage1', progress: 10 },
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.color).toBe('text-purple-400');
+    });
+
+    it('returns step 4 when downloading with active lyrics worker', () => {
+      const job = createJob('downloading', {
+        lyrics_progress: { stage: 'transcribing', progress: 10 },
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.color).toBe('text-purple-400');
+    });
+
+    it('returns step 4 with combined label when both workers active', () => {
+      const job = createJob('downloading', {
+        audio_progress: { stage: 'separating_stage1', progress: 10 },
+        lyrics_progress: { stage: 'transcribing', progress: 10 },
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toMatch(/audio.*\+.*transcribing|transcribing.*\+.*audio/);
+    });
+
+    it('shows only active worker when one is complete', () => {
+      const job = createJob('downloading', {
+        audio_progress: { stage: 'audio_complete' },
+        lyrics_progress: { stage: 'transcribing' },
+        audio_complete: true,
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('transcribing');
+    });
+
+    it('shows processing complete when both workers done', () => {
+      const job = createJob('downloading', {
+        audio_progress: { stage: 'audio_complete' },
+        lyrics_progress: { stage: 'lyrics_complete' },
+        audio_complete: true,
+        lyrics_complete: true,
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('processingComplete');
+    });
+
+    it('returns step 3 when state_data has no stage info', () => {
+      // state_data exists but no actual progress stage set
+      const job = createJob('downloading', {
+        audio_progress: {},
+        lyrics_progress: {},
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('downloading');
+    });
+  });
+
+  describe('Upload-based (tenant / existing-instrumental) jobs', () => {
+    const withInstrumental = (status: string, stateData?: Record<string, any>): Job => ({
+      ...createJob(status, stateData),
+      existing_instrumental_gcs_path: 'uploads/test-job-123/audio/existing_instrumental.mp3',
+    });
+
+    it('shows "preparingAudio" instead of "downloading" while staging uploads', () => {
+      const result = getJobStep(withInstrumental('downloading'));
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('preparingAudio');
+    });
+
+    it('also relabels the downloading_audio stage for uploaded audio', () => {
+      const result = getJobStep(withInstrumental('downloading_audio'));
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('preparingAudio');
+    });
+
+    it('advances to step 4 (transcribing) once the lyrics worker starts', () => {
+      const result = getJobStep(withInstrumental('downloading', {
+        lyrics_progress: { stage: 'transcribing', progress: 10 },
+      }));
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('transcribing');
+    });
+
+    it('does not relabel a normal download job (no uploaded instrumental)', () => {
+      const result = getJobStep(createJob('downloading'));
+      expect(result.step).toBe(3);
+      expect(result.label).toBe('downloading');
+    });
+  });
+
+  describe('Status labels are always valid i18n keys (no raw "jobStatus.X")', () => {
+    // Regression: the "downloading + workers" path used to pass the literal
+    // "Processing" (not a jobStatus key), which rendered as "jobStatus.Processing".
+    it('returns a valid key (transcribing) for lyrics-only progress, not "Processing"', () => {
+      const result = getJobStep(createJob('downloading', {
+        lyrics_progress: { stage: 'transcribing', progress: 5 },
+      }));
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('transcribing');
+      expect(result.label).not.toBe('Processing');
+    });
+
+    it('every label getJobStep can emit exists in en.json jobStatus', () => {
+      const en = require('../messages/en.json');
+      const jobStatusKeys = new Set(Object.keys(en.jobStatus));
+      // Static labels from STATUS_CONFIG plus keys emitted by the parallel/upload helpers.
+      const dynamicKeys = [
+        'processing', 'preparingAudio', 'processingComplete',
+        'audio1of2', 'audio2of2', 'audioDone', 'audio',
+        'transcribing', 'correcting', 'lyricsDone', 'lyrics',
+      ];
+      for (const cfg of Object.values(STATUS_CONFIG)) {
+        expect(jobStatusKeys.has((cfg as any).label)).toBe(true);
+      }
+      for (const k of dynamicKeys) {
+        expect(jobStatusKeys.has(k)).toBe(true);
+      }
+    });
+  });
+
+  describe('Step 4: Parallel Processing', () => {
+    it('returns step 4 for separating_stage1', () => {
+      const job = createJob('separating_stage1');
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('separatingAudio1');
+    });
+
+    it('returns step 4 for separating_stage2', () => {
+      const job = createJob('separating_stage2');
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('separatingAudio2');
+    });
+
+    it('returns step 4 for transcribing', () => {
+      const job = createJob('transcribing');
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('transcribingLyrics');
+    });
+
+    it('returns step 4 for correcting', () => {
+      const job = createJob('correcting');
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      expect(result.label).toBe('correctingLyrics');
+    });
+
+    it('shows combined progress when both audio and lyrics are in progress', () => {
+      const job = createJob('separating_stage1', {
+        audio_progress: { stage: 'separating_stage1' },
+        lyrics_progress: { stage: 'transcribing' },
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+      // Should show combined label
+      expect(result.label).toMatch(/audio|transcribing/);
+    });
+
+    it('shows combined status when audio done but lyrics in progress', () => {
+      const job = createJob('lyrics_complete', {
+        audio_progress: { stage: 'audio_complete' },
+        lyrics_progress: { stage: 'transcribing' },
+        audio_complete: true,
+      });
+      const result = getJobStep(job);
+      expect(result.step).toBe(4);
+    });
+  });
+
+  describe('Step 5: Screen Generation', () => {
+    it('returns step 5 for generating_screens', () => {
+      const job = createJob('generating_screens');
+      const result = getJobStep(job);
+      expect(result.step).toBe(5);
+      expect(result.label).toBe('generatingScreens');
+    });
+
+    it('returns step 5 for applying_padding', () => {
+      const job = createJob('applying_padding');
+      const result = getJobStep(job);
+      expect(result.step).toBe(5);
+      expect(result.label).toBe('syncingCountdown');
+    });
+  });
+
+  describe('Step 6: Lyrics Review (BLOCKING)', () => {
+    it('returns step 6 with blocking for awaiting_review', () => {
+      const job = createJob('awaiting_review');
+      const result = getJobStep(job);
+      expect(result.step).toBe(6);
+      expect(result.label).toBe('reviewLyrics');
+      expect(result.isBlocking).toBe(true);
+      expect(result.color).toBe('text-amber-400');
+    });
+
+    it('returns step 6 for in_review', () => {
+      const job = createJob('in_review');
+      const result = getJobStep(job);
+      expect(result.step).toBe(6);
+      expect(result.label).toBe('inReview');
+      expect(result.isBlocking).toBe(true);
+    });
+  });
+
+  describe('Step 7: Video Rendering', () => {
+    it('returns step 7 for review_complete', () => {
+      const job = createJob('review_complete');
+      const result = getJobStep(job);
+      expect(result.step).toBe(7);
+      expect(result.label).toBe('startingRender');
+    });
+
+    it('returns step 7 for rendering_video', () => {
+      const job = createJob('rendering_video');
+      const result = getJobStep(job);
+      expect(result.step).toBe(7);
+      expect(result.label).toBe('renderingVideo');
+    });
+  });
+
+  describe('Step 8: Instrumental Selection (BLOCKING)', () => {
+    it('returns step 8 with blocking for awaiting_instrumental_selection', () => {
+      const job = createJob('awaiting_instrumental_selection');
+      const result = getJobStep(job);
+      expect(result.step).toBe(8);
+      expect(result.label).toBe('selectInstrumental');
+      expect(result.isBlocking).toBe(true);
+      expect(result.color).toBe('text-amber-400');
+    });
+  });
+
+  describe('Step 9: Final Encoding', () => {
+    it('returns step 9 for instrumental_selected', () => {
+      const job = createJob('instrumental_selected');
+      const result = getJobStep(job);
+      expect(result.step).toBe(9);
+      expect(result.label).toBe('startingFinalEncode');
+    });
+
+    it('returns step 9 for generating_video', () => {
+      const job = createJob('generating_video');
+      const result = getJobStep(job);
+      expect(result.step).toBe(9);
+      expect(result.label).toBe('generatingFinalVideo');
+    });
+
+    it('returns step 9 for encoding', () => {
+      const job = createJob('encoding');
+      const result = getJobStep(job);
+      expect(result.step).toBe(9);
+      expect(result.label).toBe('encodingVideo');
+    });
+
+    it('returns step 9 for packaging', () => {
+      const job = createJob('packaging');
+      const result = getJobStep(job);
+      expect(result.step).toBe(9);
+      expect(result.label).toBe('packagingFiles');
+    });
+  });
+
+  describe('Step 10: Distribution / Complete', () => {
+    it('returns step 10 for uploading', () => {
+      const job = createJob('uploading');
+      const result = getJobStep(job);
+      expect(result.step).toBe(10);
+      expect(result.label).toBe('uploading');
+      expect(result.color).toBe('text-green-400');
+    });
+
+    it('returns step 10 for notifying', () => {
+      const job = createJob('notifying');
+      const result = getJobStep(job);
+      expect(result.step).toBe(10);
+      expect(result.label).toBe('sendingNotifications');
+    });
+
+    it('returns step 10 for complete', () => {
+      const job = createJob('complete');
+      const result = getJobStep(job);
+      expect(result.step).toBe(10);
+      expect(result.label).toBe('complete');
+      expect(result.color).toBe('text-green-400');
+    });
+
+    it('returns step 10 for prep_complete', () => {
+      const job = createJob('prep_complete');
+      const result = getJobStep(job);
+      expect(result.step).toBe(10);
+      expect(result.label).toBe('prepComplete');
+    });
+  });
+
+  describe('Terminal states', () => {
+    it('returns step 0 for failed status', () => {
+      const job = createJob('failed');
+      const result = getJobStep(job);
+      expect(result.step).toBe(0);
+      expect(result.label).toBe('failed');
+      expect(result.color).toBe('text-red-400');
+    });
+
+    it('returns step 0 for cancelled status', () => {
+      const job = createJob('cancelled');
+      const result = getJobStep(job);
+      expect(result.step).toBe(0);
+      expect(result.label).toBe('cancelled');
+      expect(result.color).toBe('text-muted-foreground');
+    });
+  });
+
+  describe('Unknown status handling', () => {
+    it('returns step 0 with humanized label for unknown status', () => {
+      const job = createJob('some_unknown_status');
+      const result = getJobStep(job);
+      expect(result.step).toBe(0);
+      expect(result.label).toBe('some unknown status');
+      expect(result.isBlocking).toBe(false);
+      expect(result.color).toBe('text-muted-foreground');
+    });
+
+    it('handles null status gracefully', () => {
+      const job = createJob(null as unknown as string);
+      const result = getJobStep(job);
+      expect(result.step).toBe(1); // Falls back to 'pending'
+    });
+
+    it('handles undefined status gracefully', () => {
+      const job = createJob(undefined as unknown as string);
+      const result = getJobStep(job);
+      expect(result.step).toBe(1); // Falls back to 'pending'
+    });
+  });
+
+  describe('Case insensitivity', () => {
+    it('handles uppercase status', () => {
+      const job = createJob('PENDING');
+      const result = getJobStep(job);
+      expect(result.step).toBe(1);
+    });
+
+    it('handles mixed case status', () => {
+      const job = createJob('Downloading');
+      const result = getJobStep(job);
+      expect(result.step).toBe(3);
+    });
+  });
+});
+
+describe('formatStepIndicator', () => {
+  it('formats active step correctly', () => {
+    expect(formatStepIndicator(4, 10, 'processing')).toBe('[4/10] processing');
+  });
+
+  it('omits step number for terminal states (step 0)', () => {
+    expect(formatStepIndicator(0, 10, 'failed')).toBe('failed');
+  });
+
+  it('formats first step correctly', () => {
+    expect(formatStepIndicator(1, 10, 'settingUp')).toBe('[1/10] settingUp');
+  });
+
+  it('formats last step correctly', () => {
+    expect(formatStepIndicator(10, 10, 'complete')).toBe('[10/10] complete');
+  });
+});
+
+describe('isBlockingStatus', () => {
+  it('returns true for awaiting_review', () => {
+    expect(isBlockingStatus('awaiting_review')).toBe(true);
+  });
+
+  it('returns true for in_review', () => {
+    expect(isBlockingStatus('in_review')).toBe(true);
+  });
+
+  it('returns true for awaiting_audio_selection', () => {
+    expect(isBlockingStatus('awaiting_audio_selection')).toBe(true);
+  });
+
+  it('returns true for awaiting_instrumental_selection', () => {
+    expect(isBlockingStatus('awaiting_instrumental_selection')).toBe(true);
+  });
+
+  it('returns false for non-blocking statuses', () => {
+    expect(isBlockingStatus('pending')).toBe(false);
+    expect(isBlockingStatus('downloading')).toBe(false);
+    expect(isBlockingStatus('complete')).toBe(false);
+    expect(isBlockingStatus('failed')).toBe(false);
+  });
+
+  it('returns false for unknown statuses', () => {
+    expect(isBlockingStatus('unknown_status')).toBe(false);
+  });
+
+  it('handles case insensitivity', () => {
+    expect(isBlockingStatus('AWAITING_REVIEW')).toBe(true);
+  });
+
+  it('handles null/undefined gracefully', () => {
+    expect(isBlockingStatus(null as unknown as string)).toBe(false);
+    expect(isBlockingStatus(undefined as unknown as string)).toBe(false);
+  });
+});
+
+describe('isNotifiableBlockingStatus', () => {
+  it('returns true for awaiting_review', () => {
+    expect(isNotifiableBlockingStatus('awaiting_review')).toBe(true);
+  });
+
+  it('returns true for in_review', () => {
+    expect(isNotifiableBlockingStatus('in_review')).toBe(true);
+  });
+
+  it('returns true for awaiting_instrumental_selection', () => {
+    expect(isNotifiableBlockingStatus('awaiting_instrumental_selection')).toBe(true);
+  });
+
+  it('returns false for awaiting_audio_selection (user already engaged)', () => {
+    expect(isNotifiableBlockingStatus('awaiting_audio_selection')).toBe(false);
+  });
+
+  it('returns false for non-blocking statuses', () => {
+    expect(isNotifiableBlockingStatus('pending')).toBe(false);
+    expect(isNotifiableBlockingStatus('downloading')).toBe(false);
+    expect(isNotifiableBlockingStatus('complete')).toBe(false);
+    expect(isNotifiableBlockingStatus('failed')).toBe(false);
+  });
+
+  it('handles case insensitivity', () => {
+    expect(isNotifiableBlockingStatus('AWAITING_REVIEW')).toBe(true);
+    expect(isNotifiableBlockingStatus('AWAITING_AUDIO_SELECTION')).toBe(false);
+  });
+
+  it('handles null/undefined gracefully', () => {
+    expect(isNotifiableBlockingStatus(null as unknown as string)).toBe(false);
+    expect(isNotifiableBlockingStatus(undefined as unknown as string)).toBe(false);
+  });
+
+  it("awaiting_duration_confirm is blocking + notifiable", () => {
+    expect(isBlockingStatus("awaiting_duration_confirm")).toBe(true);
+    expect(isNotifiableBlockingStatus("awaiting_duration_confirm")).toBe(true);
+  });
+});
+
+describe('getJobProgressPercent', () => {
+  it('returns 0 for terminal states (step 0)', () => {
+    const job = createJob('failed');
+    expect(getJobProgressPercent(job)).toBe(0);
+  });
+
+  it('returns 10% for step 1', () => {
+    const job = createJob('pending');
+    expect(getJobProgressPercent(job)).toBe(10);
+  });
+
+  it('returns 40% for step 4', () => {
+    const job = createJob('transcribing');
+    expect(getJobProgressPercent(job)).toBe(40);
+  });
+
+  it('returns 60% for step 6', () => {
+    const job = createJob('awaiting_review');
+    expect(getJobProgressPercent(job)).toBe(60);
+  });
+
+  it('returns 100% for step 10', () => {
+    const job = createJob('complete');
+    expect(getJobProgressPercent(job)).toBe(100);
+  });
+
+  it('returns 0 for unknown status', () => {
+    const job = createJob('unknown_status_xyz');
+    expect(getJobProgressPercent(job)).toBe(0);
+  });
+});
+
+describe('sortJobsByDate', () => {
+  // Helper to create job with specific date
+  function createJobWithDate(status: string, createdAt: string): Job {
+    return {
+      job_id: `job-${status}-${createdAt}`,
+      status,
+      progress: 0,
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+  }
+
+  it('sorts by created_at descending (newest first)', () => {
+    const jobs = [
+      createJobWithDate('complete', '2024-01-01T10:00:00Z'),
+      createJobWithDate('complete', '2024-01-01T14:00:00Z'),
+      createJobWithDate('complete', '2024-01-01T12:00:00Z'),
+    ];
+    const sorted = sortJobsByDate(jobs);
+    expect(sorted[0].created_at).toBe('2024-01-01T14:00:00Z');
+    expect(sorted[1].created_at).toBe('2024-01-01T12:00:00Z');
+    expect(sorted[2].created_at).toBe('2024-01-01T10:00:00Z');
+  });
+
+  it('does not use priority bucketing - all jobs sorted by date only', () => {
+    const jobs = [
+      createJobWithDate('complete', '2024-01-01T14:00:00Z'),
+      createJobWithDate('failed', '2024-01-01T11:00:00Z'),
+      createJobWithDate('awaiting_review', '2024-01-01T09:00:00Z'),
+      createJobWithDate('rendering_video', '2024-01-01T12:00:00Z'),
+    ];
+    const sorted = sortJobsByDate(jobs);
+    // Pure date order, regardless of status
+    expect(sorted[0].created_at).toBe('2024-01-01T14:00:00Z');
+    expect(sorted[1].created_at).toBe('2024-01-01T12:00:00Z');
+    expect(sorted[2].created_at).toBe('2024-01-01T11:00:00Z');
+    expect(sorted[3].created_at).toBe('2024-01-01T09:00:00Z');
+  });
+
+  it('does not mutate the original array', () => {
+    const jobs = [
+      createJobWithDate('complete', '2024-01-01T12:00:00Z'),
+      createJobWithDate('awaiting_review', '2024-01-01T14:00:00Z'),
+    ];
+    const originalOrder = [...jobs];
+    sortJobsByDate(jobs);
+    expect(jobs[0].status).toBe(originalOrder[0].status);
+    expect(jobs[1].status).toBe(originalOrder[1].status);
+  });
+
+  it('handles empty array', () => {
+    const sorted = sortJobsByDate([]);
+    expect(sorted).toEqual([]);
+  });
+
+  it('handles single job', () => {
+    const jobs = [createJobWithDate('complete', '2024-01-01T12:00:00Z')];
+    const sorted = sortJobsByDate(jobs);
+    expect(sorted.length).toBe(1);
+    expect(sorted[0].status).toBe('complete');
+  });
+});
+
+describe('sortJobs', () => {
+  function createSortableJob(overrides: Partial<Job> = {}): Job {
+    return {
+      job_id: overrides.job_id || `job-${Math.random()}`,
+      status: 'complete',
+      progress: 0,
+      created_at: '2024-01-01T10:00:00Z',
+      updated_at: '2024-01-01T10:00:00Z',
+      ...overrides,
+    };
+  }
+
+  it('sorts by created_at ascending and descending', () => {
+    const jobs = [
+      createSortableJob({ job_id: 'a', created_at: '2024-01-01T10:00:00Z' }),
+      createSortableJob({ job_id: 'b', created_at: '2024-01-03T10:00:00Z' }),
+      createSortableJob({ job_id: 'c', created_at: '2024-01-02T10:00:00Z' }),
+    ];
+
+    const desc = sortJobs(jobs, 'created_at', 'desc');
+    expect(desc.map(j => j.job_id)).toEqual(['b', 'c', 'a']);
+
+    const asc = sortJobs(jobs, 'created_at', 'asc');
+    expect(asc.map(j => j.job_id)).toEqual(['a', 'c', 'b']);
+  });
+
+  it('sorts by updated_at (recently active)', () => {
+    const jobs = [
+      createSortableJob({ job_id: 'a', updated_at: '2024-01-01T10:00:00Z' }),
+      createSortableJob({ job_id: 'b', updated_at: '2024-01-03T10:00:00Z' }),
+    ];
+    const sorted = sortJobs(jobs, 'updated_at', 'desc');
+    expect(sorted.map(j => j.job_id)).toEqual(['b', 'a']);
+  });
+
+  it('sorts by completed_at using updated_at only for completed statuses, others last', () => {
+    const jobs = [
+      createSortableJob({ job_id: 'in-progress', status: 'rendering_video', updated_at: '2024-01-05T10:00:00Z' }),
+      createSortableJob({ job_id: 'completed-early', status: 'complete', updated_at: '2024-01-01T10:00:00Z' }),
+      createSortableJob({ job_id: 'completed-late', status: 'prep_complete', updated_at: '2024-01-03T10:00:00Z' }),
+    ];
+    const sorted = sortJobs(jobs, 'completed_at', 'desc');
+    // Completed jobs ordered by their updated_at; the in-progress job (no
+    // completion timestamp) is always pushed to the end.
+    expect(sorted.map(j => j.job_id)).toEqual(['completed-late', 'completed-early', 'in-progress']);
+  });
+
+  it('sorts by artist and title alphabetically, case-insensitively', () => {
+    const jobs = [
+      createSortableJob({ job_id: 'a', artist: 'zebra' }),
+      createSortableJob({ job_id: 'b', artist: 'Apple' }),
+      createSortableJob({ job_id: 'c', artist: 'mango' }),
+    ];
+    const asc = sortJobs(jobs, 'artist', 'asc');
+    expect(asc.map(j => j.job_id)).toEqual(['b', 'c', 'a']);
+
+    const desc = sortJobs(jobs, 'artist', 'desc');
+    expect(desc.map(j => j.job_id)).toEqual(['a', 'c', 'b']);
+  });
+
+  it('pushes jobs with missing artist/title to the end regardless of direction', () => {
+    const jobs = [
+      createSortableJob({ job_id: 'no-title', title: undefined }),
+      createSortableJob({ job_id: 'has-title', title: 'Some Song' }),
+    ];
+    expect(sortJobs(jobs, 'title', 'asc').map(j => j.job_id)).toEqual(['has-title', 'no-title']);
+    expect(sortJobs(jobs, 'title', 'desc').map(j => j.job_id)).toEqual(['has-title', 'no-title']);
+  });
+
+  it('does not mutate the original array', () => {
+    const jobs = [
+      createSortableJob({ job_id: 'a', created_at: '2024-01-01T10:00:00Z' }),
+      createSortableJob({ job_id: 'b', created_at: '2024-01-03T10:00:00Z' }),
+    ];
+    const originalOrder = jobs.map(j => j.job_id);
+    sortJobs(jobs, 'created_at', 'asc');
+    expect(jobs.map(j => j.job_id)).toEqual(originalOrder);
+  });
+
+  it('handles empty array', () => {
+    expect(sortJobs([], 'created_at', 'desc')).toEqual([]);
+  });
+
+  it('honors the provided locale for artist/title collation', () => {
+    // Swedish collation sorts "ö" after "z"; default (undefined) locale does not.
+    const jobs = [
+      createSortableJob({ job_id: 'o-umlaut', artist: 'Örjan' }),
+      createSortableJob({ job_id: 'z', artist: 'Zorro' }),
+    ];
+    const swedish = sortJobs(jobs, 'artist', 'asc', 'sv');
+    expect(swedish.map(j => j.job_id)).toEqual(['z', 'o-umlaut']);
+  });
+});
+
+// Note: getDisplayJobs was removed — filtering is now handled server-side
+// via the status and search query parameters on GET /api/jobs
+
+
+describe('isAutoRetryPending', () => {
+  function nowOffset(seconds: number) {
+    return new Date(Date.now() + seconds * 1000).toISOString();
+  }
+
+  it('returns false when state_data is missing', () => {
+    expect(isAutoRetryPending({ state_data: undefined })).toBe(false);
+  });
+
+  it('returns false when state_data has no retry-pending field', () => {
+    expect(isAutoRetryPending({ state_data: { foo: 'bar' } })).toBe(false);
+  });
+
+  it('returns true when expires_at is in the future', () => {
+    const job = {
+      state_data: { cloud_run_retry_pending: { expires_at: nowOffset(60), expected_attempt: 1 } },
+    };
+    expect(isAutoRetryPending(job)).toBe(true);
+  });
+
+  it('returns false when expires_at is in the past', () => {
+    const job = {
+      state_data: { cloud_run_retry_pending: { expires_at: nowOffset(-60), expected_attempt: 1 } },
+    };
+    expect(isAutoRetryPending(job)).toBe(false);
+  });
+
+  it('returns false for malformed expires_at', () => {
+    expect(isAutoRetryPending({ state_data: { cloud_run_retry_pending: { expires_at: 'not-a-date' } } })).toBe(false);
+    expect(isAutoRetryPending({ state_data: { cloud_run_retry_pending: {} } })).toBe(false);
+  });
+});
+
+describe('isWaitingForEncodingCapacity', () => {
+  it('returns true when parked in render_pending_capacity', () => {
+    expect(isWaitingForEncodingCapacity(createJob('render_pending_capacity'))).toBe(true);
+  });
+
+  it('returns true during an in-flight retry attempt (status flips) with breadcrumb', () => {
+    const meta = { render_pending_capacity: { attempt_count: 2 } };
+    expect(isWaitingForEncodingCapacity(createJob('rendering_video', meta))).toBe(true);
+    expect(isWaitingForEncodingCapacity(createJob('review_complete', meta))).toBe(true);
+  });
+
+  it('returns false for a normal render with no capacity breadcrumb', () => {
+    expect(isWaitingForEncodingCapacity(createJob('rendering_video'))).toBe(false);
+    expect(isWaitingForEncodingCapacity(createJob('review_complete', { render_pending_capacity: {} }))).toBe(false);
+  });
+
+  it('does not show the note after the render succeeds even if the breadcrumb lingers', () => {
+    const meta = { render_pending_capacity: { attempt_count: 3 } };
+    expect(isWaitingForEncodingCapacity(createJob('encoding', meta))).toBe(false);
+    expect(isWaitingForEncodingCapacity(createJob('packaging', meta))).toBe(false);
+    expect(isWaitingForEncodingCapacity(createJob('complete', meta))).toBe(false);
+  });
+});
+
+describe('isVisibilityChangeInProgress', () => {
+  it('returns true only when the flag is set', () => {
+    expect(isVisibilityChangeInProgress(createJob('rendering_video', { visibility_change_in_progress: true }))).toBe(true);
+    expect(isVisibilityChangeInProgress(createJob('rendering_video'))).toBe(false);
+    expect(isVisibilityChangeInProgress(createJob('complete', {}))).toBe(false);
+  });
+});
+
+describe('shouldShowJobOnDashboard', () => {
+  const viewer = { viewerEmail: 'andrew@nomadkaraoke.com' };
+  const fiverrJob = { status: 'awaiting_audio_selection', user_email: 'fiverr@nomadkaraoke.com' };
+  const ownJob = { status: 'awaiting_audio_selection', user_email: 'Andrew@NomadKaraoke.com' };
+
+  it('shows normal (non-audio-selection) jobs', () => {
+    expect(shouldShowJobOnDashboard({ status: 'complete' })).toBe(true);
+    expect(shouldShowJobOnDashboard({ status: 'awaiting_review' })).toBe(true);
+  });
+
+  it('shows awaiting_audio_selection jobs by default', () => {
+    expect(shouldShowJobOnDashboard({ status: 'awaiting_audio_selection' })).toBe(true);
+    expect(shouldShowJobOnDashboard(fiverrJob, viewer)).toBe(true);
+  });
+
+  it("shows the viewer's own job after 'Choose different audio'", () => {
+    expect(shouldShowJobOnDashboard(ownJob, viewer)).toBe(true);
+  });
+
+  describe('with the admin toggle off', () => {
+    const off = { ...viewer, showOthersAwaitingAudio: false };
+
+    it("hides other accounts' jobs (e.g. fiverrbot)", () => {
+      expect(shouldShowJobOnDashboard(fiverrJob, off)).toBe(false);
+    });
+
+    it("keeps the viewer's own jobs (case-insensitive)", () => {
+      expect(shouldShowJobOnDashboard(ownJob, off)).toBe(true);
+    });
+
+    it('keeps made-for-you orders visible', () => {
+      expect(shouldShowJobOnDashboard({ ...fiverrJob, made_for_you: true }, off)).toBe(true);
+    });
+
+    it('hides jobs whose owner or viewer is unknown', () => {
+      expect(shouldShowJobOnDashboard({ status: 'awaiting_audio_selection' }, off)).toBe(false);
+      expect(shouldShowJobOnDashboard(fiverrJob, { showOthersAwaitingAudio: false })).toBe(false);
+    });
+
+    it('does not affect jobs at other statuses', () => {
+      expect(shouldShowJobOnDashboard({ ...fiverrJob, status: 'complete' }, off)).toBe(true);
+    });
+  });
+});

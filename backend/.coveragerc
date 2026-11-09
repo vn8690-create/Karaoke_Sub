@@ -1,0 +1,20 @@
+[run]
+source = backend
+omit =
+    backend/tests/*
+    backend/validate.py
+    backend/tests/emulator/*
+    # Workers that require external APIs are tested via integration tests
+    backend/workers/screens_worker.py
+    backend/workers/video_worker.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    pass
+
+show_missing = True
+

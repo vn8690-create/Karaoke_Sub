@@ -1,0 +1,556 @@
+"""Native Dropbox API service for cloud backend.
+
+This service provides Dropbox operations using the native Python SDK,
+replacing rclone for server-side operations. It handles:
+- Folder listing for brand code calculation
+- File and folder uploads
+- Shared link generation
+
+Credentials are loaded from Google Cloud Secret Manager.
+"""
+import hashlib
+import json
+import logging
+import os
+import re
+import tempfile
+import zipfile
+from typing import Optional, Sequence, Tuple
+
+from google.cloud import secretmanager
+
+logger = logging.getLogger(__name__)
+
+
+def prefix_zip_entries(src_zip: str, dst_zip: str, prefix: str) -> None:
+    """Copy a zip, prepending ``prefix`` to every entry's file name (not its folders).
+
+    Entries are streamed (never fully loaded into memory) and keep their original
+    timestamps/compression, so re-packing the same zip is deterministic.
+    """
+    import shutil
+
+    with zipfile.ZipFile(src_zip) as zin, zipfile.ZipFile(dst_zip, "w") as zout:
+        for info in zin.infolist():
+            folder, _, name = info.filename.rpartition("/")
+            if info.is_dir() or not name:
+                zout.writestr(info, b"")
+                continue
+            new_info = zipfile.ZipInfo(f"{folder}/{prefix}{name}" if folder else f"{prefix}{name}", info.date_time)
+            new_info.compress_type = info.compress_type
+            new_info.external_attr = info.external_attr
+            with zin.open(info) as src, zout.open(new_info, "w") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+
+
+_DROPBOX_HASH_BLOCK = 4 * 1024 * 1024
+
+
+def dropbox_content_hash(path: str) -> str:
+    """Dropbox ``content_hash`` of a local file: SHA-256 of the concatenated
+    SHA-256 digests of each 4 MiB block (https://www.dropbox.com/developers/reference/content-hash)."""
+    overall = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(_DROPBOX_HASH_BLOCK)
+            if not block:
+                break
+            overall.update(hashlib.sha256(block).digest())
+    return overall.hexdigest()
+
+
+class DropboxService:
+    """Dropbox operations using native Python SDK."""
+
+    def __init__(self):
+        self._client = None
+        self._is_configured = False
+
+    def _load_credentials(self) -> Optional[dict]:
+        """Load OAuth credentials from Secret Manager."""
+        try:
+            client = secretmanager.SecretManagerServiceClient()
+            # Use the configured GCP project. The old default "karaoke-gen" was a
+            # WRONG literal (the real project is "nomadkaraoke"); an unset var
+            # would silently target a non-existent project and disable Dropbox.
+            # Prod always sets GOOGLE_CLOUD_PROJECT (startup validation requires
+            # it), so use an empty default rather than a misleading wrong one.
+            # (Fallback audit 2026-06-09, Theme 7.)
+            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+            name = f"projects/{project_id}/secrets/dropbox-oauth-credentials/versions/latest"
+            response = client.access_secret_version(request={"name": name})
+            return json.loads(response.payload.data.decode("UTF-8"))
+        except Exception as e:
+            logger.warning(f"Failed to load Dropbox credentials from Secret Manager: {e}")
+            return None
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if Dropbox credentials are available."""
+        if self._is_configured:
+            return True
+        creds = self._load_credentials()
+        self._is_configured = creds is not None and "access_token" in creds
+        return self._is_configured
+
+    @property
+    def client(self):
+        """Get or create Dropbox client."""
+        if self._client is None:
+            # Import here to avoid import errors if dropbox is not installed
+            try:
+                from dropbox import Dropbox
+            except ImportError:
+                raise ImportError(
+                    "dropbox package is not installed. "
+                    "Install it with: pip install dropbox"
+                )
+
+            creds = self._load_credentials()
+            if not creds:
+                raise RuntimeError("Dropbox credentials not configured in Secret Manager")
+
+            self._client = Dropbox(
+                oauth2_access_token=creds["access_token"],
+                oauth2_refresh_token=creds.get("refresh_token"),
+                app_key=creds.get("app_key"),
+                app_secret=creds.get("app_secret"),
+            )
+        return self._client
+
+    def list_folders(self, path: str) -> list[str]:
+        """
+        List folder names at path for brand code calculation.
+
+        Args:
+            path: Dropbox path to list (e.g., "/Karaoke/Tracks-Organized")
+
+        Returns:
+            List of folder names in the path (empty if the path doesn't exist yet,
+            e.g. a brand-new tenant folder — the upload creates it)
+        """
+        from dropbox.exceptions import ApiError
+        from dropbox.files import FolderMetadata
+
+        # Ensure path starts with /
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        logger.info(f"Listing folders at Dropbox path: {path}")
+
+        try:
+            result = self.client.files_list_folder(path)
+        except ApiError as e:
+            err = e.error
+            if err.is_path() and err.get_path().is_not_found():
+                logger.info(f"Dropbox path {path} does not exist yet; treating as empty")
+                return []
+            raise
+        folders = []
+
+        # Get all entries (handling pagination)
+        while True:
+            for entry in result.entries:
+                if isinstance(entry, FolderMetadata):
+                    folders.append(entry.name)
+
+            if not result.has_more:
+                break
+            result = self.client.files_list_folder_continue(result.cursor)
+
+        logger.info(f"Found {len(folders)} folders in {path}")
+        return folders
+
+    def ensure_folder(self, path: str) -> bool:
+        """
+        Create a Dropbox folder (and any missing parents) if it doesn't exist.
+
+        Args:
+            path: Dropbox folder path (e.g., "/MediaUnsynced/Karaoke/Tracks-RandyVild")
+
+        Returns:
+            True if the folder was created, False if it already existed
+        """
+        from dropbox.exceptions import ApiError
+
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        try:
+            self.client.files_create_folder_v2(path)
+        except ApiError as e:
+            err = e.error
+            write_err = err.get_path() if err.is_path() else None
+            if write_err is not None and write_err.is_conflict() and write_err.get_conflict().is_folder():
+                return False
+            raise
+        logger.info(f"Created Dropbox folder {path}")
+        return True
+
+    def get_next_brand_code(self, path: str, brand_prefix: str) -> str:
+        """
+        Calculate next brand code from existing folders, filling gaps in the sequence.
+
+        NOTE: This method is only used for one-time initialization of the Firestore
+        counter (see brand_code_service.py). All runtime brand code allocation now
+        goes through BrandCodeService.allocate_brand_code() for atomic safety.
+
+        Scans the folder for existing brand codes like "NOMAD-0001" and
+        returns the first available code, filling any gaps left by deleted outputs.
+
+        Args:
+            path: Dropbox path containing organized folders
+            brand_prefix: Brand prefix (e.g., "NOMAD")
+
+        Returns:
+            Next brand code (e.g., "NOMAD-0003" if 0003 is the first gap)
+        """
+        folders = self.list_folders(path)
+        pattern = re.compile(rf"^{re.escape(brand_prefix)}-(\d{{4}})")
+
+        existing_nums: set[int] = set()
+        for folder in folders:
+            match = pattern.match(folder)
+            if match:
+                existing_nums.add(int(match.group(1)))
+
+        max_existing = max(existing_nums) if existing_nums else 0
+
+        # Only fill gaps for numbers >= 1001 (preserve legacy gaps below 1000)
+        if max_existing >= 1000:
+            next_num = 1001
+            while next_num in existing_nums:
+                next_num += 1
+        else:
+            next_num = max_existing + 1
+
+        next_code = f"{brand_prefix}-{next_num:04d}"
+        if max_existing >= 1000 and next_num <= max_existing:
+            logger.info(f"Next brand code for {brand_prefix}: {next_code} (filling gap, max existing: {max_existing})")
+        else:
+            logger.info(f"Next brand code for {brand_prefix}: {next_code} (max existing: {max_existing})")
+        return next_code
+
+    def file_exists(self, remote_path: str) -> bool:
+        """
+        Check whether a file exists at the given Dropbox path.
+
+        Args:
+            remote_path: Dropbox path (must start with /)
+
+        Returns:
+            True if a file exists at the path, False otherwise.
+        """
+        from dropbox.exceptions import ApiError
+
+        if not remote_path.startswith("/"):
+            remote_path = f"/{remote_path}"
+
+        try:
+            self.client.files_get_metadata(remote_path)
+            return True
+        except ApiError as e:
+            # Only a genuine "not found" means the file is absent. Re-raise other
+            # API errors (auth, network, rate limit) so callers don't mistake a
+            # transient failure for "missing" (e.g. the backfill uploading a dup).
+            err = e.error
+            if (
+                hasattr(err, "is_path")
+                and err.is_path()
+                and err.get_path().is_not_found()
+            ):
+                return False
+            raise
+
+    def upload_file(self, local_path: str, remote_path: str) -> None:
+        """
+        Upload a single file to Dropbox.
+
+        Args:
+            local_path: Local file path
+            remote_path: Dropbox destination path (must start with /)
+        """
+        from dropbox.files import WriteMode
+
+        # Ensure remote path starts with /
+        if not remote_path.startswith("/"):
+            remote_path = f"/{remote_path}"
+
+        file_size = os.path.getsize(local_path)
+        logger.info(f"Uploading {local_path} ({file_size / 1024 / 1024:.1f} MB) to {remote_path}")
+
+        # For large files (>150MB), use upload sessions
+        CHUNK_SIZE = 150 * 1024 * 1024  # 150 MB
+
+        with open(local_path, "rb") as f:
+            if file_size <= CHUNK_SIZE:
+                # Simple upload for smaller files
+                self.client.files_upload(f.read(), remote_path, mode=WriteMode.overwrite)
+            else:
+                # Chunked upload for large files
+                self._upload_large_file(f, remote_path, file_size)
+
+        logger.info(f"Successfully uploaded to {remote_path}")
+
+    def _upload_large_file(self, file_obj, remote_path: str, file_size: int) -> None:
+        """Upload a large file using upload sessions."""
+        from dropbox.files import CommitInfo, UploadSessionCursor, WriteMode
+
+        CHUNK_SIZE = 150 * 1024 * 1024  # 150 MB
+
+        # Start upload session
+        session_start = self.client.files_upload_session_start(file_obj.read(CHUNK_SIZE))
+        cursor = UploadSessionCursor(
+            session_id=session_start.session_id,
+            offset=file_obj.tell(),
+        )
+        commit = CommitInfo(path=remote_path, mode=WriteMode.overwrite)
+
+        # Upload remaining chunks
+        while file_obj.tell() < file_size:
+            remaining = file_size - file_obj.tell()
+            if remaining <= CHUNK_SIZE:
+                # Final chunk
+                self.client.files_upload_session_finish(
+                    file_obj.read(CHUNK_SIZE),
+                    cursor,
+                    commit,
+                )
+            else:
+                # Intermediate chunk
+                self.client.files_upload_session_append_v2(
+                    file_obj.read(CHUNK_SIZE),
+                    cursor,
+                )
+                cursor.offset = file_obj.tell()
+
+    def _remote_content_hashes(self, remote_path: str) -> dict:
+        """``{path_lower: content_hash}`` for every file under ``remote_path``.
+
+        Best-effort: a missing folder is empty, and any other error returns ``{}``
+        (the caller then uploads everything, as before).
+        """
+        from dropbox.exceptions import ApiError
+        from dropbox.files import FileMetadata
+
+        try:
+            result = self.client.files_list_folder(remote_path, recursive=True)
+        except ApiError as e:
+            err = e.error
+            if err.is_path() and err.get_path().is_not_found():
+                return {}
+            logger.warning(f"Couldn't list {remote_path} to skip unchanged files: {e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"Couldn't list {remote_path} to skip unchanged files: {e}")
+            return {}
+        hashes = {}
+        try:
+            while True:
+                for entry in result.entries:
+                    if isinstance(entry, FileMetadata) and entry.content_hash:
+                        hashes[entry.path_lower] = entry.content_hash
+                if not result.has_more:
+                    break
+                result = self.client.files_list_folder_continue(result.cursor)
+        except Exception as e:
+            logger.warning(f"Couldn't finish listing {remote_path} to skip unchanged files: {e}")
+            return {}
+        return hashes
+
+    def upload_folder(
+        self,
+        local_dir: str,
+        remote_path: str,
+        exclude_suffixes: Sequence[str] = (),
+        skip_unchanged: bool = False,
+        filename_prefix: str = "",
+    ) -> None:
+        """
+        Recursively upload all files and subdirectories to Dropbox folder.
+
+        Args:
+            local_dir: Local directory to upload
+            remote_path: Dropbox destination folder path
+            exclude_suffixes: Filename suffixes to skip (see
+                dropbox_skip_suffixes_for). Skipped files stay on local disk / GCS.
+            skip_unchanged: Don't re-upload files already in the folder with the
+                same Dropbox content hash (one recursive listing up front). Used
+                when a second pass adds files to a folder that was just uploaded.
+            filename_prefix: Prepended to every uploaded file's name (e.g. a
+                tenant's "VS6588 - " catalogue code). Entries inside .zip packages
+                (CDG/TXT) are renamed too, so CDG+MP3 pairs keep matching names.
+        """
+        # Ensure remote path starts with /
+        if not remote_path.startswith("/"):
+            remote_path = f"/{remote_path}"
+
+        logger.info(f"Uploading folder {local_dir} to {remote_path}")
+
+        remote_hashes = self._remote_content_hashes(remote_path) if skip_unchanged else {}
+
+        uploaded_count = 0
+        skipped_count = 0
+        unchanged_count = 0
+        for root, _dirs, files in os.walk(local_dir):
+            # Calculate the relative path from local_dir to current root
+            rel_root = os.path.relpath(root, local_dir)
+            if rel_root == ".":
+                current_remote = remote_path
+            else:
+                current_remote = f"{remote_path}/{rel_root}"
+
+            for filename in files:
+                if exclude_suffixes and filename.endswith(tuple(exclude_suffixes)):
+                    logger.info(f"Skipping {filename} (excluded from Dropbox upload)")
+                    skipped_count += 1
+                    continue
+                local_file = os.path.join(root, filename)
+                remote_file = f"{current_remote}/{filename_prefix}{filename}"
+                if filename_prefix and filename.lower().endswith(".zip"):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        prefixed_zip = os.path.join(tmp, filename)
+                        prefix_zip_entries(local_file, prefixed_zip, filename_prefix)
+                        remote_hash = remote_hashes.get(remote_file.lower())
+                        if remote_hash and remote_hash == dropbox_content_hash(prefixed_zip):
+                            unchanged_count += 1
+                            continue
+                        self.upload_file(prefixed_zip, remote_file)
+                    uploaded_count += 1
+                    continue
+                remote_hash = remote_hashes.get(remote_file.lower())
+                if remote_hash and remote_hash == dropbox_content_hash(local_file):
+                    unchanged_count += 1
+                    continue
+                self.upload_file(local_file, remote_file)
+                uploaded_count += 1
+
+        logger.info(
+            f"Uploaded {uploaded_count} files to {remote_path}"
+            + (f" (skipped {skipped_count} excluded)" if skipped_count else "")
+            + (f" ({unchanged_count} already up to date)" if unchanged_count else "")
+        )
+
+    def create_shared_link(self, path: str) -> str:
+        """
+        Create and return a shared link for the path.
+
+        Args:
+            path: Dropbox path to share
+
+        Returns:
+            Shared link URL
+        """
+        from dropbox.exceptions import ApiError
+        from dropbox.sharing import SharedLinkSettings
+
+        # Ensure path starts with /
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        logger.info(f"Creating shared link for: {path}")
+
+        try:
+            # Try to create a new shared link
+            settings = SharedLinkSettings(requested_visibility=None)
+            link = self.client.sharing_create_shared_link_with_settings(path, settings)
+            logger.info(f"Created new shared link: {link.url}")
+            return link.url
+        except ApiError as e:
+            # Link may already exist - try to get existing link
+            if e.error.is_shared_link_already_exists():
+                logger.info("Shared link already exists, retrieving existing link")
+                links = self.client.sharing_list_shared_links(path=path, direct_only=True)
+                if links.links:
+                    logger.info(f"Found existing shared link: {links.links[0].url}")
+                    return links.links[0].url
+            raise
+
+    def revoke_shared_link(self, url: str) -> bool:
+        """Revoke a shared link (the folder and its files stay). Idempotent.
+
+        Returns True when revoked or already gone. A link Dropbox can't revoke
+        (malformed, or a link type that has no revoke) is nothing to revoke:
+        WARNING and False, so it never blocks account deletion. Any other
+        failure (network, auth, rate limit, access denied) raises.
+        """
+        from dropbox.exceptions import ApiError
+
+        try:
+            self.client.sharing_revoke_shared_link(url)
+            logger.info("Revoked Dropbox shared link")
+            return True
+        except ApiError as e:
+            err = getattr(e, "error", None)
+
+            def _is(name: str) -> bool:
+                return bool(err is not None and getattr(err, name, lambda: False)())
+
+            if _is("is_shared_link_not_found"):
+                logger.info("Dropbox shared link already gone")
+                return True
+            if _is("is_shared_link_malformed") or _is("is_unsupported_link_type"):
+                logger.warning("Dropbox shared link can't be revoked (%s); nothing to revoke", err)
+                return False
+            raise
+
+    def delete_folder(self, path: str) -> bool:
+        """
+        Delete a folder and all its contents from Dropbox.
+
+        Args:
+            path: Dropbox path to delete (e.g., "/Karaoke/Tracks-Organized/NOMAD-1234 - Artist - Title")
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        from dropbox.exceptions import ApiError
+
+        # Ensure path starts with /
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        logger.info(f"Deleting Dropbox folder: {path}")
+
+        try:
+            self.client.files_delete_v2(path)
+            logger.info(f"Successfully deleted: {path}")
+            return True
+        except ApiError as e:
+            if e.error.is_path_lookup() and e.error.get_path_lookup().is_not_found():
+                logger.warning(f"Folder not found (already deleted?): {path}")
+                return True  # Consider it success if already gone
+            logger.error(f"Failed to delete Dropbox folder: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error deleting Dropbox folder: {e}")
+            return False
+
+
+def get_dropbox_service() -> DropboxService:
+    """Factory function to get a DropboxService instance."""
+    return DropboxService()
+
+
+def dropbox_skip_suffixes_for(dropbox_path: Optional[str]) -> Tuple[str, ...]:
+    """Filename suffixes to leave out of a Dropbox upload to ``dropbox_path``.
+
+    Only Nomad's own folders (DEFAULT_DROPBOX_PATH / DEFAULT_PRIVATE_DROPBOX_PATH)
+    skip anything — tenant folders get the full output set. The suffix list comes
+    from settings.dropbox_skip_output_suffixes ("|"-separated). Skipped files are
+    still in GCS, so job-page downloads and YouTube uploads are unaffected.
+    """
+    from backend.config import get_settings
+
+    settings = get_settings()
+    if not dropbox_path:
+        return ()
+    own_paths = {
+        p.rstrip("/")
+        for p in (settings.default_dropbox_path, settings.default_private_dropbox_path)
+        if p
+    }
+    if dropbox_path.rstrip("/") not in own_paths:
+        return ()
+    raw = settings.dropbox_skip_output_suffixes or ""
+    return tuple(s for s in raw.split("|") if s.strip())

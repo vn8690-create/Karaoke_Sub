@@ -1,0 +1,2076 @@
+'use client'
+
+import { useTranslations } from 'next-intl'
+import { useState, useEffect, useCallback, useMemo, useRef, memo } from 'react'
+import { useRouter } from '@/i18n/routing'
+import { Button } from '@/components/ui/button'
+import { Video, Check, CheckCircle2, PanelRightOpen } from 'lucide-react'
+import { useAudioReady } from '@/lib/lyrics-review/hooks/useAudioReady'
+import { useLateInstrumentalStems } from '@/lib/lyrics-review/hooks/useLateInstrumentalStems'
+import { useReferencePanelLayout, clampReferenceWidth, MAX_REFERENCE_WIDTH_FRACTION } from '@/lib/lyrics-review/hooks/useReferencePanelLayout'
+import { toast } from 'sonner'
+import {
+  AnchorSequence,
+  CorrectionData,
+  GapSequence,
+  HighlightInfo,
+  InteractionMode,
+  TranscriptionViewMode,
+  LyricsSegment,
+  ReferenceSource,
+  WordCorrection,
+  FlashType,
+  Word,
+  WordClickInfo,
+  ModalContent,
+  SearchLyricsResponse,
+  AddLyricsResult,
+} from '@/lib/lyrics-review/types'
+import type { EditLog, EditLogEntry, EditFeedbackReason } from '@/lib/lyrics-review/types'
+import type { InstrumentalSelectionType, LyricsReviewApiClient } from '@/lib/api'
+import { lyricsReviewApi, getAccessToken } from '@/lib/api'
+import { useEncodingWorkerKeepAlive } from '@/lib/lyrics-review/hooks/useEncodingWorkerKeepAlive'
+import { cn } from '@/lib/utils'
+import ReferenceView from './ReferenceView'
+import TranscriptionView from './TranscriptionView'
+import { EditModal } from './modals'
+import { ReviewChangesModal } from './modals'
+import { ReplaceAllLyricsModal } from './modals'
+import { AddLyricsModal } from './modals'
+import { FindReplaceModal } from './modals'
+import { TimingOffsetModal } from './modals'
+import CorrectionDetailCard from './CorrectionDetailCard'
+import EditFeedbackBar from './EditFeedbackBar'
+import {
+  addSegmentBefore,
+  splitSegment,
+  deleteSegment,
+  mergeSegment,
+  findAndReplace,
+  deleteWord,
+} from '@/lib/lyrics-review/utils/segmentOperations'
+import { generateStorageKey } from '@/lib/lyrics-review/utils/localStorage'
+import { countUntimedWords } from '@/lib/lyrics-review/utils/timingCompleteness'
+import { createLocalSessionStore, type LocalSessionStore } from '@/lib/lyrics-review/utils/localSessionStore'
+import {
+  setupKeyboardHandlers,
+  setModalHandler,
+  getModalState,
+} from '@/lib/lyrics-review/utils/keyboardHandlers'
+import { createEditLog, addEditEntry, attachFeedback } from '@/lib/lyrics-review/utils/editLog'
+import { useReviewSessionAutoSave } from '@/hooks/use-review-session-autosave'
+import { hasMultipleSingers } from '@/lib/lyrics-review/duet'
+import SessionRestoreDialog from './SessionRestoreDialog'
+import Header from './Header'
+import GapNavigator from './GapNavigator'
+import AutoCorrectModal from './AutoCorrectModal'
+import AutoCorrectPanel from './AutoCorrectPanel'
+import { useAutoCorrect } from '@/hooks/useAutoCorrect'
+import type { AiSuggestion } from '@/lib/api/autoCorrect'
+import type { ServerSuggestionUndoInfo } from '@/lib/lyrics-review/utils/autoCorrectApply'
+import { getWordsFromIds } from '@/lib/lyrics-review/utils/wordUtils'
+import {
+  applyOffsetToCorrectionData,
+  applyOffsetToSegment,
+  applyOffsetToTime,
+  applyOffsetToWord,
+} from '@/lib/lyrics-review/utils/timingUtils'
+import { computeNeighbourBoundsBySegment } from '@/lib/lyrics-review/utils/contextWords'
+import { resolveInitialViewMode } from '@/lib/lyrics-review/utils/segmentTiming'
+import { VocalsAudioDataLoader } from './VocalsAudioDataLoader'
+import MissingLyricsCallout, { MissingLyricsResyncHint } from './MissingLyricsCallout'
+import { useMissingLyrics } from '@/lib/lyrics-review/hooks/useMissingLyrics'
+import type { OpenMissingLyricsGap } from '@/lib/lyrics-review/utils/missingLyrics'
+
+// Add type for window augmentation
+declare global {
+  interface Window {
+    toggleAudioPlayback?: () => void
+    seekAndPlayAudio?: (startTime: number) => void
+    getAudioDuration?: () => number
+    isAudioPlaying?: boolean
+  }
+}
+
+interface ApiClient {
+  submitCorrections: (data: CorrectionData, isDuet?: boolean) => Promise<void>
+  submitAnnotations: (annotations: never[]) => Promise<void>
+  submitEditLog: (editLog: EditLog) => Promise<void>
+  updateHandlers: (handlers: string[]) => Promise<CorrectionData>
+  addLyrics: (source: string, lyrics: string, force?: boolean) => Promise<AddLyricsResult>
+  searchLyrics?: (artist: string, title: string, forceSources?: string[]) => Promise<SearchLyricsResponse>
+  getAudioUrl: (hash: string) => string
+  getVocalsAudioUrl: () => string
+  // Optional: pre-computed peaks endpoint (cloud mode); absent → loader falls
+  // back to downloading + decoding the full stem.
+  getVocalsPeaksUrl?: () => string
+  generatePreviewVideo: (data: CorrectionData, isDuet?: boolean) => Promise<{
+    status: string
+    message?: string
+    preview_hash?: string
+  }>
+  getPreviewVideoStatus: (hash: string) => Promise<{
+    status: string
+    message?: string
+  }>
+  getPreviewVideoUrl: (hash: string) => string
+  getWaveformData?: (numPoints?: number) => Promise<{ amplitudes: number[]; duration_seconds?: number; duration?: number }>
+  // Optional: separation-status poll for stems that land after page load (cloud mode).
+  getInstrumentalState?: LyricsReviewApiClient['getInstrumentalState']
+  setSyncReference?: LyricsReviewApiClient['setSyncReference']
+  completeReview: () => Promise<{ status: string; job_status: string; message: string }>
+  // Review session methods (optional - available in cloud mode)
+  saveReviewSession?: LyricsReviewApiClient['saveReviewSession']
+  listReviewSessions?: LyricsReviewApiClient['listReviewSessions']
+  getReviewSession?: LyricsReviewApiClient['getReviewSession']
+  deleteReviewSession?: LyricsReviewApiClient['deleteReviewSession']
+}
+
+export interface LyricsAnalyzerProps {
+  data: CorrectionData
+  onFileLoad: () => void
+  onShowMetadata: () => void
+  apiClient: ApiClient | null
+  isReadOnly: boolean
+  audioHash: string
+  isLocalMode?: boolean
+  jobId?: string
+  hasExistingInstrumental?: boolean
+  /** Language the lyrics get translated into after review (job option), if any —
+   *  the preview modal explains the translation isn't in the preview. */
+  translationLanguage?: string | null
+}
+
+export default function LyricsAnalyzer({
+  data: initialData,
+  onFileLoad,
+  apiClient,
+  isReadOnly,
+  audioHash,
+  isLocalMode = false,
+  jobId,
+  hasExistingInstrumental = false,
+  translationLanguage = null,
+}: LyricsAnalyzerProps) {
+  const t = useTranslations('lyricsReview')
+  const router = useRouter()
+  const isMobile = typeof window !== 'undefined' && window.innerWidth < 768
+
+  // Modal state
+  const [modalContent, setModalContent] = useState<ModalContent | null>(null)
+  const [flashingType, setFlashingType] = useState<FlashType>(null)
+  const [highlightInfo, setHighlightInfo] = useState<HighlightInfo | null>(null)
+  const [currentSource, setCurrentSource] = useState<string>(() => {
+    if (!initialData?.reference_lyrics) return ''
+    const availableSources = Object.keys(initialData.reference_lyrics)
+    return availableSources.length > 0 ? availableSources[0] : ''
+  })
+  const [isReviewComplete, setIsReviewComplete] = useState(false)
+  const [originalData] = useState(() => JSON.parse(JSON.stringify(initialData)))
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>('edit')
+  const [isShiftPressed, setIsShiftPressed] = useState(false)
+  const [isCtrlPressed, setIsCtrlPressed] = useState(false)
+  const [editModalSegment, setEditModalSegment] = useState<{
+    segment: LyricsSegment
+    index: number
+    originalSegment: LyricsSegment
+  } | null>(null)
+  const [isReplaceAllLyricsModalOpen, setIsReplaceAllLyricsModalOpen] = useState(false)
+  const [isReviewModalOpen, setIsReviewModalOpen] = useState(false)
+  const [currentAudioTime, setCurrentAudioTime] = useState(0)
+  const [isUpdatingHandlers, setIsUpdatingHandlers] = useState(false)
+  const [flashingHandler, setFlashingHandler] = useState<string | null>(null)
+  const [isAddingLyrics, setIsAddingLyrics] = useState(false)
+  const [isAddLyricsModalOpen, setIsAddLyricsModalOpen] = useState(false)
+  const [isAnyModalOpen, setIsAnyModalOpen] = useState(false)
+  const [isFindReplaceModalOpen, setIsFindReplaceModalOpen] = useState(false)
+  const [isTimingOffsetModalOpen, setIsTimingOffsetModalOpen] = useState(false)
+  const [timingOffsetMs, setTimingOffsetMs] = useState(0)
+  const [reviewMode, setReviewMode] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  // Per-screen skip (C1): when the backing decision is confidently auto-resolved,
+  // completing the lyrics review finishes the job and the instrumental screen is
+  // never shown. The reviewer can opt back in via a "review instrumental anyway"
+  // toggle in the finish modal (the verdict is confident, not infallible).
+  const [reviewInstrumentalAnyway, setReviewInstrumentalAnyway] = useState(false)
+  // The reviewer's inline instrumental pick in the finish modal ("clean" |
+  // "with_backing"), or null to use the recommended default. Completing the review
+  // submits this concrete selection so the /instrumental screen is only needed for
+  // the "Advanced mode" opt-in (section muting / custom upload).
+  const [instrumentalChoice, setInstrumentalChoice] = useState<'clean' | 'with_backing' | null>(null)
+
+  const [vocalsAudioUrl, setVocalsAudioUrl] = useState<string | null>(null)
+  const [vocalsPeaksUrl, setVocalsPeaksUrl] = useState<string | null>(null)
+
+  // Success screen state (for auto-close after submission)
+  const [showSuccess, setShowSuccess] = useState(false)
+  const [countdown, setCountdown] = useState(2)
+  const [showInstrumentalReview, setShowInstrumentalReview] = useState(false)
+
+  // AI auto-correct state
+  const [isAutoCorrectModalOpen, setIsAutoCorrectModalOpen] = useState(false)
+  // The applied-corrections details are opened on demand from the toolbar
+  // button rather than shown as a standing row.
+  const [autoCorrectDetailsOpen, setAutoCorrectDetailsOpen] = useState(false)
+
+  // Edit log state
+  const [editLog] = useState<EditLog>(() => createEditLog(jobId ?? 'unknown', audioHash))
+  const [lastEditEntry, setLastEditEntry] = useState<EditLogEntry | null>(null)
+  const [showFeedbackBar, setShowFeedbackBar] = useState(false)
+
+  // Stats panel visibility
+  const [statsVisible, setStatsVisible] = useState(false)
+
+  // Session restore state
+  const [sessionRestoreOpen, setSessionRestoreOpen] = useState(false)
+  const [savedSessions, setSavedSessions] = useState<import('@/lib/api').ReviewSession[]>([])
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+
+  // Advanced mode for transcription view (Simple/Advanced toggle)
+  const [isDuet, setIsDuet] = useState<boolean>(
+    (initialData as any).is_duet ?? false
+  )
+
+  const [focusedSegmentIndex, setFocusedSegmentIndex] = useState<number | null>(null)
+
+  // Synced Lyrics view mode: Simple text / Advanced flex-pills / Waveforms inline timelines.
+  // Migrates the old boolean `lyricsReviewAdvancedMode` localStorage key to the new enum.
+  const [transcriptionViewMode, setTranscriptionViewMode] = useState<TranscriptionViewMode>(() =>
+    resolveInitialViewMode(typeof window === 'undefined' ? null : window.localStorage)
+  )
+
+  // Waveforms view: reviewer-adjustable Synced/Reference split + collapsible Reference column.
+  const referenceLayout = useReferencePanelLayout()
+  const tReference = useTranslations('lyricsReview.reference')
+  const waveformsLayout = !isMobile && transcriptionViewMode === 'waveforms'
+  const splitRowRef = useRef<HTMLDivElement>(null)
+  const referenceColumnRef = useRef<HTMLDivElement>(null)
+
+  // Gap navigation state
+  const [currentGapIndex, setCurrentGapIndex] = useState<number | null>(null)
+
+  // Correction detail card state
+  const [correctionDetailOpen, setCorrectionDetailOpen] = useState(false)
+  const [selectedCorrection, setSelectedCorrection] = useState<{
+    wordId: string
+    originalWord: string
+    correctedWord: string
+    category: string | null
+    confidence: number
+    reason: string
+    handler: string
+    source: string
+  } | null>(null)
+
+  // State history for Undo/Redo
+  const [history, setHistory] = useState<CorrectionData[]>([initialData])
+  const [historyIndex, setHistoryIndex] = useState(0)
+
+  // Derived state: the current data based on history index
+  const data = history[historyIndex]
+
+  // Function to update data and manage history
+  const updateDataWithHistory = useCallback(
+    (newData: CorrectionData, _actionDescription?: string) => {
+      const newHistory = history.slice(0, historyIndex + 1)
+      const deepCopiedNewData = JSON.parse(JSON.stringify(newData))
+      newHistory.push(deepCopiedNewData)
+      setHistory(newHistory)
+      setHistoryIndex(newHistory.length - 1)
+    },
+    [history, historyIndex]
+  )
+
+  // Collapse history to a single baseline entry (used by the on-load auto-apply
+  // so auto-corrections are the starting point, not an undoable "edit").
+  const rebaseHistory = useCallback((next: CorrectionData) => {
+    setHistory([next])
+    setHistoryIndex(0)
+  }, [])
+
+  // Server-side pre-apply (C2): when the backend applied the AI corrections
+  // before the review-ready notification, `initialData` already carries them and
+  // marks `metadata.auto_approval.pre_applied`. In that case the UI must NOT
+  // auto-run/auto-apply again (no in-browser race) — it just displays what was
+  // applied. Keyed on the marker only (not live edits) so it doesn't churn.
+  const preApplied = useMemo(() => {
+    const m = initialData.metadata?.auto_approval
+    if (isReadOnly || isLocalMode || !m?.pre_applied || !Array.isArray(m.suggestions)) return null
+    return {
+      suggestions: m.suggestions as unknown as AiSuggestion[],
+      appliedIds: m.applied_suggestion_ids ?? [],
+      rejectedIds: m.rejected_suggestion_ids ?? [],
+      undoInfo: m.undo_info as unknown as Record<string, ServerSuggestionUndoInfo> | undefined,
+    }
+  }, [initialData.metadata?.auto_approval, isReadOnly, isLocalMode])
+
+  // AI auto-correct suggestions (opt-in; nothing runs unless triggered)
+  const autoCorrect = useAutoCorrect({
+    jobId,
+    data,
+    updateDataWithHistory,
+    rebaseData: rebaseHistory,
+    editLog,
+    getAuthToken: () => getAccessToken() ?? undefined,
+    // Auto-run + auto-apply once on load so the reviewer starts from the
+    // corrected lyrics (= clicking "Accept All"). The backend pre-generates +
+    // caches suggestions during lyrics processing, so this is normally an
+    // instant cache hit. Skipped in read-only / local mode, and only when a
+    // jobId exists (the request needs one). Also skipped when the server already
+    // pre-applied (C2) — the corrections are already in the loaded data.
+    autoRunOnLoad: !isReadOnly && !isLocalMode && Boolean(jobId) && !preApplied,
+    autoApplyOnLoad: !isReadOnly && !isLocalMode && Boolean(jobId) && !preApplied,
+    preApplied,
+  })
+
+  // Late stems: review opens as soon as LYRICS finish, but audio separation usually
+  // lands 2-3 minutes later — so the page-load data often has no instrumental stems
+  // or backing analysis. Poll until separation completes and overlay the fresh
+  // stems / analysis / auto-approval verdict, so the finish modal's instrumental
+  // chooser appears without a reload. Kept OUT of `data` (history/undo, saved
+  // sessions, and the preview render all key off it).
+  const pageLoadHasStems = (data.instrumental_options ?? []).length > 0
+  const lateStems = useLateInstrumentalStems({
+    enabled: !isReadOnly && !isLocalMode && Boolean(jobId) && !hasExistingInstrumental && !pageLoadHasStems,
+    getInstrumentalState: apiClient?.getInstrumentalState,
+  })
+  const lateState = lateStems.status === 'ready' ? lateStems.state : null
+  const effectiveAutoApproval = lateState?.auto_approval ?? data.auto_approval
+  const effectiveBackingAnalysis = lateState?.backing_vocals_analysis ?? data.backing_vocals_analysis
+
+  // Per-screen skip (C1): when the backing decision is confidently auto-resolved
+  // by the server, completing the lyrics review finishes the whole job (with the
+  // server-resolved instrumental selection) and the instrumental screen is never
+  // shown. Custom / uploaded-instrumental jobs keep the existing skip path.
+  const autoInstrumentalConfident =
+    !isReadOnly &&
+    !isLocalMode &&
+    Boolean(jobId) &&
+    !hasExistingInstrumental &&
+    Boolean(effectiveAutoApproval?.backing?.confident)
+
+  // Inline instrumental choice: offer the clean-vs-with-backing picker in the finish
+  // modal whenever BOTH stems exist — even when the auto-scorer wasn't confident — so
+  // the reviewer never has to visit the heavy /instrumental screen just to make the
+  // basic choice. That screen becomes the "Advanced mode" opt-in.
+  const instrumentalStemOptions = lateState?.instrumental_options ?? data.instrumental_options ?? []
+  // Warm the browser cache with the instrumental stems once the main review audio has
+  // loaded, so the finish modal's "click the waveform to hear backing vocals" plays
+  // instantly instead of waiting on a multi-MB fetch (and, for older jobs, on the API's
+  // on-demand OGG transcode) after the modal opens.
+  const { ready: reviewAudioReady } = useAudioReady()
+  const prefetchStemUrls =
+    reviewAudioReady && !isReadOnly
+      ? instrumentalStemOptions.map((o) => o.audio_url).filter((u): u is string => !!u)
+      : []
+  const hasCleanStem = instrumentalStemOptions.some((o) => o.id === 'clean' && o.audio_url)
+  const hasBackingStem = instrumentalStemOptions.some((o) => o.id === 'with_backing' && o.audio_url)
+  const offerInlineInstrumentalChoice =
+    !isReadOnly && !isLocalMode && Boolean(jobId) && !hasExistingInstrumental && hasCleanStem && hasBackingStem
+
+  // Which instrumental to preselect / recommend: the confident server resolution,
+  // else the backing-vocals analysis's recommendation, else keep backing where a
+  // backing stem exists ("retain where possible"), falling back to clean. Both
+  // sources can carry non-stem values (null / "review_needed"), so validate.
+  const asStem = (v: unknown): 'clean' | 'with_backing' | undefined =>
+    v === 'clean' || v === 'with_backing' ? v : undefined
+  const rawRecommended =
+    asStem(effectiveAutoApproval?.backing?.resolved_selection) ??
+    asStem(effectiveBackingAnalysis?.recommended_selection) ??
+    (hasBackingStem ? 'with_backing' : 'clean')
+  // Clamp to a stem that actually exists.
+  const recommendedInstrumental: 'clean' | 'with_backing' =
+    rawRecommended === 'with_backing' && !hasBackingStem
+      ? 'clean'
+      : rawRecommended === 'clean' && !hasCleanStem && hasBackingStem
+        ? 'with_backing'
+        : rawRecommended
+  const currentInstrumental: 'clean' | 'with_backing' = instrumentalChoice ?? recommendedInstrumental
+
+  // Close the run modal once suggestions arrive (panel takes over)
+  useEffect(() => {
+    if (autoCorrect.status === 'reviewing') {
+      setIsAutoCorrectModalOpen(false)
+    }
+  }, [autoCorrect.status])
+
+  // AI auto-correction provenance, derived from the stamped word fields so it
+  // survives reloads of an already-corrected job:
+  //  - aiCorrectedWordIds → purple highlight
+  //  - aiOriginalTextByWordId → the original-text bubble (first word of a span)
+  //  - aiEstimatedWordIds → the "guessed timing, needs review" marker
+  const { aiCorrectedWordIds, aiOriginalTextByWordId, aiEstimatedWordIds } = useMemo(() => {
+    const ids = new Set<string>()
+    const originalText = new Map<string, string>()
+    const estimated = new Set<string>()
+    for (const segment of data.corrected_segments) {
+      for (const word of segment.words) {
+        if (!word.ai_corrected) continue
+        ids.add(word.id)
+        if (word.original_text) originalText.set(word.id, word.original_text)
+        if (word.timing_estimated) estimated.add(word.id)
+      }
+    }
+    return {
+      aiCorrectedWordIds: ids,
+      aiOriginalTextByWordId: originalText,
+      aiEstimatedWordIds: estimated,
+    }
+  }, [data])
+
+  // Compute which word IDs have been edited by the user (compared to initial
+  // state), rendered green. AI-corrected words are excluded — they get their
+  // own purple treatment so the two sources stay visually distinct.
+  const editedWordIds = useMemo(() => {
+    const initial = history[0]
+    if (!initial || data === initial) return new Set<string>()
+    // Build map of word ID → text from initial state
+    const initialWordText = new Map<string, string>()
+    for (const segment of initial.corrected_segments) {
+      for (const word of segment.words) {
+        initialWordText.set(word.id, word.text)
+      }
+    }
+    const edited = new Set<string>()
+    for (const segment of data.corrected_segments) {
+      for (const word of segment.words) {
+        if (word.ai_corrected) continue
+        const originalText = initialWordText.get(word.id)
+        if (originalText === undefined) {
+          // Word was added by the user
+          edited.add(word.id)
+        } else if (originalText !== word.text) {
+          // Word text was changed
+          edited.add(word.id)
+        }
+      }
+    }
+    return edited
+  }, [data, history])
+
+  // Reset history when initial data changes
+  useEffect(() => {
+    setHistory([initialData])
+    setHistoryIndex(0)
+  }, [initialData])
+
+  // Apply restored data: replace history AND turn the duet toggle on if the
+  // restored segments encode multi-singer assignments. We never turn duet
+  // OFF here — a user who toggled duet mid-edit and then restored an early
+  // solo snapshot probably still wants the toggle on for their next edit.
+  const applyRestoredData = useCallback((restored: CorrectionData) => {
+    setHistory([restored])
+    setHistoryIndex(0)
+    if (hasMultipleSingers(restored.corrected_segments || [])) {
+      setIsDuet(true)
+    }
+  }, [])
+
+  // Session storage: the real (server) client in cloud mode, or a
+  // localStorage-backed store when running locally — so the same Session Restore
+  // dialog is used everywhere instead of an ad-hoc native confirm.
+  const sessionClient: LocalSessionStore = useMemo(() => {
+    if (apiClient?.listReviewSessions && apiClient.getReviewSession) {
+      return apiClient as unknown as LocalSessionStore
+    }
+    return createLocalSessionStore({
+      storeKey: jobId || generateStorageKey(initialData),
+      jobId: jobId || '',
+      artist: initialData.metadata?.artist ?? null,
+      title: initialData.metadata?.title ?? null,
+    })
+  }, [apiClient, jobId, initialData])
+
+  // Load saved sessions on mount → offer the Session Restore dialog if any
+  // exist. Only genuine manual-edit sessions are ever saved (see the auto-save
+  // guard), so auto-corrections alone never trigger this.
+  useEffect(() => {
+    if (isReadOnly) return
+    let cancelled = false
+    setSessionsLoading(true)
+    sessionClient
+      .listReviewSessions()
+      .then((result) => {
+        if (cancelled) return
+        setSessionsLoading(false)
+        if (result.sessions.length > 0) {
+          setSavedSessions(result.sessions)
+          setSessionRestoreOpen(true)
+        }
+      })
+      .catch(() => {
+        if (cancelled) return
+        setSessionsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [initialData, isReadOnly]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Handler for restoring a session from the dialog
+  const handleSessionRestore = useCallback((correctionData: CorrectionData) => {
+    applyRestoredData(correctionData)
+  }, [applyRestoredData])
+
+  // Handler to open session browser from toolbar
+  const handleOpenSessionBrowser = useCallback(async () => {
+    setSessionsLoading(true)
+    try {
+      const result = await sessionClient.listReviewSessions()
+      setSavedSessions(result.sessions)
+    } catch {
+      setSavedSessions([])
+    }
+    setSessionsLoading(false)
+    setSessionRestoreOpen(true)
+  }, [sessionClient])
+
+  // Keep the encoding worker VM warm while reviewing: warmup on load, heartbeat
+  // on edits AND periodically while the tab is visible and in use, so the 5-min
+  // backend idle shutdown doesn't stop it under an active reviewer. Only in cloud
+  // mode (jobId present) — the endpoints are review-auth scoped to the job, and
+  // there's no cloud encoding VM to warm in local mode.
+  const { sendHeartbeat } = useEncodingWorkerKeepAlive(jobId, !isReadOnly)
+
+  // Heartbeat the encoding worker as the reviewer works. Crash recovery /
+  // restore now flows entirely through review sessions (server in cloud mode,
+  // localStorage when local) via the auto-save hook below.
+  useEffect(() => {
+    if (!isReadOnly) sendHeartbeat()
+  }, [data, isReadOnly, sendHeartbeat])
+
+  // Server-side session auto-save (periodic backup)
+  const { saveSession } = useReviewSessionAutoSave({
+    jobId: jobId ?? '',
+    data,
+    initialData,
+    historyLength: history.length,
+    isReadOnly: isReadOnly || !apiClient?.saveReviewSession,
+    apiClient: sessionClient as LyricsReviewApiClient,
+  })
+
+  // Flash handler (defined early so gap navigation can use it)
+  const handleFlash = useCallback((type: FlashType, info?: HighlightInfo) => {
+    setFlashingType(null)
+    setHighlightInfo(null)
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setFlashingType(type)
+        if (info) {
+          setHighlightInfo(info)
+        }
+        setTimeout(() => {
+          setFlashingType(null)
+          setHighlightInfo(null)
+        }, 1200)
+      })
+    })
+  }, [])
+
+  // Compute uncorrected gaps for navigation
+  const uncorrectedGaps = useMemo(() => {
+    const gapCorrections = data.corrections.reduce(
+      (map: Record<string, boolean>, correction) => {
+        const gap = data.gap_sequences.find((g) =>
+          g.transcribed_word_ids.includes(correction.word_id)
+        )
+        if (gap) map[gap.id] = true
+        return map
+      },
+      {} as Record<string, boolean>
+    )
+    return data.gap_sequences.filter(
+      (gap) => !gapCorrections[gap.id] && gap.transcribed_word_ids.length > 0
+    )
+  }, [data.gap_sequences, data.corrections])
+
+  // Navigate to a specific gap
+  const navigateToGap = useCallback(
+    (index: number) => {
+      if (index < 0 || index >= uncorrectedGaps.length) return
+      setCurrentGapIndex(index)
+      const gap = uncorrectedGaps[index]
+      const firstWordId = gap.transcribed_word_ids[0]
+      if (firstWordId) {
+        const el = document.getElementById(`word-${firstWordId}`)
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        }
+      }
+      // Flash only the specific gap's words (not all uncorrected gaps)
+      const gapWords = gap.transcribed_word_ids
+        .map((id) => {
+          for (const seg of data.corrected_segments) {
+            const w = seg.words.find((w) => w.id === id)
+            if (w) return w
+          }
+          return null
+        })
+        .filter((w): w is Word => w !== null)
+      handleFlash('uncorrected', {
+        type: 'gap',
+        sequence: gap,
+        transcribed_words: gapWords,
+      })
+    },
+    [uncorrectedGaps, handleFlash, data.corrected_segments]
+  )
+
+  const handlePrevGap = useCallback(() => {
+    const newIndex = currentGapIndex !== null ? currentGapIndex - 1 : 0
+    navigateToGap(Math.max(0, newIndex))
+  }, [currentGapIndex, navigateToGap])
+
+  const handleNextGap = useCallback(() => {
+    const newIndex = currentGapIndex !== null ? currentGapIndex + 1 : 0
+    navigateToGap(Math.min(uncorrectedGaps.length - 1, newIndex))
+  }, [currentGapIndex, uncorrectedGaps.length, navigateToGap])
+
+  // Word IDs for the currently active gap (persistent ring indicator)
+  const activeGapWordIds = useMemo(() => {
+    if (currentGapIndex === null || currentGapIndex >= uncorrectedGaps.length) return undefined
+    return new Set(uncorrectedGaps[currentGapIndex].transcribed_word_ids)
+  }, [currentGapIndex, uncorrectedGaps])
+
+  // Keyboard handlers
+  useEffect(() => {
+    const { handleKeyDown, handleKeyUp, cleanup } = setupKeyboardHandlers({
+      setIsShiftPressed,
+      setIsCtrlPressed,
+      onNextGap: handleNextGap,
+      onPrevGap: handlePrevGap,
+      isDuet,
+      focusedSegmentIndex,
+      onAssignSegmentSinger: (idx, singer) => {
+        const segments = [...data.corrected_segments]
+        segments[idx] = { ...segments[idx], singer }
+        updateDataWithHistory({ ...data, corrected_segments: segments }, 'singer change')
+      },
+    })
+
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+
+    if (isAnyModalOpen) {
+      setIsShiftPressed(false)
+      setIsCtrlPressed(false)
+    }
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+      document.body.style.userSelect = ''
+      cleanup()
+    }
+  }, [isAnyModalOpen, handleNextGap, handlePrevGap, isDuet, focusedSegmentIndex, data, updateDataWithHistory])
+
+  // Update modal state tracking
+  useEffect(() => {
+    const modalOpen = Boolean(
+      modalContent ||
+        editModalSegment ||
+        isReviewModalOpen ||
+        isAddLyricsModalOpen ||
+        isFindReplaceModalOpen ||
+        isReplaceAllLyricsModalOpen ||
+        isTimingOffsetModalOpen
+    )
+    setIsAnyModalOpen(modalOpen)
+  }, [
+    modalContent,
+    editModalSegment,
+    isReviewModalOpen,
+    isAddLyricsModalOpen,
+    isFindReplaceModalOpen,
+    isReplaceAllLyricsModalOpen,
+    isTimingOffsetModalOpen,
+  ])
+
+  // Effect to handle local mode navigation to instrumental review
+  useEffect(() => {
+    if (showInstrumentalReview && isLocalMode) {
+      // In local mode, redirect to instrumental page served by ReviewServer
+      window.location.href = `/app/jobs/local/instrumental`
+    }
+  }, [showInstrumentalReview, isLocalMode])
+
+  useEffect(() => {
+    if (!apiClient) return
+
+    setVocalsAudioUrl(apiClient.getVocalsAudioUrl())
+    setVocalsPeaksUrl(apiClient.getVocalsPeaksUrl ? apiClient.getVocalsPeaksUrl() : null)
+  }, [apiClient])
+
+  // Countdown effect for success screen (auto-close/redirect after submission)
+  useEffect(() => {
+    if (!showSuccess) return
+
+    const interval = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval)
+          if (isLocalMode) {
+            // Note: window.close() may be blocked by browsers if the window wasn't opened
+            // by script. The success screen shows "You can close this window now" as fallback.
+            window.close()
+          } else {
+            router.push('/app')
+          }
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [showSuccess, isLocalMode, router])
+
+  // Calculate effective mode based on modifier key states
+  const effectiveMode = isCtrlPressed ? 'delete_word' : isShiftPressed ? 'highlight' : interactionMode
+
+  // Edit feedback handler
+  const handleEditFeedback = useCallback(
+    (entryId: string, reason: EditFeedbackReason) => {
+      attachFeedback(editLog, entryId, reason)
+    },
+    [editLog]
+  )
+
+  const handleViewModeChange = useCallback((mode: TranscriptionViewMode) => {
+    setTranscriptionViewMode(mode)
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('lyricsReviewViewMode', mode)
+    }
+  }, [])
+
+  const showFeedbackForEntry = useCallback(
+    (entry: EditLogEntry) => {
+      // Only show for single-word edits
+      if (!['word_change', 'word_delete', 'word_add'].includes(entry.operation)) return
+      // Dismiss previous entry with no_response if still showing
+      if (lastEditEntry && lastEditEntry.id !== entry.id) {
+        attachFeedback(editLog, lastEditEntry.id, 'no_response')
+      }
+      setLastEditEntry(entry)
+      setShowFeedbackBar(true)
+    },
+    [editLog, lastEditEntry]
+  )
+
+  // Show correction detail
+  const handleShowCorrectionDetail = useCallback(
+    (wordId: string) => {
+      const correction = data.corrections?.find(
+        (c) => c.corrected_word_id === wordId || c.word_id === wordId
+      )
+      if (!correction) return
+
+      const categoryMatch = correction.reason?.match(/\[([A-Z_]+)\]/)
+      const category = categoryMatch ? categoryMatch[1] : null
+      const correctedWord =
+        data.corrected_segments.flatMap((s) => s.words).find((w) => w.id === wordId)?.text ||
+        correction.corrected_word
+
+      setSelectedCorrection({
+        wordId,
+        originalWord: correction.original_word,
+        correctedWord,
+        category,
+        confidence: correction.confidence,
+        reason: correction.reason,
+        handler: correction.handler,
+        source: correction.source,
+      })
+      setCorrectionDetailOpen(true)
+    },
+    [data]
+  )
+
+  // Word click handler
+  const handleWordClick = useCallback(
+    (info: WordClickInfo) => {
+      if (effectiveMode === 'delete_word') {
+        const deletedWord = data.corrected_segments.flatMap((s) => s.words).find((w) => w.id === info.word_id)
+        const segment = data.corrected_segments.find((s) => s.words.some((w) => w.id === info.word_id))
+        const entry = addEditEntry(editLog, 'word_delete', {
+          segment_id: segment?.id,
+          segment_index: segment ? data.corrected_segments.indexOf(segment) : null,
+          word_ids_before: [info.word_id],
+          text_before: deletedWord?.text ?? '',
+        })
+        const newData = deleteWord(data, info.word_id)
+        updateDataWithHistory(newData, 'delete word')
+        handleFlash('word')
+        showFeedbackForEntry(entry)
+        return
+      }
+
+      if (effectiveMode === 'highlight') {
+        const correction = data.corrections?.find(
+          (c) => c.corrected_word_id === info.word_id || c.word_id === info.word_id
+        )
+
+        if (correction) {
+          if (correction.handler === 'AgenticCorrector') {
+            handleShowCorrectionDetail(info.word_id)
+            return
+          }
+
+          setHighlightInfo({
+            type: 'correction',
+            transcribed_words: [],
+            correction,
+          })
+          setFlashingType('word')
+          return
+        }
+
+        // Check anchor sequences
+        const anchor = data.anchor_sequences?.find(
+          (a) =>
+            a.transcribed_word_ids.includes(info.word_id) ||
+            Object.values(a.reference_word_ids).some((ids) => ids.includes(info.word_id))
+        )
+
+        if (anchor) {
+          const allWords = data.corrected_segments.flatMap((s) => s.words)
+          const tempSegment: LyricsSegment = {
+            id: 'temp',
+            words: allWords,
+            text: allWords.map((w) => w.text).join(' '),
+            start_time: allWords[0]?.start_time ?? null,
+            end_time: allWords[allWords.length - 1]?.end_time ?? null,
+          }
+
+          const transcribedWords = getWordsFromIds([tempSegment], anchor.transcribed_word_ids)
+          const referenceWords = Object.fromEntries(
+            Object.entries(anchor.reference_word_ids).map(([source, ids]) => {
+              const sourceWords = data.reference_lyrics[source].segments.flatMap((s) => s.words)
+              const tempSourceSegment: LyricsSegment = {
+                id: `temp-${source}`,
+                words: sourceWords,
+                text: sourceWords.map((w) => w.text).join(' '),
+                start_time: sourceWords[0]?.start_time ?? null,
+                end_time: sourceWords[sourceWords.length - 1]?.end_time ?? null,
+              }
+              return [source, getWordsFromIds([tempSourceSegment], ids)]
+            })
+          )
+
+          setHighlightInfo({
+            type: 'anchor',
+            sequence: anchor,
+            transcribed_words: transcribedWords,
+            reference_words: referenceWords,
+          })
+          setFlashingType('word')
+          return
+        }
+      } else if (effectiveMode === 'edit') {
+        const segmentIndex = data.corrected_segments.findIndex((segment) =>
+          segment.words.some((word) => word.id === info.word_id)
+        )
+
+        if (segmentIndex !== -1) {
+          const segment = data.corrected_segments[segmentIndex]
+          setEditModalSegment({
+            segment,
+            index: segmentIndex,
+            originalSegment: JSON.parse(JSON.stringify(segment)),
+          })
+        }
+      }
+    },
+    [data, effectiveMode, updateDataWithHistory, handleFlash, handleShowCorrectionDetail]
+  )
+
+  // Update segment handler
+  const handleUpdateSegment = useCallback(
+    (updatedSegment: LyricsSegment) => {
+      if (!editModalSegment) return
+
+      const currentData = history[historyIndex]
+      const newSegments = currentData.corrected_segments.map((segment, i) =>
+        i === editModalSegment.index ? updatedSegment : segment
+      )
+      const newData: CorrectionData = {
+        ...currentData,
+        corrected_segments: newSegments,
+      }
+
+      // Diff original vs updated words to create edit log entries
+      const originalSegment = editModalSegment.originalSegment || editModalSegment.segment
+      const entries: EditLogEntry[] = []
+      if (originalSegment && originalSegment.text !== updatedSegment.text) {
+        const origWordMap = new Map(originalSegment.words.map((w) => [w.id, w]))
+        const updatedWordMap = new Map(updatedSegment.words.map((w) => [w.id, w]))
+
+        // Changed or deleted words
+        for (const origWord of originalSegment.words) {
+          const updatedWord = updatedWordMap.get(origWord.id)
+          if (!updatedWord) {
+            entries.push(addEditEntry(editLog, 'word_delete', {
+              segment_id: originalSegment.id,
+              segment_index: editModalSegment.index,
+              word_ids_before: [origWord.id],
+              text_before: origWord.text,
+            }))
+          } else if (updatedWord.text !== origWord.text) {
+            entries.push(addEditEntry(editLog, 'word_change', {
+              segment_id: originalSegment.id,
+              segment_index: editModalSegment.index,
+              word_ids_before: [origWord.id],
+              word_ids_after: [updatedWord.id],
+              text_before: origWord.text,
+              text_after: updatedWord.text,
+            }))
+          }
+        }
+
+        // Added words
+        for (const updatedWord of updatedSegment.words) {
+          if (!origWordMap.has(updatedWord.id)) {
+            entries.push(addEditEntry(editLog, 'word_add', {
+              segment_id: originalSegment.id,
+              segment_index: editModalSegment.index,
+              word_ids_after: [updatedWord.id],
+              text_after: updatedWord.text,
+            }))
+          }
+        }
+
+        // Show feedback bar only for single-word edits
+        if (entries.length === 1) {
+          showFeedbackForEntry(entries[0])
+        }
+      }
+
+      updateDataWithHistory(newData, 'update segment')
+      setEditModalSegment(null)
+    },
+    [history, historyIndex, editModalSegment, updateDataWithHistory, editLog, showFeedbackForEntry]
+  )
+
+  // Waveforms mode: persist a segment's inline timing edit (fires on drag release). The
+  // incoming segment is in display coordinates (offset-applied, like the modal); un-apply
+  // the offset before storing so the manual nudge never gets baked into the saved timings.
+  const handleCommitSegmentTiming = useCallback(
+    (index: number, updatedSegment: LyricsSegment) => {
+      const currentData = history[historyIndex]
+      const segmentToStore =
+        timingOffsetMs !== 0 ? applyOffsetToSegment(updatedSegment, -timingOffsetMs) : updatedSegment
+      const newSegments = currentData.corrected_segments.map((segment, i) =>
+        i === index ? segmentToStore : segment
+      )
+      updateDataWithHistory(
+        { ...currentData, corrected_segments: newSegments },
+        'adjust word timing'
+      )
+    },
+    [history, historyIndex, timingOffsetMs, updateDataWithHistory]
+  )
+
+  // Waveforms mode: open the full Edit modal for structural edits (text / split / merge /
+  // add / delete). Uses the raw (non-offset) segment; the modal applies the offset itself.
+  const handleEditSegmentFromWaveforms = useCallback(
+    (segmentIndex: number) => {
+      const segment = data.corrected_segments[segmentIndex]
+      if (!segment) return
+      setEditModalSegment({ segment, index: segmentIndex, originalSegment: segment })
+    },
+    [data.corrected_segments]
+  )
+
+  // Delete segment handler
+  const handleDeleteSegment = useCallback(
+    (segmentIndex: number) => {
+      const segment = data.corrected_segments[segmentIndex]
+      if (segment) {
+        addEditEntry(editLog, 'segment_delete', {
+          segment_id: segment.id,
+          segment_index: segmentIndex,
+          word_ids_before: segment.words.map((w) => w.id),
+          text_before: segment.text,
+        })
+      }
+      const newData = deleteSegment(data, segmentIndex)
+      updateDataWithHistory(newData, 'delete segment')
+    },
+    [data, updateDataWithHistory, editLog]
+  )
+
+  // Correction action handlers
+  const handleRevertCorrection = useCallback(
+    (wordId: string) => {
+      const correction = data.corrections?.find(
+        (c) => c.corrected_word_id === wordId || c.word_id === wordId
+      )
+      if (!correction) return
+
+      const segmentIndex = data.corrected_segments.findIndex((segment) =>
+        segment.words.some((w) => w.id === wordId)
+      )
+      if (segmentIndex === -1) return
+
+      const segment = data.corrected_segments[segmentIndex]
+      const newWords = segment.words.map((word) => {
+        if (word.id === wordId) {
+          return {
+            ...word,
+            text: correction.original_word,
+            id: correction.word_id,
+          }
+        }
+        return word
+      })
+
+      const newText = newWords.map((w) => w.text).join(' ')
+      const newSegment = { ...segment, words: newWords, text: newText }
+      const newSegments = data.corrected_segments.map((seg, idx) =>
+        idx === segmentIndex ? newSegment : seg
+      )
+      const newCorrections =
+        data.corrections?.filter((c) => c.corrected_word_id !== wordId && c.word_id !== wordId) ||
+        []
+
+      const newData: CorrectionData = {
+        ...data,
+        corrected_segments: newSegments,
+        corrections: newCorrections,
+      }
+
+      addEditEntry(editLog, 'revert_correction', {
+        segment_id: segment.id,
+        segment_index: segmentIndex,
+        word_ids_before: [wordId],
+        word_ids_after: [correction.word_id],
+        text_before: correction.corrected_word,
+        text_after: correction.original_word,
+      })
+
+      updateDataWithHistory(newData, 'revert correction')
+    },
+    [data, updateDataWithHistory, editLog]
+  )
+
+  const handleEditCorrection = useCallback(
+    (wordId: string) => {
+      const segmentIndex = data.corrected_segments.findIndex((segment) =>
+        segment.words.some((w) => w.id === wordId)
+      )
+      if (segmentIndex === -1) return
+
+      const segment = data.corrected_segments[segmentIndex]
+      setEditModalSegment({
+        segment,
+        index: segmentIndex,
+        originalSegment: segment,
+      })
+    },
+    [data]
+  )
+
+  const handleAcceptCorrection = useCallback((wordId: string) => {
+    // For now, just log acceptance
+  }, [])
+
+  // Batch action handlers
+  const handleAcceptAllCorrections = useCallback(() => {
+    data.corrections?.forEach((c) => {
+      console.log('Batch accepted correction:', c.corrected_word_id || c.word_id)
+    })
+  }, [data.corrections])
+
+  const handleAcceptHighConfidenceCorrections = useCallback(() => {
+    const highConfidence = data.corrections?.filter((c) => c.confidence >= 0.8) || []
+    highConfidence.forEach((c) => {
+      console.log('Batch accepted high-confidence correction:', c.corrected_word_id || c.word_id)
+    })
+  }, [data.corrections])
+
+  const handleRevertAllCorrections = useCallback(() => {
+    if (
+      typeof window === 'undefined' ||
+      !window.confirm(
+        `Are you sure you want to revert all ${data.corrections?.length || 0} corrections?`
+      )
+    ) {
+      return
+    }
+
+    addEditEntry(editLog, 'revert_all', {
+      details: { count: data.corrections?.length ?? 0 },
+    })
+
+    const corrections = [...(data.corrections || [])].reverse()
+    let newData = data
+
+    for (const correction of corrections) {
+      const wordId = correction.corrected_word_id || correction.word_id
+      const segmentIndex = newData.corrected_segments.findIndex((segment) =>
+        segment.words.some((w) => w.id === wordId)
+      )
+      if (segmentIndex === -1) continue
+
+      const segment = newData.corrected_segments[segmentIndex]
+      const newWords = segment.words.map((word) => {
+        if (word.id === wordId) {
+          return { ...word, text: correction.original_word, id: correction.word_id }
+        }
+        return word
+      })
+
+      const newText = newWords.map((w) => w.text).join(' ')
+      const newSegment = { ...segment, words: newWords, text: newText }
+      const newSegments = newData.corrected_segments.map((seg, idx) =>
+        idx === segmentIndex ? newSegment : seg
+      )
+
+      newData = {
+        ...newData,
+        corrected_segments: newSegments,
+        corrections:
+          newData.corrections?.filter(
+            (c) => c.corrected_word_id !== wordId && c.word_id !== wordId
+          ) || [],
+      }
+    }
+
+    updateDataWithHistory(newData, 'revert all corrections')
+  }, [data, updateDataWithHistory, editLog])
+
+  // Finish review - opens preview modal
+  const handleFinishReview = useCallback(() => {
+    // Pause audio if playing to avoid clash with preview video
+    if (typeof window !== 'undefined' && window.isAudioPlaying && window.toggleAudioPlayback) {
+      window.toggleAudioPlayback()
+    }
+    // Trigger server-side session save on preview (signals completion milestone)
+    saveSession('preview')
+    setIsReviewModalOpen(true)
+  }, [saveSession])
+
+  // Submit to server (save corrections, don't complete review yet)
+  const handleSubmitToServer = useCallback(async (
+    opts?: { syncReference?: { verified: boolean; notes?: string } },
+  ) => {
+    if (!apiClient) return
+
+    // Block submission of lyrics that still have no timing (e.g. custom lyrics
+    // pasted into the synchronizer but never tap-synced). These otherwise reach
+    // the render pipeline and fail the job with a cryptic NoneType error; catch
+    // it here with an actionable message so the user can synchronize first.
+    const untimed = countUntimedWords(data.corrected_segments)
+    if (untimed > 0) {
+      toast.error(t('toasts.untimedWordsBlockSubmit', { count: untimed }))
+      return
+    }
+
+    setIsSubmitting(true)
+    try {
+      const dataToSubmit =
+        timingOffsetMs !== 0 ? applyOffsetToCorrectionData(data, timingOffsetMs) : data
+
+      // 1. Save corrections (not final submission yet), including current duet flag
+      await apiClient.submitCorrections(dataToSubmit, isDuet)
+
+      // 1b. Admin "perfectly synced" mark — only now that the timing it vouches for
+      // is saved. Best-effort: never blocks or fails the review.
+      if (opts?.syncReference && apiClient.setSyncReference) {
+        try {
+          await apiClient.setSyncReference(opts.syncReference.verified, opts.syncReference.notes)
+        } catch (error) {
+          console.error('Failed to save sync reference mark:', error)
+          toast.error(t('toasts.syncReferenceSaveFailed'))
+        }
+      }
+
+      // 2. Save edit log (non-blocking)
+      if (editLog.entries.length > 0) {
+        try {
+          await apiClient.submitEditLog(editLog)
+        } catch (error) {
+          console.error('Failed to submit edit log:', error)
+        }
+      }
+
+      // 3. Complete or navigate. The branches that finish the whole job
+      // (existing/auto instrumental) run a slow completeReview — keep the modal
+      // open in its "Saving…" state the entire time so the UI doesn't flash back
+      // to the review screen. The success screen (setShowSuccess) then replaces
+      // the whole view, unmounting the modal. Branches that navigate to the
+      // instrumental screen close the modal first (they're instant).
+      if (hasExistingInstrumental && jobId) {
+        // Job has an instrumental uploaded at creation time — skip instrumental review
+        // Submit with "custom" selection (maps to the uploaded instrumental)
+        toast.success('Lyrics saved! Using uploaded instrumental, generating video...')
+        try {
+          const correctionData = await lyricsReviewApi.getCorrectionData(jobId)
+          await lyricsReviewApi.completeReview(jobId, correctionData, 'custom', isDuet)
+          setShowSuccess(true)
+          setCountdown(3)
+        } catch (err) {
+          console.error('Failed to complete review with uploaded instrumental:', err)
+          toast.error('Failed to start video generation. Please try again.')
+          setIsSubmitting(false) // Keep modal open so the user can retry
+        }
+      } else if ((offerInlineInstrumentalChoice || autoInstrumentalConfident) && !reviewInstrumentalAnyway && jobId) {
+        // Inline instrumental choice: complete the review now with the reviewer's
+        // pick (or the recommended default) and skip the /instrumental screen.
+        // When both stems exist we submit the concrete selection; the confident
+        // single-stem case falls back to "auto" (backend resolves the verdict).
+        const selection = offerInlineInstrumentalChoice ? currentInstrumental : 'auto'
+        toast.success(
+          selection === 'clean'
+            ? 'Lyrics saved! Using clean instrumental, generating video...'
+            : selection === 'with_backing'
+              ? 'Lyrics saved! Using instrumental with backing vocals, generating video...'
+              : 'Lyrics saved! Instrumental auto-selected, generating video...'
+        )
+        try {
+          const correctionData = await lyricsReviewApi.getCorrectionData(jobId)
+          await lyricsReviewApi.completeReview(jobId, correctionData, selection, isDuet)
+          setShowSuccess(true)
+          setCountdown(3)
+        } catch (err) {
+          // Fall back to the manual instrumental screen if completion fails
+          // (e.g. the selected stem is unexpectedly missing) — never strand the user.
+          console.error('Inline instrumental selection failed, falling back to review:', err)
+          setIsReviewModalOpen(false)
+          setIsSubmitting(false)
+          toast('Please choose your instrumental to finish.')
+          window.location.hash = `/${jobId}/instrumental`
+        }
+      } else if (isLocalMode) {
+        // Local mode: Show transition message, navigation handled by browser/server
+        setIsReviewModalOpen(false)
+        setIsSubmitting(false)
+        toast.success('Lyrics saved! Loading instrumental review...')
+        setShowInstrumentalReview(true)
+      } else {
+        // Cloud mode: Use hash-based navigation with jobId
+        if (!jobId) {
+          console.error('No jobId available for cloud mode navigation')
+          toast.error('Navigation error - please return to dashboard')
+          setIsSubmitting(false)
+          return
+        }
+        setIsReviewModalOpen(false)
+        setIsSubmitting(false)
+        toast.success('Lyrics saved! Proceeding to instrumental review...')
+        window.location.hash = `/${jobId}/instrumental`
+      }
+    } catch (error) {
+      console.error('Failed to submit corrections:', error)
+      toast.error('Failed to submit corrections. Please try again.')
+      setIsSubmitting(false) // Reset on error so user can retry
+    }
+  }, [apiClient, data, timingOffsetMs, editLog, isLocalMode, jobId, hasExistingInstrumental, isDuet, autoInstrumentalConfident, offerInlineInstrumentalChoice, currentInstrumental, reviewInstrumentalAnyway, t])
+
+  // Play segment handler
+  const handlePlaySegment = useCallback(
+    (startTime: number) => {
+      // Ignore playback requests until the audio can play through. AudioPlayer's
+      // globals already no-op when not ready; this avoids even seeking early.
+      if (typeof window !== 'undefined' && !window.isAudioReady) return
+      if (typeof window !== 'undefined' && window.seekAndPlayAudio) {
+        const adjustedStartTime =
+          timingOffsetMs !== 0 ? startTime + timingOffsetMs / 1000 : startTime
+        // A caller can resolve to a non-finite time (e.g. an untimed segment or
+        // a zero-width timeline click); don't forward it to the media element.
+        if (!Number.isFinite(adjustedStartTime)) return
+        window.seekAndPlayAudio(adjustedStartTime)
+      }
+    },
+    [timingOffsetMs]
+  )
+
+  // Reset corrections
+  const handleResetCorrections = useCallback(() => {
+    if (
+      typeof window !== 'undefined' &&
+      window.confirm('Are you sure you want to reset all corrections?')
+    ) {
+      setHistory([JSON.parse(JSON.stringify(initialData))])
+      setHistoryIndex(0)
+      setModalContent(null)
+      setFlashingType(null)
+      setHighlightInfo(null)
+      setInteractionMode('edit')
+    }
+  }, [initialData])
+
+  // Segment operations
+  const handleAddSegment = useCallback(
+    (beforeIndex: number) => {
+      const newData = addSegmentBefore(data, beforeIndex)
+      updateDataWithHistory(newData, 'add segment')
+    },
+    [data, updateDataWithHistory]
+  )
+
+  const handleSplitSegment = useCallback(
+    (segmentIndex: number, afterWordIndex: number) => {
+      const newData = splitSegment(data, segmentIndex, afterWordIndex)
+      if (newData) {
+        updateDataWithHistory(newData, 'split segment')
+        setEditModalSegment(null)
+      }
+    },
+    [data, updateDataWithHistory]
+  )
+
+  const handleMergeSegment = useCallback(
+    (segmentIndex: number, mergeWithNext: boolean) => {
+      const newData = mergeSegment(data, segmentIndex, mergeWithNext)
+      updateDataWithHistory(newData, 'merge segment')
+      setEditModalSegment(null)
+    },
+    [data, updateDataWithHistory]
+  )
+
+  // Handler toggle
+  const handleHandlerToggle = useCallback(
+    async (handler: string, enabled: boolean) => {
+      if (!apiClient) return
+
+      try {
+        setIsUpdatingHandlers(true)
+        const currentEnabled = new Set(data.metadata.enabled_handlers || [])
+
+        if (enabled) {
+          currentEnabled.add(handler)
+        } else {
+          currentEnabled.delete(handler)
+        }
+
+        const newData = await apiClient.updateHandlers(Array.from(currentEnabled))
+        updateDataWithHistory(newData, `toggle handler ${handler}`)
+
+        setModalContent(null)
+        setFlashingType(null)
+        setHighlightInfo(null)
+        handleFlash('corrected')
+      } catch (error) {
+        console.error('Failed to update handlers:', error)
+        alert('Failed to update correction handlers. Please try again.')
+      } finally {
+        setIsUpdatingHandlers(false)
+      }
+    },
+    [apiClient, data.metadata.enabled_handlers, handleFlash, updateDataWithHistory]
+  )
+
+  const handleHandlerClick = useCallback((handler: string) => {
+    setFlashingHandler(handler)
+    setFlashingType('handler')
+    setTimeout(() => {
+      setFlashingHandler(null)
+      setFlashingType(null)
+    }, 1500)
+  }, [])
+
+  // Modal spacebar handler
+  const handleSetModalSpacebarHandler = useCallback(
+    (handler: ((e: KeyboardEvent) => void) | undefined) => {
+      setModalHandler(handler, !!handler)
+    },
+    []
+  )
+
+  // Add lyrics
+  const handleAddLyrics = useCallback(
+    async (source: string, lyrics: string, force?: boolean): Promise<AddLyricsResult | void> => {
+      if (!apiClient) return
+
+      try {
+        setIsAddingLyrics(true)
+        const result = await apiClient.addLyrics(source, lyrics, force)
+        // The relevance filter can reject the pasted lyrics — only apply the
+        // returned data when the source was actually kept; the caller shows
+        // the rejection and can retry with force=true.
+        if (result.status === 'success') {
+          updateDataWithHistory(result.data, 'add lyrics')
+        }
+        return result
+      } finally {
+        setIsAddingLyrics(false)
+      }
+    },
+    [apiClient, updateDataWithHistory]
+  )
+
+  // Search lyrics (reference lyrics search)
+  const handleSearchLyrics = useCallback(
+    async (artist: string, title: string, forceSources: string[]): Promise<SearchLyricsResponse> => {
+      if (!apiClient || !apiClient.searchLyrics) {
+        return { status: 'no_results', message: 'No API client', sources_added: [], sources_rejected: {}, sources_not_found: [] }
+      }
+      const result = await apiClient.searchLyrics(artist, title, forceSources)
+      if (result.status === 'success' && result.data) {
+        updateDataWithHistory(result.data, 'search lyrics')
+      }
+      return result
+    },
+    [apiClient, updateDataWithHistory],
+  )
+
+  // Find/replace
+  const handleFindReplace = useCallback(
+    (
+      findText: string,
+      replaceText: string,
+      options: { caseSensitive: boolean; useRegex: boolean; fullTextMode: boolean }
+    ) => {
+      const newData = findAndReplace(data, findText, replaceText, options)
+      // Count how many segments changed
+      const changedSegments = newData.corrected_segments.filter(
+        (seg, i) => seg.text !== data.corrected_segments[i]?.text
+      )
+      addEditEntry(editLog, 'find_replace', {
+        text_before: findText,
+        text_after: replaceText,
+        details: {
+          pattern: findText,
+          replacement: replaceText,
+          segments_affected: changedSegments.length,
+          ...options,
+        },
+      })
+      updateDataWithHistory(newData, 'find/replace')
+    },
+    [data, updateDataWithHistory, editLog]
+  )
+
+  // Un-correct all
+  const handleUnCorrectAll = useCallback(() => {
+    if (!originalData.original_segments) return
+
+    if (
+      typeof window !== 'undefined' &&
+      window.confirm('Are you sure you want to revert all segments to their original state?')
+    ) {
+      const newData: CorrectionData = {
+        ...data,
+        corrected_segments: JSON.parse(JSON.stringify(originalData.original_segments)),
+      }
+      updateDataWithHistory(newData, 'un-correct all segments')
+    }
+  }, [originalData.original_segments, data, updateDataWithHistory])
+
+  // Replace all lyrics
+  const handleReplaceAllLyrics = useCallback(() => {
+    setIsReplaceAllLyricsModalOpen(true)
+  }, [])
+
+  const handleSaveReplaceAllLyrics = useCallback(
+    (
+      newSegments: LyricsSegment[],
+      meta?: {
+        operation: 'replace_all_lyrics' | 'change_case' | 'custom_lyrics_replace'
+        details?: Record<string, unknown>
+      }
+    ) => {
+      const operation = meta?.operation ?? 'replace_all_lyrics'
+      const details =
+        meta?.details ?? {
+          segments_before: data.corrected_segments.length,
+          segments_after: newSegments.length,
+        }
+      addEditEntry(editLog, operation, { details })
+      const newData = { ...data, corrected_segments: newSegments }
+      const historyLabel =
+        operation === 'change_case'
+          ? 'change case'
+          : operation === 'custom_lyrics_replace'
+            ? 'custom lyrics replace'
+            : 'replace all lyrics'
+      updateDataWithHistory(newData, historyLabel)
+      setIsReplaceAllLyricsModalOpen(false)
+      if (operation === 'custom_lyrics_replace') {
+        toast.info(t('toasts.customLyricsSaved'))
+      }
+    },
+    [data, updateDataWithHistory, editLog, t]
+  )
+
+  // Undo/Redo
+  const handleUndo = useCallback(() => {
+    if (historyIndex > 0) {
+      setHistoryIndex(historyIndex - 1)
+    }
+  }, [historyIndex])
+
+  const handleRedo = useCallback(() => {
+    if (historyIndex < history.length - 1) {
+      setHistoryIndex(historyIndex + 1)
+    }
+  }, [historyIndex, history])
+
+  const canUndo = historyIndex > 0
+  const canRedo = historyIndex < history.length - 1
+
+  // Memoize metric click handlers
+  const metricClickHandlers = useMemo(
+    () => ({
+      anchor: () => handleFlash('anchor'),
+      corrected: () => handleFlash('corrected'),
+      uncorrected: () => handleFlash('uncorrected'),
+    }),
+    [handleFlash]
+  )
+
+  // Display data with timing offset applied
+  const displayData = useMemo(() => {
+    return timingOffsetMs !== 0 ? applyOffsetToCorrectionData(data, timingOffsetMs) : data
+  }, [data, timingOffsetMs])
+
+  // Words from OTHER segments that sit near the segment being edited, so the Edit Segment
+  // timeline can show them as greyed read-only context in its ±padding. Kept to a small window
+  // around the segment (the timeline filters again to its exact view); offset-applied to match.
+  const editContextWords = useMemo(() => {
+    if (!editModalSegment) return []
+    const seg = editModalSegment.segment
+    const segStart = seg.start_time ?? 0
+    const segEnd = seg.end_time ?? segStart
+    const lo = segStart - 2
+    const hi = segEnd + 2
+    const nearby: Word[] = []
+    data.corrected_segments.forEach((s, i) => {
+      if (i === editModalSegment.index) return
+      s.words.forEach((w) => {
+        if (w.start_time === null || w.end_time === null) return
+        if (w.end_time >= lo && w.start_time <= hi) nearby.push(w)
+      })
+    })
+    return timingOffsetMs !== 0 ? nearby.map((w) => applyOffsetToWord(w, timingOffsetMs)) : nearby
+  }, [editModalSegment, data.corrected_segments, timingOffsetMs])
+
+  // Nearest word edges in the neighbouring lines (offset-applied), so the modal timeline's resize /
+  // edge auto-extend can't grow a word into an adjacent line beyond the drawn context window.
+  const editNeighbourBounds = useMemo(() => {
+    if (!editModalSegment || editModalSegment.index === null) return null
+    const bounds = computeNeighbourBoundsBySegment(data.corrected_segments).get(editModalSegment.index)
+    if (!bounds) return null
+    return {
+      prevEnd: applyOffsetToTime(bounds.prevEnd, timingOffsetMs),
+      nextStart: applyOffsetToTime(bounds.nextStart, timingOffsetMs),
+    }
+  }, [editModalSegment, data.corrected_segments, timingOffsetMs])
+
+  // Possible missing lyrics: evidenced vocal gaps (singing, no words, reference lines
+  // expected) that still have no timed words in the CURRENT segments. The analysis comes
+  // from the loaded data (a restored session may predate it), is checked against the
+  // segments as loaded (stale-analysis guard), and is never mutated — the marker goes
+  // away when words land in the gap and comes back on undo. Inserts go through
+  // updateDataWithHistory (one undo step); the hook also tracks inserted lines that still
+  // need a Tap To Sync for the re-sync hint.
+  const initialSegments = initialData.corrected_segments
+  const missingLyrics = useMissingLyrics({
+    vocalGaps: initialData.vocal_gaps ?? data.vocal_gaps,
+    initialSegments,
+    data,
+    updateDataWithHistory,
+    editLog,
+    isReadOnly,
+    timingOffsetMs,
+  })
+  const insertMissingLyricsLines = missingLyrics.insertLines
+  const handleInsertMissingLyrics = useCallback(
+    (open: OpenMissingLyricsGap) => {
+      insertMissingLyricsLines(open)
+    },
+    [insertMissingLyricsLines]
+  )
+
+  // Timing offset handlers
+  const handleOpenTimingOffsetModal = useCallback(() => {
+    setIsTimingOffsetModalOpen(true)
+  }, [])
+
+  const handleApplyTimingOffset = useCallback((offsetMs: number) => {
+    setTimingOffsetMs(offsetMs)
+  }, [])
+
+  // Success screen - shown after review submission
+  if (showSuccess) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-background">
+        <div className="text-center max-w-md p-6">
+          <div className="mb-4">
+            <Check className="w-12 h-12 mx-auto text-green-500" />
+          </div>
+          <h2 className="text-2xl font-semibold text-green-500 mb-4">
+            Review Submitted
+          </h2>
+          <p className="text-lg mb-2">
+            Your lyrics corrections have been saved.
+          </p>
+          <p className="text-muted-foreground mb-4">
+            Video generation has started and you&apos;ll receive a notification when it&apos;s ready.
+          </p>
+          <p className="text-muted-foreground">
+            {countdown > 0
+              ? `${isLocalMode ? 'Closing' : 'Redirecting'} in ${countdown}s...`
+              : isLocalMode
+                ? 'You can close this window now.'
+                : 'Redirecting...'}
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <VocalsAudioDataLoader audioUrl={vocalsAudioUrl} peaksUrl={vocalsPeaksUrl}>
+      <div className="max-w-full overflow-x-hidden">
+        <Header
+          isReadOnly={isReadOnly}
+          onFileLoad={onFileLoad}
+          data={data}
+          onMetricClick={metricClickHandlers}
+          effectiveMode={effectiveMode}
+          onModeChange={setInteractionMode}
+          apiClient={apiClient}
+          audioHash={audioHash}
+          onTimeUpdate={setCurrentAudioTime}
+          onHandlerToggle={handleHandlerToggle}
+          isUpdatingHandlers={isUpdatingHandlers}
+          onHandlerClick={handleHandlerClick}
+          onFindReplace={() => setIsFindReplaceModalOpen(true)}
+          onEditAll={handleReplaceAllLyrics}
+          onTimingOffset={handleOpenTimingOffsetModal}
+          timingOffsetMs={timingOffsetMs}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          canUndo={canUndo}
+          canRedo={canRedo}
+          onResetCorrections={handleResetCorrections}
+          statsVisible={statsVisible}
+          onStatsToggle={() => setStatsVisible((v) => !v)}
+          reviewMode={reviewMode}
+          onReviewModeToggle={setReviewMode}
+          onAcceptAllCorrections={handleAcceptAllCorrections}
+          onAcceptHighConfidenceCorrections={handleAcceptHighConfidenceCorrections}
+          onRevertAllCorrections={handleRevertAllCorrections}
+          isDuet={isDuet}
+          onToggleDuet={() => setIsDuet(d => !d)}
+          onAutoCorrect={
+            !isLocalMode && jobId
+              ? () =>
+                  autoCorrect.acceptedCount > 0
+                    ? setAutoCorrectDetailsOpen((o) => !o)
+                    : setIsAutoCorrectModalOpen(true)
+              : undefined
+          }
+          autoCorrectedCount={autoCorrect.acceptedCount}
+        />
+
+        <AutoCorrectPanel
+          controller={autoCorrect}
+          isReadOnly={isReadOnly}
+          open={autoCorrectDetailsOpen}
+          onClose={() => setAutoCorrectDetailsOpen(false)}
+          onRerun={() => {
+            setAutoCorrectDetailsOpen(false)
+            setIsAutoCorrectModalOpen(true)
+          }}
+        />
+
+        {/* In Advanced/Waveforms the Synced side benefits from extra width, so the Reference
+            column shrinks to its longest line (capped) and Synced takes the rest — no wasted
+            space. Simple mode keeps the even 50/50 split. In Waveforms the reviewer can also
+            drag the divider to set the split (long reference lines then wrap) or collapse
+            the Reference column entirely to give the waveforms the full width. */}
+        <div
+          ref={splitRowRef}
+          className={cn(
+            isMobile ? 'flex flex-col gap-2' : 'flex flex-row items-start',
+            !isMobile && !waveformsLayout && 'gap-2'
+          )}
+        >
+          <div className={cn(isMobile ? 'w-full' : 'flex-1 min-w-0')}>
+          <MissingLyricsCallout
+            gaps={missingLyrics.openGaps}
+            isReadOnly={isReadOnly}
+            audioReady={reviewAudioReady}
+            onPlay={handlePlaySegment}
+            onInsert={handleInsertMissingLyrics}
+            onSync={handleEditSegmentFromWaveforms}
+            timingOffsetMs={timingOffsetMs}
+          />
+          {!isReadOnly && (
+            <MissingLyricsResyncHint
+              lines={missingLyrics.resyncLines}
+              onSync={handleEditSegmentFromWaveforms}
+              onDismiss={missingLyrics.dismissResync}
+            />
+          )}
+          <TranscriptionView
+            data={displayData}
+            mode={effectiveMode}
+            onElementClick={setModalContent}
+            onWordClick={handleWordClick}
+            flashingType={flashingType}
+            flashingHandler={flashingHandler}
+            highlightInfo={highlightInfo}
+            onPlaySegment={handlePlaySegment}
+            currentTime={isAnyModalOpen ? undefined : currentAudioTime}
+            anchors={data.anchor_sequences}
+            onDataChange={(updatedData) => {
+              updateDataWithHistory(updatedData, 'direct data change')
+            }}
+            reviewMode={reviewMode}
+            onRevertCorrection={handleRevertCorrection}
+            onEditCorrection={handleEditCorrection}
+            onAcceptCorrection={handleAcceptCorrection}
+            onShowCorrectionDetail={handleShowCorrectionDetail}
+            activeGapWordIds={activeGapWordIds}
+            viewMode={transcriptionViewMode}
+            onViewModeChange={handleViewModeChange}
+            onCommitSegment={handleCommitSegmentTiming}
+            onEditSegment={handleEditSegmentFromWaveforms}
+            editedWordIds={editedWordIds}
+            aiCorrectedWordIds={aiCorrectedWordIds}
+            aiOriginalTextByWordId={aiOriginalTextByWordId}
+            aiEstimatedWordIds={aiEstimatedWordIds}
+            isDuet={isDuet}
+            onSegmentSingerChange={(segmentIdx, next) => {
+              const segments = [...data.corrected_segments]
+              segments[segmentIdx] = { ...segments[segmentIdx], singer: next }
+              updateDataWithHistory({ ...data, corrected_segments: segments }, 'singer change')
+            }}
+            onSegmentFocus={setFocusedSegmentIndex}
+            missingLyricsMarkers={missingLyrics.markers}
+          />
+          </div>
+          {waveformsLayout && referenceLayout.collapsed ? (
+            <button
+              type="button"
+              onClick={referenceLayout.toggleCollapsed}
+              title={tReference('expand')}
+              aria-label={tReference('expand')}
+              data-testid="reference-expand"
+              className="ml-2 flex-none self-stretch flex flex-col items-center gap-2 rounded-md border bg-card px-1 py-2 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50"
+            >
+              <PanelRightOpen className="h-4 w-4" />
+              <span className="[writing-mode:vertical-rl] font-semibold">{tReference('title')}</span>
+            </button>
+          ) : (
+          <>
+          {waveformsLayout && (
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label={tReference('resize')}
+              title={tReference('resize')}
+              tabIndex={0}
+              data-testid="reference-resize-handle"
+              onPointerDown={(e) =>
+                referenceLayout.startResize(e, referenceColumnRef.current, splitRowRef.current)
+              }
+              onDoubleClick={referenceLayout.resetWidth}
+              onKeyDown={(e) => {
+                if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+                e.preventDefault()
+                const current = referenceColumnRef.current?.getBoundingClientRect().width ?? 0
+                const rowWidth = splitRowRef.current?.getBoundingClientRect().width ?? 0
+                referenceLayout.setWidthPx(
+                  clampReferenceWidth(current + (e.key === 'ArrowLeft' ? 24 : -24), rowWidth)
+                )
+              }}
+              className="group flex-none self-stretch w-2 cursor-col-resize flex justify-center focus-visible:outline-none"
+            >
+              <div
+                className={cn(
+                  'w-[3px] h-full rounded-full transition-colors',
+                  referenceLayout.dragging
+                    ? 'bg-primary'
+                    : 'bg-transparent group-hover:bg-primary/50 group-focus-visible:bg-primary/50'
+                )}
+              />
+            </div>
+          )}
+          <div
+            ref={referenceColumnRef}
+            className={cn(
+              isMobile
+                ? 'w-full'
+                : transcriptionViewMode === 'simple'
+                  ? 'flex-1 min-w-0'
+                  : waveformsLayout && referenceLayout.widthPx !== null
+                    ? 'flex-none min-w-0'
+                    : 'flex-none w-max max-w-[46%]'
+            )}
+            style={
+              waveformsLayout && referenceLayout.widthPx !== null
+                ? // Cap at the drag maximum so a width saved on a wider screen can't squeeze
+                  // the Synced column on a narrower one.
+                  { width: referenceLayout.widthPx, maxWidth: `${MAX_REFERENCE_WIDTH_FRACTION * 100}%` }
+                : undefined
+            }
+          >
+          <ReferenceView
+            onCollapse={waveformsLayout ? referenceLayout.toggleCollapsed : undefined}
+            referenceSources={data.reference_lyrics}
+            anchors={data.anchor_sequences}
+            gaps={data.gap_sequences}
+            mode={effectiveMode}
+            onElementClick={setModalContent}
+            onWordClick={handleWordClick}
+            flashingType={flashingType}
+            highlightInfo={highlightInfo}
+            currentSource={currentSource}
+            onSourceChange={setCurrentSource}
+            corrected_segments={data.corrected_segments}
+            corrections={data.corrections}
+            onAddLyrics={() => setIsAddLyricsModalOpen(true)}
+            onAddLyricsInline={handleAddLyrics}
+            onSearchLyrics={handleSearchLyrics}
+            defaultArtist={data.metadata?.lyrics_artist || data.metadata?.artist || ''}
+            defaultTitle={data.metadata?.lyrics_title || data.metadata?.title || ''}
+          />
+          </div>
+          </>
+          )}
+        </div>
+
+        {/* Spacer for sticky footer */}
+        {!isReadOnly && apiClient && <div className="h-16" />}
+
+        {/* Sticky footer bar */}
+        {!isReadOnly && apiClient && (
+          <div className="fixed bottom-0 left-0 right-0 bg-background border-t shadow-lg py-3 px-4 z-50 flex justify-center items-center gap-4 flex-wrap">
+            <GapNavigator
+              currentGapIndex={currentGapIndex}
+              totalGaps={uncorrectedGaps.length}
+              onPrevGap={handlePrevGap}
+              onNextGap={handleNextGap}
+            />
+            {data.gap_sequences.length > 0 && (
+              <div className="flex items-center gap-1.5">
+                <div className="w-16 h-1.5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-green-500 rounded-full transition-all"
+                    style={{
+                      width: `${data.gap_sequences.length > 0 ? ((data.gap_sequences.length - uncorrectedGaps.length) / data.gap_sequences.length) * 100 : 0}%`,
+                    }}
+                  />
+                </div>
+                {uncorrectedGaps.length === 0 ? (
+                  <span className="text-xs text-green-500 flex items-center gap-0.5">
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    All gaps reviewed
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted-foreground whitespace-nowrap">
+                    {data.gap_sequences.length - uncorrectedGaps.length}/{data.gap_sequences.length} gaps reviewed
+                  </span>
+                )}
+              </div>
+            )}
+            {apiClient?.saveReviewSession && (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => saveSession('manual')}
+                  disabled={history.length <= 1}
+                >
+                  Save Progress
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleOpenSessionBrowser}
+                >
+                  Session History
+                </Button>
+              </>
+            )}
+            <span className="text-sm text-muted-foreground">Lyrics look good?</span>
+            <Button onClick={handleFinishReview} disabled={isReviewComplete}>
+              {isReviewComplete ? 'Review Complete' : 'Preview Video'}
+              <Video className="ml-2 h-4 w-4" />
+            </Button>
+          </div>
+        )}
+
+        {/* Modals */}
+        <EditModal
+          open={Boolean(editModalSegment)}
+          onClose={() => {
+            setEditModalSegment(null)
+            handleSetModalSpacebarHandler(undefined)
+          }}
+          segment={
+            editModalSegment?.segment
+              ? timingOffsetMs !== 0
+                ? applyOffsetToSegment(editModalSegment.segment, timingOffsetMs)
+                : editModalSegment.segment
+              : null
+          }
+          segmentIndex={editModalSegment?.index ?? null}
+          originalSegment={
+            editModalSegment?.originalSegment
+              ? timingOffsetMs !== 0
+                ? applyOffsetToSegment(editModalSegment.originalSegment, timingOffsetMs)
+                : editModalSegment.originalSegment
+              : null
+          }
+          onSave={handleUpdateSegment}
+          onDelete={handleDeleteSegment}
+          onAddSegment={handleAddSegment}
+          onSplitSegment={handleSplitSegment}
+          onMergeSegment={handleMergeSegment}
+          onPlaySegment={handlePlaySegment}
+          currentTime={currentAudioTime}
+          contextWords={editContextWords}
+          prevBoundaryTime={editNeighbourBounds?.prevEnd ?? null}
+          nextBoundaryTime={editNeighbourBounds?.nextStart ?? null}
+          originalTranscribedSegment={
+            editModalSegment?.segment &&
+            editModalSegment?.index !== null &&
+            originalData.original_segments
+              ? (() => {
+                  const origSegment =
+                    originalData.original_segments.find(
+                      (s: LyricsSegment) => s.id === editModalSegment.segment.id
+                    ) || null
+                  return origSegment && timingOffsetMs !== 0
+                    ? applyOffsetToSegment(origSegment, timingOffsetMs)
+                    : origSegment
+                })()
+              : null
+          }
+        />
+
+        {/* Hidden stem preloaders — same URL + request mode as the modal's stem <audio>,
+            so its playback is served from the browser cache. */}
+        {prefetchStemUrls.map((url) => (
+          <audio key={url} src={url} preload="auto" muted hidden aria-hidden data-testid="stem-prefetch" />
+        ))}
+
+        <ReviewChangesModal
+          open={isReviewModalOpen}
+          onClose={() => setIsReviewModalOpen(false)}
+          data={data}
+          instrumentalOptions={instrumentalStemOptions}
+          stemsStatus={lateStems.status}
+          onSubmit={handleSubmitToServer}
+          isSubmitting={isSubmitting}
+          apiClient={apiClient}
+          timingOffsetMs={timingOffsetMs}
+          isDuet={isDuet}
+          translationLanguage={translationLanguage}
+          completesReview={hasExistingInstrumental || ((offerInlineInstrumentalChoice || autoInstrumentalConfident) && !reviewInstrumentalAnyway)}
+          offerInlineChoice={offerInlineInstrumentalChoice}
+          autoConfident={autoInstrumentalConfident}
+          recommendedSelection={recommendedInstrumental}
+          currentSelection={currentInstrumental}
+          onSelectInstrumental={setInstrumentalChoice}
+          reviewInstrumentalAnyway={reviewInstrumentalAnyway}
+          onToggleReviewInstrumental={setReviewInstrumentalAnyway}
+        />
+
+        <AddLyricsModal
+          open={isAddLyricsModalOpen}
+          onClose={() => setIsAddLyricsModalOpen(false)}
+          onAdd={handleAddLyrics}
+          onSearch={handleSearchLyrics}
+          defaultArtist={data.metadata?.lyrics_artist || data.metadata?.artist || ''}
+          defaultTitle={data.metadata?.lyrics_title || data.metadata?.title || ''}
+        />
+
+        <FindReplaceModal
+          open={isFindReplaceModalOpen}
+          onClose={() => setIsFindReplaceModalOpen(false)}
+          onReplace={handleFindReplace}
+          data={data}
+        />
+
+        <TimingOffsetModal
+          open={isTimingOffsetModalOpen}
+          onClose={() => setIsTimingOffsetModalOpen(false)}
+          currentOffset={timingOffsetMs}
+          onApply={handleApplyTimingOffset}
+        />
+
+        <ReplaceAllLyricsModal
+          open={isReplaceAllLyricsModalOpen}
+          onClose={() => setIsReplaceAllLyricsModalOpen(false)}
+          onSave={handleSaveReplaceAllLyrics}
+          onPlaySegment={handlePlaySegment}
+          currentTime={currentAudioTime}
+          setModalSpacebarHandler={handleSetModalSpacebarHandler}
+          existingSegments={data.corrected_segments}
+          jobId={jobId ?? ''}
+          artist={data.metadata?.artist}
+          title={data.metadata?.title}
+          authToken={getAccessToken() ?? undefined}
+        />
+
+        <AutoCorrectModal
+          open={isAutoCorrectModalOpen}
+          onClose={() => setIsAutoCorrectModalOpen(false)}
+          onRun={(settings) => void autoCorrect.run(settings)}
+          onCancelRun={autoCorrect.cancel}
+          status={autoCorrect.status}
+          error={autoCorrect.error}
+          hasReferences={autoCorrect.hasReferences}
+        />
+
+        <EditFeedbackBar
+          entry={lastEditEntry}
+          visible={showFeedbackBar}
+          onFeedback={handleEditFeedback}
+          onDismiss={() => setShowFeedbackBar(false)}
+        />
+
+        {selectedCorrection && (
+          <CorrectionDetailCard
+            open={correctionDetailOpen}
+            onClose={() => {
+              setCorrectionDetailOpen(false)
+              setSelectedCorrection(null)
+            }}
+            originalWord={selectedCorrection.originalWord}
+            correctedWord={selectedCorrection.correctedWord}
+            category={selectedCorrection.category}
+            confidence={selectedCorrection.confidence}
+            reason={selectedCorrection.reason}
+            handler={selectedCorrection.handler}
+            source={selectedCorrection.source}
+            onRevert={() => {
+              handleRevertCorrection(selectedCorrection.wordId)
+              setCorrectionDetailOpen(false)
+              setSelectedCorrection(null)
+            }}
+            onEdit={() => {
+              handleEditCorrection(selectedCorrection.wordId)
+              setCorrectionDetailOpen(false)
+              setSelectedCorrection(null)
+            }}
+            onAccept={() => {
+              handleAcceptCorrection(selectedCorrection.wordId)
+              setCorrectionDetailOpen(false)
+              setSelectedCorrection(null)
+            }}
+          />
+        )}
+
+        {!isReadOnly && (
+          <SessionRestoreDialog
+            open={sessionRestoreOpen}
+            onClose={() => setSessionRestoreOpen(false)}
+            onRestore={handleSessionRestore}
+            sessions={savedSessions}
+            apiClient={sessionClient as LyricsReviewApiClient}
+            isLoading={sessionsLoading}
+          />
+        )}
+      </div>
+    </VocalsAudioDataLoader>
+  )
+}

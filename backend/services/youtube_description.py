@@ -1,0 +1,197 @@
+"""
+YouTube description + tags rendering (single source of truth).
+
+Both the live upload pipeline (video_worker_orchestrator, youtube_queue_processor)
+and the bulk-rewrite maintenance tool (scripts/youtube-descriptions) render
+descriptions through this module so on-channel descriptions stay consistent with
+newly published ones.
+
+The canonical template lives in ``Settings.default_youtube_description``
+(``backend/config.py``, overridable via the ``DEFAULT_YOUTUBE_DESCRIPTION`` env
+var). It may contain these placeholders, all optional:
+
+    {title}           - song title
+    {artist}          - artist name
+    {artist_hashtag}  - artist name reduced to a valid hashtag (e.g. "#Coldplay")
+    {brand_code}      - the NOMAD-#### brand code line
+
+Templates without placeholders still work: legacy/tenant-custom templates that
+predate placeholders keep the historical behaviour of appending
+``\n\nBrand Code: <code>`` when a brand code is available.
+"""
+import re
+from typing import Any, Dict, List, Optional
+
+# Total length budget for the YouTube ``tags`` field (API rejects > 500 chars,
+# counted as the sum of tag lengths plus separators). Stay comfortably under.
+_MAX_TAGS_TOTAL_CHARS = 460
+
+
+def hashtagify(text: Optional[str]) -> str:
+    """Reduce a string to the characters that are valid inside a hashtag.
+
+    Keeps unicode word characters (letters, digits, underscore) and drops
+    everything else, so ``"P!nk"`` -> ``"Pnk"`` and ``"Twenty One Pilots"`` ->
+    ``"TwentyOnePilots"``. Returns ``""`` when nothing usable remains.
+    """
+    if not text:
+        return ""
+    return re.sub(r"[^\w]", "", text, flags=re.UNICODE)
+
+
+def _collapse_blank_lines(text: str) -> str:
+    """Collapse runs of 3+ newlines down to a blank-line separator."""
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+# YouTube rejects titles over 100 chars; the upload service truncates at 95.
+YOUTUBE_TITLE_MAX = 95
+
+
+def translated_language_name(state_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """English name of the language a job's video shows translated lyrics in, else None.
+
+    Only a ``translated`` outcome counts: a requested translation that failed or was
+    skipped (song already in that language) renders without a translation row, so the
+    published video must not claim one.
+    """
+    info = (state_data or {}).get("lyrics_translation") or {}
+    if info.get("status") != "translated":
+        return None
+    from backend.services.lyrics_translation import TRANSLATION_LANGUAGES
+
+    return TRANSLATION_LANGUAGES.get(info.get("language") or "")
+
+
+def build_youtube_title(
+    artist: Optional[str], title: Optional[str], translation_language_name: Optional[str] = None
+) -> str:
+    """``Artist - Title (Karaoke)``, labelled when the video carries translated lyrics.
+
+    The translation label sits before "(Karaoke)" (like the tempo label, which is part
+    of the title) and is never truncated away: an over-long artist/title is shortened
+    instead. Untranslated titles are returned as-is for the caller's usual truncation.
+    """
+    base = f"{artist} - {title}"
+    if not translation_language_name:
+        return f"{base} (Karaoke)"
+    suffix = f" (With Translation into {translation_language_name}) (Karaoke)"
+    budget = YOUTUBE_TITLE_MAX - len(suffix)
+    if len(base) > budget:
+        base = base[: budget - 4].rsplit(" ", 1)[0].rstrip(" -") + " ..."
+    return f"{base}{suffix}"
+
+
+def render_youtube_description(
+    artist: Optional[str] = None,
+    title: Optional[str] = None,
+    brand_code: Optional[str] = None,
+    template: Optional[str] = None,
+    translation_language_name: Optional[str] = None,
+) -> str:
+    """Render a YouTube description from the template + per-video values.
+
+    Args:
+        artist: Artist name (may be empty/unknown).
+        title: Song title (may be empty/unknown).
+        brand_code: NOMAD-#### style code, or falsy to omit the brand-code line.
+        template: Override template. Defaults to
+            ``Settings.default_youtube_description``.
+        translation_language_name: When the video shows translated lyrics (see
+            ``translated_language_name``), an up-front notice says so.
+
+    Returns:
+        The fully rendered description string, stripped of trailing whitespace.
+    """
+    if template is None:
+        # Lazy import to avoid any import-time coupling with config.
+        from backend.config import get_settings
+
+        template = get_settings().default_youtube_description or ""
+
+    result = template
+
+    # Simple token substitution (avoid str.format so stray braces in custom
+    # templates never raise).
+    result = result.replace("{artist}", artist or "")
+    result = result.replace("{title}", title or "")
+
+    artist_tag = hashtagify(artist)
+    if artist_tag:
+        result = result.replace("{artist_hashtag}", artist_tag)
+    else:
+        # Drop the artist hashtag entirely, including a leading separator space.
+        result = result.replace(" #{artist_hashtag}", "")
+        result = result.replace("#{artist_hashtag}", "")
+        result = result.replace("{artist_hashtag}", "")
+
+    if "{brand_code}" in result:
+        if brand_code:
+            result = result.replace("{brand_code}", brand_code)
+        else:
+            # Remove any line carrying the placeholder so we don't leave a
+            # dangling "Brand Code:" label.
+            result = "\n".join(
+                line for line in result.split("\n") if "{brand_code}" not in line
+            )
+    elif brand_code:
+        # Legacy template without a placeholder: preserve historical append.
+        result = f"{result}\n\nBrand Code: {brand_code}"
+
+    # Tempo-adjusted tracks get an up-front notice so nobody is surprised when
+    # the backing track doesn't play at the speed they know.
+    from backend.services.tempo_label import tempo_description_notice
+
+    notice = tempo_description_notice(title)
+    if notice:
+        result = f"{notice}\n\n{result}"
+    if translation_language_name:
+        result = (
+            f"This karaoke video includes translated lyrics ({translation_language_name}) "
+            f"beneath each line.\n\n{result}"
+        )
+
+    return _collapse_blank_lines(result).strip()
+
+
+def build_youtube_tags(artist: Optional[str], title: Optional[str]) -> List[str]:
+    """Build a de-duplicated, length-capped YouTube tags list.
+
+    Richer than the historical ``["karaoke", artist, title]`` for discoverability,
+    while respecting YouTube's ~500 char total tags budget.
+    """
+    artist = (artist or "").strip()
+    title = (title or "").strip()
+
+    candidates = [
+        "karaoke",
+        "instrumental",
+        "lyrics",
+        "karaoke version",
+        "sing along",
+        "backing track",
+        artist,
+        title,
+        f"{artist} karaoke" if artist else "",
+        f"{artist} {title} karaoke" if artist and title else "",
+    ]
+
+    tags: List[str] = []
+    seen = set()
+    total = 0
+    for tag in candidates:
+        tag = tag.strip()
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        # +1 approximates the separator cost the API counts between tags.
+        cost = len(tag) + 1
+        if total + cost > _MAX_TAGS_TOTAL_CHARS:
+            continue
+        seen.add(key)
+        tags.append(tag)
+        total += cost
+
+    return tags

@@ -1,0 +1,2989 @@
+"""
+File upload route for local file submission with style configuration support.
+
+Supports two upload flows:
+1. Direct upload (original): All files sent as multipart form data to /api/jobs/upload
+   - Simple but limited by Cloud Run's 32MB request body size
+
+2. Signed URL upload (recommended for large files):
+   - POST /api/jobs/create-with-upload-urls - Creates job, returns signed GCS upload URLs
+   - Client uploads files directly to GCS using signed URLs (no size limit)
+   - POST /api/jobs/{job_id}/uploads-complete - Validates uploads, triggers workers
+"""
+import asyncio
+import json
+import logging
+import tempfile
+import os
+import re
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Request, Depends
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Literal
+
+from pydantic import BaseModel, Field
+
+from backend.models.job import JobCreate, JobStatus
+from backend.models.theme import ColorOverrides
+from backend.services.job_manager import JobManager
+from backend.services.storage_service import StorageService
+from backend.services.worker_service import get_worker_service
+from backend.services.credential_manager import get_credential_manager, CredentialStatus
+from backend.services.theme_service import get_theme_service
+from backend.services.job_defaults_service import (
+    get_effective_distribution_settings,
+    resolve_cdg_txt_defaults,
+    EffectiveDistributionSettings,
+)
+from backend.config import get_settings
+from backend.version import VERSION
+from backend.services.metrics import metrics
+from backend.api.dependencies import require_auth
+from backend.services.auth_service import UserType, AuthResult
+from backend.middleware.tenant import get_tenant_config_from_request
+from backend.exceptions import InsufficientCreditsError
+from backend.services.tracing import add_span_attribute
+from backend.services.youtube_download_service import (
+    get_youtube_download_service,
+    YouTubeDownloadError,
+    is_bot_block_error,
+)
+from backend.i18n import t, get_locale_from_request, get_full_locale_from_request
+
+logger = logging.getLogger(__name__)
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Check if a URL is a YouTube URL."""
+    return any(domain in url.lower() for domain in [
+        'youtube.com', 'youtu.be', 'youtube-nocookie.com'
+    ])
+# Wait before retrying a bot-blocked URL download, so a cookie re-export can finish.
+BOT_BLOCK_RETRY_DELAY_SECONDS = 30
+
+router = APIRouter(tags=["jobs"])
+
+
+def _select_mixed_audio_files(files):
+    """Filter a listing of ``uploads/{job_id}/audio/`` down to the mixed (with-vocals) audio.
+
+    When a job supplies its own instrumental (existing_instrumental flow, e.g. tenant
+    submissions), that file is uploaded into the SAME ``audio/`` directory as the mixed
+    audio (``existing_instrumental.*``). The ``audio/`` prefix therefore matches both, and
+    because ``existing_instrumental`` sorts before most filenames, ``files[0]`` would pick
+    the instrumental — so transcription would run on the backing track instead of the
+    vocals. Excluding it here ensures the mixed audio is selected as the transcription input.
+    """
+    return [f for f in files if not Path(f).name.startswith('existing_instrumental')]
+
+
+# A tenant track code is used verbatim as a folder/filename prefix, so it is kept
+# to a short, filesystem-safe token: letters and digits, optionally joined by "-"
+# or "_" (e.g. "VS6588", "VS-6588").
+_TRACK_CODE_RE = re.compile(r"^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$")
+_TRACK_CODE_MAX_LEN = 24
+
+
+def normalize_track_code(raw: Optional[str]) -> Optional[str]:
+    """Return a cleaned tenant track code, None when blank; 400 when unsafe."""
+    code = (raw or "").strip()
+    if not code:
+        return None
+    if len(code) > _TRACK_CODE_MAX_LEN or not _TRACK_CODE_RE.match(code):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid track code '{code[:40]}': use letters and numbers only "
+                f"(optionally joined by - or _), up to {_TRACK_CODE_MAX_LEN} characters, e.g. VS6588"
+            ),
+        )
+    return code.upper()
+
+
+def _apply_tenant_overrides(
+    dist: EffectiveDistributionSettings,
+    tenant_config,
+    effective_theme_id: str | None,
+    is_private: bool,
+    enable_youtube_upload: bool,
+) -> tuple:
+    """
+    Apply tenant-specific overrides to distribution settings and job options.
+
+    White-label tenant config is AUTHORITATIVE: it replaces (not just fills in) the
+    distribution settings, so tenant outputs never inherit the global consumer defaults
+    (DEFAULT_BRAND_PREFIX / DEFAULT_DROPBOX_PATH / DEFAULT_GDRIVE_FOLDER_ID) that
+    ``get_effective_distribution_settings`` seeds into ``dist``. Without this, every
+    tenant job would land in the shared consumer Dropbox folder and upload to the global
+    Google Drive, regardless of the tenant's own config.
+
+    For tenant jobs:
+    - Sets brand_prefix, dropbox_path, gdrive_folder_id authoritatively from tenant config
+    - Routes Dropbox / Google Drive only when the matching feature flag is enabled;
+      otherwise disables that channel entirely (no global-default leak)
+    - Forces is_private = True
+    - Applies locked_theme as effective theme
+    - Disables YouTube upload (tenants never publish to YouTube)
+
+    Returns:
+        Tuple of (dist, effective_theme_id, is_private, enable_youtube_upload)
+    """
+    if not tenant_config:
+        return dist, effective_theme_id, is_private, enable_youtube_upload
+
+    defaults = tenant_config.defaults
+    features = tenant_config.features
+
+    # Authoritative distribution routing (overrides any global defaults in `dist`).
+    dist.brand_prefix = defaults.brand_prefix
+    dist.dropbox_path = defaults.dropbox_path if features.dropbox_upload else None
+    dist.gdrive_folder_id = defaults.gdrive_folder_id if features.gdrive_upload else None
+
+    # Force private for all tenant jobs
+    is_private = True
+
+    # Apply locked_theme (overrides any user selection)
+    if defaults.locked_theme:
+        effective_theme_id = defaults.locked_theme
+
+    # Disable YouTube upload for tenants
+    enable_youtube_upload = False
+
+    return dist, effective_theme_id, is_private, enable_youtube_upload
+
+
+# ============================================================================
+# Pydantic models for signed URL upload flow
+# ============================================================================
+
+class FileUploadRequest(BaseModel):
+    """Information about a file to be uploaded."""
+    filename: str = Field(..., description="Original filename with extension")
+    content_type: str = Field(..., description="MIME type of the file")
+    file_type: str = Field(..., description="Type of file: 'audio', 'style_params', 'style_intro_background', 'style_karaoke_background', 'style_end_background', 'style_font', 'style_cdg_instrumental_background', 'style_cdg_title_background', 'style_cdg_outro_background', 'lyrics_file'")
+
+
+class CreateJobFromUrlRequest(BaseModel):
+    """Request to create a job from a YouTube/online URL."""
+    # Required fields
+    url: str = Field(..., description="YouTube or other video URL to download audio from")
+
+    # Optional fields - will be auto-detected from URL if not provided
+    artist: Optional[str] = Field(None, description="Artist name (auto-detected from URL if not provided)")
+    title: Optional[str] = Field(None, description="Song title (auto-detected from URL if not provided)")
+
+    # Theme configuration (use pre-made theme from GCS)
+    theme_id: Optional[str] = Field(None, description="Theme ID to use (e.g., 'nomad', 'default'). If set, CDG/TXT are enabled by default.")
+    color_overrides: Optional[Dict[str, str]] = Field(None, description="Color overrides: artist_color, title_color, sung_lyrics_color, unsung_lyrics_color (hex #RRGGBB)")
+
+    # Processing options (CDG/TXT require style config or theme, disabled by default unless theme is set)
+    enable_cdg: Optional[bool] = Field(None, description="Generate CDG+MP3 package. Default: True if theme_id set, False otherwise")
+    enable_txt: Optional[bool] = Field(None, description="Generate TXT+MP3 package. Default: True if theme_id set, False otherwise")
+
+    # Finalisation options
+    brand_prefix: Optional[str] = Field(None, description="Brand code prefix (e.g., NOMAD)")
+    enable_youtube_upload: Optional[bool] = Field(None, description="Upload to YouTube. None = use server default")
+    youtube_description: Optional[str] = Field(None, description="YouTube video description text")
+    discord_webhook_url: Optional[str] = Field(None, description="Discord webhook URL for notifications")
+    webhook_url: Optional[str] = Field(None, description="Generic webhook URL")
+    user_email: Optional[str] = Field(None, description="User email for notifications")
+
+    # Distribution options (native API - preferred for remote CLI)
+    dropbox_path: Optional[str] = Field(None, description="Dropbox folder path for organized output")
+    gdrive_folder_id: Optional[str] = Field(None, description="Google Drive folder ID for public share uploads")
+
+    # Legacy distribution options (rclone - deprecated)
+    organised_dir_rclone_root: Optional[str] = Field(None, description="[Deprecated] rclone remote path")
+
+    # Lyrics configuration
+    lyrics_artist: Optional[str] = Field(None, description="Override artist name for lyrics search")
+    lyrics_title: Optional[str] = Field(None, description="Override title for lyrics search")
+    subtitle_offset_ms: int = Field(0, description="Subtitle timing offset in milliseconds")
+
+    # Audio separation model configuration
+    clean_instrumental_model: Optional[str] = Field(None, description="Model for clean instrumental separation")
+    backing_vocals_models: Optional[List[str]] = Field(None, description="Models for backing vocals separation")
+    other_stems_models: Optional[List[str]] = Field(None, description="Models for other stems")
+
+    # Non-interactive mode
+    non_interactive: bool = Field(False, description="Skip interactive steps (lyrics review, instrumental selection)")
+
+    # Private (non-published) track mode
+    is_private: bool = Field(False, description="Private track: Dropbox only (Tracks-NonPublished/NOMADNP), no YouTube/GDrive")
+
+    # Audio editing
+    requires_audio_edit: bool = Field(False, description="Pause after download for user to edit input audio")
+
+    # Review autonomy + backing-vocals preference (full-auto review, workstream C)
+    review_mode: str = Field("auto", description="'auto' (skip review when confident) or 'always_review'")
+    backing_preference: str = Field("auto", description="'auto' (retain backing where safe), 'clean', or 'review'")
+    translation_language: Optional[str] = Field(None, description="Translated lyrics language code (e.g. 'es') shown beneath each line; omit for none")
+
+
+class CreateJobFromUrlResponse(BaseModel):
+    """Response from creating a job from URL."""
+    status: str
+    job_id: str
+    message: str
+    detected_artist: Optional[str]
+    detected_title: Optional[str]
+    server_version: str
+
+
+class CreateJobWithUploadUrlsRequest(BaseModel):
+    """Request to create a job and get signed upload URLs."""
+    # Required fields
+    artist: str = Field(..., description="Artist name")
+    title: str = Field(..., description="Song title")
+    files: List[FileUploadRequest] = Field(..., description="List of files to upload")
+
+    # Theme configuration (use pre-made theme from GCS)
+    theme_id: Optional[str] = Field(None, description="Theme ID to use (e.g., 'nomad', 'default'). If set, CDG/TXT are enabled by default.")
+    color_overrides: Optional[Dict[str, str]] = Field(None, description="Color overrides: artist_color, title_color, sung_lyrics_color, unsung_lyrics_color (hex #RRGGBB)")
+
+    # Processing options (CDG/TXT require style config or theme, disabled by default unless theme is set)
+    enable_cdg: Optional[bool] = Field(None, description="Generate CDG+MP3 package. Default: True if theme_id set, False otherwise")
+    enable_txt: Optional[bool] = Field(None, description="Generate TXT+MP3 package. Default: True if theme_id set, False otherwise")
+    
+    # Finalisation options
+    brand_prefix: Optional[str] = Field(None, description="Brand code prefix (e.g., NOMAD)")
+    enable_youtube_upload: Optional[bool] = Field(None, description="Upload to YouTube. None = use server default")
+    youtube_description: Optional[str] = Field(None, description="YouTube video description text")
+    discord_webhook_url: Optional[str] = Field(None, description="Discord webhook URL for notifications")
+    webhook_url: Optional[str] = Field(None, description="Generic webhook URL")
+    user_email: Optional[str] = Field(None, description="User email for notifications")
+    
+    # Distribution options (native API - preferred for remote CLI)
+    dropbox_path: Optional[str] = Field(None, description="Dropbox folder path for organized output")
+    gdrive_folder_id: Optional[str] = Field(None, description="Google Drive folder ID for public share uploads")
+    
+    # Legacy distribution options (rclone - deprecated)
+    organised_dir_rclone_root: Optional[str] = Field(None, description="[Deprecated] rclone remote path")
+    
+    # Lyrics configuration
+    lyrics_artist: Optional[str] = Field(None, description="Override artist name for lyrics search")
+    lyrics_title: Optional[str] = Field(None, description="Override title for lyrics search")
+    subtitle_offset_ms: int = Field(0, description="Subtitle timing offset in milliseconds")
+    
+    # Audio separation model configuration
+    clean_instrumental_model: Optional[str] = Field(None, description="Model for clean instrumental separation")
+    backing_vocals_models: Optional[List[str]] = Field(None, description="Models for backing vocals separation")
+    other_stems_models: Optional[List[str]] = Field(None, description="Models for other stems")
+    
+    # Existing instrumental configuration (Batch 3)
+    existing_instrumental: bool = Field(False, description="Whether an existing instrumental file is being uploaded")
+    
+    # Two-phase workflow configuration (Batch 6)
+    prep_only: bool = Field(False, description="Stop after review phase, don't run finalisation")
+    keep_brand_code: Optional[str] = Field(None, description="Preserve existing brand code instead of generating new one")
+
+    # Review autonomy + backing-vocals preference (full-auto review, workstream C)
+    review_mode: str = Field("auto", description="'auto' (skip review when confident) or 'always_review'")
+    backing_preference: str = Field("auto", description="'auto' (retain backing where safe), 'clean', or 'review'")
+    translation_language: Optional[str] = Field(None, description="Translated lyrics language code (e.g. 'es') shown beneath each line; omit for none")
+
+    # Non-interactive mode
+    non_interactive: bool = Field(False, description="Skip interactive steps (lyrics review, instrumental selection)")
+
+    # Private (non-published) track mode
+    is_private: bool = Field(False, description="Private track: Dropbox only (Tracks-NonPublished/NOMADNP), no YouTube/GDrive")
+
+    # Bulk-upload grouping: jobs created from the same tenant bulk batch share a
+    # batch_id (stamped into state_data) so they can be grouped/filtered later.
+    batch_id: Optional[str] = Field(None, description="Groups jobs created together in one tenant bulk batch")
+    requires_audio_edit: bool = Field(False, description="Pause after upload for user to edit input audio")
+
+    # Tenant-supplied track code (e.g. Vocal Star's "VS6588"). Tenant portals only:
+    # it becomes the job's brand code, so the output folder and every delivered file
+    # are prefixed with the tenant's own catalogue code instead of an allocated
+    # "<PREFIX>-NNNN" number.
+    track_code: Optional[str] = Field(None, description="Tenant's own catalogue code for this track (tenant portals only)")
+
+    # Upload mechanism. "signed_put" (default) returns single-shot signed PUT
+    # URLs; "resumable" returns GCS resumable session URIs that support chunked
+    # uploads with mid-file resume after interruptions (flaky connections).
+    upload_mode: Literal["signed_put", "resumable"] = Field(
+        "signed_put", description="'signed_put' (default) or 'resumable'"
+    )
+
+
+class SignedUploadUrl(BaseModel):
+    """Signed URL (or resumable session URI) for uploading a file."""
+    file_type: str = Field(..., description="Type of file this URL is for")
+    gcs_path: str = Field(..., description="The GCS path where file will be stored")
+    upload_url: str = Field(..., description="Signed URL to PUT the file to, or a resumable session URI")
+    content_type: str = Field(..., description="Content-Type header to use when uploading")
+    resumable: bool = Field(False, description="True when upload_url is a GCS resumable session URI")
+
+
+class CreateJobWithUploadUrlsResponse(BaseModel):
+    """Response from creating a job with upload URLs."""
+    status: str
+    job_id: str
+    message: str
+    upload_urls: List[SignedUploadUrl]
+    server_version: str
+
+
+class UploadsCompleteRequest(BaseModel):
+    """Request to mark uploads as complete and start processing."""
+    uploaded_files: List[str] = Field(..., description="List of file_types that were successfully uploaded")
+
+
+class StyleUploadUrlsRequest(BaseModel):
+    """Request to get signed upload URLs for style assets on an existing job."""
+    files: List[FileUploadRequest] = Field(..., description="List of style files to upload")
+
+
+class StyleUploadsCompleteRequest(BaseModel):
+    """Request to finalize style asset uploads on an existing job."""
+    uploaded_files: List[str] = Field(..., description="List of style file_types that were successfully uploaded (e.g. 'style_karaoke_background')")
+    color_overrides: Optional[Dict[str, str]] = Field(None, description="Color overrides: artist_color, title_color (hex #RRGGBB)")
+
+# Initialize services
+job_manager = JobManager()
+storage_service = StorageService()
+worker_service = get_worker_service()
+
+
+def extract_request_metadata(request: Request, created_from: str = "upload", auth_result=None) -> Dict[str, Any]:
+    """
+    Extract metadata from a FastAPI Request for job tracking.
+
+    Captures:
+    - Client IP address (handles X-Forwarded-For for proxies)
+    - User-Agent header
+    - Environment from X-Environment header (test/production/development)
+    - Client ID from X-Client-ID header
+    - All custom X-* headers
+    - Server version
+    - Creation source (upload/url)
+    - Auth context (method, user type) if auth_result provided
+
+    Args:
+        request: FastAPI Request object
+        created_from: How the job was created ("upload" or "url")
+        auth_result: Optional AuthResult from authentication
+
+    Returns:
+        Dict with metadata fields for storage in job.request_metadata
+    """
+    headers = dict(request.headers)
+
+    # Extract client IP (check X-Forwarded-For for proxy scenarios)
+    client_ip = headers.get('x-forwarded-for', '').split(',')[0].strip()
+    if not client_ip and request.client:
+        client_ip = request.client.host
+
+    # Extract standard headers
+    user_agent = headers.get('user-agent', '')
+    environment = headers.get('x-environment', '')  # test, production, development
+    client_id = headers.get('x-client-id', '')  # Customer/user identifier
+
+    # Collect all X-* custom headers (excluding standard ones we already captured)
+    # Secret-bearing headers are redacted: custom_headers is visible to the job owner.
+    from backend.utils.request_helpers import collect_custom_headers
+    custom_headers = collect_custom_headers(headers)
+
+    metadata = {
+        'client_ip': client_ip,
+        'user_agent': user_agent,
+        'environment': environment,
+        'client_id': client_id,
+        'server_version': VERSION,
+        'created_from': created_from,
+        'custom_headers': custom_headers,
+    }
+
+    # Add auth context for abuse investigation and analytics
+    if auth_result is not None:
+        metadata['auth_method'] = getattr(auth_result, 'auth_method', None)
+        user_type = getattr(auth_result, 'user_type', None)
+        metadata['user_type'] = user_type.value if hasattr(user_type, 'value') else str(user_type) if user_type else None
+        remaining = getattr(auth_result, 'remaining_uses', None)
+        if remaining is not None:
+            metadata['credits_at_creation'] = remaining
+
+    return metadata
+
+
+# File extension validation
+ALLOWED_AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aac'}
+ALLOWED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+ALLOWED_FONT_EXTENSIONS = {'.ttf', '.otf', '.woff', '.woff2'}
+
+
+def _require_theme_exists(theme_id: Optional[str], locale: str) -> None:
+    """Reject an unknown theme BEFORE the job document is created.
+
+    ``_prepare_theme_for_job`` runs after ``create_job``; if the theme lookup
+    failed there, the request 400'd but left an orphaned PENDING job behind
+    (e.g. a tenant bulk submit right after the tenant was created).
+    """
+    if theme_id and not get_theme_service().theme_exists(theme_id):
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "fileUpload.invalidTheme", theme_id=theme_id)
+        )
+
+
+def _prepare_theme_for_job(
+    job_id: str,
+    theme_id: str,
+    color_overrides: Optional[Dict[str, str]] = None,
+    locale: str = "en"
+) -> Tuple[str, Dict[str, str], Optional[str]]:
+    """
+    Prepare theme style files for a job.
+
+    Args:
+        job_id: The job ID
+        theme_id: Theme identifier
+        color_overrides: Optional color override dict
+        locale: Locale for error messages
+
+    Returns:
+        Tuple of (style_params_gcs_path, style_assets, youtube_description)
+
+    Raises:
+        HTTPException: If theme not found
+    """
+    theme_service = get_theme_service()
+
+    # Verify theme exists
+    if not theme_service.theme_exists(theme_id):
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "fileUpload.invalidTheme", theme_id=theme_id)
+        )
+
+    # Convert dict to ColorOverrides model if provided
+    color_overrides_model = None
+    if color_overrides:
+        color_overrides_model = ColorOverrides(**color_overrides)
+
+    # Prepare job style from theme
+    style_params_path, style_assets = theme_service.prepare_job_style(
+        job_id=job_id,
+        theme_id=theme_id,
+        color_overrides=color_overrides_model
+    )
+
+    # Settings.default_youtube_description is the single source of truth for
+    # YouTube descriptions. A theme's legacy youtube_description.txt is only a
+    # fallback when no canonical template is configured — otherwise it silently
+    # overrode the template on every themed job (the nomad theme's copy was stale
+    # Fiverr text, which the daily description-backfill worker then had to undo).
+    youtube_desc = None
+    if not get_settings().default_youtube_description:
+        youtube_desc = theme_service.get_youtube_description(theme_id)
+
+    logger.info(f"Prepared theme '{theme_id}' for job {job_id}")
+
+    return style_params_path, style_assets, youtube_desc
+
+
+@router.post("/jobs/upload")
+async def upload_and_create_job(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    auth_result: AuthResult = Depends(require_auth),
+    # Required fields
+    file: UploadFile = File(..., description="Audio file to process"),
+    artist: str = Form(..., description="Artist name"),
+    title: str = Form(..., description="Song title"),
+    # Style configuration files (optional)
+    style_params: Optional[UploadFile] = File(None, description="Style parameters JSON file"),
+    style_intro_background: Optional[UploadFile] = File(None, description="Intro/title screen background image"),
+    style_karaoke_background: Optional[UploadFile] = File(None, description="Karaoke video background image"),
+    style_end_background: Optional[UploadFile] = File(None, description="End screen background image"),
+    style_font: Optional[UploadFile] = File(None, description="Font file (TTF/OTF)"),
+    style_cdg_instrumental_background: Optional[UploadFile] = File(None, description="CDG instrumental background"),
+    style_cdg_title_background: Optional[UploadFile] = File(None, description="CDG title screen background"),
+    style_cdg_outro_background: Optional[UploadFile] = File(None, description="CDG outro screen background"),
+    # Theme configuration (use pre-made theme from GCS)
+    theme_id: Optional[str] = Form(None, description="Theme ID to use (e.g., 'nomad', 'default'). If set, CDG/TXT are enabled by default."),
+    color_overrides: Optional[str] = Form(None, description="JSON-encoded color overrides: artist_color, title_color, sung_lyrics_color, unsung_lyrics_color (hex #RRGGBB)"),
+    # Processing options (CDG/TXT require style config or theme, disabled by default unless theme is set)
+    enable_cdg: Optional[bool] = Form(None, description="Generate CDG+MP3 package. Default: True if theme_id set, False otherwise"),
+    enable_txt: Optional[bool] = Form(None, description="Generate TXT+MP3 package. Default: True if theme_id set, False otherwise"),
+    # Finalisation options
+    brand_prefix: Optional[str] = Form(None, description="Brand code prefix (e.g., NOMAD)"),
+    enable_youtube_upload: Optional[bool] = Form(None, description="Upload to YouTube. None = use server default"),
+    youtube_description: Optional[str] = Form(None, description="YouTube video description text"),
+    discord_webhook_url: Optional[str] = Form(None, description="Discord webhook URL for notifications"),
+    webhook_url: Optional[str] = Form(None, description="Generic webhook URL"),
+    user_email: Optional[str] = Form(None, description="User email for notifications"),
+    # Distribution options (native API - preferred for remote CLI)
+    dropbox_path: Optional[str] = Form(None, description="Dropbox folder path for organized output (e.g., /Karaoke/Tracks-Organized)"),
+    gdrive_folder_id: Optional[str] = Form(None, description="Google Drive folder ID for public share uploads"),
+    # Legacy distribution options (rclone - deprecated)
+    organised_dir_rclone_root: Optional[str] = Form(None, description="[Deprecated] rclone remote path for Dropbox upload"),
+    # Lyrics configuration (overrides for search/transcription)
+    lyrics_artist: Optional[str] = Form(None, description="Override artist name for lyrics search"),
+    lyrics_title: Optional[str] = Form(None, description="Override title for lyrics search"),
+    lyrics_file: Optional[UploadFile] = File(None, description="User-provided lyrics file (TXT, DOCX, RTF)"),
+    subtitle_offset_ms: int = Form(0, description="Subtitle timing offset in milliseconds (positive = delay)"),
+    # Audio separation model configuration
+    clean_instrumental_model: Optional[str] = Form(None, description="Model for clean instrumental separation (e.g., model_bs_roformer_ep_317_sdr_12.9755.ckpt)"),
+    backing_vocals_models: Optional[str] = Form(None, description="Comma-separated list of models for backing vocals separation"),
+    other_stems_models: Optional[str] = Form(None, description="Comma-separated list of models for other stems (bass, drums, guitar, etc.)"),
+    # Non-interactive mode
+    non_interactive: bool = Form(False, description="Skip interactive steps (lyrics review, instrumental selection)"),
+    # Review autonomy + backing-vocals preference (full-auto review, workstream C)
+    review_mode: str = Form("auto", description="'auto' (skip review when confident) or 'always_review'"),
+    backing_preference: str = Form("auto", description="'auto' (retain backing where safe), 'clean', or 'review'"),
+    translation_language: Optional[str] = Form(None, description="Translated lyrics language code (e.g. 'es') shown beneath each line; omit for none"),
+    # Private (non-published) track mode
+    is_private: bool = Form(False, description="Private track: Dropbox only (Tracks-NonPublished/NOMADNP), no YouTube/GDrive"),
+    # Audio editing
+    requires_audio_edit: bool = Form(False, description="Pause after download for user to edit input audio"),
+):
+    """
+    Upload an audio file and create a karaoke generation job with full style configuration.
+    
+    This endpoint:
+    1. Validates all uploaded files
+    2. Creates a job in Firestore
+    3. Uploads all files to GCS (audio, style JSON, images, fonts)
+    4. Updates job with GCS paths
+    5. Triggers the audio and lyrics workers
+    
+    Style Configuration:
+    - style_params: JSON file with style configuration (fonts, colors, regions)
+    - style_*_background: Background images for various screens
+    - style_font: Custom font file
+    
+    The style_params JSON can reference the uploaded images/fonts by their original
+    filenames, and the backend will update the paths to GCS locations.
+    """
+    locale = get_locale_from_request(request)
+
+    # Check tenant feature flag
+    tenant_config = get_tenant_config_from_request(request)
+    if tenant_config and not tenant_config.features.file_upload:
+        raise HTTPException(
+            status_code=403,
+            detail="File upload is not available for this portal"
+        )
+
+    try:
+        # Validate main audio file type
+        file_ext = Path(file.filename).suffix.lower()
+        if file_ext not in ALLOWED_AUDIO_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid audio file type '{file_ext}'. Allowed: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}"
+            )
+        
+        # Validate style files if provided
+        if style_params and not style_params.filename.endswith('.json'):
+            raise HTTPException(status_code=400, detail="Style params must be a JSON file")
+        
+        for img_file, name in [
+            (style_intro_background, "intro_background"),
+            (style_karaoke_background, "karaoke_background"),
+            (style_end_background, "end_background"),
+            (style_cdg_instrumental_background, "cdg_instrumental_background"),
+            (style_cdg_title_background, "cdg_title_background"),
+            (style_cdg_outro_background, "cdg_outro_background"),
+        ]:
+            if img_file:
+                ext = Path(img_file.filename).suffix.lower()
+                if ext not in ALLOWED_IMAGE_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid image file type '{ext}' for {name}. Allowed: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
+                    )
+        
+        if style_font:
+            ext = Path(style_font.filename).suffix.lower()
+            if ext not in ALLOWED_FONT_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid font file type '{ext}'. Allowed: {', '.join(ALLOWED_FONT_EXTENSIONS)}"
+                )
+        
+        # Validate lyrics file if provided
+        ALLOWED_LYRICS_EXTENSIONS = {'.txt', '.docx', '.rtf'}
+        if lyrics_file:
+            ext = Path(lyrics_file.filename).suffix.lower()
+            if ext not in ALLOWED_LYRICS_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid lyrics file type '{ext}'. Allowed: {', '.join(ALLOWED_LYRICS_EXTENSIONS)}"
+                )
+        
+        # Apply default distribution settings from environment if not provided
+        dist = get_effective_distribution_settings(
+            dropbox_path=dropbox_path,
+            gdrive_folder_id=gdrive_folder_id,
+            discord_webhook_url=discord_webhook_url,
+            brand_prefix=brand_prefix,
+        )
+
+        if dist.dropbox_path and not dropbox_path:
+            logger.info(f"Using default dropbox_path: {dist.dropbox_path}")
+        if dist.gdrive_folder_id and not gdrive_folder_id:
+            logger.info(f"Using default gdrive_folder_id: {dist.gdrive_folder_id}")
+        if dist.discord_webhook_url and not discord_webhook_url:
+            logger.info("Using default discord_webhook_url (from env)")
+        if dist.brand_prefix and not brand_prefix:
+            logger.info(f"Using default brand_prefix: {dist.brand_prefix}")
+
+        # Apply YouTube upload default from settings
+        # Use explicit value if provided, otherwise fall back to server default
+        settings = get_settings()
+        effective_enable_youtube_upload = enable_youtube_upload if enable_youtube_upload is not None else settings.default_enable_youtube_upload
+        if effective_enable_youtube_upload and enable_youtube_upload is None:
+            logger.info("Using default enable_youtube_upload: True (from env)")
+
+        # Validate credentials for requested distribution services (including defaults)
+        # This prevents accepting jobs that will fail later due to missing credentials
+        # Skip YouTube/GDrive checks for private jobs (they won't use those services)
+        invalid_services = []
+        credential_manager = get_credential_manager()
+
+        if effective_enable_youtube_upload and not is_private:
+            result = await asyncio.to_thread(credential_manager.check_youtube_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"youtube ({result.message})")
+
+        if dist.dropbox_path:
+            result = await asyncio.to_thread(credential_manager.check_dropbox_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"dropbox ({result.message})")
+
+        if dist.gdrive_folder_id and not is_private:
+            result = await asyncio.to_thread(credential_manager.check_gdrive_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"gdrive ({result.message})")
+
+        if invalid_services:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "credentials_invalid",
+                    "message": f"The following distribution services need re-authorization: {', '.join(invalid_services)}",
+                    "invalid_services": invalid_services,
+                    "auth_url": "/api/auth/status"
+                }
+            )
+
+        # Extract request metadata for tracking and filtering
+        request_metadata = extract_request_metadata(request, created_from="upload", auth_result=auth_result)
+
+        # Parse color_overrides from JSON if provided
+        parsed_color_overrides: Dict[str, str] = {}
+        if color_overrides:
+            try:
+                parsed_color_overrides = json.loads(color_overrides)
+            except json.JSONDecodeError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid color_overrides JSON: {e}"
+                )
+
+        # Apply default theme if none specified
+        # This ensures all karaoke videos use the Nomad theme by default
+        effective_theme_id = theme_id
+        if effective_theme_id is None:
+            theme_service = get_theme_service()
+            effective_theme_id = theme_service.get_default_theme_id()
+            if effective_theme_id:
+                logger.info(f"Applying default theme: {effective_theme_id}")
+
+        # Apply tenant-specific overrides (brand, paths, privacy, theme)
+        dist, effective_theme_id, is_private, effective_enable_youtube_upload = _apply_tenant_overrides(
+            dist, tenant_config, effective_theme_id, is_private, effective_enable_youtube_upload,
+        )
+        if tenant_config:
+            logger.info(f"Applied tenant overrides for '{tenant_config.id}': "
+                        f"brand={dist.brand_prefix}, private={is_private}, theme={effective_theme_id}")
+
+        # Resolve CDG/TXT defaults based on theme
+        resolved_cdg, resolved_txt = resolve_cdg_txt_defaults(
+            effective_theme_id, enable_cdg, enable_txt
+        )
+
+        # Check if any custom style files are being uploaded (overrides theme)
+        has_custom_style_files = any([
+            style_params,
+            style_intro_background,
+            style_karaoke_background,
+            style_end_background,
+            style_font,
+            style_cdg_instrumental_background,
+            style_cdg_title_background,
+            style_cdg_outro_background,
+        ])
+
+        # Parse comma-separated model lists into arrays
+        parsed_backing_vocals_models = None
+        if backing_vocals_models:
+            parsed_backing_vocals_models = [m.strip() for m in backing_vocals_models.split(',') if m.strip()]
+        
+        parsed_other_stems_models = None
+        if other_stems_models:
+            parsed_other_stems_models = [m.strip() for m in other_stems_models.split(',') if m.strip()]
+        
+        # Prefer authenticated user's email over form parameter
+        effective_user_email = auth_result.user_email or user_email
+
+        # Create job first to get job_id
+        job_create = JobCreate(
+            artist=artist,
+            title=title,
+            filename=file.filename,
+            theme_id=effective_theme_id,
+            color_overrides=parsed_color_overrides,
+            enable_cdg=resolved_cdg,
+            enable_txt=resolved_txt,
+            brand_prefix=dist.brand_prefix,
+            enable_youtube_upload=effective_enable_youtube_upload,
+            youtube_description=youtube_description,
+            discord_webhook_url=dist.discord_webhook_url,
+            webhook_url=webhook_url,
+            user_email=effective_user_email,
+            # Native API distribution (preferred for remote CLI)
+            dropbox_path=dist.dropbox_path,
+            gdrive_folder_id=dist.gdrive_folder_id,
+            # Legacy rclone distribution (deprecated)
+            organised_dir_rclone_root=organised_dir_rclone_root,
+            # Lyrics configuration (overrides for search/transcription)
+            lyrics_artist=lyrics_artist,
+            lyrics_title=lyrics_title,
+            subtitle_offset_ms=subtitle_offset_ms,
+            # Audio separation model configuration
+            clean_instrumental_model=clean_instrumental_model,
+            backing_vocals_models=parsed_backing_vocals_models,
+            other_stems_models=parsed_other_stems_models,
+            # Request metadata for tracking and filtering
+            request_metadata=request_metadata,
+            # Non-interactive mode
+            non_interactive=non_interactive,
+            # Review autonomy + backing-vocals preference (full-auto review)
+            review_mode=review_mode,
+            backing_preference=backing_preference,
+            translation_language=translation_language,
+            # Private (non-published) track mode
+            is_private=is_private,
+            # Tenant scoping
+            tenant_id=tenant_config.id if tenant_config else "",
+            # UI language the job was submitted in (admin-only signal)
+            locale=get_full_locale_from_request(request),
+        )
+        _require_theme_exists(effective_theme_id, locale)
+        job = job_manager.create_job(job_create, is_admin=auth_result.is_admin)
+        job_id = job.job_id
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("job.source", "upload")
+        add_span_attribute("job.is_private", is_private)
+
+        # Record job creation metric
+        metrics.record_job_created(job_id, source="upload")
+
+        logger.info(f"Created job {job_id} for {artist} - {title}")
+
+        # Store requires_audio_edit flag in state_data
+        if requires_audio_edit:
+            job_manager.update_state_data(job_id, 'requires_audio_edit', True)
+
+        # If theme is set and no custom style files are being uploaded, prepare theme style now
+        # This copies the theme's style_params.json to the job folder so LyricsTranscriber
+        # can access the style configuration for preview videos
+        theme_style_params_path = None
+        theme_style_assets = {}
+        theme_youtube_desc = None
+        if effective_theme_id and not has_custom_style_files:
+            try:
+                theme_style_params_path, theme_style_assets, theme_youtube_desc = await asyncio.to_thread(
+                    _prepare_theme_for_job,
+                    job_id, effective_theme_id, parsed_color_overrides or None, locale=locale
+                )
+                logger.info(f"Applied theme '{effective_theme_id}' to job {job_id}")
+            except HTTPException:
+                raise  # Re-raise validation errors (e.g., theme not found)
+            except Exception as e:
+                logger.warning(f"Failed to prepare theme '{effective_theme_id}' for job {job_id}: {e}")
+                # Continue without theme - job can still be processed with defaults
+
+        # Upload main audio file to GCS
+        audio_gcs_path = f"uploads/{job_id}/audio/{file.filename}"
+        logger.info(f"Uploading audio to GCS: {audio_gcs_path}")
+        storage_service.upload_fileobj(
+            file.file,
+            audio_gcs_path,
+            content_type=file.content_type or 'audio/flac'
+        )
+        
+        # Track style assets
+        style_assets = {}
+        
+        # Upload style files if provided
+        if style_params:
+            style_gcs_path = f"jobs/{job_id}/style/style_params.json"
+            logger.info(f"Uploading style params to GCS: {style_gcs_path}")
+            storage_service.upload_fileobj(
+                style_params.file,
+                style_gcs_path,
+                content_type='application/json'
+            )
+            style_assets['style_params'] = style_gcs_path
+        
+        # Upload background images
+        for img_file, asset_key in [
+            (style_intro_background, "intro_background"),
+            (style_karaoke_background, "karaoke_background"),
+            (style_end_background, "end_background"),
+            (style_cdg_instrumental_background, "cdg_instrumental_background"),
+            (style_cdg_title_background, "cdg_title_background"),
+            (style_cdg_outro_background, "cdg_outro_background"),
+        ]:
+            if img_file:
+                gcs_path = f"jobs/{job_id}/style/{asset_key}{Path(img_file.filename).suffix.lower()}"
+                logger.info(f"Uploading {asset_key} to GCS: {gcs_path}")
+                storage_service.upload_fileobj(
+                    img_file.file,
+                    gcs_path,
+                    content_type=img_file.content_type or 'image/png'
+                )
+                style_assets[asset_key] = gcs_path
+        
+        # Upload font file
+        if style_font:
+            font_gcs_path = f"jobs/{job_id}/style/font{Path(style_font.filename).suffix.lower()}"
+            logger.info(f"Uploading font to GCS: {font_gcs_path}")
+            storage_service.upload_fileobj(
+                style_font.file,
+                font_gcs_path,
+                content_type='font/ttf'
+            )
+            style_assets['font'] = font_gcs_path
+        
+        # Upload lyrics file if provided
+        lyrics_file_gcs_path = None
+        if lyrics_file:
+            lyrics_file_gcs_path = f"uploads/{job_id}/lyrics/user_lyrics{Path(lyrics_file.filename).suffix.lower()}"
+            logger.info(f"Uploading user lyrics file to GCS: {lyrics_file_gcs_path}")
+            storage_service.upload_fileobj(
+                lyrics_file.file,
+                lyrics_file_gcs_path,
+                content_type='text/plain'
+            )
+        
+        # Update job with all GCS paths
+        update_data = {
+            'input_media_gcs_path': audio_gcs_path,
+            'filename': file.filename,
+            'enable_cdg': resolved_cdg,
+            'enable_txt': resolved_txt,
+        }
+
+        # Handle style assets - either from custom uploads or from theme
+        if style_assets:
+            # Custom style files uploaded
+            update_data['style_assets'] = style_assets
+            if 'style_params' in style_assets:
+                update_data['style_params_gcs_path'] = style_assets['style_params']
+        elif theme_style_assets or theme_style_params_path:
+            # Theme style assets (no custom uploads). A theme may have style
+            # params but no asset files (e.g. the minimal local-dev seed theme),
+            # so the params path must be written even when the assets dict is empty.
+            update_data['style_assets'] = theme_style_assets
+            if theme_style_params_path:
+                update_data['style_params_gcs_path'] = theme_style_params_path
+
+        if dist.brand_prefix:
+            update_data['brand_prefix'] = dist.brand_prefix
+        if dist.discord_webhook_url:
+            update_data['discord_webhook_url'] = dist.discord_webhook_url
+        # Use theme YouTube description if no custom one provided
+        effective_youtube_description = youtube_description or theme_youtube_desc
+        if effective_youtube_description:
+            update_data['youtube_description_template'] = effective_youtube_description
+
+        # Native API distribution (use effective values which include defaults)
+        if dist.dropbox_path:
+            update_data['dropbox_path'] = dist.dropbox_path
+        if dist.gdrive_folder_id:
+            update_data['gdrive_folder_id'] = dist.gdrive_folder_id
+        
+        # Legacy rclone distribution (deprecated)
+        if organised_dir_rclone_root:
+            update_data['organised_dir_rclone_root'] = organised_dir_rclone_root
+        
+        # Lyrics configuration
+        if lyrics_artist:
+            update_data['lyrics_artist'] = lyrics_artist
+        if lyrics_title:
+            update_data['lyrics_title'] = lyrics_title
+        if lyrics_file_gcs_path:
+            update_data['lyrics_file_gcs_path'] = lyrics_file_gcs_path
+        if subtitle_offset_ms != 0:
+            update_data['subtitle_offset_ms'] = subtitle_offset_ms
+        
+        # Audio separation model configuration
+        if clean_instrumental_model:
+            update_data['clean_instrumental_model'] = clean_instrumental_model
+        if parsed_backing_vocals_models:
+            update_data['backing_vocals_models'] = parsed_backing_vocals_models
+        if parsed_other_stems_models:
+            update_data['other_stems_models'] = parsed_other_stems_models
+        
+        job_manager.update_job(job_id, update_data)
+        
+        # Verify the update
+        updated_job = job_manager.get_job(job_id)
+        if not hasattr(updated_job, 'input_media_gcs_path') or not updated_job.input_media_gcs_path:
+            import asyncio
+            await asyncio.sleep(0.5)
+            updated_job = job_manager.get_job(job_id)
+            if not hasattr(updated_job, 'input_media_gcs_path') or not updated_job.input_media_gcs_path:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to update job with GCS paths"
+                )
+        
+        logger.info(f"All files uploaded for job {job_id}")
+        if style_assets:
+            logger.info(f"Style assets: {list(style_assets.keys())}")
+        
+        # Use centralized start_job_processing which handles:
+        # 1. Validates job exists and has input_media_gcs_path
+        # 2. Transitions to DOWNLOADING (raises InvalidStateTransitionError if invalid)
+        # 3. Triggers audio + lyrics workers in parallel
+        background_tasks.add_task(
+            job_manager.start_job_processing,
+            job_id,
+            5,  # progress
+            "Files uploaded, preparing to process"
+        )
+        
+        # Build distribution services info for response
+        distribution_services: Dict[str, Any] = {}
+
+        if dist.dropbox_path:
+            dropbox_result = await asyncio.to_thread(credential_manager.check_dropbox_credentials)
+            distribution_services["dropbox"] = {
+                "enabled": True,
+                "path": dist.dropbox_path,
+                "credentials_valid": dropbox_result.status == CredentialStatus.VALID,
+                "using_default": dropbox_path is None,
+            }
+
+        if dist.gdrive_folder_id:
+            gdrive_result = await asyncio.to_thread(credential_manager.check_gdrive_credentials)
+            distribution_services["gdrive"] = {
+                "enabled": True,
+                "folder_id": dist.gdrive_folder_id,
+                "credentials_valid": gdrive_result.status == CredentialStatus.VALID,
+                "using_default": gdrive_folder_id is None,
+            }
+        
+        if effective_enable_youtube_upload:
+            youtube_result = await asyncio.to_thread(credential_manager.check_youtube_credentials)
+            distribution_services["youtube"] = {
+                "enabled": True,
+                "credentials_valid": youtube_result.status == CredentialStatus.VALID,
+                "using_default": enable_youtube_upload is None,
+            }
+        
+        if dist.discord_webhook_url:
+            distribution_services["discord"] = {
+                "enabled": True,
+                "using_default": discord_webhook_url is None,
+            }
+        
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "message": t(locale, "fileUpload.uploadSuccess"),
+            "filename": file.filename,
+            "style_assets_uploaded": list(style_assets.keys()) if style_assets else [],
+            "server_version": VERSION,
+            "distribution_services": distribution_services,
+        }
+        
+    except HTTPException:
+        raise
+    except InsufficientCreditsError:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading files: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "fileUpload.uploadError", error=str(e))) from e
+
+
+# ============================================================================
+# Signed URL Upload Flow - For large files that exceed Cloud Run's 32MB limit
+# ============================================================================
+
+# Valid file types and their expected extensions
+VALID_FILE_TYPES = {
+    'audio': ALLOWED_AUDIO_EXTENSIONS,
+    'style_params': {'.json'},
+    'style_intro_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_karaoke_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_end_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_font': ALLOWED_FONT_EXTENSIONS,
+    'style_cdg_instrumental_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_cdg_title_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_cdg_outro_background': ALLOWED_IMAGE_EXTENSIONS,
+    'lyrics_file': {'.txt', '.docx', '.rtf'},
+    'existing_instrumental': ALLOWED_AUDIO_EXTENSIONS,  # Batch 3: user-provided instrumental
+}
+
+# Style-only file types (subset allowed for post-creation style uploads)
+STYLE_FILE_TYPES = {
+    'style_intro_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_karaoke_background': ALLOWED_IMAGE_EXTENSIONS,
+    'style_end_background': ALLOWED_IMAGE_EXTENSIONS,
+}
+
+# Statuses at or past which style uploads are no longer accepted
+# (style assets must be uploaded before screen generation begins)
+STYLE_UPLOAD_CUTOFF_STATUSES = {
+    JobStatus.GENERATING_SCREENS,
+    JobStatus.APPLYING_PADDING,
+    JobStatus.AWAITING_REVIEW,
+    JobStatus.IN_REVIEW,
+    JobStatus.REVIEW_COMPLETE,
+    JobStatus.RENDERING_VIDEO,
+    JobStatus.AWAITING_INSTRUMENTAL_SELECTION,
+    JobStatus.INSTRUMENTAL_SELECTED,
+    JobStatus.GENERATING_VIDEO,
+    JobStatus.ENCODING,
+    JobStatus.PACKAGING,
+    JobStatus.UPLOADING,
+    JobStatus.NOTIFYING,
+    JobStatus.COMPLETE,
+    JobStatus.PREP_COMPLETE,
+    JobStatus.FAILED,
+    JobStatus.CANCELLED,
+}
+
+# Valid file types for finalise-only mode (Batch 6)
+ALLOWED_VIDEO_EXTENSIONS = {'.mkv', '.mov', '.mp4'}
+FINALISE_ONLY_FILE_TYPES = {
+    'audio': ALLOWED_AUDIO_EXTENSIONS,  # Original audio
+    'with_vocals': ALLOWED_VIDEO_EXTENSIONS,  # Karaoke video from prep
+    'title_screen': ALLOWED_VIDEO_EXTENSIONS,  # Title screen video
+    'end_screen': ALLOWED_VIDEO_EXTENSIONS,  # End screen video
+    'title_jpg': ALLOWED_IMAGE_EXTENSIONS,  # Title screen JPG
+    'title_png': ALLOWED_IMAGE_EXTENSIONS,  # Title screen PNG
+    'end_jpg': ALLOWED_IMAGE_EXTENSIONS,  # End screen JPG
+    'end_png': ALLOWED_IMAGE_EXTENSIONS,  # End screen PNG
+    'instrumental_clean': ALLOWED_AUDIO_EXTENSIONS,  # Clean instrumental
+    'instrumental_backing': ALLOWED_AUDIO_EXTENSIONS,  # Instrumental with backing vocals
+    'lrc': {'.lrc'},  # LRC lyrics
+    'ass': {'.ass'},  # ASS subtitles
+    'corrections': {'.json'},  # Corrections JSON
+    'style_params': {'.json'},  # Style params
+}
+
+# Pydantic models for finalise-only flow (Batch 6)
+class FinaliseOnlyFileRequest(BaseModel):
+    """Information about a prep output file to be uploaded for finalise-only mode."""
+    filename: str = Field(..., description="Original filename with extension")
+    content_type: str = Field(..., description="MIME type of the file")
+    file_type: str = Field(..., description="Type of prep file: 'with_vocals', 'title_screen', 'end_screen', 'instrumental_clean', 'instrumental_backing', 'lrc', etc.")
+
+
+class CreateFinaliseOnlyJobRequest(BaseModel):
+    """Request to create a finalise-only job with prep output files."""
+    artist: str = Field(..., description="Artist name")
+    title: str = Field(..., description="Song title")
+    files: List[FinaliseOnlyFileRequest] = Field(..., description="List of prep output files to upload")
+
+    # Theme configuration (use pre-made theme from GCS)
+    theme_id: Optional[str] = Field(None, description="Theme ID to use (e.g., 'nomad', 'default'). If set, CDG/TXT are enabled by default.")
+    color_overrides: Optional[Dict[str, str]] = Field(None, description="Color overrides: artist_color, title_color, sung_lyrics_color, unsung_lyrics_color (hex #RRGGBB)")
+
+    # Processing options (CDG/TXT require style config or theme, disabled by default unless theme is set)
+    enable_cdg: Optional[bool] = Field(None, description="Generate CDG+MP3 package. Default: True if theme_id set, False otherwise")
+    enable_txt: Optional[bool] = Field(None, description="Generate TXT+MP3 package. Default: True if theme_id set, False otherwise")
+    
+    # Finalisation options
+    brand_prefix: Optional[str] = Field(None, description="Brand code prefix (e.g., NOMAD)")
+    keep_brand_code: Optional[str] = Field(None, description="Preserve existing brand code from folder name")
+    enable_youtube_upload: Optional[bool] = Field(None, description="Upload to YouTube. None = use server default")
+    youtube_description: Optional[str] = Field(None, description="YouTube video description text")
+    discord_webhook_url: Optional[str] = Field(None, description="Discord webhook URL for notifications")
+    
+    # Distribution options
+    dropbox_path: Optional[str] = Field(None, description="Dropbox folder path for organized output")
+    gdrive_folder_id: Optional[str] = Field(None, description="Google Drive folder ID for public share uploads")
+
+    # Private (non-published) track mode
+    is_private: bool = Field(False, description="Private track: Dropbox only (Tracks-NonPublished/NOMADNP), no YouTube/GDrive")
+
+
+
+async def _validate_audio_durations(
+    storage: StorageService,
+    audio_gcs_path: str,
+    instrumental_gcs_path: str,
+    tolerance_seconds: float = 0.5
+) -> Tuple[bool, float, float]:
+    """
+    Validate that audio and instrumental files have matching durations.
+    
+    Downloads both files to temp directory and checks their durations using pydub.
+    
+    Args:
+        storage: StorageService instance
+        audio_gcs_path: GCS path to main audio file
+        instrumental_gcs_path: GCS path to instrumental file
+        tolerance_seconds: Maximum allowed difference in seconds (default 0.5s)
+        
+    Returns:
+        Tuple of (is_valid, audio_duration, instrumental_duration)
+    """
+    # Two GCS downloads + two full decodes (15s+ seen in prod) — never on the loop.
+    return await asyncio.to_thread(
+        _validate_audio_durations_sync, storage, audio_gcs_path, instrumental_gcs_path, tolerance_seconds
+    )
+
+
+def _validate_audio_durations_sync(
+    storage: StorageService,
+    audio_gcs_path: str,
+    instrumental_gcs_path: str,
+    tolerance_seconds: float,
+) -> Tuple[bool, float, float]:
+    from pydub import AudioSegment
+
+    temp_dir = tempfile.mkdtemp(prefix="duration_check_")
+    try:
+        # Download audio file
+        audio_local = os.path.join(temp_dir, "audio" + Path(audio_gcs_path).suffix)
+        storage.download_file(audio_gcs_path, audio_local)
+        
+        # Download instrumental file
+        instrumental_local = os.path.join(temp_dir, "instrumental" + Path(instrumental_gcs_path).suffix)
+        storage.download_file(instrumental_gcs_path, instrumental_local)
+        
+        # Get durations using pydub (returns milliseconds)
+        audio_segment = AudioSegment.from_file(audio_local)
+        audio_duration = len(audio_segment) / 1000.0  # Convert to seconds
+        
+        instrumental_segment = AudioSegment.from_file(instrumental_local)
+        instrumental_duration = len(instrumental_segment) / 1000.0  # Convert to seconds
+        
+        # Check if durations are within tolerance
+        difference = abs(audio_duration - instrumental_duration)
+        is_valid = difference <= tolerance_seconds
+        
+        return is_valid, audio_duration, instrumental_duration
+        
+    finally:
+        # Clean up temp files
+        import shutil
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+# Conforming decodes both files and runs ffmpeg in the API process (2Gi, /tmp is
+# in-memory); cap how many run at once per instance.
+_CONFORM_SEMAPHORE = asyncio.Semaphore(2)
+
+
+def _conform_mismatched_instrumental_sync(
+    storage: StorageService,
+    job_id: str,
+    audio_gcs_path: str,
+    instrumental_gcs_path: str,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    from backend.services.instrumental_conform import InstrumentalConformError, conform_instrumental
+
+    temp_dir = tempfile.mkdtemp(prefix="instrumental_conform_")
+    try:
+        audio_local = os.path.join(temp_dir, "audio" + Path(audio_gcs_path).suffix)
+        instrumental_local = os.path.join(temp_dir, "instrumental" + Path(instrumental_gcs_path).suffix)
+        out_local = os.path.join(temp_dir, "conformed.flac")
+        storage.download_file(audio_gcs_path, audio_local)
+        storage.download_file(instrumental_gcs_path, instrumental_local)
+        try:
+            result = conform_instrumental(audio_local, instrumental_local, out_local)
+        except InstrumentalConformError as e:
+            if not e.mismatch:
+                raise
+            logger.warning(f"Job {job_id}: instrumental could not be conformed: {e}")
+            return None
+        conformed_gcs_path = f"uploads/{job_id}/conformed/existing_instrumental.flac"
+        storage.upload_file(out_local, conformed_gcs_path)
+        return conformed_gcs_path, {**result.to_dict(), "original_gcs_path": instrumental_gcs_path}
+    finally:
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def _conform_mismatched_instrumental(
+    storage: StorageService,
+    job_id: str,
+    audio_gcs_path: str,
+    instrumental_gcs_path: str,
+    locale: str = "en",
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Line the instrumental up with the mix and fit it to the mix's length.
+
+    Returns (conformed GCS path, adjustment details), or None when the files
+    don't line up (almost certainly the wrong instrumental). The original upload
+    is kept; the conformed copy lives outside the ``audio/`` prefix so it's never
+    mistaken for the mixed audio. Infrastructure failures (GCS, ffmpeg crash)
+    raise a retryable 503 rather than cancelling the job as a "wrong file".
+    """
+    async with _CONFORM_SEMAPHORE:
+        try:
+            return await asyncio.to_thread(
+                _conform_mismatched_instrumental_sync, storage, job_id, audio_gcs_path, instrumental_gcs_path
+            )
+        except Exception as e:
+            logger.error(f"Job {job_id}: conforming instrumental failed unexpectedly: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail=t(locale, "jobs.instrumentalConformUnavailable"),
+            ) from e
+
+
+def _get_gcs_path_for_file(job_id: str, file_type: str, filename: str) -> str:
+    """Generate the GCS path for a file based on its type."""
+    ext = Path(filename).suffix.lower()
+    
+    if file_type == 'audio':
+        return f"uploads/{job_id}/audio/{filename}"
+    elif file_type == 'style_params':
+        return f"jobs/{job_id}/style/style_params.json"
+    elif file_type.startswith('style_'):
+        # Map style_intro_background -> intro_background, etc.
+        asset_key = file_type.replace('style_', '')
+        return f"jobs/{job_id}/style/{asset_key}{ext}"
+    elif file_type == 'lyrics_file':
+        return f"uploads/{job_id}/lyrics/user_lyrics{ext}"
+    elif file_type == 'existing_instrumental':
+        # Batch 3: user-provided instrumental file
+        return f"uploads/{job_id}/audio/existing_instrumental{ext}"
+    else:
+        return f"uploads/{job_id}/other/{filename}"
+
+
+@router.post("/jobs/create-with-upload-urls", response_model=CreateJobWithUploadUrlsResponse)
+async def create_job_with_upload_urls(
+    request: Request,
+    body: CreateJobWithUploadUrlsRequest,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    Create a karaoke generation job and return signed URLs for direct file upload to GCS.
+    
+    This is the first step of the two-step upload flow for large files:
+    1. Call this endpoint with job metadata and list of files to upload
+    2. Upload each file directly to GCS using the returned signed URLs
+    3. Call POST /api/jobs/{job_id}/uploads-complete to start processing
+    
+    Benefits of this flow:
+    - No file size limits (GCS supports up to 5TB)
+    - Faster uploads (direct to storage, no proxy)
+    - Works with any HTTP client (no HTTP/2 required)
+    - Resumable uploads possible with GCS
+    """
+    locale = get_locale_from_request(request)
+
+    # Check tenant feature flag
+    tenant_config = get_tenant_config_from_request(request)
+    if tenant_config and not tenant_config.features.file_upload:
+        raise HTTPException(
+            status_code=403,
+            detail="File upload is not available for this portal"
+        )
+
+    try:
+        # Validate files list
+        if not body.files:
+            raise HTTPException(status_code=400, detail=t(locale, "fileUpload.noAudioFileProvided"))
+
+        # Check that audio file is included
+        audio_files = [f for f in body.files if f.file_type == 'audio']
+        if not audio_files:
+            raise HTTPException(status_code=400, detail=t(locale, "fileUpload.noAudioFileProvided"))
+        if len(audio_files) > 1:
+            raise HTTPException(status_code=400, detail=t(locale, "fileUpload.multipleAudioFilesNotAllowed"))
+        
+        # Validate file types and extensions
+        for file_info in body.files:
+            if file_info.file_type not in VALID_FILE_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file_type: '{file_info.file_type}'. Valid types: {list(VALID_FILE_TYPES.keys())}"
+                )
+            
+            ext = Path(file_info.filename).suffix.lower()
+            allowed_extensions = VALID_FILE_TYPES[file_info.file_type]
+            if ext not in allowed_extensions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file extension '{ext}' for file_type '{file_info.file_type}'. Allowed: {allowed_extensions}"
+                )
+
+        track_code = normalize_track_code(body.track_code)
+        if track_code and not tenant_config:
+            raise HTTPException(status_code=400, detail="Track codes are only supported on tenant portals")
+
+        # Apply default distribution settings from environment if not provided
+        dist = get_effective_distribution_settings(
+            dropbox_path=body.dropbox_path,
+            gdrive_folder_id=body.gdrive_folder_id,
+            discord_webhook_url=body.discord_webhook_url,
+            brand_prefix=body.brand_prefix,
+        )
+
+        # Apply YouTube upload default from settings
+        # Use explicit value if provided, otherwise fall back to server default
+        settings = get_settings()
+        effective_enable_youtube_upload = body.enable_youtube_upload if body.enable_youtube_upload is not None else settings.default_enable_youtube_upload
+
+        # Apply default theme if none specified
+        effective_theme_id = body.theme_id
+        if effective_theme_id is None:
+            theme_service = get_theme_service()
+            effective_theme_id = theme_service.get_default_theme_id()
+            if effective_theme_id:
+                logger.info(f"Applying default theme: {effective_theme_id}")
+
+        # Apply tenant-specific overrides (brand, paths, privacy, theme)
+        effective_is_private = body.is_private
+        dist, effective_theme_id, effective_is_private, effective_enable_youtube_upload = _apply_tenant_overrides(
+            dist, tenant_config, effective_theme_id, effective_is_private, effective_enable_youtube_upload,
+        )
+        if tenant_config:
+            logger.info(f"Applied tenant overrides for '{tenant_config.id}': "
+                        f"brand={dist.brand_prefix}, private={effective_is_private}, theme={effective_theme_id}")
+
+        # Validate credentials for requested distribution services
+        # Skip YouTube/GDrive checks for private jobs (they won't use those services)
+        invalid_services = []
+        credential_manager = get_credential_manager()
+
+        if effective_enable_youtube_upload and not effective_is_private:
+            result = await asyncio.to_thread(credential_manager.check_youtube_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"youtube ({result.message})")
+
+        if dist.dropbox_path:
+            result = await asyncio.to_thread(credential_manager.check_dropbox_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"dropbox ({result.message})")
+
+        if dist.gdrive_folder_id and not effective_is_private:
+            result = await asyncio.to_thread(credential_manager.check_gdrive_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"gdrive ({result.message})")
+
+        if invalid_services:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "credentials_invalid",
+                    "message": f"The following distribution services need re-authorization: {', '.join(invalid_services)}",
+                    "invalid_services": invalid_services,
+                    "auth_url": "/api/auth/status"
+                }
+            )
+
+        # Extract request metadata for tracking
+        request_metadata = extract_request_metadata(request, created_from="signed_url_upload", auth_result=auth_result)
+
+        # Get original audio filename
+        audio_file = audio_files[0]
+
+        # Resolve CDG/TXT defaults based on theme
+        resolved_cdg, resolved_txt = resolve_cdg_txt_defaults(
+            effective_theme_id, body.enable_cdg, body.enable_txt
+        )
+
+        # Check if style_params is being uploaded (overrides theme)
+        has_style_params_upload = any(f.file_type == 'style_params' for f in body.files)
+
+        # Prefer authenticated user's email over request body
+        effective_user_email = auth_result.user_email or body.user_email
+
+        # Create job
+        job_create = JobCreate(
+            artist=body.artist,
+            title=body.title,
+            filename=audio_file.filename,
+            theme_id=effective_theme_id,
+            color_overrides=body.color_overrides or {},
+            enable_cdg=resolved_cdg,
+            enable_txt=resolved_txt,
+            brand_prefix=dist.brand_prefix,
+            enable_youtube_upload=effective_enable_youtube_upload,
+            youtube_description=body.youtube_description,
+            youtube_description_template=body.youtube_description,  # video_worker reads this field
+            discord_webhook_url=dist.discord_webhook_url,
+            webhook_url=body.webhook_url,
+            user_email=effective_user_email,
+            dropbox_path=dist.dropbox_path,
+            gdrive_folder_id=dist.gdrive_folder_id,
+            organised_dir_rclone_root=body.organised_dir_rclone_root,
+            lyrics_artist=body.lyrics_artist,
+            lyrics_title=body.lyrics_title,
+            subtitle_offset_ms=body.subtitle_offset_ms,
+            clean_instrumental_model=body.clean_instrumental_model,
+            backing_vocals_models=body.backing_vocals_models,
+            other_stems_models=body.other_stems_models,
+            request_metadata=request_metadata,
+            non_interactive=body.non_interactive,
+            review_mode=body.review_mode,
+            backing_preference=body.backing_preference,
+            translation_language=body.translation_language,
+            is_private=effective_is_private,
+            keep_brand_code=track_code,
+            # Tenant scoping
+            tenant_id=tenant_config.id if tenant_config else "",
+            # UI language the job was submitted in (admin-only signal)
+            locale=get_full_locale_from_request(request),
+        )
+        _require_theme_exists(effective_theme_id, locale)
+        job = job_manager.create_job(job_create, is_admin=auth_result.is_admin)
+        job_id = job.job_id
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("job.source", "signed_url_upload")
+        add_span_attribute("job.is_private", effective_is_private)
+
+        # Record job creation metric
+        metrics.record_job_created(job_id, source="upload")
+
+        # The job stays PENDING until the client PUTs the files and calls
+        # uploads-complete. Flag it so the dashboard can say "Waiting for upload"
+        # (not the misleading "Setting up") and the stale-upload sweep can cancel
+        # + refund jobs whose browser upload never finished.
+        job_manager.update_state_data(job_id, 'awaiting_upload', True)
+
+        # Store requires_audio_edit flag in state_data (start_job_processing parks
+        # at the audio editor when set)
+        if body.requires_audio_edit:
+            job_manager.update_state_data(job_id, 'requires_audio_edit', True)
+
+        # Stamp bulk-batch grouping so jobs created together can be grouped/filtered later.
+        if body.batch_id:
+            job_manager.update_state_data(job_id, 'batch_id', body.batch_id)
+            job_manager.update_state_data(job_id, 'created_from', 'tenant-bulk')
+
+        logger.info(f"Created job {job_id} for {body.artist} - {body.title} (signed URL upload flow)")
+
+        # If theme is set and no style_params uploaded, prepare theme style now
+        if effective_theme_id and not has_style_params_upload:
+            style_params_path, style_assets, youtube_desc = await asyncio.to_thread(
+                _prepare_theme_for_job,
+                job_id, effective_theme_id, body.color_overrides, locale=locale
+            )
+            # Update job with theme style data
+            update_data = {
+                'style_params_gcs_path': style_params_path,
+                'style_assets': style_assets,
+            }
+            if youtube_desc and not body.youtube_description:
+                update_data['youtube_description_template'] = youtube_desc
+            job_manager.update_job(job_id, update_data)
+            logger.info(f"Applied theme '{effective_theme_id}' to job {job_id}")
+        
+        # Generate upload URLs for each file. Two modes:
+        # - "signed_put" (default): single-shot signed PUT URL — simple, but an
+        #   interrupted upload restarts the whole file.
+        # - "resumable": GCS resumable session URI — the client uploads in chunks
+        #   with Content-Range and can resume mid-file after any interruption
+        #   (network switch, sleep, reload). Sessions are created with the
+        #   caller's Origin so GCS handles CORS on the session itself.
+        use_resumable = body.upload_mode == "resumable"
+        request_origin = request.headers.get("Origin") if use_resumable else None
+
+        def _build_upload_urls() -> list:
+            urls = []
+            for file_info in body.files:
+                gcs_path = _get_gcs_path_for_file(job_id, file_info.file_type, file_info.filename)
+                if use_resumable:
+                    upload_url = storage_service.create_resumable_upload_session(
+                        gcs_path,
+                        content_type=file_info.content_type,
+                        origin=request_origin,
+                    )
+                else:
+                    # Signed PUT URL (valid for 60 minutes)
+                    upload_url = storage_service.generate_signed_upload_url(
+                        gcs_path,
+                        content_type=file_info.content_type,
+                        expiration_minutes=60
+                    )
+                urls.append(SignedUploadUrl(
+                    file_type=file_info.file_type,
+                    gcs_path=gcs_path,
+                    upload_url=upload_url,
+                    content_type=file_info.content_type,
+                    resumable=use_resumable,
+                ))
+                logger.info(
+                    f"Generated {'resumable session' if use_resumable else 'signed upload URL'} "
+                    f"for {file_info.file_type}: {gcs_path}"
+                )
+            return urls
+
+        # Resumable session creation makes a network round-trip to GCS per file;
+        # run off the event loop. (Signed URLs sign locally but share the path.)
+        upload_urls = await asyncio.to_thread(_build_upload_urls)
+
+        return CreateJobWithUploadUrlsResponse(
+            status="success",
+            job_id=job_id,
+            message=t(locale, "fileUpload.urlCreationSuccess"),
+            upload_urls=upload_urls,
+            server_version=VERSION
+        )
+        
+    except HTTPException:
+        raise
+    except InsufficientCreditsError:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating job with upload URLs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "fileUpload.urlCreationError", error=str(e))) from e
+
+
+@router.post("/jobs/{job_id}/uploads-complete")
+async def mark_uploads_complete(
+    job_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: UploadsCompleteRequest,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    Mark file uploads as complete and start job processing.
+    
+    This is the second step of the signed URL upload flow:
+    1. Create job with POST /api/jobs/create-with-upload-urls
+    2. Upload files directly to GCS using signed URLs
+    3. Call this endpoint to validate uploads and start processing
+    
+    The endpoint will:
+    - Verify the job exists and is in PENDING state
+    - Validate that required files (audio) were uploaded
+    - Update job with GCS paths
+    - Trigger audio and lyrics workers
+    """
+    locale = get_locale_from_request(request)
+    try:
+        # Get job and verify it exists
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+        # A signed-in user may not finalize someone else's job. (Token auth without
+        # an email — trusted API integrations creating jobs on behalf of a
+        # body.user_email — keeps working, as before this check existed.)
+        if (
+            not auth_result.is_admin
+            and auth_result.user_email
+            and job.user_email
+            and auth_result.user_email.lower() != job.user_email.lower()
+        ):
+            raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+        # Verify job is in pending state
+        if job.status != JobStatus.PENDING:
+            raise HTTPException(
+                status_code=400,
+                detail=t(locale, "jobs.notCompleted", status=job.status)
+            )
+
+        # Validate required files
+        if 'audio' not in body.uploaded_files:
+            raise HTTPException(status_code=400, detail=t(locale, "fileUpload.noAudioFileProvided"))
+        
+        # Build GCS paths for uploaded files and validate they exist
+        update_data = {}
+        style_assets = {}
+        
+        for file_type in body.uploaded_files:
+            if file_type not in VALID_FILE_TYPES:
+                logger.warning(f"Unknown file_type in uploaded_files: {file_type}")
+                continue
+            
+            # Determine the GCS path - we need to find the actual file
+            prefix = f"uploads/{job_id}/"
+            if file_type == 'audio':
+                prefix = f"uploads/{job_id}/audio/"
+            elif file_type == 'style_params':
+                prefix = f"jobs/{job_id}/style/style_params"
+            elif file_type.startswith('style_'):
+                asset_key = file_type.replace('style_', '')
+                prefix = f"jobs/{job_id}/style/{asset_key}"
+            elif file_type == 'lyrics_file':
+                prefix = f"uploads/{job_id}/lyrics/user_lyrics"
+            elif file_type == 'existing_instrumental':
+                prefix = f"uploads/{job_id}/audio/existing_instrumental"
+            
+            # List files with this prefix to find the actual uploaded file
+            files = storage_service.list_files(prefix)
+            if file_type == 'audio':
+                files = _select_mixed_audio_files(files)
+            if not files:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File for '{file_type}' was not uploaded to GCS. Expected prefix: {prefix}"
+                )
+
+            # Use the first (and should be only) file found
+            gcs_path = files[0]
+            
+            # Update appropriate field based on file type
+            if file_type == 'audio':
+                update_data['input_media_gcs_path'] = gcs_path
+                update_data['filename'] = Path(gcs_path).name
+            elif file_type == 'style_params':
+                update_data['style_params_gcs_path'] = gcs_path
+                style_assets['style_params'] = gcs_path
+            elif file_type.startswith('style_'):
+                asset_key = file_type.replace('style_', '')
+                style_assets[asset_key] = gcs_path
+            elif file_type == 'lyrics_file':
+                update_data['lyrics_file_gcs_path'] = gcs_path
+            elif file_type == 'existing_instrumental':
+                update_data['existing_instrumental_gcs_path'] = gcs_path
+        
+        # Validate existing instrumental duration if provided (Batch 3)
+        audio_gcs_path = update_data.get('input_media_gcs_path')
+        instrumental_gcs_path = update_data.get('existing_instrumental_gcs_path')
+        
+        if audio_gcs_path and instrumental_gcs_path:
+            logger.info(f"Validating instrumental duration for job {job_id}")
+            try:
+                duration_valid, audio_duration, instrumental_duration = await _validate_audio_durations(
+                    storage_service, audio_gcs_path, instrumental_gcs_path
+                )
+                if not duration_valid:
+                    # Different edits of the same song (extra count-in, longer or
+                    # shorter outro) are lined up with the mix automatically; only a
+                    # file that doesn't correlate with the mix at all is rejected.
+                    conform = await _conform_mismatched_instrumental(
+                        storage_service, job_id, audio_gcs_path, instrumental_gcs_path, locale
+                    )
+                    if conform is None:
+                        # Cancel (refunds the credit) so the job isn't stranded PENDING
+                        # with uploaded files — the stale-upload sweep skips those.
+                        job_manager.cancel_job(
+                            job_id,
+                            reason=(
+                                f"Instrumental duration ({instrumental_duration:.2f}s) does not match "
+                                f"audio duration ({audio_duration:.2f}s) and could not be aligned"
+                            ),
+                        )
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "error": "duration_mismatch",
+                                "message": t(locale, "jobs.uploadDurationMismatchCancelled",
+                                             instrumental_duration=f"{instrumental_duration:.1f}",
+                                             audio_duration=f"{audio_duration:.1f}"),
+                                "audio_duration": audio_duration,
+                                "instrumental_duration": instrumental_duration,
+                                "difference": abs(audio_duration - instrumental_duration),
+                            }
+                        )
+                    conformed_path, conform_info = conform
+                    update_data['existing_instrumental_gcs_path'] = conformed_path
+                    job_manager.update_state_data(job_id, 'instrumental_conformed', conform_info)
+                    logger.info(f"Job {job_id}: conformed instrumental to mix length: {conform_info}")
+                else:
+                    logger.info(f"Duration validation passed: audio={audio_duration:.2f}s, instrumental={instrumental_duration:.2f}s")
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"Duration validation failed with error: {e}. Proceeding without validation.")
+                # Don't block the job if we can't validate - the video worker will fail more gracefully
+        
+        # uploads/ expires (bucket lifecycle): keep the user's instrumental at the job
+        # root (where the video pipeline stages it anyway) so later re-renders,
+        # regenerates and edits still have it.
+        if (update_data.get('existing_instrumental_gcs_path') or '').startswith('uploads/'):
+            from backend.utils.existing_instrumental import persistent_instrumental_path
+            source = update_data['existing_instrumental_gcs_path']
+            dest = persistent_instrumental_path(job_id, source)
+            try:
+                storage_service.copy_blob(source, dest)
+                update_data['existing_instrumental_gcs_path'] = dest
+                logger.info(f"Job {job_id}: persisted existing instrumental {source} -> {dest}")
+            except Exception as e:
+                logger.warning(f"Job {job_id}: couldn't persist existing instrumental {source}: {e}")
+
+        # Add style assets to update if any
+        if style_assets:
+            update_data['style_assets'] = style_assets
+        
+        # Update job with GCS paths
+        job_manager.update_job(job_id, update_data)
+        job_manager.delete_state_data_keys(job_id, ['awaiting_upload'])
+        
+        logger.info(f"Validated uploads for job {job_id}: {body.uploaded_files}")
+        
+        # Use centralized start_job_processing which handles:
+        # 1. Validates job exists and has input_media_gcs_path
+        # 2. Transitions to DOWNLOADING (raises InvalidStateTransitionError if invalid)
+        # 3. Triggers audio + lyrics workers in parallel
+        background_tasks.add_task(
+            job_manager.start_job_processing,
+            job_id,
+            5,  # progress
+            "Files uploaded, preparing to process"
+        )
+        
+        # Get distribution services info for response
+        credential_manager = get_credential_manager()
+        distribution_services: Dict[str, Any] = {}
+        
+        # Get fresh job data
+        updated_job = job_manager.get_job(job_id)
+        
+        if updated_job.dropbox_path:
+            dropbox_result = await asyncio.to_thread(credential_manager.check_dropbox_credentials)
+            distribution_services["dropbox"] = {
+                "enabled": True,
+                "path": updated_job.dropbox_path,
+                "credentials_valid": dropbox_result.status == CredentialStatus.VALID,
+            }
+        
+        if updated_job.gdrive_folder_id:
+            gdrive_result = await asyncio.to_thread(credential_manager.check_gdrive_credentials)
+            distribution_services["gdrive"] = {
+                "enabled": True,
+                "folder_id": updated_job.gdrive_folder_id,
+                "credentials_valid": gdrive_result.status == CredentialStatus.VALID,
+            }
+        
+        if updated_job.enable_youtube_upload:
+            youtube_result = await asyncio.to_thread(credential_manager.check_youtube_credentials)
+            distribution_services["youtube"] = {
+                "enabled": True,
+                "credentials_valid": youtube_result.status == CredentialStatus.VALID,
+            }
+        
+        if updated_job.discord_webhook_url:
+            distribution_services["discord"] = {
+                "enabled": True,
+            }
+        
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "message": t(locale, "fileUpload.uploadsCompleteSuccess"),
+            "files_validated": body.uploaded_files,
+            "style_assets": list(style_assets.keys()) if style_assets else [],
+            "server_version": VERSION,
+            "distribution_services": distribution_services,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error completing uploads for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "fileUpload.uploadsCompleteError", error=str(e))) from e
+
+
+# ============================================================================
+# URL-based Job Creation - For YouTube and other online video URLs
+# ============================================================================
+
+def _validate_url(url: Optional[str]) -> bool:
+    """
+    Validate that a URL is a supported video/audio URL.
+    
+    Supports YouTube, Vimeo, SoundCloud, and other platforms supported by yt-dlp.
+    
+    Args:
+        url: The URL to validate. Can be None or non-string.
+        
+    Returns:
+        True if valid URL, False otherwise.
+    """
+    # Handle None and non-string inputs safely
+    if url is None or not isinstance(url, str):
+        return False
+    
+    # Handle empty string
+    if not url:
+        return False
+    
+    # Basic URL validation
+    if not url.startswith(('http://', 'https://')):
+        return False
+    
+    # List of known supported domains (subset - yt-dlp supports many more)
+    supported_domains = [
+        'youtube.com', 'youtu.be', 'www.youtube.com', 'm.youtube.com',
+        'vimeo.com', 'www.vimeo.com',
+        'soundcloud.com', 'www.soundcloud.com',
+        'dailymotion.com', 'www.dailymotion.com',
+        'twitch.tv', 'www.twitch.tv',
+        'twitter.com', 'www.twitter.com', 'x.com', 'www.x.com',
+        'facebook.com', 'www.facebook.com', 'fb.watch',
+        'instagram.com', 'www.instagram.com',
+        'tiktok.com', 'www.tiktok.com',
+    ]
+    
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    
+    # Remove port if present
+    if ':' in domain:
+        domain = domain.split(':')[0]
+    
+    # Check if domain matches any supported domain
+    for supported in supported_domains:
+        if domain == supported or domain.endswith('.' + supported):
+            return True
+
+    # For other URLs, let yt-dlp try (it supports many more sites)
+    return True
+
+
+# Streaming services whose catalogue is DRM-protected and therefore cannot be
+# downloaded by yt-dlp / flacfetch. Submitting one of these only creates a job
+# that fails deep in the download stage with a cryptic "Unsupported URL" error
+# (and lets the user trigger a futile retry), so we reject them at submission
+# time with a clear, actionable message. Maps host -> friendly platform name;
+# matching is suffix-based, so e.g. "spotify.com" also covers open./play.
+_UNSUPPORTED_DRM_HOSTS = {
+    'music.apple.com': 'Apple Music',
+    'itunes.apple.com': 'Apple Music',
+    'spotify.com': 'Spotify',
+    'tidal.com': 'Tidal',
+    'deezer.com': 'Deezer',
+    'pandora.com': 'Pandora',
+}
+
+# Third-party tools that can download audio from a DRM platform, which the user
+# can then upload to us. Listed where we know of working options; platforms
+# without an entry fall back to a web-search link for "<platform> downloader".
+_DRM_DOWNLOADER_SUGGESTIONS = {
+    'Apple Music': ['https://am-dl.pages.dev', 'https://aplmate.com'],
+    'Spotify': ['https://spotdown.org', 'https://spotmate.online'],
+}
+
+
+def _drm_unsupported_detail(locale: str, platform: str) -> str:
+    """
+    Build the user-facing 400 message for a rejected DRM streaming URL.
+
+    Platforms with known downloader tools get a "download from {tools}, then
+    upload" message linking each tool; everything else gets a "search the web
+    for a '<platform> downloader'" message linking a Google search. Either way
+    the goal is to guide the user to obtain the audio and upload it themselves.
+    """
+    downloaders = _DRM_DOWNLOADER_SUGGESTIONS.get(platform)
+    if downloaders:
+        # Join with commas (locale-neutral) rather than an English "or"; the
+        # message wording frames them as options and LinkifiedText makes each
+        # URL clickable in the frontend.
+        return t(
+            locale, "audioSearch.drmUrlUnsupportedWithLink",
+            platform=platform, downloader=", ".join(downloaders),
+        )
+
+    from urllib.parse import quote_plus
+    search_url = "https://www.google.com/search?q=" + quote_plus(f"{platform} downloader")
+    return t(
+        locale, "audioSearch.drmUrlUnsupportedSearch",
+        platform=platform, searchUrl=search_url,
+    )
+
+
+def _unsupported_url_platform(url: Optional[str]) -> Optional[str]:
+    """
+    Return a friendly platform name if the URL belongs to a known DRM-protected
+    streaming service that cannot be downloaded, else None.
+
+    These links (Apple Music, Spotify, Tidal, Amazon Music, Deezer, Pandora) are
+    rejected at submission time instead of being allowed to create a job that
+    always fails deep in the download stage. Note: YouTube Music
+    (music.youtube.com) is downloadable and is deliberately NOT included.
+    """
+    if not url or not isinstance(url, str):
+        return None
+
+    from urllib.parse import urlparse
+    try:
+        # .hostname is already lowercased and strips userinfo, port, and IPv6
+        # brackets, so it's safer than parsing .netloc by hand.
+        domain = (urlparse(url).hostname or "").lower()
+    except (ValueError, TypeError):
+        return None
+
+    if not domain:
+        return None
+    # Normalise leading www.
+    if domain.startswith('www.'):
+        domain = domain[4:]
+
+    for host, platform in _UNSUPPORTED_DRM_HOSTS.items():
+        if domain == host or domain.endswith('.' + host):
+            return platform
+
+    # Amazon Music spans many country domains (music.amazon.com, .co.uk, .co.jp,
+    # .fr, .de, ...), so match the music.amazon.* prefix generically.
+    if domain == 'music.amazon' or domain.startswith('music.amazon.'):
+        return 'Amazon Music'
+
+    return None
+
+
+class ValidateUrlRequest(BaseModel):
+    """Request to pre-validate a URL before submitting a job."""
+    url: str = Field(..., description="The URL the user intends to submit")
+
+
+class ValidateUrlResponse(BaseModel):
+    """Whether a URL can be used for a job, with a friendly reason if not."""
+    supported: bool
+    detail: Optional[str] = None
+
+
+@router.post("/jobs/validate-url", response_model=ValidateUrlResponse)
+def validate_job_url(
+    request: Request,
+    body: ValidateUrlRequest,
+    auth_result: AuthResult = Depends(require_auth),
+) -> ValidateUrlResponse:
+    """
+    Lightweight pre-flight check for a job URL, used by the guided submission
+    flow so unsupported links are caught at the "Use this URL" step instead of
+    only at final submit. Mirrors the URL validation in create_job_from_url.
+    """
+    locale = get_locale_from_request(request)
+
+    platform = _unsupported_url_platform(body.url)
+    if platform:
+        return ValidateUrlResponse(
+            supported=False, detail=_drm_unsupported_detail(locale, platform)
+        )
+
+    if not _validate_url(body.url):
+        return ValidateUrlResponse(
+            supported=False,
+            detail="Invalid URL. Please provide a valid YouTube, Vimeo, SoundCloud, or other supported video URL.",
+        )
+
+    return ValidateUrlResponse(supported=True)
+
+
+async def _download_url_with_bot_block_retry(download_service, **download_kwargs) -> str:
+    """Download a URL, retrying once if YouTube bot-blocks flacfetch's session.
+
+    flacfetch already asks its credential keeper for fresh cookies and retries before
+    reporting a bot block. The delay here covers the case where that re-export was
+    still in progress or on cooldown.
+    """
+    try:
+        return await download_service.download(**download_kwargs)
+    except YouTubeDownloadError as e:
+        if not is_bot_block_error(e):
+            raise
+        logger.warning(
+            f"URL download bot-blocked, retrying in {BOT_BLOCK_RETRY_DELAY_SECONDS}s: {e}"
+        )
+    await asyncio.sleep(BOT_BLOCK_RETRY_DELAY_SECONDS)
+    return await download_service.download(**download_kwargs)
+
+
+@router.post("/jobs/create-from-url", response_model=CreateJobFromUrlResponse)
+async def create_job_from_url(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: CreateJobFromUrlRequest,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    Create a karaoke generation job from a YouTube or other online video URL.
+    
+    The backend will:
+    1. Validate the URL
+    2. Extract metadata (artist/title) from the URL if not provided
+    3. Create the job
+    4. Trigger the audio worker to download and process
+    
+    This is an alternative to file upload for cases where the audio
+    source is a YouTube video or other online content.
+    
+    Note: YouTube rate limiting may cause occasional download failures.
+    The backend will retry automatically.
+    """
+    locale = get_locale_from_request(request)
+
+    # Check tenant feature flag
+    tenant_config = get_tenant_config_from_request(request)
+    if tenant_config and not tenant_config.features.youtube_url:
+        raise HTTPException(
+            status_code=403,
+            detail="URL-based job creation is not available for this portal"
+        )
+
+    try:
+        # Reject DRM-protected streaming links upfront (Apple Music, Spotify,
+        # Tidal, etc.). These can never be downloaded, so creating a job would
+        # only fail deep in the pipeline with a cryptic error and tempt the user
+        # into a futile retry storm.
+        unsupported_platform = _unsupported_url_platform(body.url)
+        if unsupported_platform:
+            raise HTTPException(
+                status_code=400,
+                detail=_drm_unsupported_detail(locale, unsupported_platform),
+            )
+
+        # Validate URL
+        if not _validate_url(body.url):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid URL. Please provide a valid YouTube, Vimeo, SoundCloud, or other supported video URL."
+            )
+
+        # For YouTube URLs, check availability before creating the job
+        # This catches geo-restricted, private, and removed videos early
+        if _is_youtube_url(body.url):
+            youtube_service = get_youtube_download_service()
+            availability = await youtube_service.check_availability(body.url)
+
+            # flacfetch starts a cookie re-export when this check gets bot-blocked,
+            # so give it time and check again before turning the user away.
+            if availability and availability.get("is_bot_blocked"):
+                logger.warning(
+                    f"Availability check bot-blocked, rechecking in {BOT_BLOCK_RETRY_DELAY_SECONDS}s: {body.url}"
+                )
+                await asyncio.sleep(BOT_BLOCK_RETRY_DELAY_SECONDS)
+                availability = await youtube_service.check_availability(body.url)
+
+            if availability and not availability.get("available"):
+                error_msg = availability.get("error", "This video is not available")
+
+                if availability.get("is_geo_restricted"):
+                    detail = (
+                        "This YouTube video is not available in our server's region. "
+                        "Videos that are restricted to certain countries cannot be downloaded. "
+                        "Try using a different source for this song."
+                    )
+                elif availability.get("is_private"):
+                    detail = "This YouTube video is private and cannot be downloaded."
+                elif availability.get("is_removed"):
+                    detail = "This YouTube video has been removed and cannot be downloaded."
+                elif availability.get("is_bot_blocked"):
+                    detail = t(locale, "audioSearch.youtubeBotBlocked")
+                elif availability.get("is_age_restricted"):
+                    detail = "This YouTube video is age-restricted and cannot be downloaded."
+                else:
+                    detail = f"This YouTube video is unavailable: {error_msg}"
+
+                raise HTTPException(status_code=400, detail=detail)
+
+        # Apply default distribution settings from environment if not provided
+        dist = get_effective_distribution_settings(
+            dropbox_path=body.dropbox_path,
+            gdrive_folder_id=body.gdrive_folder_id,
+            discord_webhook_url=body.discord_webhook_url,
+            brand_prefix=body.brand_prefix,
+        )
+
+        # Apply YouTube upload default from settings
+        # Use explicit value if provided, otherwise fall back to server default
+        settings = get_settings()
+        effective_enable_youtube_upload = body.enable_youtube_upload if body.enable_youtube_upload is not None else settings.default_enable_youtube_upload
+
+        # Validate credentials for requested distribution services
+        # Skip YouTube/GDrive checks for private jobs (they won't use those services)
+        invalid_services = []
+        credential_manager = get_credential_manager()
+
+        if effective_enable_youtube_upload and not body.is_private:
+            result = await asyncio.to_thread(credential_manager.check_youtube_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"youtube ({result.message})")
+
+        if dist.dropbox_path:
+            result = await asyncio.to_thread(credential_manager.check_dropbox_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"dropbox ({result.message})")
+
+        if dist.gdrive_folder_id and not body.is_private:
+            result = await asyncio.to_thread(credential_manager.check_gdrive_credentials)
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"gdrive ({result.message})")
+
+        if invalid_services:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "credentials_invalid",
+                    "message": f"The following distribution services need re-authorization: {', '.join(invalid_services)}",
+                    "invalid_services": invalid_services,
+                    "auth_url": "/api/auth/status"
+                }
+            )
+
+        # Extract request metadata for tracking
+        request_metadata = extract_request_metadata(request, created_from="url", auth_result=auth_result)
+
+        # Use provided artist/title or leave as None (will be auto-detected by audio worker)
+        artist = body.artist
+        title = body.title
+
+        # Apply default theme if none specified
+        # This ensures all karaoke videos use the Nomad theme by default
+        effective_theme_id = body.theme_id
+        if effective_theme_id is None:
+            theme_service = get_theme_service()
+            effective_theme_id = theme_service.get_default_theme_id()
+            if effective_theme_id:
+                logger.info(f"Applying default theme: {effective_theme_id}")
+
+        # Resolve CDG/TXT defaults based on theme
+        resolved_cdg, resolved_txt = resolve_cdg_txt_defaults(
+            effective_theme_id, body.enable_cdg, body.enable_txt
+        )
+
+        # Prefer authenticated user's email over request body
+        effective_user_email = auth_result.user_email or body.user_email
+
+        # Create job with URL
+        job_create = JobCreate(
+            url=body.url,
+            artist=artist,
+            title=title,
+            filename=None,  # No file uploaded
+            theme_id=effective_theme_id,
+            color_overrides=body.color_overrides or {},
+            enable_cdg=resolved_cdg,
+            enable_txt=resolved_txt,
+            brand_prefix=dist.brand_prefix,
+            enable_youtube_upload=effective_enable_youtube_upload,
+            youtube_description=body.youtube_description,
+            discord_webhook_url=dist.discord_webhook_url,
+            webhook_url=body.webhook_url,
+            user_email=effective_user_email,
+            dropbox_path=dist.dropbox_path,
+            gdrive_folder_id=dist.gdrive_folder_id,
+            organised_dir_rclone_root=body.organised_dir_rclone_root,
+            lyrics_artist=body.lyrics_artist,
+            lyrics_title=body.lyrics_title,
+            subtitle_offset_ms=body.subtitle_offset_ms,
+            clean_instrumental_model=body.clean_instrumental_model,
+            backing_vocals_models=body.backing_vocals_models,
+            other_stems_models=body.other_stems_models,
+            request_metadata=request_metadata,
+            non_interactive=body.non_interactive,
+            review_mode=body.review_mode,
+            backing_preference=body.backing_preference,
+            translation_language=body.translation_language,
+            is_private=body.is_private,
+            # Tenant scoping
+            tenant_id=tenant_config.id if tenant_config else "",
+            # UI language the job was submitted in (admin-only signal)
+            locale=get_full_locale_from_request(request),
+        )
+        _require_theme_exists(effective_theme_id, locale)
+        job = job_manager.create_job(job_create, is_admin=auth_result.is_admin)
+        job_id = job.job_id
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("job.source", "url")
+        add_span_attribute("job.is_private", body.is_private)
+
+        # Record job creation metric
+        metrics.record_job_created(job_id, source="url")
+
+        # If theme is set, prepare theme style now
+        if effective_theme_id:
+            style_params_path, style_assets, youtube_desc = await asyncio.to_thread(
+                _prepare_theme_for_job,
+                job_id, effective_theme_id, body.color_overrides, locale=locale
+            )
+            # Update job with theme style data
+            update_data = {
+                'style_params_gcs_path': style_params_path,
+                'style_assets': style_assets,
+            }
+            if youtube_desc and not body.youtube_description:
+                update_data['youtube_description_template'] = youtube_desc
+            job_manager.update_job(job_id, update_data)
+            logger.info(f"Applied theme '{effective_theme_id}' to job {job_id}")
+
+        # Store requires_audio_edit flag in state_data
+        if body.requires_audio_edit:
+            job_manager.update_state_data(job_id, 'requires_audio_edit', True)
+
+        logger.info(f"Created URL-based job {job_id} for URL: {body.url}")
+        if artist:
+            logger.info(f"  Artist: {artist}")
+        if title:
+            logger.info(f"  Title: {title}")
+
+        # Download audio NOW via the flacfetch service for ALL URLs (YouTube and
+        # any other yt-dlp-supported site, e.g. Facebook/SoundCloud/TikTok).
+        # flacfetch is the sole downloader — no yt-dlp ever runs on Cloud Run.
+        # Downloading up front (before the GPU worker starts) also keeps the GPU
+        # idle until the audio is in GCS.
+        logger.info(f"Downloading audio from URL via flacfetch: {body.url}")
+        try:
+            download_service = get_youtube_download_service()
+            audio_gcs_path = await _download_url_with_bot_block_retry(
+                download_service,
+                url=body.url,
+                job_id=job_id,
+                artist=artist,
+                title=title,
+            )
+
+            # Update job with the downloaded audio path
+            job_manager.update_job(job_id, {
+                'input_media_gcs_path': audio_gcs_path,
+                'filename': os.path.basename(audio_gcs_path),
+            })
+
+            logger.info(f"Audio downloaded to GCS: {audio_gcs_path}")
+
+            # Use centralized start_job_processing which handles:
+            # 1. Validates job exists and has input_media_gcs_path
+            # 2. Transitions PENDING → DOWNLOADING (raises if invalid)
+            # 3. Triggers audio + lyrics workers in parallel
+            background_tasks.add_task(
+                job_manager.start_job_processing,
+                job_id,
+                10,  # progress
+                "Audio downloaded, starting processing"
+            )
+
+        except YouTubeDownloadError as e:
+            if is_bot_block_error(e):
+                # Our problem, not the user's or the video's: don't show them yt-dlp's
+                # advice about cookies. fail_job raises the alert, so WARNING here.
+                logger.warning(f"URL download still bot-blocked after retry: {e}")
+                detail = t(locale, "audioSearch.youtubeBotBlocked")
+                job_manager.fail_job(
+                    job_id,
+                    detail,
+                    error_details={"code": "youtube_bot_block", "raw_error": str(e)},
+                )
+                raise HTTPException(status_code=500, detail=detail)
+            logger.error(f"URL download failed: {e}")
+            job_manager.fail_job(job_id, f"Download failed: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=t(locale, "audioSearch.youtubeDownloadError", error=str(e))
+            )
+
+        return CreateJobFromUrlResponse(
+            status="success",
+            job_id=job_id,
+            message="Job created. Audio will be downloaded from URL.",
+            detected_artist=artist,
+            detected_title=title,
+            server_version=VERSION
+        )
+        
+    except HTTPException:
+        raise
+    except InsufficientCreditsError:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating job from URL: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ============================================================================
+# Finalise-Only Upload Flow (Batch 6)
+# ============================================================================
+
+def _get_gcs_path_for_finalise_file(job_id: str, file_type: str, filename: str) -> str:
+    """Generate the GCS path for a finalise-only file based on its type."""
+    ext = Path(filename).suffix.lower()
+    
+    # Map file types to appropriate GCS paths
+    if file_type == 'audio':
+        return f"uploads/{job_id}/audio/{filename}"
+    elif file_type == 'with_vocals':
+        return f"jobs/{job_id}/videos/with_vocals{ext}"
+    elif file_type == 'title_screen':
+        return f"jobs/{job_id}/screens/title{ext}"
+    elif file_type == 'end_screen':
+        return f"jobs/{job_id}/screens/end{ext}"
+    elif file_type == 'title_jpg':
+        return f"jobs/{job_id}/screens/title.jpg"
+    elif file_type == 'title_png':
+        return f"jobs/{job_id}/screens/title.png"
+    elif file_type == 'end_jpg':
+        return f"jobs/{job_id}/screens/end.jpg"
+    elif file_type == 'end_png':
+        return f"jobs/{job_id}/screens/end.png"
+    elif file_type == 'instrumental_clean':
+        return f"jobs/{job_id}/stems/instrumental_clean{ext}"
+    elif file_type == 'instrumental_backing':
+        return f"jobs/{job_id}/stems/instrumental_with_backing{ext}"
+    elif file_type == 'lrc':
+        return f"jobs/{job_id}/lyrics/karaoke.lrc"
+    elif file_type == 'ass':
+        return f"jobs/{job_id}/lyrics/karaoke.ass"
+    elif file_type == 'corrections':
+        return f"jobs/{job_id}/lyrics/corrections.json"
+    elif file_type == 'style_params':
+        return f"jobs/{job_id}/style/style_params.json"
+    else:
+        return f"uploads/{job_id}/other/{filename}"
+
+
+@router.post("/jobs/create-finalise-only")
+def create_finalise_only_job(
+    request: Request,
+    body: CreateFinaliseOnlyJobRequest,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    Create a finalise-only job for continuing from a local prep phase.
+    
+    This endpoint is used when:
+    1. User previously ran --prep-only which created local prep outputs
+    2. User optionally made manual edits to stems, lyrics, etc.
+    3. User now wants cloud to handle finalisation (encoding, distribution)
+    
+    Required files:
+    - with_vocals: The karaoke video from prep (*.mkv or *.mov)
+    - title_screen: Title screen video
+    - end_screen: End screen video
+    - instrumental_clean or instrumental_backing: At least one instrumental
+    
+    The endpoint returns signed URLs for uploading all the prep files.
+    """
+    locale = get_locale_from_request(request)
+
+    # Check tenant feature flag - finalise-only requires file upload capability
+    tenant_config = get_tenant_config_from_request(request)
+    if tenant_config and not tenant_config.features.file_upload:
+        raise HTTPException(
+            status_code=403,
+            detail="File upload is not available for this portal"
+        )
+
+    try:
+        # Validate files list
+        if not body.files:
+            raise HTTPException(status_code=400, detail="At least one file is required")
+        
+        # Validate file types
+        file_types = {f.file_type for f in body.files}
+        
+        # Check required files for finalise-only
+        if 'with_vocals' not in file_types:
+            raise HTTPException(
+                status_code=400,
+                detail="with_vocals video is required for finalise-only mode"
+            )
+        if 'title_screen' not in file_types:
+            raise HTTPException(
+                status_code=400,
+                detail="title_screen video is required for finalise-only mode"
+            )
+        if 'end_screen' not in file_types:
+            raise HTTPException(
+                status_code=400,
+                detail="end_screen video is required for finalise-only mode"
+            )
+        if 'instrumental_clean' not in file_types and 'instrumental_backing' not in file_types:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one instrumental (clean or backing) is required"
+            )
+        
+        # Validate file extensions
+        for file_info in body.files:
+            if file_info.file_type not in FINALISE_ONLY_FILE_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file_type: '{file_info.file_type}'. Valid types: {list(FINALISE_ONLY_FILE_TYPES.keys())}"
+                )
+            
+            ext = Path(file_info.filename).suffix.lower()
+            allowed_extensions = FINALISE_ONLY_FILE_TYPES[file_info.file_type]
+            if ext not in allowed_extensions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file extension '{ext}' for file_type '{file_info.file_type}'. Allowed: {allowed_extensions}"
+                )
+        
+        # Apply default distribution settings
+        dist = get_effective_distribution_settings(
+            dropbox_path=body.dropbox_path,
+            gdrive_folder_id=body.gdrive_folder_id,
+            discord_webhook_url=body.discord_webhook_url,
+            brand_prefix=body.brand_prefix,
+        )
+
+        # Apply YouTube upload default from settings
+        # Use explicit value if provided, otherwise fall back to server default
+        settings = get_settings()
+        effective_enable_youtube_upload = body.enable_youtube_upload if body.enable_youtube_upload is not None else settings.default_enable_youtube_upload
+
+        # Validate distribution credentials if services are requested
+        # Skip YouTube/GDrive checks for private jobs (they won't use those services)
+        invalid_services = []
+        credential_manager = get_credential_manager()
+
+        if effective_enable_youtube_upload and not body.is_private:
+            result = credential_manager.check_youtube_credentials()
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"youtube ({result.message})")
+
+        if dist.dropbox_path:
+            result = credential_manager.check_dropbox_credentials()
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"dropbox ({result.message})")
+
+        if dist.gdrive_folder_id and not body.is_private:
+            result = credential_manager.check_gdrive_credentials()
+            if result.status != CredentialStatus.VALID:
+                invalid_services.append(f"gdrive ({result.message})")
+
+        if invalid_services:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "credentials_invalid",
+                    "message": f"The following distribution services need re-authorization: {', '.join(invalid_services)}",
+                    "invalid_services": invalid_services,
+                    "auth_url": "/api/auth/status"
+                }
+            )
+
+        # Extract request metadata
+        request_metadata = extract_request_metadata(request, created_from="finalise_only_upload", auth_result=auth_result)
+
+        # Apply default theme if none specified
+        # This ensures all karaoke videos use the Nomad theme by default
+        effective_theme_id = body.theme_id
+        if effective_theme_id is None:
+            theme_service = get_theme_service()
+            effective_theme_id = theme_service.get_default_theme_id()
+            if effective_theme_id:
+                logger.info(f"Applying default theme: {effective_theme_id}")
+
+        # Resolve CDG/TXT defaults based on theme
+        resolved_cdg, resolved_txt = resolve_cdg_txt_defaults(
+            effective_theme_id, body.enable_cdg, body.enable_txt
+        )
+
+        # Check if style_params is being uploaded (overrides theme)
+        has_style_params_upload = any(f.file_type == 'style_params' for f in body.files)
+
+        # Use authenticated user's email
+        effective_user_email = auth_result.user_email
+
+        # Create job with finalise_only=True
+        job_create = JobCreate(
+            artist=body.artist,
+            title=body.title,
+            filename="finalise_only",  # No single audio file - using prep outputs
+            theme_id=effective_theme_id,
+            color_overrides=body.color_overrides or {},
+            enable_cdg=resolved_cdg,
+            enable_txt=resolved_txt,
+            brand_prefix=dist.brand_prefix,
+            enable_youtube_upload=effective_enable_youtube_upload,
+            youtube_description=body.youtube_description,
+            discord_webhook_url=dist.discord_webhook_url,
+            dropbox_path=dist.dropbox_path,
+            gdrive_folder_id=dist.gdrive_folder_id,
+            user_email=effective_user_email,
+            finalise_only=True,
+            keep_brand_code=body.keep_brand_code,
+            request_metadata=request_metadata,
+            is_private=body.is_private,
+            # Tenant scoping
+            tenant_id=tenant_config.id if tenant_config else "",
+            # UI language the job was submitted in (admin-only signal)
+            locale=get_full_locale_from_request(request),
+        )
+        _require_theme_exists(effective_theme_id, locale)
+        job = job_manager.create_job(job_create, is_admin=auth_result.is_admin)
+        job_id = job.job_id
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("job.source", "finalise")
+        add_span_attribute("job.is_private", body.is_private)
+
+        # Record job creation metric
+        metrics.record_job_created(job_id, source="finalise")
+
+        logger.info(f"Created finalise-only job {job_id} for {body.artist} - {body.title}")
+
+        # If theme is set and no style_params uploaded, prepare theme style now
+        if effective_theme_id and not has_style_params_upload:
+            style_params_path, style_assets, youtube_desc = _prepare_theme_for_job(
+                job_id, effective_theme_id, body.color_overrides, locale=locale
+            )
+            # Update job with theme style data
+            update_data = {
+                'style_params_gcs_path': style_params_path,
+                'style_assets': style_assets,
+            }
+            if youtube_desc and not body.youtube_description:
+                update_data['youtube_description_template'] = youtube_desc
+            job_manager.update_job(job_id, update_data)
+            logger.info(f"Applied theme '{effective_theme_id}' to job {job_id}")
+        
+        # Generate signed upload URLs for each file
+        upload_urls = []
+        for file_info in body.files:
+            gcs_path = _get_gcs_path_for_finalise_file(job_id, file_info.file_type, file_info.filename)
+            
+            # Generate signed upload URL (valid for 60 minutes)
+            signed_url = storage_service.generate_signed_upload_url(
+                gcs_path,
+                content_type=file_info.content_type,
+                expiration_minutes=60
+            )
+            
+            upload_urls.append(SignedUploadUrl(
+                file_type=file_info.file_type,
+                gcs_path=gcs_path,
+                upload_url=signed_url,
+                content_type=file_info.content_type
+            ))
+            
+            logger.info(f"Generated signed upload URL for {file_info.file_type}: {gcs_path}")
+        
+        return CreateJobWithUploadUrlsResponse(
+            status="success",
+            job_id=job_id,
+            message="Finalise-only job created. Upload files to the provided URLs, then call /api/jobs/{job_id}/finalise-uploads-complete",
+            upload_urls=upload_urls,
+            server_version=VERSION
+        )
+        
+    except HTTPException:
+        raise
+    except InsufficientCreditsError:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating finalise-only job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/jobs/{job_id}/finalise-uploads-complete")
+def mark_finalise_uploads_complete(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    body: UploadsCompleteRequest,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    Mark finalise-only file uploads as complete and start video generation.
+
+    This is called after uploading prep outputs for a finalise-only job.
+    The job will transition directly to AWAITING_INSTRUMENTAL_SELECTION.
+
+    Note: Finalise-only jobs are a special case where users upload pre-rendered
+    video and only need to select instrumental. For normal jobs, instrumental
+    selection is combined with lyrics review in a single step.
+    """
+    try:
+        # Get job and verify it exists
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        
+        # Verify job is in pending state and is finalise-only
+        if job.status != JobStatus.PENDING:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job {job_id} is not in pending state (current: {job.status}). Cannot complete uploads."
+            )
+        
+        if not job.finalise_only:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job {job_id} is not a finalise-only job. Use /api/jobs/{{job_id}}/uploads-complete instead."
+            )
+        
+        # Validate required files were uploaded
+        required_files = {'with_vocals', 'title_screen', 'end_screen'}
+        uploaded_set = set(body.uploaded_files)
+        
+        missing_files = required_files - uploaded_set
+        if missing_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing required files: {missing_files}"
+            )
+        
+        # Require at least one instrumental
+        if 'instrumental_clean' not in uploaded_set and 'instrumental_backing' not in uploaded_set:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one instrumental (clean or backing) is required"
+            )
+        
+        # Build file_urls structure from uploaded files
+        file_urls: Dict[str, Dict[str, str]] = {
+            'videos': {},
+            'screens': {},
+            'stems': {},
+            'lyrics': {},
+        }
+        
+        for file_type in body.uploaded_files:
+            if file_type not in FINALISE_ONLY_FILE_TYPES:
+                logger.warning(f"Unknown file_type in uploaded_files: {file_type}")
+                continue
+            
+            # Determine the GCS path - we need to find the actual file
+            if file_type == 'audio':
+                prefix = f"uploads/{job_id}/audio/"
+            elif file_type == 'with_vocals':
+                prefix = f"jobs/{job_id}/videos/with_vocals"
+            elif file_type == 'title_screen':
+                prefix = f"jobs/{job_id}/screens/title"
+            elif file_type == 'end_screen':
+                prefix = f"jobs/{job_id}/screens/end"
+            elif file_type == 'title_jpg':
+                prefix = f"jobs/{job_id}/screens/title.jpg"
+            elif file_type == 'title_png':
+                prefix = f"jobs/{job_id}/screens/title.png"
+            elif file_type == 'end_jpg':
+                prefix = f"jobs/{job_id}/screens/end.jpg"
+            elif file_type == 'end_png':
+                prefix = f"jobs/{job_id}/screens/end.png"
+            elif file_type == 'instrumental_clean':
+                prefix = f"jobs/{job_id}/stems/instrumental_clean"
+            elif file_type == 'instrumental_backing':
+                prefix = f"jobs/{job_id}/stems/instrumental_with_backing"
+            elif file_type == 'lrc':
+                prefix = f"jobs/{job_id}/lyrics/karaoke.lrc"
+            elif file_type == 'ass':
+                prefix = f"jobs/{job_id}/lyrics/karaoke.ass"
+            elif file_type == 'corrections':
+                prefix = f"jobs/{job_id}/lyrics/corrections"
+            elif file_type == 'style_params':
+                prefix = f"jobs/{job_id}/style/style_params"
+            else:
+                continue
+            
+            # List files with this prefix to find the actual uploaded file
+            files = storage_service.list_files(prefix)
+            if not files:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File for '{file_type}' was not uploaded to GCS. Expected prefix: {prefix}"
+                )
+            
+            gcs_path = files[0]
+            
+            # Map to file_urls structure
+            if file_type == 'audio':
+                pass  # Handled separately
+            elif file_type == 'with_vocals':
+                file_urls['videos']['with_vocals'] = gcs_path
+            elif file_type == 'title_screen':
+                file_urls['screens']['title'] = gcs_path
+            elif file_type == 'end_screen':
+                file_urls['screens']['end'] = gcs_path
+            elif file_type == 'title_jpg':
+                file_urls['screens']['title_jpg'] = gcs_path
+            elif file_type == 'title_png':
+                file_urls['screens']['title_png'] = gcs_path
+            elif file_type == 'end_jpg':
+                file_urls['screens']['end_jpg'] = gcs_path
+            elif file_type == 'end_png':
+                file_urls['screens']['end_png'] = gcs_path
+            elif file_type == 'instrumental_clean':
+                file_urls['stems']['instrumental_clean'] = gcs_path
+            elif file_type == 'instrumental_backing':
+                file_urls['stems']['instrumental_with_backing'] = gcs_path
+            elif file_type == 'lrc':
+                file_urls['lyrics']['lrc'] = gcs_path
+            elif file_type == 'ass':
+                file_urls['lyrics']['ass'] = gcs_path
+            elif file_type == 'corrections':
+                file_urls['lyrics']['corrections'] = gcs_path
+        
+        # Get audio path if uploaded
+        audio_gcs_path = None
+        if 'audio' in body.uploaded_files:
+            audio_files = storage_service.list_files(f"uploads/{job_id}/audio/")
+            if audio_files:
+                audio_gcs_path = audio_files[0]
+        
+        # Update job with file paths
+        update_data = {
+            'file_urls': file_urls,
+            'finalise_only': True,
+        }
+        
+        if audio_gcs_path:
+            update_data['input_media_gcs_path'] = audio_gcs_path
+        
+        # Mark parallel processing as complete (we're skipping it)
+        update_data['state_data'] = {
+            'audio_complete': True,
+            'lyrics_complete': True,
+            'finalise_only': True,
+        }
+        
+        job_manager.update_job(job_id, update_data)
+        
+        logger.info(f"Validated finalise-only uploads for job {job_id}: {body.uploaded_files}")
+        
+        # Transition directly to AWAITING_INSTRUMENTAL_SELECTION
+        job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.AWAITING_INSTRUMENTAL_SELECTION,
+            progress=80,
+            message="Prep files uploaded - select your instrumental"
+        )
+        
+        # Get distribution services info for response
+        credential_manager = get_credential_manager()
+        distribution_services: Dict[str, Any] = {}
+        
+        updated_job = job_manager.get_job(job_id)
+        
+        if updated_job.dropbox_path:
+            dropbox_result = credential_manager.check_dropbox_credentials()
+            distribution_services["dropbox"] = {
+                "enabled": True,
+                "path": updated_job.dropbox_path,
+                "credentials_valid": dropbox_result.status == CredentialStatus.VALID,
+            }
+        
+        if updated_job.gdrive_folder_id:
+            gdrive_result = credential_manager.check_gdrive_credentials()
+            distribution_services["gdrive"] = {
+                "enabled": True,
+                "folder_id": updated_job.gdrive_folder_id,
+                "credentials_valid": gdrive_result.status == CredentialStatus.VALID,
+            }
+        
+        if updated_job.enable_youtube_upload:
+            youtube_result = credential_manager.check_youtube_credentials()
+            distribution_services["youtube"] = {
+                "enabled": True,
+                "credentials_valid": youtube_result.status == CredentialStatus.VALID,
+            }
+        
+        if updated_job.discord_webhook_url:
+            distribution_services["discord"] = {
+                "enabled": True,
+            }
+        
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "message": "Finalise-only uploads validated. Select instrumental to continue.",
+            "files_validated": body.uploaded_files,
+            "server_version": VERSION,
+            "distribution_services": distribution_services,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error completing finalise-only uploads for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ============================================================================
+# Post-creation style asset upload endpoints (for private/custom branding)
+# ============================================================================
+
+@router.post("/jobs/{job_id}/style-upload-urls")
+def get_style_upload_urls(
+    job_id: str,
+    body: StyleUploadUrlsRequest,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Get signed GCS upload URLs for style assets on an already-created job.
+
+    Used by the guided flow to upload custom backgrounds/images after job creation.
+    Only accepts style file types (backgrounds). The job must not have progressed
+    past the screen generation stage.
+    """
+    try:
+        # Get job and verify it exists
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+        # Verify ownership (non-admin users can only modify their own jobs)
+        if auth_result.user_type != UserType.ADMIN:
+            if job.user_email != auth_result.user_email:
+                raise HTTPException(status_code=403, detail="Not authorized to modify this job")
+
+        # Check cutoff - reject if job is too far along
+        try:
+            current_status = JobStatus(job.status)
+        except ValueError:
+            current_status = None
+        if current_status in STYLE_UPLOAD_CUTOFF_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job {job_id} is past the style upload cutoff (status: {job.status}). "
+                        "Style assets must be uploaded before screen generation begins."
+            )
+
+        # Validate file types - only style files allowed
+        upload_urls = []
+        for file_info in body.files:
+            if file_info.file_type not in STYLE_FILE_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file_type for style upload: '{file_info.file_type}'. "
+                           f"Allowed: {list(STYLE_FILE_TYPES.keys())}"
+                )
+
+            ext = Path(file_info.filename).suffix.lower()
+            allowed_extensions = STYLE_FILE_TYPES[file_info.file_type]
+            if ext not in allowed_extensions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid extension '{ext}' for {file_info.file_type}. Allowed: {allowed_extensions}"
+                )
+
+            gcs_path = _get_gcs_path_for_file(job_id, file_info.file_type, file_info.filename)
+            signed_url = storage_service.generate_signed_upload_url(
+                gcs_path, file_info.content_type
+            )
+
+            upload_urls.append({
+                "file_type": file_info.file_type,
+                "gcs_path": gcs_path,
+                "upload_url": signed_url,
+                "content_type": file_info.content_type,
+            })
+
+        logger.info(f"Generated {len(upload_urls)} style upload URLs for job {job_id}")
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "upload_urls": upload_urls,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating style upload URLs for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/jobs/{job_id}/style-uploads-complete")
+def complete_style_uploads(
+    job_id: str,
+    body: StyleUploadsCompleteRequest,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Finalize style asset uploads on an existing job.
+
+    Verifies uploaded files exist in GCS, merges them into the job's style_assets,
+    and re-generates style_params.json with any color overrides applied.
+    """
+    try:
+        # Get job and verify it exists
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+        # Verify ownership
+        if auth_result.user_type != UserType.ADMIN:
+            if job.user_email != auth_result.user_email:
+                raise HTTPException(status_code=403, detail="Not authorized to modify this job")
+
+        # Check cutoff
+        try:
+            current_status = JobStatus(job.status)
+        except ValueError:
+            current_status = None
+        if current_status in STYLE_UPLOAD_CUTOFF_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job {job_id} is past the style upload cutoff (status: {job.status})."
+            )
+
+        # Verify uploaded files exist in GCS and build asset mapping
+        new_style_assets = {}
+        for file_type in body.uploaded_files:
+            if file_type not in STYLE_FILE_TYPES:
+                logger.warning(f"Unknown style file_type: {file_type}")
+                continue
+
+            asset_key = file_type.replace('style_', '')
+            prefix = f"jobs/{job_id}/style/{asset_key}"
+            files = storage_service.list_files(prefix)
+            if not files:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File for '{file_type}' was not uploaded to GCS. Expected prefix: {prefix}"
+                )
+            new_style_assets[asset_key] = files[0]
+
+        # Merge with existing style_assets (preserve font, other theme assets)
+        existing_assets = dict(job.style_assets) if job.style_assets else {}
+        existing_assets.update(new_style_assets)
+
+        update_data: Dict[str, Any] = {"style_assets": existing_assets}
+
+        # If the job has a theme, reload its style_params, apply overrides + custom paths
+        theme_id = getattr(job, 'theme_id', None)
+        if theme_id:
+            theme_service = get_theme_service()
+            style_params = theme_service.get_theme_style_params(theme_id)
+            if style_params:
+                # Apply color overrides if provided
+                if body.color_overrides:
+                    color_overrides_model = ColorOverrides(**body.color_overrides)
+                    style_params = theme_service.apply_color_overrides(style_params, color_overrides_model)
+
+                # Update asset paths in style_params to use theme paths first
+                style_params = theme_service._update_asset_paths_in_style(theme_id, style_params)
+
+                # Overwrite background paths with custom uploads
+                for asset_key, gcs_path in new_style_assets.items():
+                    bucket_name = storage_service.bucket.name
+                    gcs_uri = f"gs://{bucket_name}/{gcs_path}"
+                    if asset_key == "intro_background" and "intro" in style_params:
+                        style_params["intro"]["background_image"] = gcs_uri
+                    elif asset_key == "karaoke_background" and "karaoke" in style_params:
+                        style_params["karaoke"]["background_image"] = gcs_uri
+                    elif asset_key == "end_background" and "end" in style_params:
+                        style_params["end"]["background_image"] = gcs_uri
+
+                # Upload updated style_params.json
+                style_params_path = f"jobs/{job_id}/style/style_params.json"
+                storage_service.upload_json(style_params_path, style_params)
+                update_data["style_params_gcs_path"] = style_params_path
+
+        # Update job in Firestore
+        job_manager.update_job(job_id, update_data)
+
+        logger.info(f"Completed style uploads for job {job_id}: {list(new_style_assets.keys())}")
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "message": "Style assets applied successfully.",
+            "assets_updated": list(new_style_assets.keys()),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error completing style uploads for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e

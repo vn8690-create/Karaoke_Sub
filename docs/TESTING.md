@@ -1,0 +1,1113 @@
+# Testing & Code Quality Guide
+
+This document defines testing standards, code quality principles, and CI requirements for Nomad Karaoke Gen.
+
+## Critical: All Tests Must Pass
+
+**All tests must pass before merging.** If tests fail:
+
+1. **Fix them** - Don't assume failures are "pre-existing issues"
+2. **Investigate** - Understand why the test is failing
+3. **Don't dismiss** - If a test fails, either the code or test needs fixing
+
+CI blocks merging if tests fail. If you encounter failures locally, fix them as part of your work.
+
+### Running Tests
+
+```bash
+# Run ALL tests (backend + frontend) - installs deps automatically
+make test
+
+# Run subsets for faster iteration
+make test-backend   # Backend only (~2 min)
+make test-frontend  # Frontend only (~3 min)
+```
+
+Dependencies are installed automatically when needed.
+
+## Critical: Automate Manual Testing Steps
+
+**If your plan includes "Manual Testing" steps, convert them to automated Playwright E2E tests.**
+
+When you write a plan with steps like "manually verify the dialog opens" or "test that the button appears for complete jobs", these are perfect candidates for automated E2E tests. Don't leave verification as a manual step that may never happen.
+
+### Why Automate?
+
+1. **Codifies expected behavior** - The test documents exactly what should happen
+2. **Repeatable verification** - Can re-run after future changes to catch regressions
+3. **Actually gets executed** - Manual steps are often skipped; automated tests run reliably
+4. **Proves the feature works** - Passing test = working feature in production
+
+### Production E2E Tests Are Valuable
+
+It's acceptable (and preferred) to write E2E tests that only run against production:
+
+```typescript
+// frontend/e2e/production/admin-delete-outputs.spec.ts
+test('Admin can delete job outputs', async ({ page }) => {
+  // This test runs against real production after deployment
+  // It verifies the feature actually works end-to-end
+  await page.goto(`${PROD_URL}/admin/jobs/${testJobId}`);
+  await page.click('[data-testid="delete-outputs-button"]');
+  await expect(page.getByText('Confirm deletion')).toBeVisible();
+  // ... complete the flow
+});
+```
+
+**Even if the test is only run once** after deployment, it's still valuable because:
+- It codifies the expected behavior completely
+- It proves the deployed code works
+- It can be re-run if issues are suspected
+- It serves as documentation for the feature
+
+### Workflow for Production-Only E2E Tests
+
+1. **Implement the feature** with unit tests and regression E2E tests (mocked API)
+2. **Write production E2E test** that exercises the real flow
+3. **Merge and deploy** to production
+4. **Run the production E2E test** to verify: `npm run test:e2e:prod -- admin-delete-outputs.spec.ts`
+5. **Commit passed** - Feature is verified working in production
+
+### Example: Converting Manual Steps to E2E
+
+**Before (manual testing in plan):**
+```
+Manual testing:
+- Create/complete a test job with YouTube/Dropbox upload
+- Navigate to admin job detail
+- Click "Delete All Outputs" button
+- Verify dialog shows, confirm deletion
+- Verify "Outputs Deleted" badge appears
+```
+
+**After (automated production E2E):**
+```typescript
+test('Delete outputs flow', async ({ page }) => {
+  // Use existing complete job or create one via API
+  const jobId = process.env.E2E_COMPLETE_JOB_ID;
+
+  await page.goto(`${PROD_URL}/admin/jobs/${jobId}`);
+  await page.click('[data-testid="delete-outputs-button"]');
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.click('[data-testid="confirm-delete"]');
+  await expect(page.getByText('Outputs Deleted')).toBeVisible();
+});
+```
+
+### When to Use Each Test Type
+
+| Scenario | Test Type | Location |
+|----------|-----------|----------|
+| UI component behavior | Jest unit test | `components/__tests__/` |
+| UI flow with mocked API | Playwright regression | `e2e/regression/` |
+| Multi-step journey / job states, real backend, offline | Playwright local stack | `e2e/local-stack/` |
+| Full flow against real backend | Playwright production | `e2e/production/` |
+| API endpoint logic | pytest unit test | `backend/tests/` |
+| Database operations | Emulator test | `backend/tests/emulator/` |
+
+**Default to production E2E** for any feature that involves user-facing workflows. The goal is automated verification of deployed code, not checkbox completion of manual steps.
+
+## Core Principles
+
+### SOLID Principles
+
+All code should follow SOLID principles:
+
+1. **Single Responsibility** - Each class/function does one thing well
+2. **Open/Closed** - Open for extension, closed for modification
+3. **Liskov Substitution** - Subtypes must be substitutable for base types
+4. **Interface Segregation** - Many specific interfaces over one general interface
+5. **Dependency Inversion** - Depend on abstractions, not concretions
+
+### Code Quality Standards
+
+- **Maintainability** - Code should be easy to understand and modify
+- **Testability** - Code should be designed for easy testing (dependency injection, pure functions)
+- **No magic numbers** - Use named constants
+- **Explicit over implicit** - Clear is better than clever
+- **DRY but not prematurely** - Don't repeat yourself, but don't abstract too early
+
+## Test Types
+
+### Unit Tests
+
+**Locations:**
+- `tests/unit/` - CLI package (`karaoke_gen/`) unit tests
+- `backend/tests/` - Backend API unit tests (excludes `emulator/`)
+- `frontend/components/__tests__/` - React component unit tests
+
+**Characteristics:**
+- Fast (< 1ms per test typical)
+- No external dependencies (mocked)
+- No network, database, or filesystem access
+- Run on every commit
+
+**Coverage targets:**
+- `karaoke_gen/` package: 69%+
+- `backend/` package: No explicit threshold (but coverage collected)
+- `frontend/` components: No explicit threshold (but coverage collected)
+
+```python
+# Good unit test example (backend/tests/test_job_manager.py)
+def test_create_job_applies_default_theme(mock_firestore, mock_gcs):
+    job_manager = JobManager()
+    job = job_manager.create_job(
+        artist="Test Artist",
+        title="Test Song",
+        user_email="test@example.com"
+    )
+    assert job.theme_id == "nomad"  # Default theme applied
+```
+
+**Critical: Mocks Must Match Real API Contracts**
+
+When mocking methods, ensure the mock's `return_value` matches what the real method returns. A common bug pattern:
+
+```python
+# ❌ BAD: Assumes method returns boolean
+mock_service.update_job.return_value = True
+
+# Code under test:
+success = job_manager.update_job(job_id, updates)
+if not success:  # BUG: if real method returns None, this is always True!
+    raise HTTPException(500)
+```
+
+The fix:
+
+```python
+# ✅ GOOD: Check real method signature first
+# def update_job(self, job_id: str, updates: Dict) -> None:
+mock_service.update_job.return_value = None  # Match real API
+```
+
+**Before writing a mock**, check the actual method's return type. Void methods should mock `return_value = None`. Methods that raise on error (rather than returning False) should have mocks that raise exceptions for error cases. See [LESSONS-LEARNED.md](LESSONS-LEARNED.md#mocks-must-match-real-return-values-feb-2026) for a production bug caused by this.
+
+**Critical: Test the Contract Between Caller and Callee**
+
+When function A calls function B, it's not enough to test B with hand-crafted ideal inputs. You must also verify A actually produces those inputs. This is a "contract test."
+
+```python
+# ❌ BAD: Tests _store_metadata in isolation with hand-crafted input
+# If transcribe_lyrics() never includes "lyrics_dir", this test still passes
+# but production silently loses all metadata
+def test_stores_audioshake_ids(tmp_path):
+    _store_lyrics_processing_metadata(
+        transcription_result={"lyrics_dir": str(tmp_path)},  # Too helpful!
+        ...
+    )
+    assert call_args["audioshake_task_id"] == "task-abc"  # ✅ passes, but useless
+
+# ✅ GOOD: Also test that the caller produces the expected input
+def test_transcribe_lyrics_returns_lyrics_dir(tmp_path):
+    result = processor.transcribe_lyrics(audio, artist, title, tmp_path)
+    assert "lyrics_dir" in result  # Catches the actual bug
+```
+
+**When to write contract tests:**
+- Function A builds a dict/object and passes it to function B
+- Function B reads specific keys/fields from that dict/object
+- The dict/object shape is implicit (no schema, no TypedDict, no dataclass)
+
+**Especially dangerous:** Non-fatal code paths (try/except that swallows errors). If the function is designed to never crash, a test that only checks "didn't raise" provides zero signal. Assert on the *positive outcome* (data was stored, value was returned) not just the absence of exceptions.
+
+See [LESSONS-LEARNED.md](LESSONS-LEARNED.md#test-the-contract-not-just-the-function-mar-2026) for the production bug this pattern caused.
+
+#### Render tests: verify lyrics as they actually render (CJK / RTL)
+
+Correct-looking ASS tags can still render wrong (a Hebrew job shipped with words laid
+out and highlighted left-to-right). `tests/unit/lyrics_transcriber/output/test_ass_render_highlight.py`
+generates ASS with the real `SubtitlesGenerator` in a pure-colour palette (sung = green,
+unsung = magenta, lead-in = cyan, on black), renders frames with ffmpeg/libass
+(`ass_render_harness.py`), and asserts on pixels for English, Hebrew, Arabic, Chinese,
+Japanese, Korean and an RTL duet line: highlight starts at the reading-start edge,
+sung pixels always precede unsung ones in reading order (pins word order *and* in-word
+fill direction), progress is monotonic and in time with the words, the lead-in lands
+outside the start edge, and libass found every glyph. `tests/unit/test_font_fallback_render.py`
+does the same for PIL-rendered title cards / portrait headers (no `.notdef` tofu, Hebrew
+title reads right-to-left). `test_translated_lyrics_render.py` covers translated lyrics: the
+translation row renders beneath its line (smaller, centred, never highlighted, every glyph
+found) for Latin/Hebrew/Arabic/CJK translations and mixed directions (Hebrew/Arabic lyrics with
+English or Arabic translations), and an RTL lyric still fills right-to-left.
+
+- **CI** installs `fonts-noto-core fonts-noto-cjk` and runs with `CI=true`, where these
+  tests fail instead of skipping on a missing precondition.
+- **macOS**: Homebrew libass uses the CoreText font provider (different fallback fonts, no
+  CJK fallback), so font-sensitive checks skip. Run the full set in Linux against both
+  Debian's ffmpeg and prod's static ffmpeg with `scripts/run-render-tests-linux.sh`.
+- When touching ASS generation, add a sample to `SAMPLES` rather than asserting on tag strings.
+
+### Integration Tests (`tests/integration/`)
+
+**Purpose:** Test CLI workflows and component interactions.
+
+**Characteristics:**
+- May mock high-level components
+- Tests full command pipelines
+- Uses `@pytest.mark.integration` marker
+- Often async (`@pytest.mark.asyncio`)
+
+**Example scenarios:**
+- CLI `--edit-lyrics` flow end-to-end
+- Job creation → processing pipeline
+- Audio separation → transcription coordination
+
+### Emulator Tests (`backend/tests/emulator/`)
+
+**Purpose:** Test real Firestore/GCS behavior without production access.
+
+**Characteristics:**
+- Requires GCP emulators running
+- Tests actual database operations
+- Verifies subcollections, TTL policies, etc.
+- Auto-skips if emulators unavailable
+
+**Setup:**
+```bash
+# Start emulators
+make emulators-start
+
+# Run emulator tests
+poetry run pytest backend/tests/emulator/ -v
+
+# Stop emulators
+make emulators-stop
+```
+
+### E2E Tests (Frontend)
+
+**Locations:**
+- `frontend/e2e/regression/` - Mocked API tests (CI-safe, fast)
+- `frontend/e2e/local-stack/` - Real backend on emulators with fake workers (CI-safe, ~1 min) — see [Local stack](#local-stack-real-backend-fake-workers)
+- `frontend/e2e/production/` - Real backend tests (comprehensive, slower)
+- `frontend/e2e/manual/` - Tests requiring manual setup (not in CI)
+
+**Tool:** Playwright
+
+**Regression tests** run on every PR:
+- Mock API responses via fixtures
+- Test UI behavior in isolation
+- Playwright auto-starts dev server via `webServer` config
+- ~3 min total runtime
+
+**Production tests** run on-demand or daily:
+- Hit real `https://gen.nomadkaraoke.com` and `https://api.nomadkaraoke.com`
+- Full user journeys (20-40 min for happy path)
+- Require authentication tokens
+
+**Manual tests** are NOT included in CI:
+- Require separate dev servers (e.g., LyricsTranscriber frontend on port 5173)
+- See `frontend/e2e/manual/README.md` for setup instructions
+
+## Local stack (real backend, fake workers)
+
+`scripts/local-stack.sh` runs the **real** FastAPI backend on the Firestore + GCS
+emulators with `FAKE_WORKERS=1`. Every API route, the review UI's data endpoints,
+credits, emails and downloads run for real. Only the workers are swapped out
+(`backend/services/fake_workers/`): they walk each job through its real states in
+seconds, writing small real media (ffmpeg tones, 320x180 video) and a
+schema-valid `corrections.json` built from the real `CorrectionResult` types.
+Web Playwright (`frontend/e2e/local-stack/`) and mobile Maestro flows run against
+it, so both clients hit the same endpoints.
+
+```bash
+scripts/local-stack.sh up --frontend   # emulators + API :8010 + Next dev :3010
+make test-local-stack                  # or: cd frontend && npm run test:e2e:local-stack
+scripts/local-stack.sh logs backend    # tail the API log
+scripts/local-stack.sh down
+```
+
+Requirements: Docker (fake-gcs-server), Java 21 + the gcloud Firestore emulator,
+ffmpeg, and the poetry env. The Playwright config starts the stack itself if it
+isn't running (`scripts/local-stack.sh serve` + `next dev`).
+
+**Several stacks on one machine** (the mobile app's parallel E2E lanes) share the
+emulators. Give each its own `LOCAL_STACK_API_PORT` / `LOCAL_STACK_WEB_PORT`,
+`LOCAL_STACK_PROJECT` (the Firestore project, default `test-project`; fake-config,
+including the global search knobs, lives in Firestore per project),
+`LOCAL_STACK_GCS_BUCKET` (default `test-bucket`; the test reset empties the bucket,
+so each stack needs its own) and `LOCAL_STACK_STATE_DIR` (pids and logs, default `.local-stack`). Stop one with
+`LOCAL_STACK_KEEP_EMULATORS=1 scripts/local-stack.sh down`, or the others lose
+their emulators.
+
+**What is faked, and where.** Each fake lives at one seam, guarded by
+`fake_workers_enabled()`. That check is strict (`is True`), so a `MagicMock`
+settings object in a unit test never turns it on.
+
+| Real thing | Fake | Seam |
+|------------|------|------|
+| Cloud Run Jobs / Cloud Tasks workers | in-process threads (`fake_workers/pipeline.py`) | `WorkerService.trigger_*` |
+| flacfetch / YouTube search | 3 deterministic results (lossless "perfect match", Spotify, YouTube) | `get_audio_search_service()` |
+| audio download | canned tone song (then the REAL `process_audio_download` continues: duration reconcile etc.) | `audio_download_worker._download_audio` |
+| Stripe Checkout | `/api/test/fake-checkout/{id}` page; Pay runs the real webhook handler | `StripeService._create_checkout` |
+| Postmark | console provider + captured outbox | `ConsoleEmailProvider` |
+| Secret Manager, DeBounce, encoding VM | skipped | `get_secret`, `is_disposable_domain`, warmup |
+
+**kjbox partner calls.** The stack exports `KJBOX_PARTNER_SECRET=local-stack-secret`
+(and `DECIDE_GEN_PARTNER_SECRET`, same value) so a local kjbox stack can call
+`/api/kjbox/*` with `X-Kjbox-Secret: local-stack-secret`. For jobs created with
+`X-Client-Id: kjbox…` the fake audio worker also writes the real "quick version"
+outputs (`state_data.quick_version` separating -> rendering -> ready, and
+`file_urls.quick.video_mp4` from the fixture mp4), so `/api/jobs/{id}/download-urls`
+lists `quick/video_mp4` and `/download/quick/video_mp4` streams it, like prod.
+
+The audio worker reuses the real stem upload, OGG transcode and backing-vocals
+analysis. The review preview video is the real local ffmpeg render. Startup
+**refuses** `FAKE_WORKERS` in production (`validate_production_config`).
+
+**Test API** (`/api/test/*`, mounted only with `FAKE_WORKERS`, no auth):
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/test/status` | readiness, effective config, running fake workers, scenario names |
+| `POST /api/test/scenario {name, email?, credits?, artist?, title?}` | seed `user`, `job_awaiting_review`, `job_complete`, `job_failed`, `job_awaiting_duration_confirm` → `{email, session_token, credits, job_id?}`. Jobs are made through the real search + create-from-search routes. |
+| `GET/PUT /api/test/fake-config[?email=]` | knobs: `step_delay_seconds`, `auto_approve`, `fail_at`, `audio_duration_seconds`, `search_result_count`, `search_confidence` (`perfect` / `recommended` / `unsure` → the UI's confidence tier 1 / 2 / 3), `youtube_url_enabled` (default `true`: the fake video step sets `state_data.youtube_url = https://youtu.be/dQw4w9WgXcQ` on non-private jobs). With `?email=` the knobs apply only to that user's jobs, so tests that each use their own user can run in parallel. Search runs before a job exists, so `search_result_count` and `search_confidence` only take effect globally. **Fake match judge** (no Gemini/catalog): `judge_kind` (`none` default / `cosmetic` / `content` / `ambiguous`; anything else is rejected), `judge_canonical_artist`, `judge_canonical_title` (default `Fake Artist` / `Fake Title`). `POST /api/catalog/match-judge` reads the signed-in user's config (`?email=`); `POST /api/kjbox/catalog/resolve` is called by partners with no user, so it reads the **global** config (no cache or rate budget in fake mode). `ambiguous` returns two alternatives. |
+| `GET /api/test/emails?to=` | captured outbound email, newest first, with extracted `links` and 6-digit `codes` |
+| `POST /api/test/reset` | wipe the emulator Firestore + bucket (keeps seeded themes) |
+
+**Sign-in in tests:** seed a user and put `session_token` in
+`localStorage.karaoke_access_token` (`signInAs` in `e2e/local-stack/stack.ts`).
+Alternatively, drive the real magic link or email code and read it from
+`/api/test/emails`.
+
+**Google / Apple sign-in:** `POST /api/users/auth/google|apple {"id_token": "fake:<email>"}`
+signs in as `<email>` with no network call, only in fake mode (outside it, 401). The
+mobile app's fake-social switch sends these.
+
+**Handoff to the web review:** with a session for a `job_awaiting_review` scenario,
+`POST /api/users/auth/handoff-token {"target": "job_review", "job_id": …}` returns a
+2-minute, single-use `…/auth/verify?token=…&handoff=1` URL (on `FRONTEND_URL`) that
+signs in without the "Complete Sign-In" tap and lands on the review.
+
+**Checkout back to the app:** `POST /api/users/credits/checkout` with
+`"return_to": "app"` makes the fake checkout's Pay / Cancel redirect to
+`$LOCAL_STACK_API_URL/api/users/credits/app-return?status=…`, which 302s to
+`nomadkaraoke://checkout?status=success|cancelled`. Cancel never runs the webhook.
+
+**Fake search tiers:** `fake_workers/search.py` builds the `search_confidence`
+shapes, and `frontend/lib/__tests__/fake-search-tiers.test.ts` feeds them to the real
+`getSearchConfidence` via `frontend/lib/__tests__/fixtures/fake-search-tiers.json`.
+A backend test fails if that fixture is stale; regenerate it with
+`poetry run python -m backend.services.fake_workers.search --write-fixture`.
+
+**Review-flow knobs (per user, for the mobile review Maestro flows):** set with
+`PUT /api/test/fake-config?email=<user>` *before* `POST /api/test/scenario` with `job_awaiting_review`
+for that email. Defaults keep the plain 6-line, silent-backing behaviour.
+
+| Knob | Values | Effect |
+|---|---|---|
+| `review_fixture` | `default` / `corrections` / `duet` / `rtl` / `large` | Shape of the fake lyrics. `corrections`: two AI-applied corrections (words with `ai_corrected` / `original_text`, one `timing_estimated` split) with matching `metadata.auto_approval.undo_info`, one untimed word, one word held > 2 s and one evidenced vocal gap with synced reference lines (needs `audio_duration_seconds` >= 30). `duet`: `is_duet` true, per-line singers 1 / 2 / 0. `rtl`: Hebrew lines, one also with Arabic. `large`: 300 lines, 2,100 words (~1.3 MB JSON; needs `audio_duration_seconds` >= 305, or the lyrics run past the end of the audio). |
+| `backing_vocals` | `silent` / `audible` | `audible`: a 440 Hz tone in the 10-20 s window, so the real analysis recommends `with_backing`. |
+| `stems_delay_seconds` | 0-600 | The fake audio worker uploads stems this long after it starts, so the job reaches `awaiting_review` with `instrumental-urls` `audio_complete: false` until then. |
+| `review_mode` | `always_review` / `auto` | `review_mode` of the seeded `job_awaiting_review` job. `auto` lets a stored confident verdict skip a screen. |
+| `auto_approval` | `none` / `lyrics_confident` / `backing_confident` / `both_unsure` | Writes `processing_metadata.auto_approval` when the job parks at review (only has an effect with `review_mode: auto`; `correction-data` `auto_approval` then reports `lyrics.confident` / `backing.confident`). |
+| `review_complete_fail_once` | bool | The next `POST /api/review/{id}/complete` for this user's job answers 503, then the knob resets to false. Inert unless `FAKE_WORKERS=1`. |
+
+`GET /api/test/jobs/{job_id}/review-result` (no auth, test API only) returns
+`{status, instrumental_selection, is_duet, lines: [{text, singer, words: [{text, start_time, end_time}]}]}`
+from the saved `corrections_updated.json` (`lines` is empty until a review completed), so Maestro can
+assert on what the app submitted.
+
+**Mobile (Maestro / dev builds):** run the stack, then point the app at
+`http://10.0.2.2:8010` (Android emulator) or `http://127.0.0.1:8010` (iOS
+simulator). Set `LOCAL_STACK_API_URL` to that address before `up`, so fake-checkout
+URLs open on the device. Seed state with `curl -X POST .../api/test/scenario`, and read
+sign-in codes from `/api/test/emails`.
+
+**Ports:** `LOCAL_STACK_API_PORT` (8010) and `LOCAL_STACK_WEB_PORT` (3010). The
+emulators use the fixed 8080 / 4443 that `start-emulators.sh` uses, so stop other
+emulator runs first.
+
+## Playwright Usage
+
+### Installation
+
+```bash
+cd frontend
+npm install -D @playwright/test
+npx playwright install
+```
+
+### Running E2E Tests
+
+```bash
+# Regression tests (mocked API, default)
+npm run test:e2e
+
+# Production tests (real backend)
+npm run test:e2e:prod
+
+# With UI mode for debugging
+npm run test:e2e:ui
+
+# Specific test file
+npx playwright test e2e/regression/smoke.spec.ts
+
+# Production test with environment
+E2E_TEST_TOKEN=xxx npm run test:e2e:prod
+```
+
+### Investigating Frontend Issues
+
+When debugging frontend issues, use Playwright to:
+
+1. **Reproduce the issue** - Write a test that fails
+2. **Debug visually** - Use `--ui` mode or `--headed`
+3. **Capture evidence** - Screenshots, traces, console logs
+4. **Verify the fix** - Test passes after fix
+
+```bash
+# Debug mode with browser visible
+npm run test:e2e:headed
+
+# Generate trace for failed tests
+npx playwright test --trace on
+```
+
+### Writing E2E Tests
+
+**Regression test example (mocked API):**
+```typescript
+// frontend/e2e/regression/smoke.spec.ts
+import { test, expect } from '@playwright/test';
+import { setupApiFixtures, clearAuthToken } from '../fixtures/test-helper';
+
+test.describe('Smoke Tests', () => {
+  test.beforeEach(async ({ page }) => {
+    await clearAuthToken(page);
+  });
+
+  test('landing page loads and shows hero', async ({ page }) => {
+    await setupApiFixtures(page, { mocks: [] });
+    await page.goto('/');
+    await expect(page.locator('h1')).toContainText('Karaoke');
+  });
+});
+```
+
+**Production test example (real backend):**
+```typescript
+// frontend/e2e/production/lyrics-review-only.spec.ts
+import { test, expect } from '@playwright/test';
+
+const PROD_URL = 'https://gen.nomadkaraoke.com';
+
+test.describe('Lyrics Review', () => {
+  test('Complete lyrics review via UI', async ({ page }) => {
+    test.setTimeout(900_000); // 15 min - preview generation can be slow
+
+    const jobId = process.env.E2E_JOB_ID;
+    await page.goto(`${PROD_URL}/review/${jobId}`);
+    // ... test implementation
+  });
+});
+```
+
+## CI Pipeline
+
+### Required Checks (Block PR Merge)
+
+All PRs must pass these checks (path-filtered for efficiency):
+
+| Check | Description | Threshold |
+|-------|-------------|-----------|
+| `backend-lint` | Ruff linter | No errors |
+| `backend-unit-tests` | Backend tests (excludes emulator) | Must pass |
+| `backend-emulator-tests` | GCP emulator integration | Must pass |
+| `local-stack-e2e` | Playwright full journeys vs the local stack (backend or frontend changes) | Must pass |
+| `package-unit-tests` | CLI package tests | 69% coverage |
+| `package-integration-tests` | CLI integration tests | Must pass |
+| `frontend-lint` | ESLint (Rules of Hooks) | No errors |
+| `frontend-unit-tests` | Jest component tests | Must pass |
+| `frontend-e2e-smoke` | Playwright smoke tests | Must pass |
+| `frontend-build` | Next.js build | Must pass |
+
+### On-Demand Checks
+
+| Check | Trigger | Description |
+|-------|---------|-------------|
+| `frontend-e2e-full` | `e2e` PR label | Full regression E2E suite |
+| `e2e-happy-path` | Daily 6 AM UTC | Complete production happy path |
+
+### Path Filtering
+
+CI intelligently runs only relevant tests based on changed files:
+
+| Changed Path | Tests Run |
+|--------------|-----------|
+| `frontend/` | Frontend lint, unit, E2E, local-stack E2E |
+| `backend/` | Backend lint, unit, emulator, local-stack E2E |
+| `karaoke_gen/` | Package unit, integration |
+| `tests/` | Package tests |
+| `infrastructure/` | Infrastructure validation |
+
+### Known Testing Gaps
+
+**Infrastructure dependencies** (Modal, AudioShake, Cloud Tasks, Firestore) are mocked in tests. This means IAM permission errors or API changes won't be caught until production. Mitigations:
+
+1. **Emulator tests** - Use `backend/tests/emulator/` for Firestore/GCS integration
+2. **Manual verification** after infrastructure changes (Pulumi updates)
+3. **Health endpoints** - `/api/health` and `/api/health/detailed` validate connectivity
+4. **Daily E2E** - `e2e-happy-path.yml` runs full production flow
+
+## Production E2E Testing
+
+For comprehensive production testing:
+
+```bash
+cd frontend
+
+# Run full happy path (requires tokens)
+E2E_TEST_TOKEN=<token> npx playwright test e2e/production/happy-path-real-user.spec.ts \
+  --config=playwright.production.config.ts
+
+# Run focused tests (faster iteration)
+E2E_JOB_ID=<id> E2E_REVIEW_TOKEN=<token> npx playwright test e2e/production/lyrics-review-only.spec.ts \
+  --config=playwright.production.config.ts
+
+# Admin dashboard tests
+KARAOKE_ADMIN_TOKEN=<admin-token> npx playwright test e2e/production/admin-dashboard.spec.ts \
+  --config=playwright.production.config.ts
+```
+
+### Environment Variables
+
+| Variable | Purpose | Required For |
+|----------|---------|--------------|
+| `E2E_TEST_TOKEN` | User authentication | Most production tests |
+| `KARAOKE_ADMIN_TOKEN` | Admin authentication | Admin dashboard tests |
+| `E2E_JOB_ID` | Existing job to test | Focused tests |
+| `E2E_REVIEW_TOKEN` | Review page access | Lyrics review tests |
+| `TESTMAIL_API_KEY` | TestMail.app API | Magic link auth tests |
+| `TESTMAIL_NAMESPACE` | TestMail.app namespace | Magic link auth tests |
+
+### Getting Test Tokens
+
+**Option 1: From browser**
+1. Login to https://gen.nomadkaraoke.com
+2. Open DevTools → Application → Local Storage
+3. Copy the `karaoke_access_token` value
+
+**Option 2: From backend logs**
+When the daily E2E runs, tokens are logged for debugging.
+
+The production tests cover:
+- Magic link authentication flow
+- Audio search and selection
+- YouTube URL processing
+- File upload workflow
+- Lyrics review and correction
+- Preview video generation
+- Instrumental selection
+- Final encoding and download
+- Admin dashboard functionality
+
+## Self-Healing Stripe Checkout (daily E2E Stage 1)
+
+> **Payment mode (repo variable `E2E_REAL_PAYMENT`).** Unset/anything but `true` →
+> `E2E_PAYMENT_MODE=checkout-only` (current default since 2026-10-05, no working test card):
+> Stage 1 signs up via the referral link, creates a real Checkout session, fills it with Stripe's
+> public test card `4242…` (`NO_CHARGE_CARD`), asserts the $0.50 price + Pay button, and **stops
+> before Pay** — no charge, no credit grant, no self-heal PR. Stage 2 uses the new account's signup
+> credit. Set `E2E_REAL_PAYMENT=true` (Settings → Variables) to resume buying a real credit with
+> the `E2E_STRIPE_CARD_*` card.
+
+Stripe changes its hosted checkout page without notice (5 breaking changes Apr–Oct 2026),
+so `frontend/e2e/helpers/stripe-checkout.ts` runs the checkout as **verified sub-goals**
+(`selectCard`, `fillCardNumber`, `fillCardExpiry`, `fillCardCvc`, `fillCardholderName`,
+`fillPostalCode`, `uncheckSaveInfo`, `submitPayment`) via `e2e/helpers/self-healing/`:
+
+1. **Learned variants** (`self-healing/learned-variants.json`, newest first) — recipes the
+   LLM discovered on earlier live runs.
+2. **Builtin variants** — the hand-written selectors in `stripe-checkout.ts`.
+3. **LLM fallback** — Gemini (`E2E_SELF_HEAL_MODELS`, default
+   `gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash`; unavailable ids are skipped,
+   failures escalate down the list) is shown a redacted ARIA snapshot + input-masked screenshot
+   and drives the page one action at a time until the step's `verify` postcondition passes.
+
+Each attempt is judged only by the step's `verify` (e.g. "card-number input visible",
+"filled field holds the expected value and looks like a card-number field", "redirected to
+our success page or credit granted server-side") — never by "the click didn't throw".
+
+**Card data never reaches the LLM:** it may only use `{{CARD_NUMBER}}`-style placeholders
+(per-step allowlist) that are substituted locally; textbox values and PAN-like digit runs are
+redacted from observations; inputs are masked in screenshots. Guardrails refuse clicks on
+Link/Klarna/Cash App/Bank/"Back to…" and on the final Pay button outside `submitPayment`.
+
+**Fully automatic loop.** When the LLM heals a step and the purchase is verified server-side,
+the spec writes `test-results/self-heal/learned-variants.json`; the workflow's
+`self-heal-pr` job opens a data-only PR (label `e2e-self-heal`, `@coderabbitai ignore`),
+enables auto-merge, and approves the PR's `pull_request` CI run (bot PRs' runs start as
+"action_required" and block the CI Gate until run; falls back to dispatching `ci.yml`).
+Next run replays the recipe without the LLM.
+
+**Repo setting this depends on (changed 2026-10-03, not in code):** the `protect main`
+ruleset (id 11423976) has `require_extra_approval_for_unattributed_changes: false`. GitHub
+defaults it to `true` (server-side, ~Aug 2026), which silently blocks bot-authored PRs
+(`mergeStateStatus: BLOCKED` with all checks green) until a human approves. If a ruleset
+update ever omits the key, GitHub resets it to `true` — set it explicitly. Discord + the daily email
+report 🩹 when this happens. Only one open self-heal PR at a time.
+
+**Declined card ≠ layout change.** The helper watches Stripe's
+`/v1/payment_pages/<id>/confirm` response; a `card_error` (e.g. `card_declined/generic_decline`)
+fails `submitPayment` immediately with `STRIPE_CARD_DECLINED: …` — no LLM calls, no second Pay
+click. The workflow surfaces it as the Stage 1 `failure_reason` in Discord and the daily email
+("Test card declined, not a checkout bug"). Fix it on the card side (issuer fraud hold — e.g.
+after many live $0.50 runs in a day — or an expired/replaced card), then re-run.
+
+The Gemini key is the AI Studio `gemini-api-key` (billed outside the nomadkaraoke project):
+a `GEMINI_API_KEY` repo secret if set, else read from Secret Manager via keyless auth (the
+credential file is deleted before tests run). No key → deterministic-only, as before.
+
+```bash
+cd frontend
+# Offline tests (fixture checkout pages + stub LLM) — also run in CI's smoke job
+npx playwright test --config=playwright.selfheal.config.ts
+# Exercise the live LLM path end-to-end: Actions → E2E Daily → Run workflow →
+#   self_heal_force_llm = selectCard   (forces that step through Gemini; opens a PR)
+```
+
+## E2E Artifacts Are Public — Scrub Before Upload
+
+karaoke-gen is a **public** repo: any signed-in GitHub user can download Actions artifacts.
+Every workflow that uploads production-E2E output runs `frontend/e2e/scripts/scrub-artifacts.mjs`
+first and only uploads if the scrub succeeded:
+
+- deletes Playwright traces (`*.zip` — they contain every request header incl. `X-Admin-Token`
+  and every typed value) and `e2e-session-token.txt`;
+- replaces literal secret values (admin token, testmail key, card number, session tokens…) and
+  card-number-shaped digit runs in text files; deletes any text file still containing a secret;
+- Stage 1 also passes `--drop-videos --blank-inputs` (videos of the Stripe page; `<input value>`
+  and ARIA-snapshot textbox values in DOM dumps / `error-context.md`).
+
+In addition, `playwright.production.config.ts` turns traces **off on CI** (`E2E_TRACE=on` to
+override), the credit-purchase spec disables trace/video/auto-screenshots, and the Stripe helper's
+own screenshots mask every input. When adding a new secret to a production E2E job, add its env
+var to `SECRET_ENV_VARS` in the scrubber and to the job's scrub step.
+
+### Debugging CI failures without a trace: `page-activity.log`
+
+Since CI has no traces, the tenant happy-path spec records a public-safe stand-in with
+`e2e/helpers/page-activity.ts` (`recordPageActivity(page)` in `beforeEach`,
+`writeOnFailure(testInfo)` in `afterEach`). On failure it writes `page-activity.log` to the
+test's `test-results/` dir (uploaded in the artifact) and prints the requests still in flight
+to the job log as `[page-activity] …` lines. It holds main-frame navigations, each request's
+method + origin/path (query strings dropped: magic-link tokens and signed-URL signatures) with
+status and duration or failure reason, console errors/warnings, and uncaught page errors. It
+holds no headers or bodies. It is plain text, so the scrubber still checks it. Use the same
+two hooks in any other production spec that needs it. Offline tests:
+`e2e/self-healing/page-activity.spec.ts`.
+
+Added after tenant E2E run #155 (2026-10-28). The singa portal sat on `/en/app/`'s initial
+spinner for 30s and never redirected to the Sign In landing. The backend served tenant config in
+168ms, 8 live re-runs were fine, and it didn't recur. The suspected cause, a JS chunk stalled on
+Cloudflare Pages, was unconfirmable without network detail. If it happens again, the log's
+`IN FLIGHT AT FAILURE` section shows what hung. Until then, treat it as a one-off flake.
+
+## Concurrent-Load Regression Test (review pages)
+
+`scripts/load-test-review.py` replays the 2026-09-18 "10 tabs melt the backend"
+incident: N simultaneous review-tab loads, each firing the page's real GET trio
+(correction-data, waveform-data, ranged audio/vocals), authenticated with per-job
+review tokens read from Firestore via ADC (no admin secret needed).
+
+```bash
+python scripts/load-test-review.py                   # 10 tabs vs prod, warm thresholds
+python scripts/load-test-review.py --tabs 20
+python scripts/load-test-review.py --max-tab-seconds 45   # cold caches (first-ever waveforms)
+```
+
+Pass = every request 2xx and every tab under the threshold; exit 1 otherwise.
+Run it after changes to the review hot path (`backend/api/routes/review.py`,
+`audio_transcoding_service`, `audio_analysis_service`) or Cloud Run deploy flags.
+Background + before/after numbers:
+`docs/archive/2026-09-18-concurrent-review-reliability-investigation-and-plan.md`.
+
+## Ad-Hoc Production Debugging (for Agents)
+
+When asked to "test it yourself in prod" or debug a specific production issue, use the debug script template:
+
+### Quick Start
+
+```bash
+# Copy the template (the .local suffix is gitignored)
+cp frontend/e2e/helpers/debug-prod-template.mjs frontend/test-my-issue.local.mjs
+
+# Edit the script to customize what you're testing
+# You can hardcode tokens in .local files - they won't be committed
+
+# Run it
+cd frontend && node test-my-issue.local.mjs
+```
+
+### With Environment Variables (Preferred)
+
+```bash
+# Get admin token from Secret Manager
+export KARAOKE_ADMIN_TOKEN=$(gcloud secrets versions access latest --secret=admin-tokens --project=nomadkaraoke | cut -d',' -f1)
+
+# Run the template directly
+cd frontend && node e2e/helpers/debug-prod-template.mjs
+
+# Or with a specific job
+DEBUG_JOB_ID=abc123 node e2e/helpers/debug-prod-template.mjs
+```
+
+### What the Template Provides
+
+- Playwright browser automation against production
+- Auth token injection (via localStorage)
+- Console error capture
+- HTTP error capture (4xx, 5xx responses)
+- Screenshot capability
+- Customizable debug steps
+
+### Gitignore Patterns
+
+Files matching these patterns are gitignored in `frontend/`:
+- `test-*.local.*` - Ad-hoc test scripts
+- `debug-*.local.*` - Debug scripts
+
+**Never commit tokens.** Use env vars or `.local` files only.
+
+### When to Use What
+
+| Scenario | Approach |
+|----------|----------|
+| Quick one-off debugging | Copy template → `.local` file |
+| Reusable production test | Add to `e2e/production/` with env var auth |
+| Regression test (mocked) | Add to `e2e/regression/` |
+
+### Example: Debug a Specific Job's Review Page
+
+```javascript
+// frontend/test-review-debug.local.mjs
+import { chromium } from 'playwright';
+
+const TOKEN = 'your-token-here'; // OK in .local files
+const JOB_ID = '26391a79';
+
+async function debug() {
+  const browser = await chromium.launch({ headless: false }); // See the browser
+  const page = await browser.newContext().then(c => c.newPage());
+
+  await page.addInitScript(t => localStorage.setItem('karaoke_access_token', t), TOKEN);
+  await page.goto(`https://gen.nomadkaraoke.com/app/jobs#/${JOB_ID}/review`);
+
+  // Debug interactively - the browser stays open
+  await page.pause(); // Opens Playwright inspector
+
+  await browser.close();
+}
+
+debug();
+```
+
+## Running Tests Locally
+
+```bash
+# All backend/package tests
+make test
+
+# Specific suites
+make test-unit       # Package unit tests (69% coverage)
+make test-backend    # Backend tests only
+make test-e2e        # E2E with emulators
+
+# With coverage report
+poetry run pytest tests/unit --cov=karaoke_gen --cov-report=html
+open htmlcov/index.html
+
+# Frontend tests
+cd frontend
+npm run test:unit    # Jest watch mode
+npm run test:ci      # Jest with coverage
+npm run test:e2e     # Playwright regression
+npm run test:all     # Unit + E2E combined
+```
+
+## Test File Organization
+
+```
+karaoke-gen/
+├── tests/
+│   ├── unit/                        # CLI package unit tests
+│   │   ├── conftest.py              # Shared fixtures
+│   │   ├── test_audio.py            # Audio separation tests
+│   │   ├── test_karaoke_finalise/   # Finalize module tests
+│   │   └── ...
+│   ├── integration/                 # CLI integration tests
+│   │   ├── test_cli_edit_lyrics.py  # Edit lyrics workflow
+│   │   └── test_cli_backend_integration.py
+│   └── conftest.py                  # Root fixtures
+├── backend/
+│   └── tests/
+│       ├── conftest.py              # FastAPI TestClient, mocks
+│       ├── test_job_manager.py      # Job management tests
+│       ├── test_dependencies.py     # DI tests
+│       ├── test_made_for_you_webhook.py  # Webhook tests
+│       └── emulator/                # GCP emulator tests
+│           ├── conftest.py          # Emulator setup
+│           ├── test_emulator_integration.py
+│           └── test_worker_logs_direct.py
+└── frontend/
+    ├── components/__tests__/        # Jest component tests
+    │   ├── JobCard.test.tsx
+    │   ├── ThemeSelector.test.tsx
+    │   └── ...
+    ├── e2e/
+    │   ├── fixtures/                # Shared test helpers
+    │   │   ├── test-helper.ts       # API mocking utilities
+    │   │   └── mock-responses.ts    # Canned API responses
+    │   ├── regression/              # Mocked API E2E (CI)
+    │   │   ├── smoke.spec.ts
+    │   │   ├── authentication.spec.ts
+    │   │   ├── karaoke-generation.spec.ts
+    │   │   └── ...
+    │   ├── production/              # Real backend E2E
+    │   │   ├── happy-path-real-user.spec.ts
+    │   │   ├── lyrics-review-only.spec.ts
+    │   │   └── admin-dashboard.spec.ts
+    │   └── manual/                  # Manual setup required (NOT in CI)
+    │       ├── README.md            # Setup instructions
+    │       └── lyrics-review-mobile.spec.ts  # LyricsTranscriber frontend
+    ├── jest.config.js
+    ├── jest.setup.js
+    ├── playwright.config.ts         # Default (regression)
+    └── playwright.production.config.ts
+```
+
+## Writing Good Tests
+
+### Do
+
+- Test behavior, not implementation
+- Use descriptive test names: `test_create_job_applies_default_theme_when_none_specified`
+- One assertion per test (when practical)
+- Use fixtures for common setup
+- Test edge cases and error conditions
+- Mock external services (Modal, AudioShake, Genius, etc.)
+
+### Don't
+
+- Test private methods directly
+- Write tests that depend on execution order
+- Use sleep/wait without timeouts
+- Test framework code (FastAPI, React, Next.js)
+- Skip tests without a reason
+
+## Coverage Enforcement
+
+Coverage is enforced in CI for the CLI package:
+
+```bash
+# Package unit tests require 69% coverage
+poetry run pytest tests/unit/ --cov=karaoke_gen --cov-fail-under=69
+```
+
+To check coverage locally:
+
+```bash
+# CLI package
+poetry run pytest tests/unit --cov=karaoke_gen --cov-report=term-missing
+
+# Backend (no threshold, but useful to see)
+poetry run pytest backend/tests --cov=backend --cov-report=term-missing
+
+# Frontend (via Jest)
+cd frontend && npm run test:ci  # Includes coverage
+```
+
+## Mocking Guidelines
+
+### When to Mock
+
+- External APIs (Modal, AudioShake, Genius, Spotify lyrics, YouTube)
+- GCS/Firestore in unit tests
+- FFmpeg in unit tests
+- Time-dependent operations
+- Network requests
+
+### When NOT to Mock
+
+- Your own code (test the real thing)
+- Simple data transformations
+- In emulator tests (use real Firestore/GCS emulators)
+- In production E2E tests (use real backend)
+
+### Mock Example
+
+```python
+from unittest.mock import Mock, patch
+
+def test_fetch_audio_handles_modal_timeout():
+    with patch('karaoke_gen.audio.modal_api.submit_job') as mock_submit:
+        mock_submit.side_effect = TimeoutError("Modal API timeout")
+
+        with pytest.raises(AudioSeparationError):
+            separate_audio("test.mp3")
+```
+
+### Frontend Mock Example
+
+```typescript
+// Using Playwright route interception
+test('shows error on API failure', async ({ page }) => {
+  await page.route('**/api/jobs', route => {
+    route.fulfill({ status: 500, body: 'Server Error' });
+  });
+
+  await page.goto('/app');
+  await expect(page.getByText('Error loading jobs')).toBeVisible();
+});
+```
+
+## Debugging Failed Tests
+
+### Local Debugging
+
+```bash
+# Run single test with verbose output
+poetry run pytest tests/unit/test_audio.py::test_separate_audio -vvs
+
+# Drop into debugger on failure
+poetry run pytest --pdb
+
+# Show local variables on failure
+poetry run pytest -l
+
+# Frontend: Debug specific test
+cd frontend && npx playwright test smoke.spec.ts --debug
+```
+
+### CI Debugging
+
+1. Check the GitHub Actions logs
+2. Look for the specific assertion that failed
+3. Reproduce locally with the same command
+4. If flaky, check for timing/ordering issues
+5. Download test artifacts (screenshots, videos) from failed E2E runs
+
+## Adding Tests for New Features
+
+When adding a new feature:
+
+1. **Write tests first** (TDD) or immediately after
+2. **Unit tests** for business logic in `karaoke_gen/` or `backend/`
+3. **Backend tests** for new API endpoints
+4. **Frontend unit tests** for new components
+5. **E2E regression tests** for UI flows with mocked API (add to `e2e/regression/`)
+6. **Production E2E test** for full workflow verification (add to `e2e/production/`)
+7. **Update this doc** if new patterns emerge
+
+**Remember:** If your verification plan includes manual steps, write a production E2E test instead. See [Critical: Automate Manual Testing Steps](#critical-automate-manual-testing-steps).
+
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| **All tests (before commit)** | `make test` |
+| Backend only | `make test-backend` |
+| Frontend only | `make test-frontend` |
+| Package unit | `make test-unit` |
+| Emulator tests | `make test-e2e` |
+| Frontend E2E (production) | `cd frontend && npm run test:e2e:prod` |
+| Coverage HTML | `poetry run pytest tests/unit --cov=karaoke_gen --cov-report=html` |
+| Install deps | `make install` |
+| Start emulators | `make emulators-start` |
+| Stop emulators | `make emulators-stop` |
+
+## New Guard / New Enforcement Checklist
+
+> Added after the NOMAD-1632 incident pair (2026-09-11/12). The *fix* for a silent
+> partial-publish bug became a louder outage: a new completeness guard inside
+> `GCEEncodingBackend.encode()` conflated an **empty** (recoverable, stale-cache)
+> result with a **partial** (defective) one and shipped enforce-first with only
+> mocked unit tests. Both the original bug and its fix lived in the encode→publish
+> seam, which had **no composed integration test**. See
+> `docs/archive/2026-09-12-incident-hardening-plan.md` for the full post-mortem.
+
+Any **new enforcement on a critical path** (a check that can fail/block a job, reject
+a result, or change what gets published) MUST satisfy all of the following before it
+enforces:
+
+1. **Distinguish "nothing yet / recoverable" from "wrong result."** An empty, missing,
+   not-ready, or cached-but-stale input is usually a *recoverable* condition some
+   other layer already handles — it is NOT the same as a present-but-incorrect result.
+   Guarding the recoverable case short-circuits recovery and manufactures a new
+   failure mode (exactly Failure B: the guard fired on empty `output_files`, which the
+   orchestrator already recovers from by re-encoding).
+2. **Default to prior behavior on uncertainty — fail OPEN unless you are sure it's a
+   defect.** If you can't positively classify the input as wrong, let it through and
+   log, rather than blocking. A guard that is wrong in the blocking direction is an
+   outage; one that is wrong in the permissive direction degrades to the (known) prior
+   behavior.
+3. **Test against empty / partial / malformed / complete inputs** — not just the happy
+   shape. The data shape that broke us (empty) was simply never in the test corpus.
+4. **Ship in SHADOW mode first** (log + alert, do NOT fail/block), and enforce only
+   after a clean shadow window (~1–2 weeks of real traffic with no false positives).
+   Precedent: the timing gate's "G3 shadow" rollout.
+5. **Have a composed integration test, not only isolated unit mocks.** Wire the real
+   producer to the real consumer across the seam the guard lives in; patch only the
+   true external boundary (network/GCS). A whole-component mock proves nothing about
+   the seam. Reference implementation: `TestEncodePublishSeam` in
+   `backend/tests/test_video_worker_orchestrator.py` (real `GCEEncodingBackend.encode()`
+   through the real orchestrator) and the golden-fixture contract test in
+   `backend/tests/test_encoding_contract.py`.
+
+## Critical-Path Change Tier
+
+Some code paths are **critical path**: a silent or loud defect there directly damages
+customer deliverables or revenue. Treat **encode**, **publish**, and **distribution**
+changes (and anything they call at that seam) as critical-path.
+
+A change tagged critical-path requires, before it enforces new behavior:
+
+- A **composed integration test** of the affected seam (producer + consumer, real, with
+  only the external boundary mocked) — see the New Guard checklist item 5.
+- **Shadow-first** rollout for any new enforcement (checklist item 4).
+- A **real-job verification in production** (manual, or the daily E2E) before the change is trusted at 100%
+  (a fresh happy-path job plus, where relevant, an admin-reset + retry to exercise the
+  recovery path).
+
+Mock drift is the recurring root cause here: every encoding mock was hand-authored and
+the real "cached/empty" shape was never captured. Critical-path seams should be backed
+by **golden fixtures** captured from real responses and a **typed schema** shared by
+caller and callee (e.g. `GceEncodeResponse` in `backend/services/encoding_interface.py`
+with fixtures under `backend/tests/fixtures/encoding/`), so caller and worker can't
+drift apart silently.
+
+### Blameless Post-Mortem Template
+
+Keep a running incident log in `docs/` (archive the detailed write-up under
+`docs/archive/YYYY-MM-DD-<incident>.md`; the NOMAD-1632 hardening plan is the first
+entry). For each incident, capture — blamelessly, focused on the system and process,
+not the person:
+
+```markdown
+# Incident: <short title> (<date>)
+
+## Summary
+One or two sentences: what broke, who/what was affected, blast radius, duration.
+
+## Impact
+Jobs/customers affected, data integrity, revenue, how it was detected and when.
+
+## Timeline
+- <ts> trigger / deploy
+- <ts> first symptom
+- <ts> detected (by whom/what)
+- <ts> mitigated
+- <ts> resolved
+
+## Root cause
+The actual defect AND the process gap that let it reach prod (e.g. "no composed test
+of the seam", "guard enforced without shadow"). Distinguish recoverable vs defective
+if a guard/enforcement was involved.
+
+## What went well / what went poorly
+
+## Action items (with owners, tracked in BACKLOG.md)
+- Detection, guardrail, test, deploy, and process fixes — prefer the cheapest net that
+  catches the whole *class*, not just this instance.
+```

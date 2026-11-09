@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Karaoke Studio • Local</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/" aria-label="Karaoke Studio"><span class="brand-icon">♫</span><span>Karaoke<span class="brand-light">Studio</span><small>KHÔNG GIAN ÂM NHẠC CỦA BẠN</small></span></a>
+    <div class="header-right"><span class="local-pill"><i></i> Chạy trên máy của bạn</span><span id="gpu-status" class="device-pill">Đang kiểm tra GPU…</span></div>
+  </header>
+  <main class="workspace">
+    <div class="workspace-heading"><div><p class="eyebrow">TỪ BÀI HÁT ĐẾN SÂN KHẤU</p><h1>Làm karaoke theo cách của bạn<span>.</span></h1><p class="intro">Tạo lời tự động, chỉnh từng từ và xuất video sẵn sàng để hát.</p></div><div class="project-switch"><label for="project-select">DỰ ÁN CỦA BẠN</label><div><select id="project-select"><option value="">Chọn dự án đã lưu</option></select><button id="new-project" class="icon-button" title="Tạo dự án mới" aria-label="Tạo dự án mới">＋</button></div></div></div>
+    <aside class="setup-column">
+      <section class="panel import-panel">
+        <div class="section-heading"><span class="step">01</span><h2>Chọn bài hát</h2><span class="section-note">LOCAL FILES</span></div>
+        <form id="upload-form">
+          <label class="field-label" for="title">Tên dự án</label><input id="title" name="title" type="text" placeholder="Một bài hát thật hay…" maxlength="120">
+          <label class="upload-zone" for="source"><span class="upload-icon">↥</span><strong id="source-label">Thả bài hát vào đây</strong><span>hoặc nhấn để chọn audio / video</span><small>MP3 · WAV · FLAC · M4A · MP4</small><input id="source" name="source" type="file" accept="audio/*,video/*,.mkv,.flac" required></label>
+          <div class="optional-uploads"><label class="file-option" for="background"><span class="file-symbol">▧</span><span><strong>Ảnh / video nền</strong><small id="background-label">Tùy chọn · lặp theo bài hát</small></span><span class="file-plus">＋</span><input id="background" name="background" type="file" accept="image/png,image/jpeg,image/webp,video/*,.mkv"></label><label class="file-option" for="instrumental"><span class="file-symbol">♬</span><span><strong>Nhạc beat có sẵn</strong><small id="instrumental-label">Tùy chọn · thay cho tách vocal</small></span><span class="file-plus">＋</span><input id="instrumental" name="instrumental" type="file" accept="audio/*,.flac"></label></div>
+          <button id="create-button" class="button primary full" type="submit">Tạo dự án <span>↗</span></button>
+        </form>
+      </section>
+      <section class="panel ai-panel">
+        <div class="section-heading"><span class="step">02</span><h2>Tạo sub tự động</h2><span class="sparkle">✦</span></div>
+        <div class="two-fields"><div><label class="field-label" for="language">Ngôn ngữ</label><select id="language"><option value="vi">Tiếng Việt</option><option value="en">English</option><option value="auto">Tự nhận diện</option></select></div><div><label class="field-label" for="model">Model Whisper</label><select id="model"><option value="small">Small · nhanh</option><option value="medium">Medium · chi tiết</option><option value="large-v3">Large v3 · nhiều VRAM</option><option value="base">Base · nhẹ</option><option value="tiny">Tiny · thử nhanh</option></select></div></div>
+        <label class="field-label" for="device">Thiết bị xử lý</label><select id="device"><option value="auto">Tự động · ưu tiên NVIDIA GPU</option><option value="cuda">NVIDIA CUDA</option><option value="cpu">CPU</option></select>
+        <label class="check-row"><input id="separate-first" type="checkbox" checked><span>Tách giọng hát trước khi nhận diện<small>Đồng thời tạo nhạc nền để hát karaoke.</small></span></label>
+        <button id="transcribe-button" class="button accent full" disabled>✦ Tạo lời &amp; canh thời gian</button>
+        <button id="separate-button" class="text-button full" disabled>Chỉ tách vocal / tạo nhạc beat</button>
+        <p class="helper">Model tải về trong lần chạy đầu. Small phù hợp để bắt đầu trên RTX 3060; lời bài hát vẫn cần nghe và rà lại.</p>
+      </section>
+      <section class="panel export-panel">
+        <div class="section-heading"><span class="step">03</span><h2>Xuất thành phẩm</h2><span class="section-note">MP4 + SUB</span></div>
+        <div class="two-fields"><div><label class="field-label" for="resolution">Kích thước</label><select id="resolution"><option value="1080p">1080p · Full HD</option><option value="720p">720p · nhẹ hơn</option></select></div><div><label class="field-label" for="font-size">Cỡ chữ</label><input id="font-size" type="number" min="24" max="100" value="54"></div></div>
+        <label class="field-label" for="export-mode">Âm thanh video xuất</label><select id="export-mode"><option value="original">Bài hát gốc</option><option value="instrumental">Nhạc beat · không vocal</option><option value="silent">Không âm thanh</option></select>
+        <button id="render-button" class="button primary full" disabled>Xuất video karaoke <span>↓</span></button>
+        <button id="subtitles-button" class="button secondary full" disabled>Xuất sub ASS / SRT / LRC</button>
+        <div id="downloads" class="download-list" hidden></div>
+      </section>
+      <p class="privacy-note">⌂ File và dự án được lưu trên máy. Không cần tài khoản dịch vụ cloud.</p>
+    </aside>
+    <div class="studio-column">
+      <section class="panel player-panel">
+        <div class="player-heading"><div><span class="live-dot"></span><span class="eyebrow">KARAOKE PREVIEW</span></div><span id="project-name" class="project-name">Chưa chọn bài hát</span><button id="fullscreen-button" class="icon-button" title="Toàn màn hình" aria-label="Xem toàn màn hình">⛶</button></div>
+        <div id="stage" class="stage">
+          <video id="background-video" class="stage-background" muted loop playsinline hidden></video><img id="background-image" class="stage-background" alt="Nền karaoke" hidden>
+          <div class="stage-shade"></div><div class="stage-grain"></div>
+          <div id="stage-empty" class="stage-empty"><div class="record"><span>♫</span></div><p>Sân khấu đang chờ bài hát của bạn</p><small>Tải bài hát lên để bắt đầu một dự án mới</small></div>
+          <div id="stage-lyrics" class="stage-lyrics" hidden><p id="lyric-context" class="lyric-context"></p><div id="current-lyric" class="current-lyric"></div><div id="next-lyric" class="next-lyric"></div></div>
+          <span id="stage-badge" class="stage-badge">YOUR MUSIC. YOUR STAGE.</span><div class="stage-corner">K<span>•</span>S</div>
+        </div>
+        <audio id="audio" preload="metadata"></audio>
+        <div class="player-controls"><div class="seek-row"><span id="current-time">0:00</span><input id="seek" type="range" min="0" max="1000" value="0" aria-label="Vị trí phát"><span id="duration">0:00</span></div><div class="transport-row"><div class="transport-left"><button id="play-button" class="play-button" disabled aria-label="Phát">▶</button><button id="mute-button" class="mute-button" aria-pressed="false" title="Tắt / bật toàn bộ tiếng khi nghe">♪ <span>Mute</span></button><select id="audio-mode" aria-label="Âm thanh nghe thử"><option value="original">Nghe bản gốc</option><option value="instrumental">Hát với nhạc beat</option><option value="silent">Không tiếng</option></select></div><span class="preview-note">Sub chạy màu theo từng từ</span></div></div>
+      </section>
+      <section id="progress-panel" class="panel progress-panel" hidden aria-live="polite"><div><span id="progress-label">Đang xử lý…</span><strong id="progress-value">0%</strong></div><progress id="progress-bar" value="0" max="100"></progress><p id="progress-message"></p></section>
+      <section class="panel lyrics-panel">
+        <div class="lyrics-heading"><div><p class="eyebrow">TINH CHỈNH TRƯỚC KHI XUẤT</p><h2>Lời &amp; thời gian <span id="lyrics-count" class="count-badge">0 câu</span></h2></div><div class="editor-actions"><span id="save-state" class="save-state"></span><button id="add-segment" class="button small secondary" disabled>＋ Thêm câu</button><button id="save-lyrics" class="button small accent" disabled>Lưu lời</button></div></div>
+        <p class="editor-tip">Nhấn một câu để phát từ vị trí đó. Mở “Chỉnh từng từ” để sửa lời và mốc thời gian (giây).</p>
+        <div id="lyrics-list" class="lyrics-list"><div class="editor-empty"><span>≋</span><h3>Mỗi lời ca, đúng một nhịp</h3><p>Tạo sub tự động hoặc thêm câu thủ công.<br>Bạn có thể chỉnh lời và thời gian trước khi xuất.</p></div></div>
+      </section>
+      <section id="result-panel" class="panel result-panel" hidden><div class="section-heading"><span class="step">✓</span><h2>Video đã xuất</h2><a id="video-download" class="button small secondary" href="#" download>Tải MP4 ↓</a></div><video id="result-video" controls preload="metadata" playsinline></video></section>
+    </div>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="add-dialog"><form id="add-form"><div class="section-heading"><h2>Thêm một câu hát</h2><button id="close-dialog" class="icon-button" type="button" aria-label="Đóng">×</button></div><label class="field-label" for="new-line">Lời bài hát</label><textarea id="new-line" rows="3" placeholder="Nhập một câu hát…" required></textarea><div class="two-fields"><div><label class="field-label" for="new-start">Bắt đầu (giây)</label><input id="new-start" type="number" min="0" step="0.01" value="0" required></div><div><label class="field-label" for="new-end">Kết thúc (giây)</label><input id="new-end" type="number" min="0" step="0.01" value="5" required></div></div><p class="helper">Các từ được chia đều trong câu. Nghe lại và chỉnh mốc từng từ để khớp bài hát.</p><button class="button primary full" type="submit">Thêm vào lời bài hát</button></form></dialog>
+  <noscript>Vui lòng bật JavaScript để sử dụng Karaoke Studio.</noscript>
+</body>
+</html>

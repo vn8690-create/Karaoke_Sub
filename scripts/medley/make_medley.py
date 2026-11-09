@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""
+Build a karaoke medley (audio + synced karaoke video) from completed gen jobs.
+
+See docs/MEDLEYS.md for the full process and the craft of choosing cut points.
+
+Every section of the medley is cut from a gen job for the ORIGINAL song. Gen already gave
+us the lossless source, sample-aligned stems and reviewed word-level lyrics for each one,
+so the medley is just: the same cuts applied to every audio variant, plus the reviewed
+lyric segments shifted onto the medley timeline and rendered with gen's own renderer.
+
+Usage (from the repo root, in an env where karaoke_gen imports):
+    python scripts/medley/make_medley.py fetch spec.json   # Firestore + GCS -> <workdir>/<job_id>/
+    python scripts/medley/make_medley.py audio spec.json   # medley WAV/MP3 per audio variant
+    python scripts/medley/make_medley.py video spec.json [--resolution 4k]  # karaoke + guide MP4s
+    python scripts/medley/make_medley.py chords spec.json  # optional: detect guitar chords per song
+                                                          # (needs MEDLEY_CHORDMINI; see docs)
+    python scripts/medley/make_medley.py chart spec.json [--wrap 56]  # optional: the customer's own
+                                                          # chord chart(s) instead (after `chords`)
+
+Requires Firestore read access (ADC; the claude-readonly SA is enough), the gcloud CLI for GCS
+downloads (set MEDLEY_GCLOUD_ACCOUNT to pick an account, e.g. the read-only SA when your user
+login has expired) and ffmpeg.
+See scripts/medley/example-spec.json for the spec format.
+"""
+import argparse
+import dataclasses
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Optional
+
+PROJECT = "nomadkaraoke"
+BUCKET = "karaoke-gen-storage-nomadkaraoke"
+DEFAULT_CROSSFADE = 2.0
+SEGMENT_TARGET_LUFS = -18.0
+FINAL_LUFS = -14.0
+FINAL_PEAK_DB = -1.0
+# Audio variants built by `audio`: name -> stem file (None = the job's original input audio)
+VARIANTS = {
+    "instrumental_with_backing": "instrumental_with_backing.flac",
+    "instrumental_clean": "instrumental_clean.flac",
+    "guide_with_vocals": None,
+}
+KARAOKE_VARIANT = "instrumental_with_backing"
+GUIDE_VARIANT = "guide_with_vocals"
+
+log = logging.getLogger("medley")
+
+
+# --- Spec + timeline (pure, unit-tested) -------------------------------------------------
+
+
+@dataclass
+class Section:
+    job_id: str
+    start: float                    # source seconds
+    end: Optional[float]            # source seconds; None = to the end of the song
+    join: str = "crossfade"         # how this section joins the PREVIOUS one: crossfade | gap
+    join_duration: float = DEFAULT_CROSSFADE  # crossfade length, or silence length for a gap
+    fade_in: float = 0.0            # "pot in": fade-in length at the start of this section
+    fade_out_start: Optional[float] = None  # "pot out": source second the fader starts dropping
+    label: str = ""
+    # Karaoke track only: backing vocals at this level (dB) instead of as mixed, e.g. -14 = faint
+    backing_vocals_db: Optional[float] = None
+
+
+def parse_spec(spec: dict) -> list[Section]:
+    sections = []
+    for i, s in enumerate(spec["sections"]):
+        join = s.get("join", "crossfade")
+        if join not in ("crossfade", "gap"):
+            raise ValueError(f"section {i}: join must be 'crossfade' or 'gap', got {join!r}")
+        sec = Section(
+            job_id=s["job_id"], start=float(s.get("start", 0.0)),
+            end=None if s.get("end") is None else float(s["end"]),
+            join=join,
+            join_duration=float(s.get("join_duration", DEFAULT_CROSSFADE if join == "crossfade" else 0.5)),
+            fade_in=float(s.get("fade_in", 0.0)),
+            fade_out_start=None if s.get("fade_out_start") is None else float(s["fade_out_start"]),
+            label=s.get("label", ""),
+            backing_vocals_db=None if s.get("backing_vocals_db") is None else float(s["backing_vocals_db"]),
+        )
+        if sec.end is not None and sec.end <= sec.start:
+            raise ValueError(f"section {i}: end must be after start")
+        if sec.fade_out_start is not None and sec.end is not None and not sec.start < sec.fade_out_start < sec.end:
+            raise ValueError(f"section {i}: fade_out_start must fall inside the section")
+        sections.append(sec)
+    if not sections:
+        raise ValueError("spec has no sections")
+    return sections
+
+
+def compute_offsets(sections: list[Section], durations: list[float]) -> list[float]:
+    """Medley start time of each section. durations[i] = section length in seconds.
+
+    A crossfade overlaps the previous section's tail by join_duration; a gap inserts
+    join_duration seconds of silence. Offsets are what the lyric shift adds to source times.
+    """
+    offsets, cursor = [], 0.0
+    for i, (sec, dur) in enumerate(zip(sections, durations)):
+        if i == 0:
+            start = 0.0
+        elif sec.join == "crossfade":
+            start = cursor - sec.join_duration
+        else:
+            start = cursor + sec.join_duration
+        offsets.append(start)
+        cursor = start + dur
+    return offsets
+
+
+def shift_segments(segments, start: float, end: Optional[float], offset: float, prefix: str, tolerance: float = 0.05):
+    """Keep lyric lines that START inside [start, end) and move them by offset.
+
+    IDs are prefixed so the same song can appear twice (e.g. opener + finale).
+    """
+    out = []
+    for seg in segments:
+        if seg.start_time >= start - tolerance and (end is None or seg.start_time < end):
+            words = [dataclasses.replace(w, id=f"{prefix}_{w.id}", start_time=w.start_time + offset,
+                                         end_time=w.end_time + offset) for w in seg.words]
+            out.append(dataclasses.replace(seg, id=f"{prefix}_{seg.id}", words=words,
+                                           start_time=seg.start_time + offset, end_time=seg.end_time + offset))
+    return out
+
+
+def shift_chords(chords: list[dict], src_start: float, src_end: float, offset: float,
+                 trim_in: float = 0.0, trim_out: float = 0.0) -> list[dict]:
+    """Chords of one section on the medley timeline.
+
+    Clipped to [src_start + trim_in, src_end - trim_out] (half of each crossfade, so the
+    outgoing song's chords hand over to the incoming song's mid-fade) and moved by offset.
+    """
+    lo, hi = src_start + trim_in, src_end - trim_out
+    out = []
+    for c in chords:
+        start, end = max(c["start"], lo), min(c["end"], hi)
+        if end - start > 0.05:
+            out.append({**c, "start": start + offset, "end": end + offset})
+    return out
+
+
+def medley_chords(sections: list[Section], durations: list[float], offsets: list[float],
+                  chords_by_job: dict) -> list[dict]:
+    out = []
+    for i, (sec, dur, off) in enumerate(zip(sections, durations, offsets)):
+        trim_in = sec.join_duration / 2 if i > 0 and sec.join == "crossfade" else 0.0
+        nxt = sections[i + 1] if i + 1 < len(sections) else None
+        trim_out = nxt.join_duration / 2 if nxt is not None and nxt.join == "crossfade" else 0.0
+        out += shift_chords(chords_by_job.get(sec.job_id, []), sec.start, sec.start + dur, off - sec.start,
+                            trim_in, trim_out)
+    return out
+
+
+def build_filtergraph(sections: list[Section], durations: list[float], gains_db: list[float]) -> str:
+    """ffmpeg filter_complex joining inputs 0..n-1 (one per section, already trimmed) into [out].
+
+    Un-mastered: `master_filter` brings the result to FINAL_LUFS in a second pass.
+    """
+    chains = []
+    for i, (sec, dur, gain) in enumerate(zip(sections, durations, gains_db)):
+        f = f"[{i}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume={gain:.2f}dB"
+        if sec.fade_in > 0:
+            f += f",afade=t=in:st=0:d={sec.fade_in:.3f}:curve=qsin"
+        if sec.fade_out_start is not None:
+            st = sec.fade_out_start - sec.start
+            f += f",afade=t=out:st={st:.3f}:d={dur - st:.3f}:curve=qsin"
+        nxt = sections[i + 1] if i + 1 < len(sections) else None
+        if nxt is not None and nxt.join == "gap":
+            f += f",apad=pad_dur={nxt.join_duration:.3f}"
+        chains.append(f + f"[s{i}]")
+    cur = "s0"
+    for i in range(1, len(sections)):
+        out = f"x{i}"
+        if sections[i].join == "crossfade":
+            chains.append(f"[{cur}][s{i}]acrossfade=d={sections[i].join_duration:.3f}:c1=qsin:c2=qsin[{out}]")
+        else:
+            chains.append(f"[{cur}][s{i}]concat=n=2:v=0:a=1[{out}]")
+        cur = out
+    chains.append(f"[{cur}]anull[out]")
+    return ";".join(chains)
+
+
+def master_filter(measured_lufs: float) -> str:
+    """One static gain to FINAL_LUFS, then a peak limiter (4x oversampled ~ true peak).
+
+    Never single-pass loudnorm: its dynamic mode rides the gain on a 3s window, so a
+    near-silent stretch (an a cappella pickup, where the instrumental is just separation
+    residue) gets boosted ~50 dB into loud robotic artifacts.
+    """
+    limit = 10 ** (FINAL_PEAK_DB / 20)
+    return (f"volume={FINAL_LUFS - measured_lufs:.2f}dB,aresample=176400,"
+            f"alimiter=limit={limit:.4f}:attack=5:release=50:level=false:latency=true,aresample=44100")
+
+
+# --- I/O helpers ---------------------------------------------------------------------------
+
+
+def _run(args, **kw):
+    return subprocess.run(args, check=True, **kw)
+
+
+def probe_duration(path: str) -> float:
+    out = _run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+               capture_output=True, text=True).stdout
+    return float(out.strip())
+
+
+def measure_lufs(path: str, start: float, end: Optional[float]) -> float:
+    args = ["ffmpeg", "-hide_banner", "-nostats", "-ss", str(start)]
+    if end is not None:
+        args += ["-to", str(end)]
+    args += ["-i", path, "-af", "ebur128", "-f", "null", "-"]
+    res = subprocess.run(args, capture_output=True, text=True)
+    found = re.findall(r"I:\s+(-?[\d.]+) LUFS", res.stderr)
+    if res.returncode != 0 or not found:
+        raise RuntimeError(f"loudness measurement failed for {path}: {res.stderr.strip()[-300:]}")
+    return float(found[-1])
+
+
+def gcs_download(src: str, dst: str, required: bool = True) -> bool:
+    """Download gs://BUCKET/src via the gcloud CLI (the Python client stalled for ~1h on large FLACs)."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    args = ["gcloud", "storage", "cp", f"gs://{BUCKET}/{src}", dst]
+    if os.environ.get("MEDLEY_GCLOUD_ACCOUNT"):
+        args.insert(3, f"--account={os.environ['MEDLEY_GCLOUD_ACCOUNT']}")
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        if required:
+            raise RuntimeError(f"download failed for gs://{BUCKET}/{src}: {result.stderr.strip()[-300:]}")
+        return False
+    return True
+
+
+def job_dir(workdir: str, job_id: str) -> str:
+    return os.path.join(workdir, job_id)
+
+
+def load_job_meta(workdir: str, job_id: str) -> dict:
+    with open(os.path.join(job_dir(workdir, job_id), "job.json")) as f:
+        return json.load(f)
+
+
+def variant_path(workdir: str, job_id: str, variant: str) -> str:
+    d = job_dir(workdir, job_id)
+    stem = VARIANTS[variant]
+    if stem is None:
+        return os.path.join(d, "input", os.path.basename(load_job_meta(workdir, job_id)["input_media_gcs_path"]))
+    return os.path.join(d, "stems", stem)
+
+
+def backing_mix_args(clean: str, backing: str, gain_db: float, out: str) -> list[str]:
+    """ffmpeg args: clean instrumental + backing vocals at gain_db (sample-aligned stems)."""
+    return ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", clean, "-i", backing,
+            "-filter_complex", f"[1:a]volume={gain_db:.1f}dB[b];[0:a][b]amix=inputs=2:normalize=0[out]",
+            "-map", "[out]", "-c:a", "flac", out]
+
+
+def section_audio(workdir: str, sec: Section, variant: str) -> str:
+    """Audio file for one section of one variant (the karaoke track can have its backing
+    vocals turned down per section, built once from the clean + backing stems)."""
+    if variant != KARAOKE_VARIANT or sec.backing_vocals_db is None:
+        return variant_path(workdir, sec.job_id, variant)
+    stems = os.path.join(job_dir(workdir, sec.job_id), "stems")
+    out = os.path.join(stems, f"instrumental_backing_{sec.backing_vocals_db:+.1f}dB.flac")
+    if not os.path.exists(out):
+        backing = os.path.join(stems, "backing_vocals.flac")
+        if not os.path.exists(backing):
+            raise SystemExit(f"{sec.job_id}: backing_vocals_db needs stems/backing_vocals.flac (not in this job)")
+        partial = out[:-len(".flac")] + ".partial.flac"  # never leave a truncated mix to be reused
+        _run(backing_mix_args(os.path.join(stems, "instrumental_clean.flac"), backing, sec.backing_vocals_db, partial))
+        os.replace(partial, out)
+    return out
+
+
+def section_durations(sections: list[Section], workdir: str) -> list[float]:
+    durs = []
+    for sec in sections:
+        end = sec.end if sec.end is not None else probe_duration(variant_path(workdir, sec.job_id, GUIDE_VARIANT))
+        durs.append(end - sec.start)
+    return durs
+
+
+# --- Commands ------------------------------------------------------------------------------
+
+
+def cmd_fetch(spec: dict, workdir: str):
+    from google.cloud import firestore
+    db = firestore.Client(project=PROJECT)
+    for job_id in dict.fromkeys(s["job_id"] for s in spec["sections"]):
+        doc = db.collection("jobs").document(job_id).get()
+        if not doc.exists:
+            raise SystemExit(f"job {job_id} not found")
+        job = doc.to_dict()
+        if job.get("status") != "complete":
+            log.warning("job %s is %s, not complete: lyrics may not be reviewed yet", job_id, job.get("status"))
+        d = job_dir(workdir, job_id)
+        os.makedirs(os.path.join(d, "stems"), exist_ok=True)
+        os.makedirs(os.path.join(d, "input"), exist_ok=True)
+        meta = {k: job.get(k) for k in ("job_id", "artist", "title", "status", "input_media_gcs_path",
+                                         "style_params_gcs_path", "style_assets")}
+        with open(os.path.join(d, "job.json"), "w") as f:
+            json.dump(meta, f, indent=1, default=str)
+        wanted = {job["input_media_gcs_path"]: os.path.join(d, "input", os.path.basename(job["input_media_gcs_path"]))}
+        for name in ("instrumental_with_backing", "instrumental_clean", "lead_vocals", "backing_vocals"):
+            wanted[f"jobs/{job_id}/stems/{name}.flac"] = os.path.join(d, "stems", f"{name}.flac")
+        for name in ("corrections.json", "corrections_updated.json"):
+            wanted[f"jobs/{job_id}/lyrics/{name}"] = os.path.join(d, name)
+        for src, dst in wanted.items():
+            optional = "corrections_updated" in src or src.endswith(("lead_vocals.flac", "backing_vocals.flac"))
+            if not gcs_download(src, dst, required=not optional) and not optional:
+                log.warning("missing gs://%s/%s", BUCKET, src)
+        log.info("fetched %s - %s (%s)", job.get("artist"), job.get("title"), job_id)
+
+
+def cmd_audio(spec: dict, workdir: str, outdir: str):
+    sections = parse_spec(spec)
+    durations = section_durations(sections, workdir)
+    os.makedirs(outdir, exist_ok=True)
+    for variant in VARIANTS:
+        inputs, gains = [], []
+        for sec in sections:
+            p = section_audio(workdir, sec, variant)
+            gains.append(SEGMENT_TARGET_LUFS - measure_lufs(p, sec.start, sec.end))
+            inputs += ["-ss", str(sec.start)] + (["-to", str(sec.end)] if sec.end is not None else []) + ["-i", p]
+        wav = os.path.join(outdir, f"medley_{variant}.wav")
+        raw = wav[:-4] + ".unmastered.wav"
+        _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + inputs +
+             ["-filter_complex", build_filtergraph(sections, durations, gains), "-map", "[out]", "-c:a", "pcm_f32le", raw])
+        _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", raw,
+              "-af", master_filter(measure_lufs(raw, 0.0, None)), "-c:a", "pcm_s24le", wav])
+        os.remove(raw)
+        _run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", wav, "-c:a", "libmp3lame", "-b:a", "320k",
+              wav[:-4] + ".mp3"])
+        log.info("%s: %.1fs", wav, probe_duration(wav))
+    offsets = compute_offsets(sections, durations)
+    with open(os.path.join(outdir, "timeline.json"), "w") as f:
+        json.dump([{"label": s.label, "job_id": s.job_id, "source_start": s.start, "source_end": s.start + d,
+                    "medley_start": o, "medley_end": o + d} for s, d, o in zip(sections, durations, offsets)], f, indent=1)
+
+
+def cmd_chords(spec: dict, workdir: str):
+    """Detect chords for each job with scripts/medley/detect_chords.py (ChordMini ensemble).
+
+    MEDLEY_CHORDMINI = a ChordMini checkout with its own .venv (see docs/MEDLEYS.md).
+    Harmonic stems (guitar+piano+bass+other via htdemucs_6s) are added when the
+    audio-separator CLI is available; otherwise just the full mix + clean instrumental.
+    """
+    chordmini = os.environ.get("MEDLEY_CHORDMINI")
+    if not chordmini or not os.path.isdir(chordmini):
+        raise SystemExit("set MEDLEY_CHORDMINI to a ChordMini checkout (see docs/MEDLEYS.md § Guitar chords)")
+    python = os.path.join(chordmini, ".venv", "bin", "python")
+    detect = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detect_chords.py")
+    for job_id in dict.fromkeys(s["job_id"] for s in spec["sections"]):
+        d = job_dir(workdir, job_id)
+        inputs = [f"mix={variant_path(workdir, job_id, GUIDE_VARIANT)}",
+                  f"inst={variant_path(workdir, job_id, 'instrumental_clean')}"]
+        harm = _harmonic_stem(d, variant_path(workdir, job_id, GUIDE_VARIANT))
+        if harm:
+            inputs.append(f"harm={harm}")
+        args = [python, detect, "--chordmini", chordmini, "--out", os.path.join(d, "chords_detected.json")]
+        for i in inputs:
+            args += ["--input", i]
+        _run(args)
+        shutil.copyfile(os.path.join(d, "chords_detected.json"), os.path.join(d, "chords.json"))
+
+
+def cmd_chart(spec: dict, workdir: str, wrap: Optional[int]):
+    """chords.json from the customer's chord chart (<job>/chart.txt or chart.docx), timed on the
+    reviewed lyrics; chords_detected.json (from `chords`) fills intros and breaks."""
+    import chord_chart
+    for job_id in dict.fromkeys(s["job_id"] for s in spec["sections"]):
+        d = job_dir(workdir, job_id)
+        chart = next((os.path.join(d, n) for n in ("chart.txt", "chart.docx") if os.path.exists(os.path.join(d, n))), None)
+        if chart is None:
+            log.info("%s: no chart, keeping its chords.json", job_id)
+            continue
+        detected = os.path.join(d, "chords_detected.json")
+        if not os.path.exists(detected):
+            if not os.path.exists(os.path.join(d, "chords.json")):
+                raise SystemExit(f"{job_id}: run the `chords` step first (breaks are filled from detected chords)")
+            shutil.copyfile(os.path.join(d, "chords.json"), detected)  # chords.json from before `chart` existed
+        with open(detected) as f:
+            detected_chords = json.load(f)
+        updated = os.path.join(d, "corrections_updated.json")
+        sung = chord_chart.sung_words(os.path.join(d, "corrections.json"), updated if os.path.exists(updated) else None)
+        chords = chord_chart.chart_to_chords(chord_chart.read_chart(chart, wrap), sung, detected_chords,
+                                             probe_duration(variant_path(workdir, job_id, GUIDE_VARIANT)))
+        with open(os.path.join(d, "chords.json"), "w") as f:
+            json.dump(chords, f, indent=1)
+        log.info("%s: %d chord changes from %s", job_id, len(chords), os.path.basename(chart))
+
+
+def _harmonic_stem(d: str, source: str) -> Optional[str]:
+    """guitar+piano+bass+other from htdemucs_6s (drums and vocals removed), cached per job."""
+    out = os.path.join(d, "harmonic.flac")
+    if os.path.exists(out):
+        return out
+    if subprocess.run(["which", "audio-separator"], capture_output=True).returncode != 0:
+        log.info("audio-separator not on PATH: skipping harmonic stems")
+        return None
+    stems_dir = os.path.join(d, "stems6")
+    os.makedirs(stems_dir, exist_ok=True)
+    _run(["audio-separator", "-m", "htdemucs_6s.yaml", "--output_format", "FLAC", "--output_dir", stems_dir, source],
+         capture_output=True)
+    parts = [os.path.join(stems_dir, f) for f in sorted(os.listdir(stems_dir))
+             if any(f"({n})" in f for n in ("Guitar", "Piano", "Bass", "Other"))]
+    if len(parts) != 4:
+        log.warning("unexpected htdemucs_6s output in %s", stems_dir)
+        return None
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    for part in parts:
+        args += ["-i", part]
+    _run(args + ["-filter_complex", "amix=inputs=4:normalize=0", out])
+    return out
+
+
+def _load_reviewed_lyrics(workdir: str, job_id: str):
+    from karaoke_gen.lyrics_transcriber.correction.operations import CorrectionOperations
+    from karaoke_gen.lyrics_transcriber.types import CorrectionResult
+    d = job_dir(workdir, job_id)
+    with open(os.path.join(d, "corrections.json")) as f:
+        base = CorrectionResult.from_dict(json.load(f))
+    updated = os.path.join(d, "corrections_updated.json")
+    if os.path.exists(updated):
+        with open(updated) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "corrections" in data:
+            return CorrectionOperations.update_correction_result_with_data(base, data)
+    return base
+
+
+def cmd_video(spec: dict, workdir: str, outdir: str, resolution: str):
+    from karaoke_gen.lyrics_transcriber.core.config import OutputConfig
+    from karaoke_gen.lyrics_transcriber.output.countdown_processor import CountdownProcessor
+    from karaoke_gen.lyrics_transcriber.output.generator import OutputGenerator
+    from karaoke_gen.style_loader import get_end_format, get_intro_format, load_styles_from_gcs
+    from karaoke_gen.video_generator import VideoGenerator
+
+    sections = parse_spec(spec)
+    durations = section_durations(sections, workdir)
+    offsets = compute_offsets(sections, durations)
+    karaoke_wav = os.path.join(outdir, f"medley_{KARAOKE_VARIANT}.wav")
+    guide_wav = os.path.join(outdir, f"medley_{GUIDE_VARIANT}.wav")
+    if not os.path.exists(karaoke_wav):
+        raise SystemExit("run the `audio` step first")
+    render_dir = os.path.join(outdir, f"render_{resolution}")
+    cache_dir = os.path.join(render_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    lyrics = {j: _load_reviewed_lyrics(workdir, j) for j in dict.fromkeys(s.job_id for s in sections)}
+    segments = []
+    for n, (sec, dur, off) in enumerate(zip(sections, durations, offsets)):
+        segments += shift_segments(lyrics[sec.job_id].corrected_segments, sec.start, sec.start + dur,
+                                   off - sec.start, prefix=f"m{n}")
+    first = lyrics[sections[0].job_id]
+    medley = dataclasses.replace(first, corrected_segments=segments, resized_segments=[])
+    for seg in segments:
+        log.info("%7.2f-%7.2f  %s", seg.start_time, seg.end_time, seg.text)
+
+    # Theme: the style of the job named in the spec (default: first section's job)
+    theme_job = load_job_meta(workdir, spec.get("theme_job_id", sections[0].job_id))
+    styles_path, _ = load_styles_from_gcs(theme_job["style_params_gcs_path"], theme_job["style_assets"],
+                                          os.path.join(render_dir, "style"), gcs_download, log)
+    with open(styles_path) as f:
+        style = json.load(f)
+
+    # Same countdown gen adds when the first word starts within 3s (pads audio + shifts lyrics)
+    medley, audio, _, pad = CountdownProcessor(cache_dir=cache_dir, logger=log).process(
+        correction_result=medley, audio_filepath=karaoke_wav)
+
+    chords = None
+    if spec.get("chords"):
+        from karaoke_gen.lyrics_transcriber.output.ass.chords import ChordChange
+        by_job = {}
+        for job_id in dict.fromkeys(s.job_id for s in sections):
+            path = os.path.join(job_dir(workdir, job_id), "chords.json")
+            if not os.path.exists(path):
+                raise SystemExit(f"no chords for {job_id}: run the `chords` step first")
+            with open(path) as f:
+                by_job[job_id] = json.load(f)
+        chords = [ChordChange(c["start"] + pad, c["end"] + pad, c["label"], c.get("capo", 0))
+                  for c in medley_chords(sections, durations, offsets, by_job)]
+        log.info("guitar chords: %d changes", len(chords))
+
+    artist, title = spec["artist"], spec["title"]
+    vg = VideoGenerator(logger=log, ffmpeg_base_command="ffmpeg -hide_banner -loglevel error -nostats -y",
+                        render_bounding_boxes=False, output_png=True, output_jpg=False)
+    title_png, end_png = os.path.join(render_dir, "title"), os.path.join(render_dir, "end")
+    vg.create_title_video(artist=artist, title=title, format=get_intro_format(style), output_image_filepath_noext=title_png,
+                          output_video_filepath=title_png + ".mov", existing_title_image=None, intro_video_duration=0)
+    vg.create_end_video(artist=artist, title=title, format=get_end_format(style), output_image_filepath_noext=end_png,
+                        output_video_filepath=end_png + ".mov", existing_end_image=None, end_video_duration=0)
+
+    cfg = OutputConfig(output_dir=render_dir, cache_dir=cache_dir, output_styles_json=styles_path, render_video=True,
+                       generate_cdg=False, generate_plain_text=True, generate_lrc=True, video_resolution=resolution)
+    outputs = OutputGenerator(cfg, log).generate_outputs(
+        transcription_corrected=medley, lyrics_results={}, output_prefix=title, audio_filepath=audio,
+        artist=artist, title=title, chords=chords)
+
+    w, h = {"4k": (3840, 2160), "1080p": (1920, 1080), "720p": (1280, 720), "360p": (640, 360)}[resolution]
+    intro_s, end_s = style["intro"]["video_duration"], style["end"]["video_duration"]
+    master = os.path.join(outdir, f"{title} (Karaoke {resolution}).mp4")
+    scale = f"scale={w}:{h},fps=30,format=yuv420p,setsar=1"
+    _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+          "-loop", "1", "-t", str(intro_s), "-i", title_png + ".png", "-f", "lavfi", "-t", str(intro_s), "-i", "anullsrc=r=44100:cl=stereo",
+          "-i", outputs.video,
+          "-loop", "1", "-t", str(end_s), "-i", end_png + ".png", "-f", "lavfi", "-t", str(end_s), "-i", "anullsrc=r=44100:cl=stereo",
+          "-filter_complex", f"[0:v]{scale}[t];[2:v]{scale}[k];[3:v]{scale}[e];[t][k][e]concat=n=3:v=1:a=0[v];[1:a][2:a][4:a]concat=n=3:v=0:a=1[a]",
+          "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-c:a", "aac", "-b:a", "320k",
+          "-movflags", "+faststart", master])
+    # Guide: same picture, original-vocals medley delayed by title + countdown (for checking sync)
+    delay_ms = int((intro_s + pad) * 1000)
+    guide = os.path.join(outdir, f"{title} (With Vocals {resolution}).mp4")
+    _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", master, "-i", guide_wav,
+          "-filter_complex", f"[1:a]adelay={delay_ms}|{delay_ms},apad[a]", "-map", "0:v", "-map", "[a]", "-shortest",
+          "-c:v", "copy", "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", guide])
+    if outputs.lrc:
+        _run(["cp", outputs.lrc, os.path.join(outdir, f"{title} (Karaoke).lrc")])
+    log.info("karaoke: %s\nguide: %s", master, guide)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("command", choices=["fetch", "audio", "video", "chords", "chart"])
+    p.add_argument("spec")
+    p.add_argument("--resolution", default="4k", choices=["4k", "1080p", "720p", "360p"])
+    p.add_argument("--wrap", type=int, help="chart: page width in columns (undoes Word's soft wrapping)")
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    with open(args.spec) as f:
+        spec = json.load(f)
+    parse_spec(spec)  # validate early
+    base = os.path.dirname(os.path.abspath(args.spec))
+    workdir = os.path.join(base, spec.get("workdir", "work"))
+    outdir = os.path.join(base, spec.get("outdir", "out"))
+    if args.command == "fetch":
+        cmd_fetch(spec, workdir)
+    elif args.command == "chords":
+        cmd_chords(spec, workdir)
+    elif args.command == "chart":
+        cmd_chart(spec, workdir, args.wrap)
+    elif args.command == "audio":
+        cmd_audio(spec, workdir, outdir)
+    else:
+        cmd_video(spec, workdir, outdir, args.resolution)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,434 @@
+# Development Guide
+
+> **External contributor?** See [CONTRIBUTING.md](../CONTRIBUTING.md) at the repo
+> root — the backend runs fully locally against emulators with **no GCP
+> credentials or paid API keys**. This file covers the full setup including
+> production/deployment concerns.
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.12
+- Node.js 20+
+- Docker (for GCS emulator)
+- Google Cloud SDK with Firestore emulator
+
+```bash
+# Install Firestore emulator
+gcloud components install cloud-firestore-emulator
+```
+
+### Backend Setup
+
+```bash
+# Create and activate venv
+python3.12 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+poetry install
+
+# Optional: copy environment template for API keys / overrides
+# (nothing in it is required to run locally with emulators)
+cp .env.example .env
+```
+
+### Frontend Setup
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local
+# Edit .env.local with KARAOKE_ACCESS_TOKEN
+```
+
+## Running Locally
+
+### Backend with Emulators
+
+```bash
+# Start emulators, create the bucket, seed a default theme, run the backend
+./scripts/run-backend-local.sh --with-emulators
+
+# Backend runs at http://localhost:8000
+# API docs at http://localhost:8000/docs
+```
+
+In emulator mode no GCP credentials are needed: workers run as local
+subprocesses, signed URLs are rewritten to emulator URLs, and magic-link
+login emails are printed to the console. Jobs must be created via **file
+upload** (URL jobs require the flacfetch cloud service). Set `MODEL_DIR` to
+enable local audio separation. See [CONTRIBUTING.md](../CONTRIBUTING.md) for
+the full walkthrough.
+
+### Local stack (full app, fake workers)
+
+```bash
+scripts/local-stack.sh up --frontend
+# API http://127.0.0.1:8010 (FAKE_WORKERS=1), web http://127.0.0.1:3010
+```
+
+The whole product runs offline: search, job creation, review, credits, fake
+Stripe checkout, emails (read them at `/api/test/emails`) and downloads. Jobs
+move through their real states in seconds via in-process fake workers, and
+`POST /api/test/scenario` seeds users and jobs in any state. This is what the
+`frontend/e2e/local-stack` Playwright suite and the mobile app's Maestro flows
+run against. See [TESTING.md § Local stack](TESTING.md#local-stack-real-backend-fake-workers).
+
+### Frontend
+
+```bash
+cd frontend
+npm run dev
+# Runs at http://localhost:3000
+```
+
+## Testing
+
+**See [TESTING.md](TESTING.md) for complete testing guidance.**
+
+Quick reference (run before committing):
+
+```bash
+make test 2>&1 | tail -n 500
+```
+
+This runs ALL tests (backend + frontend) and installs dependencies automatically.
+
+For faster iteration, run subsets:
+- `make test-backend` - Backend only (~2 min)
+- `make test-frontend` - Frontend only (~3 min)
+
+TESTING.md covers: test types, CI requirements, Playwright usage, mocking guidelines, and coverage enforcement.
+
+**For ad-hoc production debugging**, see the "Ad-Hoc Production Debugging" section in TESTING.md. Use the template at `frontend/e2e/helpers/debug-prod-template.mjs`.
+
+## Deployment
+
+### Automatic (CI/CD)
+
+Push to `main` triggers GitHub Actions:
+1. Run tests
+2. Build Docker image
+3. Deploy to Cloud Run
+4. Deploy frontend to Cloudflare Pages
+
+### Infrastructure Changes (Pulumi)
+
+**All infrastructure changes must go through PRs.** The CI pipeline automatically deploys Pulumi changes when PRs merge to main.
+
+**IMPORTANT: Always deploy infrastructure changes locally first.** CI deploys run on spot VMs that can be preempted mid-apply, leaving Pulumi state partially applied (e.g., resources deleted but not recreated). Running `pulumi up` locally before merging ensures changes work correctly and avoids painful state recovery.
+
+```bash
+cd infrastructure
+
+# 1. Preview changes
+pulumi preview --stack nomadkaraoke/karaoke-gen-infrastructure/prod
+
+# 2. Apply locally FIRST (ensures clean apply before CI)
+pulumi up --stack nomadkaraoke/karaoke-gen-infrastructure/prod
+
+# 3. Then create PR and merge (CI will run pulumi up again as a no-op)
+```
+
+**If CI deploy fails or is interrupted:**
+```bash
+# Cancel stale lock from interrupted run
+pulumi cancel --stack nomadkaraoke/karaoke-gen-infrastructure/prod
+
+# Sync state with actual GCP resources
+pulumi refresh --stack nomadkaraoke/karaoke-gen-infrastructure/prod --yes
+
+# Re-apply (may need `pulumi import` for resources created but not in state)
+pulumi up --stack nomadkaraoke/karaoke-gen-infrastructure/prod
+```
+
+See `docs/LESSONS-LEARNED.md` for Pulumi CI gotchas and recovery examples.
+
+**What's managed by Pulumi:**
+- Firestore database and indexes
+- GCS buckets
+- Cloud Run service configuration
+- Cloud Tasks queues
+- Secret Manager secrets
+- Service accounts and IAM bindings
+- Workload Identity Federation
+- GCE instances (GitHub runners x3 spot + 1 on-demand build runner, encoding worker)
+
+**Workflow:**
+1. Make changes in the appropriate module under `infrastructure/`
+   - `modules/` - Core GCP resources (database, storage, secrets, IAM, etc.)
+   - `compute/` - VM definitions and startup scripts
+   - `config.py` - Shared configuration constants
+   - `__main__.py` - Entry point that wires modules together
+2. Run `pulumi preview` locally to verify
+3. Run `pulumi up` locally to apply
+4. Create PR and merge (CI re-runs `pulumi up` as a no-op confirmation)
+
+### Manual Frontend Deploy
+
+```bash
+cd frontend
+npm run build
+npx wrangler pages deploy out
+```
+
+Requires `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` environment variables (set via `.envrc` or exported manually). Since 2026-10-14 these must point at the dedicated **Nomad Karaoke** Cloudflare account (`4585249dcf5d2f9fb4e075c5382cd071`) — the workspace `.envrc` does this (the personal account is `PERSONAL_CLOUDFLARE_*` there), as do the CI GitHub secrets of the same names (Pages-only token). The `wrangler.toml` in the repo root configures the project name (`karaoke-gen`, i.e. `karaoke-gen-9k4.pages.dev`, custom domain `gen.nomadkaraoke.com`) and build output directory. Tenant portals deploy to the separate `karaoke-gen-tenant` project (`karaoke-gen-tenant-x0h.pages.dev`); the pages.dev names carry suffixes because they are globally unique and the projects were recreated in the new account.
+
+### Testing Tenant Portals Locally
+
+To test a tenant portal on `localhost:3000`, add a `?tenant=` query parameter:
+
+```
+http://localhost:3000/?tenant=singa      # Singa portal (green/black)
+http://localhost:3000/?tenant=vocalstar  # Vocal Star portal (yellow/blue)
+http://localhost:3000/                   # Default Nomad Karaoke (no tenant)
+```
+
+The frontend's `detectTenantFromUrl()` checks for the `tenant` query param on localhost. In production, tenants are detected from the subdomain (e.g., `singa.nomadkaraoke.com`).
+
+## Environment Variables
+
+### Backend (.env)
+
+```bash
+# Required
+AUDIOSHAKE_API_TOKEN=...
+GENIUS_ACCESS_TOKEN=...
+
+# GCP (auto-configured in Cloud Run)
+GOOGLE_CLOUD_PROJECT=...
+GCS_BUCKET_NAME=...
+
+# Auth
+ADMIN_TOKENS=token1,token2
+```
+
+### Frontend (.env.local)
+
+```bash
+NEXT_PUBLIC_API_URL=http://localhost:8000
+
+# For E2E tests (see frontend/.env.local.example)
+KARAOKE_ACCESS_TOKEN=...     # Skip email enrollment
+TESTMAIL_API_KEY=...         # testmail.app API key
+TESTMAIL_NAMESPACE=...       # testmail.app namespace
+```
+
+## Key Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `make test` | Run all backend tests |
+| `./scripts/run-backend-local.sh` | Start backend with emulators |
+| `./scripts/start-emulators.sh` | Start emulators only |
+| `./scripts/stop-emulators.sh` | Stop emulators |
+| `./scripts/debug-job.sh <job_id>` | Debug a cloud job (status, logs, files) |
+| `./scripts/get_job.py <job_id>` | Fetch job data from Firestore |
+| `./scripts/fetch_job_logs.py <job_id>` | Fetch cloud job logs to local file |
+| `./scripts/analyze_log_timing.py <log>` | Profile karaoke-gen performance from logs |
+| `./scripts/benchmark_ffmpeg.py` | Isolated FFmpeg encoding benchmark |
+| `./scripts/compare_local_vs_remote.py` | Compare local vs cloud karaoke-gen performance |
+| `./scripts/setup-singa-tenant.py` | Generate Singa tenant assets and upload to GCS |
+| `./scripts/setup-vocalstar-tenant.py` | Generate Vocal Star tenant assets and upload to GCS |
+
+## Encoding Worker Operations
+
+The encoding worker is the AWS EC2 box `aws-encoding-worker-1` (preferred, also runs distribution) plus one stopped on-demand GCE fallback (`encoding-worker-fallback-c2df`, c2d-highcpu-16, us-central1-f). The c4d Spot pair (`encoding-worker-a`/`-b`) was retired and deleted in 2026-11; examples below that name it should use c2df (`--zone=us-central1-f`). CI only blue-green redeploys the worker when a path in `infrastructure/encoding-worker/worker_code_paths.txt` changed since the serving version (or via Actions → CI → Run workflow with "Force a blue-green redeploy of the GCE encoding worker"). Candidate ordering (runtime + deploy) is the shared `backend/services/encoding_worker_preference.py`. See [ARCHITECTURE.md](ARCHITECTURE.md#encoding-worker-blue-green-primary-pair--multi-family-fallback-pool) for the full design.
+
+### Seed Firestore config (initial setup or reset)
+
+```bash
+python scripts/seed-encoding-worker-config.py <ip-a> <ip-b>
+```
+
+### Check VM status
+
+```bash
+gcloud compute instances describe encoding-worker-a \
+  --zone=us-central1-c --project=nomadkaraoke \
+  --format='value(status)'
+```
+
+### Manually start / stop a VM
+
+```bash
+# Start
+gcloud compute instances start encoding-worker-a \
+  --zone=us-central1-c --project=nomadkaraoke
+
+# Stop
+gcloud compute instances stop encoding-worker-a \
+  --zone=us-central1-c --project=nomadkaraoke
+```
+
+### Check worker health
+
+```bash
+IP=$(gcloud compute instances describe encoding-worker-a \
+  --zone=us-central1-c --project=nomadkaraoke \
+  --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+curl http://$IP:8080/health
+```
+
+### Manually trigger idle shutdown
+
+Go to Cloud Scheduler in the GCP console and click "Force run" on the `encoding-worker-idle-shutdown` job, or:
+
+```bash
+gcloud scheduler jobs run encoding-worker-idle-shutdown \
+  --location=us-central1 --project=nomadkaraoke
+```
+
+### Roll back a deploy
+
+If a deploy went wrong, swap the Firestore config back to the old primary:
+
+```bash
+python3 << 'EOF'
+import os
+os.environ['GOOGLE_CLOUD_PROJECT'] = 'nomadkaraoke'
+from google.cloud import firestore
+db = firestore.Client(project='nomadkaraoke')
+db.collection('config').document('encoding-worker').update({'primary': 'a'})  # or 'b'
+print("Rolled back")
+EOF
+```
+
+The backend's 30-second URL cache will pick up the change within 30 seconds.
+
+## Project Structure
+
+```
+karaoke-gen/
+├── backend/
+│   ├── api/routes/       # FastAPI endpoints
+│   ├── models/           # Pydantic models
+│   ├── services/         # Business logic
+│   ├── workers/          # Background workers
+│   └── tests/            # Backend tests
+├── frontend/
+│   ├── src/
+│   │   ├── app/          # Next.js pages
+│   │   ├── components/   # React components
+│   │   └── lib/          # Utilities
+│   └── tests/            # Frontend tests
+├── infrastructure/       # Pulumi IaC
+├── karaoke_gen/          # CLI package
+└── scripts/              # Dev scripts
+```
+
+## Observability & Debugging
+
+The backend exports OpenTelemetry traces to Google Cloud Trace. Use these for investigating production issues.
+
+### Accessing Cloud Trace
+
+**Cloud Console (easiest for browsing):**
+```
+https://console.cloud.google.com/traces/list?project=nomadkaraoke
+```
+
+**CLI queries:**
+```bash
+# List recent traces (requires `gcloud alpha` for trace commands)
+# Easier to use the Console UI for trace browsing
+
+# Find traces by job_id in logs, then correlate with Cloud Trace
+gcloud logging read 'resource.type="cloud_run_revision" textPayload=~"JOB_ID"' \
+  --project=nomadkaraoke --limit=50
+```
+
+### Key Traced Spans
+
+| Span Name | What It Measures | Key Attributes |
+|-----------|------------------|----------------|
+| `lyrics_corrector.run` | Full lyrics correction pipeline | `word_count`, `reference_count` |
+| `lyrics_corrector.find_anchors_and_gaps` | Anchor sequence matching | `anchor_count`, `gap_count` |
+| `lyrics_corrector.process_corrections` | Agentic correction processing | `gap_count`, `total_proposals` |
+| `anchor_search.find_anchors` | N-gram parallel processing | `transcription.text_length`, `timeout_seconds` |
+| `agentic.propose_for_gap` | AI gap classification | `gap_id`, `word_count`, `gap_category` |
+| `add-lyrics` | Adding reference lyrics | `job_id`, `source` |
+| `generate-preview-video` | Video preview generation | `job_id`, `use_gce` |
+
+### Investigating Slow Operations
+
+1. **Find the trace**: Go to Cloud Trace console, filter by time range around the failure
+2. **Look at waterfall**: Identify which span took longest
+3. **Check attributes**: Each span has metadata (word counts, durations, etc.)
+4. **Correlate with logs**: Use timestamp and job_id to find related logs
+
+### Example Investigation Workflow
+
+```bash
+# 1. Find job failures in logs
+gcloud logging read 'resource.type="cloud_run_revision" severity>=ERROR' \
+  --project=nomadkaraoke --limit=20 --format="table(timestamp,textPayload)"
+
+# 2. Get timeline for specific job
+./scripts/debug-job.sh <job_id>
+
+# 3. Check anchor search progress (time-based logging every 30s)
+gcloud logging read 'resource.type="cloud_run_revision" "ANCHOR SEARCH: Progress"' \
+  --project=nomadkaraoke --limit=20
+
+# 4. Open Cloud Trace to see detailed timing breakdown
+# Filter traces by time window when the job ran
+```
+
+### Debugging Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `./scripts/debug-job.sh <job_id>` | Show job status, timeline, logs, GCS files |
+| `./scripts/get_job.py <job_id>` | Fetch raw job data from Firestore |
+| `./scripts/fetch_job_logs.py <job_id>` | Download all logs for a job to local file |
+
+### Adding New Traces
+
+When adding new operations that may need investigation:
+
+```python
+from karaoke_gen.lyrics_transcriber.utils.tracing import create_span, add_span_attribute
+
+with create_span("operation_name", {"initial": "attributes"}) as span:
+    # ... do work ...
+    if span:
+        span.set_attribute("result_count", len(results))
+```
+
+For backend code:
+```python
+from backend.services.tracing import create_span
+
+with create_span("operation_name", {"job_id": job_id}) as span:
+    # ... do work ...
+```
+
+## Troubleshooting
+
+### Emulators Won't Start
+
+```bash
+# Check if already running
+lsof -i :8080  # Firestore
+lsof -i :4443  # GCS
+
+# Stop them
+./scripts/stop-emulators.sh
+```
+
+### Docker Issues
+
+```bash
+# Ensure Docker is running
+docker info
+
+# For GCS emulator
+docker pull fsouza/fake-gcs-server
+```
+
+### Test Failures
+
+See [TESTING.md](TESTING.md#debugging-failed-tests) for debugging test failures, coverage issues, and CI troubleshooting.

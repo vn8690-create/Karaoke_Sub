@@ -1,0 +1,29 @@
+# DEPRECATED: This file is no longer used for Docker builds or CI.
+# Docker and CI both use poetry/pyproject.toml directly.
+# This file is kept for reference only.
+
+fastapi>=0.104.0,<1.0.0
+uvicorn[standard]>=0.24.0,<1.0.0
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+python-multipart>=0.0.6,<1.0.0
+httpx>=0.25.0,<1.0.0
+google-cloud-firestore>=2.14.0,<3.0.0
+google-cloud-storage>=2.14.0,<3.0.0
+google-cloud-secret-manager>=2.18.0,<3.0.0
+google-cloud-tasks>=2.14.0,<3.0.0
+google-cloud-run>=0.10.0,<1.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# Audio processing (reuses karaoke_gen library)
+audio-separator[remote]>=0.18.0  # Remote Modal API client
+pydub>=0.25.1  # Audio manipulation (used by karaoke_gen)
+yt-dlp>=2024.0.0  # YouTube downloads (future use)
+
+# Cloud storage native APIs
+dropbox>=11.0.0  # Dropbox Python SDK for native API access
+# google-api-python-client already installed via karaoke_gen for YouTube
+
+# karaoke-gen dependencies (will be installed from parent dir in Dockerfile)
+# Using explicit dependencies instead of -e ../
+

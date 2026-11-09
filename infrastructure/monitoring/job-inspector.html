@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Karaoke Job Inspector</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #eee;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding-top: 30px;
+        }
+        h1 {
+            text-align: center;
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 30px;
+        }
+        .input-group {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            font-size: 0.9rem;
+            color: #aaa;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 16px 20px;
+            font-size: 1.5rem;
+            font-family: 'Monaco', 'Menlo', monospace;
+            border: 2px solid #333;
+            border-radius: 10px;
+            background: #0d0d1a;
+            color: #00d4ff;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus {
+            border-color: #00d4ff;
+        }
+        input[type="text"]::placeholder {
+            color: #444;
+        }
+        .buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 20px;
+        }
+        button, .btn {
+            flex: 1;
+            padding: 16px 24px;
+            font-size: 1rem;
+            font-weight: 600;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.2s;
+            text-align: center;
+            text-decoration: none;
+        }
+        button:hover, .btn:hover {
+            transform: translateY(-2px);
+        }
+        button:active, .btn:active {
+            transform: translateY(0);
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            color: #000;
+        }
+        .btn-primary:hover {
+            box-shadow: 0 4px 20px rgba(0, 212, 255, 0.4);
+        }
+        .btn-secondary {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
+            border: 1px solid #444;
+        }
+        .btn-secondary:hover {
+            background: rgba(255,255,255,0.15);
+            box-shadow: 0 4px 20px rgba(255,255,255,0.1);
+        }
+        .settings-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #333;
+        }
+        .settings-row label {
+            margin: 0;
+            flex-shrink: 0;
+        }
+        select {
+            flex: 1;
+            padding: 10px 14px;
+            font-size: 0.95rem;
+            border: 2px solid #333;
+            border-radius: 8px;
+            background: #0d0d1a;
+            color: #00d4ff;
+            outline: none;
+            cursor: pointer;
+        }
+        select:focus {
+            border-color: #00d4ff;
+        }
+        .quick-links {
+            background: rgba(255,255,255,0.03);
+            border-radius: 16px;
+            padding: 20px 30px;
+            margin-bottom: 20px;
+        }
+        .quick-links h3 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #666;
+            margin: 0 0 15px 0;
+        }
+        .quick-links a {
+            display: block;
+            color: #00d4ff;
+            text-decoration: none;
+            padding: 10px 0;
+            border-bottom: 1px solid #222;
+            transition: color 0.2s;
+            cursor: pointer;
+        }
+        .quick-links a:last-child {
+            border-bottom: none;
+        }
+        .quick-links a:hover {
+            color: #fff;
+        }
+        
+        /* Guide section styles */
+        .guide-section {
+            background: rgba(255,255,255,0.03);
+            border-radius: 16px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        .guide-header {
+            padding: 20px 30px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: background 0.2s;
+        }
+        .guide-header:hover {
+            background: rgba(255,255,255,0.02);
+        }
+        .guide-header h3 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #666;
+            margin: 0;
+        }
+        .guide-header .toggle {
+            color: #666;
+            transition: transform 0.3s;
+        }
+        .guide-header.open .toggle {
+            transform: rotate(180deg);
+        }
+        .guide-content {
+            display: none;
+            padding: 0 30px 25px;
+        }
+        .guide-content.open {
+            display: block;
+        }
+        .guide-content h4 {
+            color: #00d4ff;
+            font-size: 1rem;
+            margin: 20px 0 10px 0;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #333;
+        }
+        .guide-content h4:first-child {
+            margin-top: 0;
+        }
+        .guide-content p {
+            color: #aaa;
+            line-height: 1.6;
+            margin: 10px 0;
+        }
+        .guide-content ul, .guide-content ol {
+            color: #aaa;
+            line-height: 1.8;
+            padding-left: 20px;
+        }
+        .guide-content li {
+            margin: 8px 0;
+        }
+        .guide-content code {
+            background: #0d0d1a;
+            color: #00d4ff;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 0.85rem;
+        }
+        .guide-content pre {
+            background: #0d0d1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            overflow-x: auto;
+            margin: 15px 0;
+        }
+        .guide-content pre code {
+            background: none;
+            padding: 0;
+            color: #7fdbca;
+            font-size: 0.8rem;
+            line-height: 1.5;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .status-badge.error { background: #ff4757; color: #fff; }
+        .status-badge.warning { background: #ffa502; color: #000; }
+        .status-badge.success { background: #2ed573; color: #000; }
+        .status-badge.info { background: #1e90ff; color: #fff; }
+        
+        .pipeline-flow {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            margin: 15px 0;
+            padding: 15px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }
+        .pipeline-step {
+            background: #1e3a5f;
+            color: #7fdbca;
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .pipeline-arrow {
+            color: #444;
+            font-size: 1.2rem;
+        }
+        
+        .hint {
+            text-align: center;
+            color: #555;
+            font-size: 0.85rem;
+            margin-top: 20px;
+        }
+        
+        .copy-btn {
+            background: rgba(255,255,255,0.1);
+            border: none;
+            color: #888;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.75rem;
+            margin-left: 10px;
+            transition: all 0.2s;
+        }
+        .copy-btn:hover {
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+            transform: none;
+        }
+        .copy-btn.copied {
+            background: #2ed573;
+            color: #000;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Karaoke Job Inspector</h1>
+        <p class="subtitle">Debug failed jobs in seconds</p>
+        
+        <div class="input-group">
+            <div class="settings-row">
+                <label for="authUser">Google Account</label>
+                <select id="authUser" onchange="saveAuthUser()">
+                    <option value="0">Account 0 (default)</option>
+                    <option value="1" selected>Account 1</option>
+                    <option value="2">Account 2</option>
+                    <option value="3">Account 3</option>
+                    <option value="4">Account 4</option>
+                    <option value="5">Account 5</option>
+                </select>
+            </div>
+            
+            <label for="jobId">Enter Job ID</label>
+            <input 
+                type="text" 
+                id="jobId" 
+                placeholder="e.g. 8f03f0ac-1234-5678-abcd"
+                autofocus
+                autocomplete="off"
+            >
+            <div class="buttons">
+                <button class="btn-primary" onclick="openLogs()">
+                    📋 View Logs
+                </button>
+                <button class="btn-secondary" onclick="openTrace()">
+                    🔍 View Trace
+                </button>
+            </div>
+        </div>
+        
+        <div class="quick-links">
+            <h3>Quick Links</h3>
+            <a onclick="openLink('monitoring/dashboards/builder/0ea8ed34-409c-4fa4-b663-d8e282f3b3a2')">
+                📊 System Dashboard
+            </a>
+            <a onclick="openLink('logs/query;query=resource.type%3D%22cloud_run_revision%22%0Aresource.labels.service_name%3D%22karaoke-backend%22%0Aseverity%3E%3DERROR;duration=PT1H')">
+                🚨 Recent Errors (last hour)
+            </a>
+            <a onclick="openLink('cloudtasks')">
+                📥 Cloud Tasks Queues
+            </a>
+            <a onclick="openLink('run/detail/us-central1/karaoke-backend/metrics')">
+                ☁️ Cloud Run Service
+            </a>
+        </div>
+        
+        <!-- Job Pipeline Guide -->
+        <div class="guide-section">
+            <div class="guide-header" onclick="toggleGuide('pipeline')">
+                <h3>📚 Understanding the Job Pipeline</h3>
+                <span class="toggle">▼</span>
+            </div>
+            <div class="guide-content" id="guide-pipeline">
+                <h4>Job Processing Flow</h4>
+                <p>When a job is submitted, it goes through these stages:</p>
+                
+                <div class="pipeline-flow">
+                    <span class="pipeline-step">Job Created</span>
+                    <span class="pipeline-arrow">→</span>
+                    <span class="pipeline-step">Audio Worker</span>
+                    <span class="pipeline-arrow">→</span>
+                    <span class="pipeline-step">Lyrics Worker</span>
+                    <span class="pipeline-arrow">→</span>
+                    <span class="pipeline-step">Screens Worker</span>
+                    <span class="pipeline-arrow">→</span>
+                    <span class="pipeline-step">Human Review</span>
+                    <span class="pipeline-arrow">→</span>
+                    <span class="pipeline-step">Render Video</span>
+                    <span class="pipeline-arrow">→</span>
+                    <span class="pipeline-step">Video Worker</span>
+                </div>
+                
+                <h4>Worker Descriptions</h4>
+                <ul>
+                    <li><strong>Audio Worker:</strong> Downloads audio, separates vocals/instrumental using Modal API (5-10 min)</li>
+                    <li><strong>Lyrics Worker:</strong> Transcribes lyrics via AudioShake, fetches from Genius, auto-corrects (2-5 min)</li>
+                    <li><strong>Screens Worker:</strong> Generates title and end screen images</li>
+                    <li><strong>Render Video Worker:</strong> After human review, renders the karaoke video with corrections</li>
+                    <li><strong>Video Worker:</strong> Final encoding, thumbnail generation, distribution (YouTube/Dropbox/GDrive)</li>
+                </ul>
+                
+                <h4>Job Statuses</h4>
+                <ul>
+                    <li><span class="status-badge info">searching_audio</span> Looking for audio source</li>
+                    <li><span class="status-badge info">downloading</span> Downloading/preparing input files</li>
+                    <li><span class="status-badge info">separating</span> Audio separation in progress (Modal)</li>
+                    <li><span class="status-badge info">transcribing</span> Lyrics transcription (AudioShake)</li>
+                    <li><span class="status-badge warning">awaiting_review</span> Ready for human review</li>
+                    <li><span class="status-badge info">rendering</span> Video generation in progress</li>
+                    <li><span class="status-badge success">complete</span> Job finished successfully</li>
+                    <li><span class="status-badge error">failed</span> Job encountered an error</li>
+                </ul>
+            </div>
+        </div>
+        
+        <!-- Debugging Guide -->
+        <div class="guide-section">
+            <div class="guide-header" onclick="toggleGuide('debugging')">
+                <h3>🔍 How to Debug a Failed Job</h3>
+                <span class="toggle">▼</span>
+            </div>
+            <div class="guide-content" id="guide-debugging">
+                <h4>Step 1: Check the Logs</h4>
+                <p>Enter the job ID above and click "View Logs". Look for:</p>
+                <ul>
+                    <li><span class="status-badge error">ERROR</span> severity entries - these show what went wrong</li>
+                    <li>Messages like <code>Created Cloud Task for audio worker</code> - confirms task was queued</li>
+                    <li>Messages like <code>AUDIO WORKER STARTED</code> - confirms worker began processing</li>
+                    <li>The last log entry before failure - often reveals the cause</li>
+                </ul>
+                
+                <h4>Step 2: Check Cloud Tasks</h4>
+                <p>Go to <strong>Cloud Tasks Queues</strong> and look for:</p>
+                <ul>
+                    <li><strong>Queue depth</strong> - if > 0, tasks are waiting to be processed</li>
+                    <li><strong>Failed tasks</strong> - click into the queue to see failed task details</li>
+                    <li><strong>Retry count</strong> - tasks retry up to 5 times before failing permanently</li>
+                </ul>
+                
+                <h4>Step 3: Check Trace (for timing issues)</h4>
+                <p>Click "View Trace" to see the distributed trace. Look for:</p>
+                <ul>
+                    <li>Spans with long durations - indicates slow operations</li>
+                    <li>Missing spans - worker may have crashed before creating span</li>
+                    <li>Error annotations on spans</li>
+                </ul>
+                
+                <h4>Step 4: Common Issues</h4>
+                <table style="width:100%; color:#aaa; font-size:0.9rem; border-collapse:collapse;">
+                    <tr style="border-bottom:1px solid #333;">
+                        <td style="padding:10px 0;"><strong>401 on worker endpoints</strong></td>
+                        <td>Auth token issue - check ADMIN_TOKENS secret is set</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #333;">
+                        <td style="padding:10px 0;"><strong>Job stuck at "downloading"</strong></td>
+                        <td>Audio download failed - check if source URL is valid</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #333;">
+                        <td style="padding:10px 0;"><strong>No worker logs appear</strong></td>
+                        <td>Cloud Task failed to trigger - check Cloud Tasks queue</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid #333;">
+                        <td style="padding:10px 0;"><strong>Modal API timeout</strong></td>
+                        <td>Audio separation took > 30min - try a shorter track</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px 0;"><strong>AudioShake error</strong></td>
+                        <td>Transcription failed - check API key and credits</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+        
+        <!-- CLI Commands Guide -->
+        <div class="guide-section">
+            <div class="guide-header" onclick="toggleGuide('commands')">
+                <h3>💻 Useful gcloud Commands</h3>
+                <span class="toggle">▼</span>
+            </div>
+            <div class="guide-content" id="guide-commands">
+                <h4>View logs for a specific job</h4>
+                <pre><code id="cmd1">gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="karaoke-backend" AND "YOUR_JOB_ID"' \
+  --project=nomadkaraoke --limit=50 --format="table(timestamp,severity,textPayload)"</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd1')">📋 Copy</button>
+                
+                <h4>View recent errors only</h4>
+                <pre><code id="cmd2">gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="karaoke-backend" AND severity>=ERROR' \
+  --project=nomadkaraoke --limit=20 --freshness=1h --format="table(timestamp,jsonPayload.message,textPayload)"</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd2')">📋 Copy</button>
+                
+                <h4>Check Cloud Tasks queue status</h4>
+                <pre><code id="cmd3">gcloud tasks queues list --location=us-central1 --project=nomadkaraoke</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd3')">📋 Copy</button>
+                
+                <h4>View pending tasks in a queue</h4>
+                <pre><code id="cmd4">gcloud tasks list --queue=audio-worker-queue --location=us-central1 --project=nomadkaraoke</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd4')">📋 Copy</button>
+                
+                <h4>Check Cloud Run service status</h4>
+                <pre><code id="cmd5">gcloud run services describe karaoke-backend --region=us-central1 --project=nomadkaraoke \
+  --format="yaml(status.conditions)"</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd5')">📋 Copy</button>
+                
+                <h4>Get job data from Firestore (via API)</h4>
+                <pre><code id="cmd6">curl -H "Authorization: Bearer YOUR_TOKEN" \
+  "https://karaoke-backend-723537321261.us-central1.run.app/api/jobs/YOUR_JOB_ID"</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd6')">📋 Copy</button>
+                
+                <h4>Force redeploy Cloud Run</h4>
+                <pre><code id="cmd7">gcloud run services update karaoke-backend --region=us-central1 --project=nomadkaraoke \
+  --update-labels=force-redeploy=$(date +%s)</code></pre>
+                <button class="copy-btn" onclick="copyCommand('cmd7')">📋 Copy</button>
+            </div>
+        </div>
+        
+        <!-- Log Patterns Guide -->
+        <div class="guide-section">
+            <div class="guide-header" onclick="toggleGuide('patterns')">
+                <h3>📝 Log Patterns to Look For</h3>
+                <span class="toggle">▼</span>
+            </div>
+            <div class="guide-content" id="guide-patterns">
+                <h4>Successful Worker Execution</h4>
+                <pre><code>[job:abc123] Created Cloud Task for audio worker: projects/.../tasks/123
+[job:abc123] === AUDIO WORKER STARTED ===
+[job:abc123] Downloading audio file...
+[job:abc123] Audio downloaded: track.flac
+[job:abc123] Starting audio separation...
+[job:abc123] Audio separation complete!
+[job:abc123] Uploaded stems to GCS</code></pre>
+                
+                <h4>Authentication Failure (401)</h4>
+                <pre><code>POST /api/internal/workers/audio HTTP/1.1" 401
+Authentication failed: Invalid token. Token provided: True, Token length: 820</code></pre>
+                <p><strong>Cause:</strong> Cloud Tasks OIDC token overwriting admin token (fixed in v0.75.3+)</p>
+                
+                <h4>Worker Timeout</h4>
+                <pre><code>DeadlineExceeded: 504 Deadline Exceeded
+The request deadline was exceeded.</code></pre>
+                <p><strong>Cause:</strong> Worker took longer than Cloud Run timeout (default 30min)</p>
+                
+                <h4>External API Failure</h4>
+                <pre><code>Modal API error: Connection refused
+AudioShake error: 429 Too Many Requests
+Genius API: 401 Unauthorized</code></pre>
+                <p><strong>Cause:</strong> External service issue - check API keys and rate limits</p>
+                
+                <h4>File Not Found</h4>
+                <pre><code>Failed to download audio file
+GCS object not found: gs://bucket/path/file.flac</code></pre>
+                <p><strong>Cause:</strong> Input file missing or path incorrect</p>
+            </div>
+        </div>
+        
+        <p class="hint">
+            Tip: Press Enter after typing the job ID to view logs. All guides above are collapsible - click to expand.
+        </p>
+    </div>
+
+    <script>
+        const PROJECT = 'nomadkaraoke';
+        const SERVICE = 'karaoke-backend';
+        const STORAGE_KEY = 'karaoke-inspector-authuser';
+        const GUIDE_STATE_KEY = 'karaoke-inspector-guides';
+        
+        // Load saved authUser and guide states on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            // Load auth user
+            const savedAuth = localStorage.getItem(STORAGE_KEY);
+            if (savedAuth !== null) {
+                document.getElementById('authUser').value = savedAuth;
+            }
+            
+            // Load guide states (which ones are open)
+            const savedGuides = JSON.parse(localStorage.getItem(GUIDE_STATE_KEY) || '{}');
+            Object.keys(savedGuides).forEach(guideId => {
+                if (savedGuides[guideId]) {
+                    const content = document.getElementById('guide-' + guideId);
+                    const header = content.previousElementSibling;
+                    content.classList.add('open');
+                    header.classList.add('open');
+                }
+            });
+        });
+        
+        function saveAuthUser() {
+            const value = document.getElementById('authUser').value;
+            localStorage.setItem(STORAGE_KEY, value);
+        }
+        
+        function getAuthUser() {
+            return document.getElementById('authUser').value;
+        }
+        
+        function toggleGuide(guideId) {
+            const content = document.getElementById('guide-' + guideId);
+            const header = content.previousElementSibling;
+            
+            content.classList.toggle('open');
+            header.classList.toggle('open');
+            
+            // Save state
+            const savedGuides = JSON.parse(localStorage.getItem(GUIDE_STATE_KEY) || '{}');
+            savedGuides[guideId] = content.classList.contains('open');
+            localStorage.setItem(GUIDE_STATE_KEY, JSON.stringify(savedGuides));
+        }
+        
+        function buildUrl(path) {
+            const authUser = getAuthUser();
+            return `https://console.cloud.google.com/${path}?project=${PROJECT}&authuser=${authUser}`;
+        }
+        
+        function openLink(path) {
+            window.open(buildUrl(path), '_blank');
+        }
+        
+        function getJobId() {
+            const jobId = document.getElementById('jobId').value.trim();
+            if (!jobId) {
+                alert('Please enter a Job ID');
+                return null;
+            }
+            return jobId;
+        }
+        
+        function openLogs() {
+            const jobId = getJobId();
+            if (!jobId) return;
+            
+            const authUser = getAuthUser();
+            
+            // Build the Logs Explorer query - search both structured (jsonPayload) and text formats
+            const query = `resource.type="cloud_run_revision"
+resource.labels.service_name="${SERVICE}"
+("${jobId}" OR jsonPayload.job_id="${jobId}")`;
+            
+            const encodedQuery = encodeURIComponent(query);
+            const url = `https://console.cloud.google.com/logs/query;query=${encodedQuery};duration=PT6H?project=${PROJECT}&authuser=${authUser}`;
+            
+            window.open(url, '_blank');
+        }
+        
+        function openTrace() {
+            const jobId = getJobId();
+            if (!jobId) return;
+            
+            const authUser = getAuthUser();
+            
+            // Cloud Trace search - filter spans containing job_id in the name or attributes
+            const filter = encodeURIComponent(`+span_name:${jobId}`);
+            const url = `https://console.cloud.google.com/traces/list?project=${PROJECT}&filter=${filter}&authuser=${authUser}`;
+            
+            window.open(url, '_blank');
+        }
+        
+        function copyCommand(elementId) {
+            const code = document.getElementById(elementId).textContent;
+            navigator.clipboard.writeText(code).then(() => {
+                const btn = document.querySelector(`button[onclick="copyCommand('${elementId}')"]`);
+                btn.textContent = '✓ Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = '📋 Copy';
+                    btn.classList.remove('copied');
+                }, 2000);
+            });
+        }
+        
+        // Handle Enter key
+        document.getElementById('jobId').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                openLogs();
+            }
+        });
+    </script>
+</body>
+</html>

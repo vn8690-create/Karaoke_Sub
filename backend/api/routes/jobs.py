@@ -1,0 +1,3498 @@
+"""
+Job management routes.
+
+Handles job lifecycle endpoints including:
+- Job creation and submission
+- Status polling
+- Human-in-the-loop interactions (combined lyrics + instrumental review)
+- Job deletion and cancellation
+"""
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, Request, UploadFile, File
+
+from datetime import datetime, timezone
+from google.cloud.exceptions import NotFound
+from backend.utils.loop_bridge import run_in_body_thread, run_on_loop
+from backend.utils.request_helpers import get_client_ip
+from backend.services.review_state import ensure_in_review
+from backend.models.job import Job, JobCreate, JobResponse, JobStatus
+from backend.models.requests import (
+    URLSubmissionRequest,
+    CorrectionsSubmission,
+    StartReviewRequest,
+    CancelJobRequest,
+    InstrumentalSelection,
+    CompleteReviewRequest,
+    CreateCustomInstrumentalRequest,
+)
+from backend.services.audio_download_limits import KEEP_TRYING_STATE_KEY
+from backend.services.job_manager import JobManager
+from backend.services.tempo_label import apply_tempo_to_title
+from backend.services.worker_service import get_worker_service
+from backend.services.storage_service import StorageService
+from backend.services.theme_service import get_theme_service
+from backend.services.theme_rerender_service import RerenderError
+from backend.config import get_settings
+from backend.services.tracing import add_span_attribute
+from backend.api.dependencies import require_admin, require_auth
+from backend.services.auth_service import AuthResult
+from backend.services.metrics import metrics
+from backend.i18n import t, get_locale_from_request, get_full_locale_from_request
+from backend.middleware.tenant import get_tenant_from_request
+from backend.utils.test_data import is_test_email
+from backend.exceptions import InsufficientCreditsError, InvalidStateTransitionError
+from backend.services.firestore_service import FirestoreService, log_to_job
+from backend.models.requests import ChangeVisibilityRequest, ChangeVisibilityResponse
+from backend.services.user_service import get_user_service
+from backend.services.youtube_download_service import get_youtube_download_service
+from backend.services.pricing import duration_to_credits, is_blocked
+from backend.workers.style_helper import screen_included
+from pydantic import BaseModel, Field, HttpUrl, validator
+
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+# Initialize services
+job_manager = JobManager()
+worker_service = get_worker_service()
+settings = get_settings()
+
+
+async def _trigger_workers_parallel(job_id: str) -> None:
+    """
+    Trigger both audio and lyrics workers in parallel.
+    
+    FastAPI's BackgroundTasks runs async tasks sequentially, so we use
+    asyncio.gather to ensure both workers start at the same time.
+    """
+    await asyncio.gather(
+        worker_service.trigger_audio_worker(job_id),
+        worker_service.trigger_lyrics_worker(job_id)
+    )
+
+
+@router.post("", response_model=JobResponse)
+def create_job(
+    request: URLSubmissionRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    auth_result: AuthResult = Depends(require_auth)
+) -> JobResponse:
+    """
+    Create a new karaoke generation job from a URL.
+    
+    This triggers the complete workflow:
+    1. Job created in PENDING state
+    2. Audio and lyrics workers triggered in parallel
+    3. Both workers update job state as they progress
+    4. When both complete, job transitions to AWAITING_REVIEW
+    """
+    locale = get_locale_from_request(http_request)
+    try:
+        # Determine job owner email:
+        # All authentication methods must provide a user_email for job ownership
+        if auth_result.user_email:
+            # Use authenticated user's email (standard case)
+            user_email = auth_result.user_email
+        else:
+            # This should never happen - all auth methods now require user_email
+            logger.error("Authentication succeeded but no user_email provided")
+            raise HTTPException(
+                status_code=500,
+                detail=t(locale, "jobs.authError")
+            )
+
+        # Admins can optionally create jobs on behalf of other users
+        if request.user_email and auth_result.is_admin and request.user_email != auth_result.user_email:
+            user_email = request.user_email
+            logger.info(f"Admin {auth_result.user_email} creating job on behalf of {user_email}")
+
+        # Apply YouTube upload default from settings
+        # Use explicit value if provided, otherwise fall back to server default
+        settings = get_settings()
+        effective_enable_youtube_upload = request.enable_youtube_upload if request.enable_youtube_upload is not None else settings.default_enable_youtube_upload
+
+        # Apply default theme - all jobs require a theme
+        theme_service = get_theme_service()
+        effective_theme_id = theme_service.get_default_theme_id()
+        if not effective_theme_id:
+            raise HTTPException(
+                status_code=422,
+                detail=t(locale, "jobs.noDefaultTheme")
+            )
+        logger.info(f"Applying default theme: {effective_theme_id}")
+
+        # Duration-based pricing: derive credit cost from known audio duration.
+        # Reject inputs that are too long before any job is created.
+        duration_seconds = request.duration_seconds
+        if duration_seconds is not None and is_blocked(duration_seconds):
+            raise HTTPException(
+                status_code=422,
+                detail="Inputs over 60 minutes aren't supported"
+            )
+        credits = duration_to_credits(duration_seconds) if duration_seconds is not None else 1
+
+        # Anti-mismatch guard: if the client told us how many credits it expects,
+        # reject early if the server's computation disagrees (avoids surprise charges).
+        if request.acknowledged_credits is not None and request.acknowledged_credits != credits:
+            raise HTTPException(
+                status_code=409,
+                detail="Credit figure changed; please refresh"
+            )
+
+        # Build initial state_data with duration estimate for observability.
+        initial_state_data: Dict[str, Any] = {}
+        if duration_seconds is not None:
+            initial_state_data["duration_estimate_seconds"] = duration_seconds
+            initial_state_data["duration_estimate_source"] = "youtube_metadata"
+        else:
+            initial_state_data["duration_estimate_source"] = "unknown"
+
+        # Create job with all preferences
+        job_create = JobCreate(
+            url=str(request.url),
+            artist=request.artist,
+            title=request.title,
+            theme_id=effective_theme_id,  # Required - all jobs must have a theme
+            enable_cdg=request.enable_cdg,
+            enable_txt=request.enable_txt,
+            enable_youtube_upload=effective_enable_youtube_upload,
+            youtube_description=request.youtube_description,
+            webhook_url=request.webhook_url,
+            user_email=user_email,
+            is_private=request.is_private or False,
+            credits=credits,
+            locale=get_full_locale_from_request(http_request),
+        )
+        job = job_manager.create_job(job_create, is_admin=auth_result.is_admin)
+
+        # Persist duration estimate fields and creation_ip in a single Firestore write.
+        update_payload = {
+            f"state_data.{k}": v for k, v in initial_state_data.items()
+        }
+        creation_ip = get_client_ip(http_request)
+        if creation_ip:
+            update_payload["creation_ip"] = creation_ip
+        FirestoreService().update_job(job.job_id, update_payload)
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job.job_id)
+        add_span_attribute("job.source", "url")
+        add_span_attribute("job.is_private", job_create.is_private)
+
+        # Record job creation metric
+        metrics.record_job_created(job.job_id, source="url")
+
+        # Trigger both workers in parallel using asyncio.gather
+        # (FastAPI's BackgroundTasks runs async tasks sequentially)
+        background_tasks.add_task(_trigger_workers_parallel, job.job_id)
+        
+        logger.info(f"Job {job.job_id} created, workers triggered")
+        
+        return JobResponse(
+            status="success",
+            job_id=job.job_id,
+            message=t(locale, "jobs.created")
+        )
+    except (InsufficientCreditsError, HTTPException):
+        raise
+    except Exception as e:
+        logger.error(f"Error creating job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Worker triggering is now handled by WorkerService
+# See backend/services/worker_service.py
+
+
+@router.get("/{job_id}", response_model=Job)
+def get_job(
+    job_id: str,
+    request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> Job:
+    """Get job status and details."""
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership - users can only see their own jobs, admins can see all
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    # If job is complete, include download URLs
+    if job.status == JobStatus.COMPLETE:
+        job.download_urls = job_manager.get_output_urls(job_id)
+
+    _resolve_credits_charged_in_response(job)
+    return job
+
+
+def _resolve_credits_charged_in_response(job: Job) -> Job:
+    """Fill state_data.credits_charged in a response for legacy jobs (never persisted)."""
+    from backend.services.job_credits import with_resolved_credits_charged
+
+    if (job.state_data or {}).get("credits_charged") is None:
+        job.state_data = with_resolved_credits_charged(
+            job.state_data, user_email=job.user_email,
+            tenant_id=job.tenant_id, creation_params=job.creation_params,
+        )
+    return job
+
+
+def _resolve_credits_charged_in_summary(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Summary-dict variant; drops the projection-only inputs it needed."""
+    from backend.services.job_credits import with_resolved_credits_charged
+
+    tenant_id = data.pop("tenant_id", None)
+    creation_params = data.pop("creation_params", None)
+    sd = data.get("state_data")
+    if not isinstance(sd, dict) or sd.get("credits_charged") is None:
+        data["state_data"] = with_resolved_credits_charged(
+            sd if isinstance(sd, dict) else {}, user_email=data.get("user_email"),
+            tenant_id=tenant_id, creation_params=creation_params,
+        )
+    return data
+
+
+def _check_job_ownership(job: Job, auth_result: AuthResult) -> bool:
+    """
+    Check if the authenticated user owns the job or has admin access.
+
+    Returns:
+        True if user can access the job, False otherwise
+    """
+    # Admins can access all jobs
+    if auth_result.is_admin:
+        return True
+
+    # Check if user owns the job
+    if auth_result.user_email and job.user_email:
+        return auth_result.user_email.lower() == job.user_email.lower()
+
+    # If no user_email on auth (token auth without email), deny access to jobs with user_email
+    # This prevents token-based auth from accessing user jobs
+    if job.user_email:
+        return False
+
+    # Legacy jobs without user_email - allow access for backward compatibility
+    # TODO: Consider restricting this in the future
+    return True
+
+
+class EditTrackRequest(BaseModel):
+    """Request body for editing a completed track."""
+    artist: Optional[str] = None
+    title: Optional[str] = None
+
+
+class EditTrackResponse(BaseModel):
+    """Response from editing a completed track."""
+    status: str
+    job_id: str
+    message: str
+    review_url: str
+    review_token: str
+    metadata_updated: bool
+    cleanup_results: Dict[str, Any]
+
+
+@router.post("/{job_id}/edit", response_model=EditTrackResponse)
+def edit_completed_track(
+    job_id: str,
+    request: EditTrackRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Edit a completed track by cleaning up distributed outputs and reopening review.
+
+    This allows users to correct lyrics, change instrumental selection, or update
+    artist/title metadata on a completed job. The existing outputs (YouTube, Dropbox,
+    GDrive, GCS finals) are deleted, the brand code is recycled, and the job is
+    reset to AWAITING_REVIEW so the user can make changes and re-submit.
+
+    No additional credits are consumed — the original credit covers re-edits.
+    """
+    locale = get_locale_from_request(http_request)
+    from datetime import timezone
+    from google.cloud.firestore_v1 import DELETE_FIELD, ArrayUnion
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionEdit"))
+
+    # Only completed jobs can be edited
+    if job.status != JobStatus.COMPLETE.value and job.status != "complete":
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.notCompleted", status=job.status)
+        )
+
+    # Storage retention is deleting this job's files right now (seconds).
+    from backend.services.storage_retention import PURGE_IN_PROGRESS_MESSAGE, purge_in_progress
+    if purge_in_progress(job):
+        raise HTTPException(status_code=409, detail=PURGE_IN_PROGRESS_MESSAGE)
+
+    # Prevent editing if outputs already deleted (edit already in progress)
+    if job.outputs_deleted_at:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.alreadyBeingEdited")
+        )
+
+    user_email = auth_result.user_email or "unknown"
+    state_data = job.state_data or {}
+    cleanup_results = {}
+
+    # Snapshot current outputs before cleanup (preserved in timeline metadata)
+    from backend.services.published_outputs_cleanup import (
+        delete_dropbox_folder,
+        delete_gdrive_files,
+        delete_youtube_video,
+        snapshot_published_outputs,
+    )
+    previous_outputs = snapshot_published_outputs(state_data)
+
+    log_to_job(job_id, "edit", "INFO", f"Edit initiated by {user_email}", {"previous_outputs": previous_outputs})
+
+    # --- Phase 1: Clean up distributed outputs ---
+
+    cleanup_results["youtube"] = delete_youtube_video(job_id, state_data.get('youtube_url'))
+    log_to_job(job_id, "edit", "INFO", f"YouTube cleanup: {cleanup_results['youtube'].get('status')}", cleanup_results["youtube"])
+
+    brand_code = state_data.get('brand_code')
+    cleanup_results["dropbox"] = delete_dropbox_folder(
+        job_id, getattr(job, 'dropbox_path', None), brand_code, job.artist, job.title
+    )
+    log_to_job(job_id, "edit", "INFO", f"Dropbox cleanup: {cleanup_results['dropbox'].get('status')}", cleanup_results["dropbox"])
+
+    # Also removes the Nomad 720p master from the GCS fast-sync mirror (the
+    # brand code is recycled below, so the mirror copy must go).
+    cleanup_results["gdrive"] = delete_gdrive_files(job_id, state_data.get('gdrive_files'), brand_code)
+    log_to_job(job_id, "edit", "INFO", f"GDrive cleanup: {cleanup_results['gdrive'].get('status')}", cleanup_results["gdrive"])
+
+    # Delete GCS finals folder
+    try:
+        storage = StorageService()
+        finals_prefix = f"jobs/{job_id}/finals/"
+        deleted_count = storage.delete_folder(finals_prefix)
+        cleanup_results["gcs_finals"] = {"status": "success", "deleted_count": deleted_count}
+    except Exception as e:
+        logger.error(f"Error deleting GCS finals for job {job_id}: {e}", exc_info=True)
+        cleanup_results["gcs_finals"] = {"status": "error", "error": str(e)}
+
+    # Recycle brand code if Dropbox + GDrive cleanup both succeeded
+    dropbox_ok = cleanup_results.get("dropbox", {}).get("status") in ("success", "skipped")
+    gdrive_ok = cleanup_results.get("gdrive", {}).get("status") in ("success", "skipped")
+    from backend.services.brand_code_service import is_preserved_brand_code
+    if brand_code and dropbox_ok and gdrive_ok and not is_preserved_brand_code(job, brand_code):
+        try:
+            from backend.services.brand_code_service import BrandCodeService, get_brand_code_service
+            prefix, number = BrandCodeService.parse_brand_code(brand_code)
+            get_brand_code_service().recycle_brand_code(prefix, number)
+            cleanup_results["brand_code"] = {"status": "recycled", "code": brand_code}
+            logger.info(f"Recycled brand code {brand_code} during edit for job {job_id}")
+        except (ValueError, Exception) as e:
+            logger.warning(f"Failed to recycle brand code {brand_code}: {e}")
+            cleanup_results["brand_code"] = {"status": "failed", "error": str(e)}
+
+    # Check for critical cleanup failures before proceeding
+    critical_failures = [
+        svc for svc in ["dropbox", "gdrive"]
+        if cleanup_results.get(svc, {}).get("status") == "error"
+    ]
+    if critical_failures:
+        raise HTTPException(
+            status_code=500,
+            detail=t(locale, "jobs.cleanupFailed", services=", ".join(critical_failures))
+        )
+
+    # --- Phase 2: Update job record ---
+
+    db = FirestoreService().db
+    job_ref = db.collection("jobs").document(job_id)
+    now = datetime.now(timezone.utc)
+
+    update_payload: Dict[str, Any] = {
+        "outputs_deleted_at": now,
+        "outputs_deleted_by": user_email,
+        "updated_at": now,
+        "edit_count": (job.edit_count if hasattr(job, 'edit_count') else 0) + 1,
+    }
+
+    # Clear distribution state_data keys
+    output_keys = ["youtube_url", "youtube_video_id", "dropbox_link", "brand_code", "gdrive_files"]
+    for key in output_keys:
+        if key in state_data:
+            update_payload[f"state_data.{key}"] = DELETE_FIELD
+
+    # An earlier (failed) admin re-render's marker must not leak into the
+    # edited run (notification suppression, forced brand code).
+    from backend.services.admin_rerender_service import clear_admin_rerender_update
+    update_payload.update(clear_admin_rerender_update(job))
+
+    # Clear processing state so workers re-run from scratch
+    processing_keys = ["render_progress", "video_progress", "encoding_progress", "review_complete"]
+    for key in processing_keys:
+        if key in state_data:
+            update_payload[f"state_data.{key}"] = DELETE_FIELD
+
+    # --- Phase 3: Update metadata if provided ---
+
+    metadata_updated = False
+    if request.artist and request.artist != job.artist:
+        update_payload["artist"] = request.artist
+        metadata_updated = True
+    # A tempo-changed track keeps its "(90% Tempo)" label whatever the user
+    # renames it to — the audio is still at that tempo.
+    job_tempo_factor = getattr(job, "tempo_factor", None)
+    requested_title = (
+        apply_tempo_to_title(request.title, job_tempo_factor)
+        if request.title and job_tempo_factor is not None
+        else request.title
+    )
+    if requested_title and requested_title != job.title:
+        update_payload["title"] = requested_title
+        metadata_updated = True
+
+    # If metadata changed, delete screens so they get regenerated
+    if metadata_updated:
+        try:
+            screens_prefix = f"jobs/{job_id}/screens/"
+            storage = StorageService()
+            storage.delete_folder(screens_prefix)
+            logger.info(f"Deleted screens for job {job_id} due to metadata change")
+        except Exception as e:
+            logger.warning(f"Failed to delete screens for job {job_id}: {e}")
+
+        # Clear screens progress so screens worker re-runs
+        if "screens_progress" in state_data:
+            update_payload[f"state_data.screens_progress"] = DELETE_FIELD
+
+        # Clear stale file_urls.screens so retry logic doesn't skip screen generation
+        file_urls = job.file_urls or {}
+        for key in list(file_urls.get('screens', {}).keys()):
+            update_payload[f"file_urls.screens.{key}"] = DELETE_FIELD
+
+    # Tenant track made with an older theme: the edited version uses the current one.
+    try:
+        from backend.services.theme_change_service import edit_theme_update
+        update_payload.update(edit_theme_update(job, screens_regenerating=metadata_updated))
+    except Exception as e:
+        logger.warning(f"Couldn't apply the current theme to edited job {job_id}: {e}")
+
+    # Add timeline event with structured metadata
+    edit_number = (job.edit_count if hasattr(job, 'edit_count') else 0) + 1
+    timeline_event = {
+        "status": "complete",
+        "timestamp": now.isoformat(),
+        "message": f"Track edit initiated by {user_email} (edit #{edit_number})",
+        "metadata": {
+            "action": "edit_initiated",
+            "initiated_by": user_email,
+            "edit_number": edit_number,
+            "previous_outputs": previous_outputs,
+            "cleanup_results": cleanup_results,
+        },
+    }
+    update_payload["timeline"] = ArrayUnion([timeline_event])
+
+    # Apply Firestore update
+    job_ref.update(update_payload)
+
+    # --- Phase 4: Transition state ---
+    # Storage retention archived this track's stems: review needs them, so go
+    # through the screens worker, which re-separates them before review opens.
+    from backend.services.regenerate_service import stems_need_restore
+    stems_restore_needed = stems_need_restore(job)
+    if metadata_updated or stems_restore_needed:
+        # Metadata changed → screens need regeneration.
+        # Transition to LYRICS_COMPLETE so screens worker can run
+        # (LYRICS_COMPLETE → GENERATING_SCREENS is a valid transition;
+        #  AWAITING_REVIEW → GENERATING_SCREENS is not).
+        job_manager.transition_to_state(
+            job_id,
+            JobStatus.LYRICS_COMPLETE,
+            progress=55,
+            message=(
+                "Regenerating screens with updated metadata" if metadata_updated
+                else "Restoring audio stems before review"
+            ),
+        )
+        background_tasks.add_task(worker_service.trigger_screens_worker, job_id)
+    else:
+        # No metadata change → screens still valid, go straight to review
+        job_manager.transition_to_state(
+            job_id,
+            JobStatus.AWAITING_REVIEW,
+            progress=60,
+            message="Track reopened for editing",
+        )
+
+    # Fetch updated job to get the review token
+    updated_job = job_manager.get_job(job_id)
+    if not updated_job:
+        logger.error(f"Job {job_id} not found after state transition")
+        raise HTTPException(status_code=500, detail="Job state update failed unexpectedly")
+    review_token = updated_job.review_token or ""
+
+    logger.info(
+        f"User {user_email} initiated edit #{edit_number} for job {job_id}. "
+        f"Metadata updated: {metadata_updated}. "
+        f"Cleanup: YouTube={cleanup_results.get('youtube', {}).get('status')}, "
+        f"Dropbox={cleanup_results.get('dropbox', {}).get('status')}, "
+        f"GDrive={cleanup_results.get('gdrive', {}).get('status')}"
+    )
+    log_to_job(job_id, "edit", "INFO", f"Edit #{edit_number} complete: reopened for review", {
+        "cleanup_results": cleanup_results,
+        "metadata_updated": metadata_updated,
+    })
+
+    return EditTrackResponse(
+        status="success",
+        job_id=job_id,
+        message=t(locale, "jobs.reopened"),
+        review_url=f"/app/jobs#/{job_id}/review",
+        review_token=review_token,
+        metadata_updated=metadata_updated,
+        cleanup_results=cleanup_results,
+    )
+
+
+_SUMMARY_STATE_DATA_KEYS = {
+    'brand_code', 'youtube_url', 'dropbox_link',
+    'audio_progress', 'lyrics_progress',
+    'audio_complete', 'lyrics_complete',
+    'backing_vocals_analysis', 'visibility_change_in_progress',
+    'render_pending_capacity',
+    'cloud_run_retry_pending',
+    'credits_charged',
+    'payment_bypassed',
+    'pending_additional_credits',
+    'duration_actual_seconds',
+    'duration_confirm_reason',
+    'batch_id',
+    'bulk_auto_selected',
+    'awaiting_upload',
+    'regenerate',
+    'stems_restore',
+    'instrumental_selection',
+}
+_SUMMARY_FILE_URLS_KEYS = {'finals', 'videos', 'packages'}
+_HIDE_COMPLETED_STATUSES = ['complete', 'prep_complete', 'cancelled']
+
+
+def _is_auto_retry_pending(state_data: Optional[Dict[str, Any]]) -> bool:
+    """Return True if a Cloud Run Job auto-retry is currently expected.
+
+    The audio-download worker records `state_data.cloud_run_retry_pending`
+    with an `expires_at` when it fails and another task attempt is coming.
+    The /retry endpoint uses this to refuse starting a parallel execution,
+    and the UI uses the projected field to show a "Retrying automatically..."
+    indicator instead of a Retry button.
+    """
+    pending = (state_data or {}).get('cloud_run_retry_pending')
+    if not isinstance(pending, dict):
+        return False
+    expires_at_str = pending.get('expires_at')
+    if not expires_at_str:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_str).replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc)
+
+
+def _has_title_screen(file_urls: Dict[str, Any], state_data: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True if the screens stage is done: a title screen image (jpg or png)
+    was generated, or the theme leaves the title screen out and the screens worker
+    finished.
+
+    Used by the /retry endpoint to decide whether to resume from the render
+    stage or rewind further. The actual screen URLs live under format-specific
+    keys (`title_jpg`, `title_png`) rather than a bare `title` key, so a
+    naive `screens.get('title')` check produced false-negatives and forced
+    completed-review jobs back to AWAITING_REVIEW.
+    """
+    screens = file_urls.get('screens') or {}
+    if isinstance(screens, dict) and any(k == 'title' or k.startswith('title_') for k in screens):
+        return True
+    # No title image by design: rely on the screens worker's completion marker
+    # (cleared by every re-render/regeneration, so a stale "omitted" can't count).
+    state_data = state_data or {}
+    return (
+        not screen_included(state_data, 'title')
+        and (state_data.get('screens_progress') or {}).get('stage') == 'complete'
+    )
+
+
+def _prune_state_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip state_data down to dashboard-required keys."""
+    sd = data.get('state_data')
+    if isinstance(sd, dict):
+        data['state_data'] = {k: v for k, v in sd.items() if k in _SUMMARY_STATE_DATA_KEYS}
+    return data
+
+
+def _prune_file_urls(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip file_urls down to dashboard-required keys."""
+    fu = data.get('file_urls')
+    if isinstance(fu, dict):
+        data['file_urls'] = {k: v for k, v in fu.items() if k in _SUMMARY_FILE_URLS_KEYS}
+    return data
+
+
+def _search_filter_jobs(jobs: List[Dict[str, Any]], search: str) -> List[Dict[str, Any]]:
+    """Filter job dicts by case-insensitive substring match across key fields."""
+    if not search:
+        return jobs
+    term = search.lower()
+    results = []
+    for job in jobs:
+        searchable = " ".join(
+            str(job.get(f) or "") for f in ("job_id", "artist", "title", "audio_search_artist", "audio_search_title")
+        )
+        if term in searchable.lower():
+            results.append(job)
+    return results
+
+
+@router.get("", response_model=None)
+def list_jobs(
+    request: Request,
+    status: Optional[JobStatus] = None,
+    environment: Optional[str] = None,
+    client_id: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    exclude_test: bool = True,
+    limit: int = 100,
+    fields: Optional[str] = None,
+    hide_completed: bool = False,
+    search: Optional[str] = None,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    List jobs with optional filters.
+
+    Regular users only see their own jobs. Admins see all jobs.
+    Users on tenant portals only see jobs from their tenant.
+
+    Args:
+        status: Filter by job status (pending, complete, failed, etc.)
+        environment: Filter by request_metadata.environment (test/production/development)
+        client_id: Filter by request_metadata.client_id (customer identifier)
+        created_after: Filter jobs created after this ISO datetime (e.g., 2024-01-01T00:00:00Z)
+        created_before: Filter jobs created before this ISO datetime
+        exclude_test: If True (default), exclude jobs from test users (admin only)
+        limit: Maximum number of jobs to return (default 100)
+        fields: Set to "summary" for reduced payload with only dashboard-required fields
+        hide_completed: If True, exclude successful completions (complete, prep_complete). Failed jobs remain visible.
+        search: Text search filter - matches against artist, title, audio_search_artist, audio_search_title, and job_id (case-insensitive substring). Only works with fields=summary.
+
+    Returns:
+        List of jobs matching filters, ordered by created_at descending.
+        When fields=summary, returns List[dict] (pruned).
+        Otherwise returns List[Job] (full model).
+    """
+    from datetime import datetime
+
+    try:
+        # Parse datetime strings if provided
+        created_after_dt = None
+        created_before_dt = None
+
+        locale = get_locale_from_request(request)
+
+        if created_after:
+            try:
+                created_after_dt = datetime.fromisoformat(created_after.replace('Z', '+00:00'))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=t(locale, "jobs.invalidDatetimeFormat", field="created_after", value=created_after)) from e
+
+        if created_before:
+            try:
+                created_before_dt = datetime.fromisoformat(created_before.replace('Z', '+00:00'))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=t(locale, "jobs.invalidDatetimeFormat", field="created_before", value=created_before)) from e
+
+        # Determine user_email filter based on admin status
+        # Admins see all jobs, regular users only see their own
+        user_email_filter = None
+        if not auth_result.is_admin:
+            if auth_result.user_email:
+                user_email_filter = auth_result.user_email
+                logger.debug(f"Filtering jobs for user: {user_email_filter}")
+            else:
+                # Token-based auth without user email - show no jobs for security
+                logger.warning("Non-admin auth without user_email, returning empty job list")
+                return []
+
+        # Get tenant_id from request for portal scoping.
+        # Tenant portal: filters to that tenant's jobs.
+        # Consumer portal (no tenant): filters to tenant_id="" (consumer jobs only).
+        # All jobs have tenant_id set: "" for consumer, "vocalstar"/etc for tenants.
+        tenant_id = get_tenant_from_request(request)
+        effective_tenant_id = tenant_id if tenant_id else ""
+
+        # --- Summary mode: field-projected query returning dicts ---
+        if fields == "summary":
+            exclude_statuses = _HIDE_COMPLETED_STATUSES if hide_completed else None
+            # When searching, fetch more results and filter in Python
+            fetch_limit = 1000 if search else limit
+            jobs_dicts = job_manager.list_jobs_summary(
+                status=status,
+                exclude_statuses=exclude_statuses,
+                environment=environment,
+                client_id=client_id,
+                created_after=created_after_dt,
+                created_before=created_before_dt,
+                user_email=user_email_filter,
+                tenant_id=effective_tenant_id,
+                limit=fetch_limit,
+            )
+
+            # Exclude test user jobs (Python-side, same as full mode).
+            # Never hide the caller's OWN jobs: an admin that is itself a test
+            # account (e.g. the e2e-test-runner the CI canary impersonates) must
+            # still see the jobs it just created in its own "My Jobs" list —
+            # otherwise the happy-path E2E breaks right after job creation.
+            if exclude_test and auth_result.is_admin:
+                own_email = (auth_result.user_email or "").lower()
+                jobs_dicts = [
+                    j for j in jobs_dicts
+                    if not is_test_email(j.get('user_email') or "")
+                    or (own_email and (j.get('user_email') or "").lower() == own_email)
+                ]
+
+            # Apply search filter if provided
+            if search:
+                jobs_dicts = _search_filter_jobs(jobs_dicts, search)
+                jobs_dicts = jobs_dicts[:limit]  # Apply original limit after filtering
+
+            # Safety-net pruning (in case Firestore returned extra nested keys)
+            jobs_dicts = [_prune_file_urls(_prune_state_data(j)) for j in jobs_dicts]
+            jobs_dicts = [_resolve_credits_charged_in_summary(j) for j in jobs_dicts]
+
+            logger.debug(f"Listed {len(jobs_dicts)} summary jobs for user={auth_result.user_email}")
+            return jobs_dicts
+
+        # --- Full mode: existing behaviour (List[Job]) ---
+        jobs = job_manager.list_jobs(
+            status=status,
+            environment=environment,
+            client_id=client_id,
+            created_after=created_after_dt,
+            created_before=created_before_dt,
+            user_email=user_email_filter,
+            tenant_id=effective_tenant_id,
+            limit=limit
+        )
+
+        # Filter out test user jobs if exclude_test is True (admin only).
+        # Never hide the caller's OWN jobs (see summary-mode note above).
+        if exclude_test and auth_result.is_admin:
+            own_email = (auth_result.user_email or "").lower()
+            jobs = [
+                j for j in jobs
+                if not is_test_email(j.user_email or "")
+                or (own_email and (j.user_email or "").lower() == own_email)
+            ]
+
+        for j in jobs:
+            _resolve_credits_charged_in_response(j)
+        logger.debug(f"Listed {len(jobs)} jobs for user={auth_result.user_email}, admin={auth_result.is_admin}")
+        return jobs
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing jobs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.listError", error=str(e)))
+
+
+@router.delete("/{job_id}")
+def delete_job(
+    job_id: str,
+    request: Request,
+    delete_files: bool = True,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """Delete a job and optionally its output files."""
+    locale = get_locale_from_request(request)
+    try:
+        job = job_manager.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+        # Check ownership - users can only delete their own jobs
+        if not _check_job_ownership(job, auth_result):
+            raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionDelete"))
+
+        # If the job still has published outputs (brand code allocated, outputs never
+        # cleaned up), delete the distributed files BEFORE deleting the job record.
+        # The brand code is recycled inside the cleanup only once Dropbox + GDrive are
+        # confirmed clean: recycling while files remain in the public share hands the
+        # same NOMAD-#### to a future job and creates duplicate brand codes (NOMAD-1583
+        # incident, 2026-08-29). If cleanup fails, the code stays allocated — a sequence
+        # gap the GDrive validator surfaces, which is safe and recoverable.
+        state_data = job.state_data or {}
+        brand_code = state_data.get('brand_code')
+        distribution_cleanup = None
+        if brand_code and not job.outputs_deleted_at:
+            if not delete_files:
+                # Published outputs cannot be preserved when their job record is
+                # deleted — the record holds the only file IDs/paths needed to ever
+                # clean them up or reconcile the brand code.
+                raise HTTPException(
+                    status_code=400,
+                    detail=t(locale, "jobs.deletePublishedRequiresFiles"),
+                )
+            logger.warning(
+                f"Deleting job {job_id} with brand_code {brand_code} whose outputs "
+                f"were not cleaned up first — running distribution cleanup before delete."
+            )
+            distribution_cleanup = _run_distribution_cleanup(job_id, job)
+            incomplete = [
+                svc for svc in ("youtube", "dropbox", "gdrive")
+                if distribution_cleanup.get(svc, {}).get("status") in ("failed", "partial", "error")
+            ]
+            if incomplete:
+                # Keep the job record: it holds the file IDs/paths needed to retry.
+                # Deleting it anyway would orphan the remaining published files with
+                # no way to resolve them later (NOMAD-1583 incident).
+                logger.error(
+                    f"Aborting delete of job {job_id}: distribution cleanup incomplete "
+                    f"for {incomplete} — {distribution_cleanup}"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=t(locale, "jobs.cleanupFailed", services=", ".join(incomplete)),
+                )
+
+        job_manager.delete_job(job_id, delete_files=delete_files)
+
+        # A requests-board pick whose owner deleted the job goes back on the board (or is
+        # removed if nobody backs it) instead of staying "in progress" on a dead job.
+        try:
+            from backend.services.song_request_service import get_song_request_service
+            get_song_request_service().reopen_after_job_deleted(job_id)
+        except Exception:
+            logger.warning("requests-board: could not reopen request for deleted job %s", job_id, exc_info=True)
+
+        response = {"status": "success", "message": f"Job {job_id} deleted"}
+        if distribution_cleanup is not None:
+            response["distribution_cleanup"] = distribution_cleanup
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.deleteError", job_id=job_id, error=str(e)))
+
+
+@router.delete("")
+def bulk_delete_jobs(
+    request: Request,
+    environment: Optional[str] = None,
+    client_id: Optional[str] = None,
+    status: Optional[JobStatus] = None,
+    created_before: Optional[str] = None,
+    delete_files: bool = True,
+    confirm: bool = False,
+    _auth_result: AuthResult = Depends(require_admin)
+) -> dict:
+    """
+    Delete multiple jobs matching filter criteria.
+    
+    CAUTION: This is a destructive operation. Requires confirm=true.
+    
+    Use cases:
+    - Delete all test jobs: ?environment=test&confirm=true
+    - Delete jobs from a specific client: ?client_id=test-runner&confirm=true
+    - Delete old failed jobs: ?status=failed&created_before=2024-01-01T00:00:00Z&confirm=true
+    
+    Args:
+        environment: Delete jobs with this environment (test/production/development)
+        client_id: Delete jobs from this client
+        status: Delete jobs with this status
+        created_before: Delete jobs created before this ISO datetime
+        delete_files: Also delete GCS files (default True)
+        confirm: Must be True to execute deletion (safety check)
+        
+    Returns:
+        Statistics about the deletion
+    """
+    from datetime import datetime
+    
+    locale = get_locale_from_request(request)
+
+    # Require at least one filter to prevent accidental deletion of all jobs
+    if not any([environment, client_id, status, created_before]):
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.deletionRequiresFilters")
+        )
+
+    # Require explicit confirmation
+    if not confirm:
+        # Return preview of what would be deleted
+        created_before_dt = None
+        if created_before:
+            try:
+                created_before_dt = datetime.fromisoformat(created_before.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid created_before format: {created_before}")
+        
+        jobs = job_manager.list_jobs(
+            status=status,
+            environment=environment,
+            client_id=client_id,
+            created_before=created_before_dt,
+            limit=1000
+        )
+        
+        return {
+            "status": "preview",
+            "message": t(locale, "jobs.deletionPreview"),
+            "jobs_to_delete": len(jobs),
+            "sample_jobs": [
+                {
+                    "job_id": j.job_id,
+                    "artist": j.artist,
+                    "title": j.title,
+                    "status": j.status,
+                    "environment": j.request_metadata.get('environment'),
+                    "client_id": j.request_metadata.get('client_id'),
+                    "created_at": j.created_at.isoformat() if j.created_at else None
+                }
+                for j in jobs[:10]  # Show first 10 as sample
+            ]
+        }
+    
+    try:
+        # Parse datetime string
+        created_before_dt = None
+        if created_before:
+            try:
+                created_before_dt = datetime.fromisoformat(created_before.replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid created_before format: {created_before}")
+        
+        result = job_manager.delete_jobs_by_filter(
+            environment=environment,
+            client_id=client_id,
+            status=status,
+            created_before=created_before_dt,
+            delete_files=delete_files
+        )
+        
+        return {
+            "status": "success",
+            "message": f"Deleted {result['jobs_deleted']} jobs",
+            "jobs_deleted": result['jobs_deleted'],
+            "files_deleted": result.get('files_deleted', 0)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error bulk deleting jobs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.bulkDeleteError", error=str(e)))
+
+
+# ============================================================================
+# Human-in-the-Loop Interaction Endpoints
+# ============================================================================
+
+@router.get("/{job_id}/review-data")
+def get_review_data(
+    job_id: str,
+    request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> Dict[str, Any]:
+    """
+    Get data needed for lyrics review interface.
+
+    Returns corrections JSON URL and audio URL.
+    Frontend loads these to render the review UI.
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.reviewNotReady", status=job.status)
+        )
+    
+    # Get URLs from file_urls
+    corrections_url = job.file_urls.get('lyrics', {}).get('corrections')
+
+    # For audio, try multiple sources in order of preference:
+    # 1. Explicit lyrics audio (if worker uploaded it)
+    # 2. Lead vocals stem (best for reviewing lyrics sync)
+    # 3. Input media (original audio)
+    audio_url = (
+        job.file_urls.get('lyrics', {}).get('audio') or
+        job.file_urls.get('stems', {}).get('lead_vocals') or
+        job.input_media_gcs_path
+    )
+
+    if not corrections_url:
+        raise HTTPException(
+            status_code=500,
+            detail=t(locale, "jobs.correctionsUnavailable")
+        )
+
+    if not audio_url:
+        raise HTTPException(
+            status_code=500,
+            detail=t(locale, "jobs.audioUnavailable")
+        )
+    
+    # Generate signed URLs for direct access
+    from backend.services.storage_service import StorageService
+    storage = StorageService()
+    
+    return {
+        "corrections_url": storage.generate_signed_url(corrections_url, expiration_minutes=120),
+        "audio_url": storage.generate_signed_url(audio_url, expiration_minutes=120),
+        "status": job.status,
+        "artist": job.artist,
+        "title": job.title
+    }
+
+
+def _job_not_in_review_conflict(locale: str, status: Any) -> HTTPException:
+    """409 for a review request on a job that isn't in review."""
+    return HTTPException(
+        status_code=409,
+        detail=t(locale, "jobs.jobNotInReviewState", status=getattr(status, "value", status)),
+    )
+
+
+@router.post("/{job_id}/start-review")
+def start_review(
+    job_id: str,
+    request: StartReviewRequest,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Mark job as IN_REVIEW (user opened review interface).
+
+    This helps track that the user is actively working on the review.
+    """
+    locale = get_locale_from_request(http_request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    # Idempotent: concurrent/duplicate opens (React double-mount, double-tap, two
+    # tabs) must not fail with "in_review -> in_review". Already in review == success,
+    # and the one-time side effects (record_review_started) are not repeated.
+    # A job past review (e.g. a stale "review lyrics" push tapped on a finished song)
+    # is the client's to handle: 409, no transition attempted, nothing logged at ERROR.
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise _job_not_in_review_conflict(locale, job.status)
+
+    was_awaiting = job.status == JobStatus.AWAITING_REVIEW
+    try:
+        result = ensure_in_review(
+            job_manager, job_id, job.status, "User started reviewing lyrics"
+        )
+    except InvalidStateTransitionError:
+        # Lost the race: the auto-approver (or another worker) moved the job on
+        # between our read and the transition.
+        current = job_manager.get_job(job_id)
+        raise _job_not_in_review_conflict(locale, current.status if current else job.status)
+    if result == "refused":
+        raise HTTPException(status_code=400, detail=t(locale, "jobs.reviewCannotStart"))
+    if result == "started" and was_awaiting:
+        job_manager.record_review_started(
+            job_id, getattr(job, "user_email", None), auth_result.user_email, auth_result.is_admin
+        )
+
+    return {"status": "success", "job_status": "in_review"}
+
+
+@router.post("/{job_id}/corrections")
+def submit_corrections(
+    job_id: str,
+    submission: CorrectionsSubmission,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Save corrected lyrics during human review.
+
+    This endpoint saves review progress but does NOT complete the review.
+    Call POST /{job_id}/complete-review to finish and trigger video rendering.
+
+    Can be called multiple times to save progress.
+    """
+    locale = get_locale_from_request(http_request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.jobNotInReviewState", status=job.status)
+        )
+    
+    try:
+        # Persist ONLY a lightweight summary of the corrections to Firestore —
+        # never the full segment arrays. The complete corrections JSON
+        # (corrected_segments, original_segments, resized_segments, etc.) can be
+        # several MB for long songs (e.g. a 30+ minute mashup with hundreds of
+        # segments) and would blow past Firestore's 1MB per-document hard limit,
+        # failing the save with a 400. (An earlier fix stripped only
+        # reference_lyrics, but the segment arrays are the real bulk.) The full
+        # data is preserved in the GCS upload below (corrections_updated.json),
+        # which the render worker reads. The only in-Firestore consumer is the
+        # complete-review 0-segment guard, which just needs the segment count.
+        corrected_segments = submission.corrections.get('corrected_segments')
+        corrected_lyrics_summary = {
+            'corrected_segment_count': (
+                len(corrected_segments) if isinstance(corrected_segments, list) else 0
+            ),
+        }
+        job_manager.update_state_data(job_id, 'corrected_lyrics', corrected_lyrics_summary)
+        if submission.user_notes:
+            job_manager.update_state_data(job_id, 'review_notes', submission.user_notes)
+
+        # Persist is_duet when explicitly provided; don't overwrite a previously-set flag
+        # when the field is absent from the request (None means "not specified").
+        if submission.is_duet is not None:
+            job_manager.update_state_data(job_id, 'is_duet', submission.is_duet)
+            logger.info(f"Job {job_id}: Stored is_duet flag via /corrections: {submission.is_duet}")
+
+        # Transition to IN_REVIEW if not already
+        if job.status == JobStatus.AWAITING_REVIEW:
+            if job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.IN_REVIEW,
+                message="User is reviewing lyrics"
+            ):
+                job_manager.record_review_started(
+                    job_id, getattr(job, "user_email", None), auth_result.user_email, auth_result.is_admin
+                )
+
+        # Save updated corrections to GCS for the render worker
+        from backend.services.storage_service import StorageService
+        storage = StorageService()
+
+        # Safety net: never persist word timings that fall outside their segment.
+        # Frontend should already prevent this; this guarantees clean stored data
+        # (the render worker reads corrections_updated.json verbatim).
+        from backend.services.timing_sanitizer import sanitize_corrections
+        sanitized, clamp_count = sanitize_corrections(submission.corrections)
+        if clamp_count:
+            logger.warning(
+                f"Job {job_id}: sanitized {clamp_count} out-of-bounds word timing(s) "
+                f"in submitted corrections before persisting"
+            )
+        submission.corrections = sanitized
+
+        corrections_gcs_path = f"jobs/{job_id}/lyrics/corrections_updated.json"
+        storage.upload_json(corrections_gcs_path, submission.corrections)
+        job_manager.update_file_url(job_id, 'lyrics', 'corrections_updated', corrections_gcs_path)
+
+        logger.info(f"Job {job_id}: Corrections saved (review in progress)")
+        
+        return {
+            "status": "success",
+            "job_status": "in_review",
+            "message": t(locale, "jobs.correctionsProcessing")
+        }
+        
+    except Exception as e:
+        logger.error(f"Error saving corrections for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{job_id}/edit-log")
+def submit_edit_log(
+    job_id: str,
+    edit_log: Dict[str, Any],
+    request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Store an edit log from a lyrics review session.
+
+    Edit logs capture what edits users made and optional feedback on why,
+    for use as training data to improve transcription models.
+
+    Stored to GCS as jobs/{job_id}/lyrics/edit_log_{session_id}.json.
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    session_id = edit_log.get("session_id", "unknown")
+    entries = edit_log.get("entries", [])
+    feedback_count = sum(1 for e in entries if e.get("feedback") and e["feedback"].get("reason") != "no_response")
+
+    try:
+        storage = StorageService()
+        gcs_path = f"jobs/{job_id}/lyrics/edit_log_{session_id}.json"
+        storage.upload_json(gcs_path, edit_log)
+
+        job_manager.update_state_data(job_id, 'last_edit_log_path', gcs_path)
+        job_manager.update_state_data(job_id, 'last_edit_log_session', session_id)
+
+        logger.info(
+            f"Job {job_id}: Edit log saved — {len(entries)} entries, "
+            f"{feedback_count} with feedback, session {session_id}"
+        )
+
+        return {
+            "status": "success",
+            "entries_count": len(entries),
+            "feedback_count": feedback_count,
+        }
+
+    except Exception as e:
+        logger.error(f"Error saving edit log for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.editLogSaveFailed", job_id=job_id, error=str(e)))
+
+
+@router.post("/{job_id}/create-custom-instrumental")
+async def create_custom_instrumental(
+    job_id: str,
+    request: CreateCustomInstrumentalRequest,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Create a custom instrumental by muting regions of backing vocals.
+
+    Downloads the clean instrumental and backing vocals stems, applies mute
+    regions, combines them, uploads to GCS, and returns a signed URL for playback.
+    """
+    locale = get_locale_from_request(http_request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.jobNotInReviewState", status=job.status)
+        )
+
+    # Get stem paths from job
+    stems = job.file_urls.get('stems', {})
+    clean_path = stems.get('instrumental_clean')
+    backing_path = stems.get('backing_vocals')
+
+    if not clean_path or not backing_path:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.stemsMissing")
+        )
+
+    try:
+        from backend.services.audio_editing_service import AudioEditingService
+        from karaoke_gen.instrumental_review import MuteRegion
+
+        storage = StorageService()
+        editing_service = AudioEditingService(storage_service=storage)
+
+        # Convert request mute regions to domain model
+        mute_regions = [
+            MuteRegion(start_seconds=r.start_seconds, end_seconds=r.end_seconds)
+            for r in request.mute_regions
+        ]
+
+        # Create custom instrumental and upload to GCS (offload blocking IO to thread)
+        output_path = f"jobs/{job_id}/stems/custom_instrumental.flac"
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: editing_service.create_custom_instrumental(
+                gcs_clean_instrumental_path=clean_path,
+                gcs_backing_vocals_path=backing_path,
+                mute_regions=mute_regions,
+                gcs_output_path=output_path,
+                job_id=job_id,
+            )
+        )
+
+        # Store the custom instrumental path in job file_urls
+        job_manager.update_file_url(job_id, 'stems', 'custom_instrumental', output_path)
+
+        # Generate signed URL for playback (overwrote the stem in place — drop any
+        # cached transcode of a previous custom/uploaded instrumental first)
+        from backend.services.audio_transcoding_service import AudioTranscodingService
+        transcoding = AudioTranscodingService(storage_service=storage)
+        await asyncio.to_thread(transcoding.invalidate_cache, output_path)
+        audio_url = await transcoding.get_review_audio_url_async(output_path, expiration_minutes=120)
+
+        logger.info(f"Job {job_id}: Custom instrumental created with {len(mute_regions)} mute regions")
+
+        return {
+            "status": "success",
+            "message": f"Custom instrumental created with {len(mute_regions)} mute regions",
+            "audio_url": audio_url,
+            "muted_duration_seconds": result.total_muted_duration_seconds,
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating custom instrumental for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.customInstrumentalFailed", job_id=job_id, error=str(e)))
+
+
+# Audio extensions accepted for a user-supplied instrumental (signed-URL upload).
+_INSTRUMENTAL_UPLOAD_EXTENSIONS = {
+    ".flac", ".mp3", ".wav", ".m4a", ".ogg", ".aac", ".aif", ".aiff", ".opus",
+}
+_CUSTOM_INSTRUMENTAL_OUTPUT = "jobs/{job_id}/stems/custom_instrumental.flac"
+
+
+def _instrumental_source_prefix(job_id: str) -> str:
+    return f"jobs/{job_id}/uploads/custom_instrumental_source"
+
+
+def _get_review_job(job_id: str, auth_result: AuthResult, locale: str):
+    """Load a job the caller owns that is in review — shared by the instrumental upload routes."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.reviewNotInState", status=job.status)
+        )
+    return job
+
+
+# Keep in sync with MAX_INSTRUMENTAL_UPLOAD_BYTES in frontend/lib/upload.ts
+MAX_INSTRUMENTAL_UPLOAD_BYTES = 200 * 1024 * 1024
+
+
+async def _store_custom_instrumental(
+    job_id: str, job, local_path: str, suffix: str, storage: StorageService, locale: str
+) -> dict:
+    """
+    Validate + store a user-supplied instrumental already on local disk.
+
+    Shared by the multipart upload and the signed-URL upload-complete routes:
+    duration check against the job's original audio (±0.5s), FLAC conversion
+    (the GCE encoder globs *.flac), upload to stems/custom_instrumental.flac,
+    file_urls update. Returns the API response including a playback audio_url.
+    The caller owns local_path cleanup.
+    """
+    from pydub import AudioSegment
+
+    flac_path = None
+    output_path = _CUSTOM_INSTRUMENTAL_OUTPUT.format(job_id=job_id)
+    try:
+        audio_segment = await asyncio.to_thread(AudioSegment.from_file, local_path)
+        upload_duration = len(audio_segment) / 1000.0
+
+        original_duration = await _get_audio_duration_ffprobe_signed(job_id, job, storage)
+        if original_duration is not None:
+            diff = abs(upload_duration - original_duration)
+            if diff > 0.5:
+                raise HTTPException(
+                    status_code=400,
+                    detail=t(locale, "jobs.durationMismatch",
+                             upload_duration=f"{upload_duration:.1f}",
+                             original_duration=f"{original_duration:.1f}"),
+                )
+
+        if suffix != '.flac':
+            flac_path = local_path.rsplit('.', 1)[0] + '.flac' if '.' in local_path else local_path + '.flac'
+            await asyncio.to_thread(audio_segment.export, flac_path, format='flac')
+            upload_source = flac_path
+        else:
+            upload_source = local_path  # Already FLAC, no conversion needed
+
+        await asyncio.to_thread(storage.upload_file, upload_source, output_path)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error processing uploaded instrumental: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.audioProcessingFailed", error=str(e)))
+    finally:
+        if flac_path and flac_path != local_path and os.path.exists(flac_path):
+            os.unlink(flac_path)
+
+    job_manager.update_file_url(job_id, 'stems', 'custom_instrumental', output_path)
+    logger.info(f"Job {job_id}: Custom instrumental uploaded ({upload_duration:.1f}s) to {output_path}")
+
+    # Playback URL for the review UI (non-fatal: the selection still works without it)
+    audio_url = None
+    try:
+        from backend.services.audio_transcoding_service import AudioTranscodingService
+        transcoding = AudioTranscodingService(storage_service=storage)
+        await asyncio.to_thread(transcoding.invalidate_cache, output_path)
+        audio_url = await transcoding.get_review_audio_url_async(output_path, expiration_minutes=120)
+    except Exception as e:
+        logger.warning(f"Job {job_id}: Could not create playback URL for custom instrumental: {e}")
+
+    return {
+        "status": "success",
+        "duration_seconds": upload_duration,
+        "message": f"Custom instrumental uploaded ({upload_duration:.1f}s)",
+        "audio_url": audio_url,
+    }
+
+
+@router.post("/{job_id}/upload-instrumental")
+async def upload_custom_instrumental(
+    job_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Upload a custom instrumental audio file for use during review (multipart).
+
+    Kept for CLI/back-compat; the web UI uses the signed-URL flow
+    (instrumental-upload-url → PUT → instrumental-upload-complete) because
+    Cloud Run caps request bodies at 32 MiB.
+
+    Accepts any audio format supported by pydub/ffmpeg (mp3, wav, flac, ogg, etc.).
+    The user can then select 'custom' as their instrumental_selection when completing review.
+    """
+    locale = get_locale_from_request(request)
+    job = _get_review_job(job_id, auth_result, locale)
+
+    # Determine extension from filename or content type
+    original_filename = file.filename or "instrumental"
+    suffix = Path(original_filename).suffix.lower()
+    if not suffix:
+        content_type = file.content_type or ""
+        suffix_map = {
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/flac": ".flac",
+            "audio/x-flac": ".flac",
+            "audio/ogg": ".ogg",
+            "audio/aac": ".aac",
+            "audio/mp4": ".m4a",
+        }
+        suffix = suffix_map.get(content_type, ".audio")
+
+    storage = StorageService()
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            content = await file.read()
+            tmp.write(content)
+        return await _store_custom_instrumental(job_id, job, tmp_path, suffix, storage, locale)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+class InstrumentalUploadUrlRequest(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+
+
+class InstrumentalUploadCompleteRequest(BaseModel):
+    gcs_path: str
+
+
+@router.post("/{job_id}/instrumental-upload-url")
+async def get_instrumental_upload_url(
+    job_id: str,
+    request: Request,
+    body: InstrumentalUploadUrlRequest,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Step 1 of the signed-URL instrumental upload: returns a signed PUT URL so the
+    browser uploads straight to GCS (no Cloud Run 32 MiB body cap), then calls
+    instrumental-upload-complete with the returned gcs_path.
+    """
+    locale = get_locale_from_request(request)
+    _get_review_job(job_id, auth_result, locale)
+
+    suffix = Path(body.filename).suffix.lower()
+    if suffix not in _INSTRUMENTAL_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.instrumentalUploadBadType",
+                     allowed=", ".join(sorted(_INSTRUMENTAL_UPLOAD_EXTENSIONS))),
+        )
+
+    gcs_path = f"{_instrumental_source_prefix(job_id)}{suffix}"
+    storage = StorageService()
+    upload_url = await asyncio.to_thread(
+        storage.generate_signed_upload_url, gcs_path, body.content_type, 60
+    )
+    return {"upload_url": upload_url, "gcs_path": gcs_path, "content_type": body.content_type}
+
+
+@router.post("/{job_id}/instrumental-upload-complete")
+async def complete_instrumental_upload(
+    job_id: str,
+    request: Request,
+    body: InstrumentalUploadCompleteRequest,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Step 2 of the signed-URL instrumental upload: validates + stores the uploaded
+    object exactly like the multipart upload-instrumental route.
+    """
+    locale = get_locale_from_request(request)
+    job = _get_review_job(job_id, auth_result, locale)
+
+    prefix = _instrumental_source_prefix(job_id)
+    suffix = Path(body.gcs_path).suffix.lower()
+    if (
+        not body.gcs_path.startswith(prefix)
+        or body.gcs_path != f"{prefix}{suffix}"
+        or suffix not in _INSTRUMENTAL_UPLOAD_EXTENSIONS
+    ):
+        raise HTTPException(status_code=400, detail=t(locale, "jobs.instrumentalUploadBadPath"))
+
+    storage = StorageService()
+    size = await asyncio.to_thread(storage.get_file_size, body.gcs_path)
+    if size is None:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.instrumentalUploadMissing"))
+    # Decoding holds tmpfs copy + PCM + FLAC in memory on a 2Gi instance.
+    if size > MAX_INSTRUMENTAL_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.instrumentalUploadTooLarge",
+                     size_mb=f"{size / (1024 * 1024):.0f}",
+                     max_mb=f"{MAX_INSTRUMENTAL_UPLOAD_BYTES // (1024 * 1024)}"),
+        )
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+        await asyncio.to_thread(storage.download_file, body.gcs_path, tmp_path)
+        return await _store_custom_instrumental(job_id, job, tmp_path, suffix, storage, locale)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+async def _get_audio_duration_ffprobe_signed(job_id: str, job, storage: StorageService) -> Optional[float]:
+    """
+    Get the duration of the job's original audio using ffprobe on a signed GCS URL.
+
+    Uses ffprobe which reads only the container header - fast even for large files.
+    Returns None if the duration cannot be determined (non-fatal, upload proceeds).
+    """
+    gcs_path = job.input_media_gcs_path
+    if not gcs_path:
+        return None
+
+    try:
+        signed_url = storage.generate_signed_url(gcs_path, expiration_minutes=5)
+
+        def _run_ffprobe() -> float:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', signed_url],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                raise ValueError(f"ffprobe error: {result.stderr[:200]}")
+            data = json.loads(result.stdout)
+            return float(data['format']['duration'])
+
+        return await asyncio.get_event_loop().run_in_executor(None, _run_ffprobe)
+
+    except Exception as e:
+        logger.warning(f"Job {job_id}: Could not determine original audio duration: {e}")
+        return None
+
+
+@router.post("/{job_id}/complete-review")
+def complete_review(
+    job_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    auth_result: AuthResult = Depends(require_auth),
+    body: Optional[CompleteReviewRequest] = None
+) -> dict:
+    """
+    Complete the human review and trigger video rendering.
+
+    Supports both legacy flows (no body) and combined review flow (with instrumental_selection).
+    When instrumental_selection is provided, it's stored in state_data for the render worker.
+
+    After this:
+    1. Job transitions to REVIEW_COMPLETE
+    2. Render video worker is triggered
+    3. Worker uses OutputGenerator to create with_vocals.mkv
+    4. Job transitions to INSTRUMENTAL_SELECTED then GENERATING_VIDEO
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    if job.status not in [JobStatus.AWAITING_REVIEW, JobStatus.IN_REVIEW]:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.reviewNotInState", status=job.status)
+        )
+
+    # Check for 0-segment lyrics — fail early with user-friendly message
+    # Only check when lyrics pipeline has run (lyrics_metadata exists in state_data)
+    state_data = job.state_data or {}
+    lyrics_metadata = state_data.get('lyrics_metadata')
+    if lyrics_metadata is not None:
+        segment_count = lyrics_metadata.get('segment_count', 0)
+        corrected_lyrics = state_data.get('corrected_lyrics') or {}
+        # corrected_lyrics now stores a lightweight summary
+        # ({'corrected_segment_count': N}). Fall back to the legacy shape (full
+        # dict with a corrected_segments list) for jobs saved before that change.
+        corrected_segment_count = corrected_lyrics.get('corrected_segment_count')
+        if corrected_segment_count is None:
+            corrected_segment_count = len(corrected_lyrics.get('corrected_segments') or [])
+
+        if segment_count == 0 and corrected_segment_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=t(locale, "jobs.noLyricsDetected")
+            )
+
+    try:
+        # Store instrumental selection if provided (combined review flow)
+        instrumental_selection = body.instrumental_selection if body else None
+        # Jobs that supplied their own instrumental (existing_instrumental flow, e.g. tenant
+        # submissions) have no instrumental-selection UI step. Default to 'custom' so the
+        # render uses the provided instrumental instead of a separated stem that was never
+        # produced (the orchestrator otherwise defaults to 'clean' and fails prerequisites).
+        if not instrumental_selection and getattr(job, 'existing_instrumental_gcs_path', None):
+            instrumental_selection = 'custom'
+            logger.info(f"Job {job_id}: Defaulting instrumental selection to 'custom' (existing instrumental provided)")
+        if instrumental_selection:
+            job_manager.update_state_data(job_id, 'instrumental_selection', instrumental_selection)
+            logger.info(f"Job {job_id}: Stored instrumental selection: {instrumental_selection}")
+
+        # Transition to REVIEW_COMPLETE
+        message = f"Review complete (instrumental: {instrumental_selection})" if instrumental_selection else "Review complete"
+        job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.REVIEW_COMPLETE,
+            progress=70,
+            message=f"{message}, rendering video with corrected lyrics"
+        )
+
+        # Trigger render video worker
+        background_tasks.add_task(worker_service.trigger_render_video_worker, job_id)
+
+        logger.info(f"Job {job_id}: Review complete, triggering render video worker")
+
+        return {
+            "status": "success",
+            "job_status": "review_complete",
+            "message": t(locale, "jobs.reviewCompleteStartRendering")
+        }
+
+    except Exception as e:
+        logger.error(f"Error completing review for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.reviewCompleteError", job_id=job_id, error=str(e)))
+
+
+@router.post("/{job_id}/select-instrumental")
+def select_instrumental(
+    job_id: str,
+    selection: InstrumentalSelection,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Select instrumental audio option for finalise-only jobs.
+
+    This endpoint is used for jobs that enter AWAITING_INSTRUMENTAL_SELECTION
+    state directly (finalise-only jobs where users upload pre-rendered video).
+
+    For normal jobs, instrumental selection happens during the combined review
+    flow via the complete-review endpoint.
+
+    Args:
+        job_id: Job identifier
+        selection: Instrumental selection (clean, with_backing, custom, uploaded)
+
+    Returns:
+        Status and confirmation of selection
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    if job.status != JobStatus.AWAITING_INSTRUMENTAL_SELECTION:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.reviewNotInState", status=job.status)
+        )
+
+    try:
+        # Store selection in state_data
+        state_data = job.state_data or {}
+        state_data["instrumental_selection"] = selection.selection
+        job_manager.update_job(job_id, state_data=state_data)
+
+        # Transition to INSTRUMENTAL_SELECTED
+        job_manager.transition_to_state(
+            job_id=job_id,
+            new_status=JobStatus.INSTRUMENTAL_SELECTED,
+            progress=80,
+            message=f"Instrumental selection: {selection.selection}"
+        )
+
+        # Trigger video worker
+        background_tasks.add_task(worker_service.trigger_video_worker, job_id)
+
+        logger.info(f"Job {job_id}: Instrumental selected ({selection.selection}), triggering video worker")
+
+        return {
+            "status": "success",
+            "job_status": "instrumental_selected",
+            "selection": selection.selection,
+            "message": t(locale, "jobs.instrumentalSelected")
+        }
+
+    except Exception as e:
+        logger.error(f"Error selecting instrumental for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=t(locale, "jobs.instrumentalSelectionError", job_id=job_id, error=str(e)))
+
+
+@router.get("/{job_id}/download-urls")
+def get_download_urls(
+    job_id: str,
+    request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Get download URLs for all job output files.
+
+    Returns a dictionary mapping file types to download URLs.
+    Uses the streaming download endpoint which proxies through the backend.
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    file_urls = job.file_urls or {}
+    download_urls = {}
+
+    # Build download URLs using the streaming endpoint
+    base_url = f"/api/jobs/{job_id}/download"
+
+    for category, files in file_urls.items():
+        if isinstance(files, dict):
+            download_urls[category] = {}
+            for file_key, gcs_path in files.items():
+                if gcs_path:
+                    download_urls[category][file_key] = f"{base_url}/{category}/{file_key}"
+        elif isinstance(files, str) and files:
+            # For single-file categories, use the category name as the file_key
+            download_urls[category] = f"{base_url}/{category}/{category}"
+
+    return {
+        "job_id": job_id,
+        "artist": job.artist,
+        "title": job.title,
+        "download_urls": download_urls
+    }
+
+
+# Map file keys to human-readable suffixes (matching Dropbox naming from karaoke_finalise.py)
+DOWNLOAD_FILENAME_SUFFIXES = {
+    "lossless_4k_mp4": " (Final Karaoke Lossless 4k).mp4",
+    "lossless_4k_mkv": " (Final Karaoke Lossless 4k).mkv",
+    "lossy_4k_mp4": " (Final Karaoke Lossy 4k).mp4",
+    "lossy_720p_mp4": " (Final Karaoke Lossy 720p).mp4",
+    "portrait_1080x1920": " (Final Karaoke Portrait 1080x1920).mp4",
+    "cdg_zip": " (Final Karaoke CDG).zip",
+    "txt_zip": " (Final Karaoke TXT).zip",
+    "with_vocals_mp4": " (With Vocals).mp4",
+    "with_vocals": " (With Vocals).mkv",  # legacy: raw MKV from render step
+    "video_mp4": " (Quick Version).mp4",  # file_urls.quick — kjbox make-it draft
+}
+
+
+def _archived_output(job, category: str, file_key: str) -> bool:
+    """True if storage retention purged this download (recorded in the job's manifest)."""
+    if not (getattr(job, 'renders_purged_at', None) or getattr(job, 'stems_purged_at', None)):
+        return False
+    manifest = getattr(job, 'storage_purge', None) or {}
+    for entry in manifest.get('files') or []:
+        path = (entry or {}).get('path') or ''
+        rel = path.split('/', 2)[-1] if path.startswith('jobs/') else path
+        if rel.startswith(f"{category}/{file_key}.") or rel == f"{category}/{file_key}":
+            return True
+    return False
+
+
+def _archived_error(job, locale: str) -> HTTPException:
+    """410 Gone with a machine-readable code so clients can offer/trigger a regenerate."""
+    return HTTPException(
+        status_code=410,
+        detail={
+            "code": "output_archived",
+            "message": t(locale, "jobs.fileNoLongerAvailable"),
+            "regenerate_url": f"/api/jobs/{job.job_id}/regenerate",
+        },
+    )
+
+
+def _cleanup_temp_file(path: Optional[str]) -> None:
+    """Best-effort removal of a temp file created for a download that failed
+    before streaming started (so it never reaches the iterator's cleanup)."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+@router.get("/{job_id}/download/{category}/{file_key}")
+def download_file(
+    job_id: str,
+    category: str,
+    file_key: str,
+    request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+):
+    """
+    Stream download a specific file from a completed job.
+
+    This endpoint proxies the file from GCS through the backend,
+    so no client-side authentication is required.
+    """
+    locale = get_locale_from_request(request)
+    from fastapi.responses import StreamingResponse
+    import tempfile
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    file_urls = job.file_urls or {}
+    category_files = file_urls.get(category)
+
+    if isinstance(category_files, dict):
+        gcs_path = category_files.get(file_key)
+    elif category_files:
+        gcs_path = category_files if file_key == category else None
+    else:
+        gcs_path = None
+
+    if not gcs_path:
+        # Archived by storage retention: tell clients (UI, kjbox) it can be
+        # regenerated rather than a plain 404.
+        if _archived_output(job, category, file_key):
+            raise _archived_error(job, locale)
+        if not category_files:
+            raise HTTPException(status_code=404, detail=f"Category '{category}' not found")
+        raise HTTPException(status_code=404, detail=f"File '{file_key}' not found in '{category}'")
+    
+    # Determine content type based on file extension
+    ext = gcs_path.split('.')[-1].lower()
+    content_types = {
+        'mp4': 'video/mp4',
+        'mkv': 'video/x-matroska',
+        'mov': 'video/quicktime',
+        'flac': 'audio/flac',
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'ass': 'text/plain',
+        'lrc': 'text/plain',
+        'txt': 'text/plain',
+        'json': 'application/json',
+        'zip': 'application/zip',
+        'png': 'image/png',
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+    }
+    content_type = content_types.get(ext, 'application/octet-stream')
+    
+    # Build proper filename: "Artist - Title (Final Karaoke Lossy 4k).mp4"
+    # Use sanitize_filename to handle Unicode characters (curly quotes, em dashes, etc.)
+    # that cause HTTP header encoding issues (Content-Disposition uses latin-1)
+    from karaoke_gen.utils import sanitize_filename
+    artist_clean = sanitize_filename(job.artist) if job.artist else None
+    title_clean = sanitize_filename(job.title) if job.title else None
+    base_name = f"{artist_clean} - {title_clean}" if artist_clean and title_clean else None
+
+    if base_name and file_key in DOWNLOAD_FILENAME_SUFFIXES:
+        filename = f"{base_name}{DOWNLOAD_FILENAME_SUFFIXES[file_key]}"
+    else:
+        filename = gcs_path.split('/')[-1]  # Fallback to original
+    
+    # Created below with delete=False; the streaming iterator's finally removes it
+    # on the happy path. If download/setup raises before streaming starts, the
+    # except handlers below unlink it so failed (e.g. 404) requests don't leak
+    # temp files and fill local disk.
+    tmp_path = None
+    try:
+        # Download to temp file and stream
+        storage = StorageService()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{ext}') as tmp:
+            tmp_path = tmp.name
+
+        storage.download_file(gcs_path, tmp_path)
+
+        def file_iterator():
+            try:
+                with open(tmp_path, 'rb') as f:
+                    while chunk := f.read(8192):
+                        yield chunk
+            finally:
+                import os
+                os.unlink(tmp_path)
+
+        # Build Content-Disposition header with RFC 5987 encoding for non-ASCII filenames
+        # (e.g. Chinese, Japanese, Korean characters that can't be encoded in latin-1)
+        from urllib.parse import quote
+        try:
+            filename.encode('latin-1')
+            content_disposition = f'attachment; filename="{filename}"'
+        except UnicodeEncodeError:
+            ascii_filename = filename.encode('ascii', 'replace').decode('ascii')
+            utf8_filename = quote(filename)
+            content_disposition = f"attachment; filename=\"{ascii_filename}\"; filename*=UTF-8''{utf8_filename}"
+
+        return StreamingResponse(
+            file_iterator(),
+            media_type=content_type,
+            headers={
+                'Content-Disposition': content_disposition
+            }
+        )
+    except NotFound:
+        # The recorded output is gone from GCS (e.g. a stale download link hit
+        # mid-reprocess after a visibility change / edit deleted the finals). This
+        # is "not found", not a server error — return 404 and log at warning so it
+        # doesn't trip the error-monitor.
+        _cleanup_temp_file(tmp_path)
+        logger.warning(f"Download requested for missing object {gcs_path}")
+        if getattr(job, 'renders_purged_at', None) or getattr(job, 'stems_purged_at', None):
+            raise _archived_error(job, locale)
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.fileNoLongerAvailable"))
+    except Exception as e:
+        _cleanup_temp_file(tmp_path)
+        logger.error(f"Error downloading {gcs_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error downloading file: {e}")
+
+
+@router.post("/{job_id}/cancel")
+def cancel_job(
+    job_id: str,
+    request: CancelJobRequest,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Cancel a job.
+
+    Jobs can be cancelled at any stage before completion.
+    """
+    locale = get_locale_from_request(http_request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    success = job_manager.cancel_job(job_id, reason=request.reason)
+    
+    if not success:
+        raise HTTPException(status_code=400, detail="Cannot cancel job")
+    
+    return {
+        "status": "success",
+        "job_status": "cancelled",
+        "message": "Job cancelled successfully"
+    }
+
+
+class RetryJobRequest(BaseModel):
+    """Optional body for POST /jobs/{id}/retry."""
+    # For a stalled torrent download: wait up to an hour (instead of the default
+    # 20 minutes) for the file's seeder to come back online.
+    keep_trying: bool = False
+
+
+@router.post("/{job_id}/retry")
+async def retry_job(
+    job_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: Optional[RetryJobRequest] = None,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Retry a failed or cancelled job from the last successful checkpoint.
+
+    Body (optional): ``{"keep_trying": true}`` retries a stalled audio download
+    with the extended (1 hour) stall budget.
+
+    This endpoint allows resuming jobs that failed or were cancelled during:
+    - Audio processing (re-runs from beginning if input audio exists)
+    - Video generation (re-runs video worker)
+    - Encoding (re-runs video worker)
+    - Packaging (re-runs video worker)
+
+    The retry logic determines the appropriate stage to resume from
+    based on what files/state already exist.
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    if job.status not in [JobStatus.FAILED, JobStatus.CANCELLED]:
+        raise HTTPException(
+            status_code=400,
+            detail=t(locale, "jobs.notCompleted", status=job.status)
+        )
+
+    # A failed admin re-render is admin-only to resume: every retry path keeps
+    # its marker (brand code, deleted/re-published outputs, notification choice).
+    from backend.services.admin_rerender_service import active_admin_rerender
+    admin_rerender = active_admin_rerender(job)
+    if admin_rerender and not auth_result.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=t(locale, "jobs.adminRerenderRetryAdminOnly"),
+        )
+
+    # Refuse if a Cloud Run Job auto-retry is already coming for this job.
+    # Otherwise the manual retry races with the automatic one and produces
+    # duplicate downloads and downstream worker triggers (see job 8a9c74ff).
+    if _is_auto_retry_pending(job.state_data):
+        raise HTTPException(
+            status_code=409,
+            detail="An automatic retry is already in progress. Please wait a few minutes."
+        )
+
+    try:
+        # Determine retry point based on what's already complete
+        error_details = job.error_details or {}
+        error_stage = error_details.get('stage', 'unknown')
+        original_status = job.status
+
+        logger.info(f"Job {job_id}: Retrying from {original_status} state (error stage: '{error_stage}')")
+        
+        # Check what state exists to determine retry point
+        file_urls = job.file_urls or {}
+        state_data = job.state_data or {}
+
+        # A theme re-render that failed before its new screens were made: re-run
+        # the re-render (not the generic ladder below, which could send the job
+        # back to review). Once screens exist, the render/video branches below
+        # resume it correctly.
+        theme_rerender = state_data.get('theme_rerender') or {}
+        if (theme_rerender.get('theme_id') and original_status == JobStatus.FAILED
+                and not _has_title_screen(file_urls, state_data)):
+            from backend.services.theme_rerender_service import RerenderError, ThemeRerenderService
+            try:
+                await ThemeRerenderService(job_manager).start(
+                    job, theme_id=theme_rerender['theme_id'],
+                    requested_by=auth_result.user_email or "unknown",
+                    notify_customer=theme_rerender.get('notify_customer', True),
+                )
+            except RerenderError as e:
+                raise HTTPException(status_code=e.status_code, detail=str(e))
+            return {
+                "status": "success",
+                "job_status": "lyrics_complete",
+                "message": "Job retry: re-running the theme re-render",
+                "retry_stage": "theme_rerender",
+            }
+
+        # Same for an admin re-render (state_data.admin_rerender): re-run it,
+        # keeping the admin's notify_customer choice. Its published outputs were
+        # already removed on the first attempt (recorded in the marker).
+        if (admin_rerender and original_status in (JobStatus.FAILED, JobStatus.CANCELLED)
+                and not _has_title_screen(file_urls, state_data)):
+            from backend.services.admin_rerender_service import AdminRerenderService
+            from backend.services.theme_rerender_service import RerenderError
+            try:
+                await AdminRerenderService(job_manager).start(
+                    job,
+                    requested_by=auth_result.user_email or "unknown",
+                    notify_customer=bool(admin_rerender.get('notify_customer', False)),
+                )
+            except RerenderError as e:
+                raise HTTPException(status_code=e.status_code, detail=str(e))
+            return {
+                "status": "success",
+                "job_status": "lyrics_complete",
+                "message": "Job retry: re-running the admin re-render",
+                "retry_stage": "admin_rerender",
+            }
+
+        # A failed storage-retention regenerate: re-run it (re-claims the job and
+        # restores purged stems first) until its screens exist; after that the
+        # branches below resume it (the marker keeps the run GCS-only).
+        from backend.services.regenerate_service import active_regenerate, stems_need_restore, RegenerateService
+        from backend.services.theme_rerender_service import RerenderError
+        regenerate = active_regenerate(job)
+        if (regenerate and original_status in (JobStatus.FAILED, JobStatus.CANCELLED)
+                and (not _has_title_screen(file_urls, state_data) or stems_need_restore(job))):
+            try:
+                await RegenerateService(job_manager).start(
+                    job,
+                    requested_by=auth_result.user_email or "unknown",
+                    source=regenerate.get('source') or 'retry',
+                    notify_customer=bool(regenerate.get('notify_customer', True)),
+                    after=regenerate.get('after'),
+                )
+            except RerenderError as e:
+                raise HTTPException(status_code=e.status_code, detail=str(e))
+            return {
+                "status": "success",
+                "job_status": "lyrics_complete",
+                "message": "Job retry: re-running the regenerate",
+                "retry_stage": "regenerate",
+            }
+
+        # Stems archived by storage retention (e.g. an Edit whose stems restore
+        # failed): go back through the screens worker, which restores them first.
+        if stems_need_restore(job) and file_urls.get('lyrics', {}).get('corrections'):
+            from google.cloud.firestore_v1 import DELETE_FIELD as _DEL
+            # A manual retry gets a fresh set of automatic restore attempts.
+            job_manager.update_job(job_id, {'error_message': None, 'error_details': None,
+                                            'state_data.stems_restore': _DEL})
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.LYRICS_COMPLETE,
+                progress=45,
+                message="Retrying: restoring audio stems",
+            ):
+                raise HTTPException(status_code=500, detail="Failed to transition job status for retry")
+            background_tasks.add_task(worker_service.trigger_screens_worker, job_id)
+            return {
+                "status": "success",
+                "job_status": "lyrics_complete",
+                "message": "Job retry started: restoring audio stems",
+                "retry_stage": "stems_restore",
+            }
+
+        # If we have a video with vocals and instrumental selection, retry video generation
+        if (file_urls.get('videos', {}).get('with_vocals') and 
+            state_data.get('instrumental_selection')):
+            
+            logger.info(f"Job {job_id}: Has rendered video and instrumental selection, retrying video generation")
+            
+            # Clear error state and reset worker progress for idempotency
+            job_manager.update_job(job_id, {
+                'error_message': None,
+                'error_details': None,
+            })
+            job_manager.update_state_data(job_id, 'video_progress', {'stage': 'pending'})
+
+            # Reset to INSTRUMENTAL_SELECTED and trigger video worker
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.INSTRUMENTAL_SELECTED,
+                progress=65,
+                message=f"Retrying video generation from failed state"
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to transition job status for retry"
+                )
+            
+            # Trigger video generation worker
+            background_tasks.add_task(worker_service.trigger_video_worker, job_id)
+            
+            return {
+                "status": "success",
+                "job_status": "instrumental_selected",
+                "message": "Job retry started from video generation stage",
+                "retry_stage": "video_generation"
+            }
+        
+        # If we have corrections, screens, AND review was completed, retry render
+        # Review completion is proven by instrumental_selection in state_data
+        # (set only when user submits the review endpoint)
+        elif (file_urls.get('lyrics', {}).get('corrections') and
+              _has_title_screen(file_urls, state_data) and
+              state_data.get('instrumental_selection')):
+
+            logger.info(f"Job {job_id}: Has corrections, screens, and completed review — retrying from render stage")
+
+            # Clear error state and reset worker progress for idempotency
+            job_manager.update_job(job_id, {
+                'error_message': None,
+                'error_details': None,
+            })
+            job_manager.update_state_data(job_id, 'render_progress', {'stage': 'pending'})
+
+            # Reset to REVIEW_COMPLETE and trigger render worker
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.REVIEW_COMPLETE,
+                progress=70,
+                message=f"Retrying video render from failed state"
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to transition job status for retry"
+                )
+
+            # Trigger render video worker
+            background_tasks.add_task(worker_service.trigger_render_video_worker, job_id)
+
+            return {
+                "status": "success",
+                "job_status": "review_complete",
+                "message": "Job retry started from render stage",
+                "retry_stage": "render_video"
+            }
+
+        # If we have corrections and screens but review was NOT completed,
+        # return to awaiting_review so the user can review lyrics
+        elif (file_urls.get('lyrics', {}).get('corrections') and
+              _has_title_screen(file_urls, state_data)):
+
+            logger.info(f"Job {job_id}: Has corrections and screens but review not completed — returning to review")
+
+            # Clear error state
+            job_manager.update_job(job_id, {
+                'error_message': None,
+                'error_details': None,
+            })
+
+            # Transition to AWAITING_REVIEW so user can review lyrics
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.AWAITING_REVIEW,
+                progress=55,
+                message=f"Ready for review. Please review lyrics and select your instrumental."
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to transition job status for retry"
+                )
+
+            return {
+                "status": "success",
+                "job_status": "awaiting_review",
+                "message": "Job retry: returning to lyrics review (review was not completed before failure)",
+                "retry_stage": "awaiting_review"
+            }
+        
+        # If we have stems and corrections, retry from screens generation
+        elif (file_urls.get('stems', {}).get('instrumental_clean') and 
+              file_urls.get('lyrics', {}).get('corrections')):
+            
+            logger.info(f"Job {job_id}: Has stems and corrections, retrying from screens stage")
+
+            # Clear error state and reset worker progress for idempotency
+            job_manager.update_job(job_id, {
+                'error_message': None,
+                'error_details': None,
+            })
+            job_manager.update_state_data(job_id, 'screens_progress', {'stage': 'pending'})
+
+            # Reset to a state before screens and trigger screens worker
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.LYRICS_COMPLETE,
+                progress=45,
+                message=f"Retrying from screens generation"
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to transition job status for retry"
+                )
+            
+            # Trigger screens worker
+            background_tasks.add_task(worker_service.trigger_screens_worker, job_id)
+            
+            return {
+                "status": "success",
+                "job_status": "lyrics_complete",
+                "message": "Job retry started from screens generation",
+                "retry_stage": "screens_generation"
+            }
+        
+        # If the input audio is already in GCS (an uploaded file, or a URL whose
+        # download succeeded), restart from beginning — the audio/lyrics workers
+        # re-fetch it from GCS.
+        #
+        # A URL job whose download never succeeded has only `job.url` and NO
+        # audio in GCS, so it must NOT take this branch: triggering the workers
+        # would just fail with "Failed to download audio file" and Cloud Run
+        # would retry them repeatedly (see job 7f36304a — an Apple Music link).
+        # Such jobs fall through to the "resubmit" refusal below, since there is
+        # no worker that re-downloads a generic URL.
+        elif job.input_media_gcs_path:
+            logger.info(f"Job {job_id}: Has input audio in GCS, restarting from beginning")
+
+            # Clear error state and any partial progress
+            # Clear parallel worker progress, but keep billing state: wiping
+            # credits_charged would make a re-run reconcile re-charge (or a later
+            # refund under-refund) a job that was already paid for.
+            from backend.services.job_credits import preserve_billing_state
+            job_manager.update_job(job_id, {
+                'error_message': None,
+                'error_details': None,
+                'state_data': preserve_billing_state(job.state_data),
+            })
+
+            # Reset to DOWNLOADING and trigger audio worker
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.DOWNLOADING,
+                progress=5,
+                message=f"Restarting job from {original_status} state"
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to transition job status for retry"
+                )
+
+            # Trigger audio worker (which kicks off parallel audio + lyrics processing)
+            background_tasks.add_task(worker_service.trigger_audio_worker, job_id)
+            background_tasks.add_task(worker_service.trigger_lyrics_worker, job_id)
+
+            return {
+                "status": "success",
+                "job_id": job_id,
+                "job_status": "downloading",
+                "message": f"Job restarted from {original_status} state",
+                "retry_stage": "from_beginning"
+            }
+
+        # If we have audio search download params, retry the download
+        elif (job.audio_source_type == 'audio_search' and
+              job.source_name and job.source_id):
+            logger.info(
+                f"Job {job_id}: Has audio search params, retrying download: "
+                f"source_name={job.source_name}, source_id={job.source_id}"
+            )
+
+            # Clear error state
+            job_manager.update_job(job_id, {
+                'error_message': None,
+                'error_details': None,
+            })
+            keep_trying = bool(body and body.keep_trying)
+            job_manager.update_state_data(job_id, KEEP_TRYING_STATE_KEY, keep_trying or None)
+
+            # Reset to DOWNLOADING_AUDIO state
+            if not job_manager.transition_to_state(
+                job_id=job_id,
+                new_status=JobStatus.DOWNLOADING_AUDIO,
+                progress=12,
+                message=f"Retrying audio download from {job.source_name}"
+            ):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to transition job status for retry"
+                )
+
+            # Trigger audio download via Cloud Run Job (runs to completion,
+            # immune to HTTP instance termination)
+            triggered = await worker_service.trigger_audio_download_worker(
+                job_id, keep_trying=keep_trying
+            )
+            if not triggered:
+                job_manager.fail_job(job_id, "Failed to trigger audio download worker")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to trigger audio download worker"
+                )
+
+            return {
+                "status": "success",
+                "job_id": job_id,
+                "job_status": "downloading_audio",
+                "keep_trying": keep_trying,
+                "message": f"Job retry started: re-downloading from {job.source_name}",
+                "retry_stage": "audio_download"
+            }
+
+        else:
+            # No input audio available - job needs to be resubmitted
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot retry: no input audio available. Job must be resubmitted."
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrying job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{job_id}/choose-different-audio")
+def choose_different_audio(
+    job_id: str,
+    request: Request,
+    auth_result: AuthResult = Depends(require_auth)
+) -> dict:
+    """
+    Reopen audio selection for a job whose audio download failed.
+
+    Moves a FAILED job (error stage ``audio_download``) back to
+    AWAITING_AUDIO_SELECTION using its cached search results, so the owner can
+    pick another source (e.g. the Spotify version when the only torrent seeder
+    is offline) via the usual Select Audio dialog.
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+    if job.status != JobStatus.FAILED or (job.error_details or {}).get('stage') != 'audio_download':
+        raise HTTPException(
+            status_code=400,
+            detail="Only jobs whose audio download failed can choose different audio",
+        )
+    if _is_auto_retry_pending(job.state_data):
+        raise HTTPException(
+            status_code=409,
+            detail="An automatic retry is already in progress. Please wait a few minutes."
+        )
+    if not (job.state_data or {}).get('audio_search_results'):
+        raise HTTPException(status_code=400, detail="No saved audio search results for this job")
+
+    job_manager.update_job(job_id, {'error_message': None, 'error_details': None})
+    job_manager.update_state_data(job_id, KEEP_TRYING_STATE_KEY, None)
+    if not job_manager.transition_to_state(
+        job_id=job_id,
+        new_status=JobStatus.AWAITING_AUDIO_SELECTION,
+        progress=10,
+        message="Choosing different audio after a failed download",
+    ):
+        raise HTTPException(status_code=500, detail="Failed to reopen audio selection")
+
+    logger.info(f"Job {job_id}: reopened audio selection after failed download")
+    return {"status": "success", "job_id": job_id, "job_status": "awaiting_audio_selection"}
+
+
+@router.get("/{job_id}/logs")
+def get_worker_logs(
+    job_id: str,
+    request: Request,
+    since_index: int = 0,
+    worker: Optional[str] = None,
+    auth_result: AuthResult = Depends(require_auth)
+) -> Dict[str, Any]:
+    """
+    Get worker logs for debugging.
+
+    This endpoint returns worker logs stored in Firestore.
+    Use `since_index` for efficient polling (returns only new logs).
+
+    Logs are stored in a subcollection (jobs/{job_id}/logs) to avoid
+    the 1MB document size limit. Older jobs may have logs in an embedded
+    array (worker_logs field) - this endpoint handles both transparently.
+
+    Args:
+        job_id: Job ID
+        since_index: Return only logs after this index (for pagination/polling)
+        worker: Filter by worker name (audio, lyrics, screens, video, render, distribution)
+
+    Returns:
+        {
+            "logs": [{"timestamp": "...", "level": "INFO", "worker": "audio", "message": "..."}],
+            "next_index": 42,  # Use this for next poll
+            "total_logs": 42
+        }
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # Check ownership - users can only see logs for their own jobs
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    logs = job_manager.get_worker_logs(job_id, since_index=since_index, worker=worker)
+    total = job_manager.get_worker_logs_count(job_id)
+
+    return {
+        "logs": logs,
+        "next_index": since_index + len(logs),
+        "total_logs": total
+    }
+
+
+def _run_distribution_cleanup(job_id: str, job) -> dict:
+    """
+    Delete a job's distributed outputs (YouTube video, Dropbox folder, Google Drive
+    files, kjbox GCS mirror objects) and recycle its brand code once Dropbox AND
+    GDrive are confirmed clean.
+
+    Shared by the admin cleanup-distribution endpoint and job deletion. Deleting a
+    job whose outputs are still published MUST run this first: recycling the brand
+    code while the files remain in the public share hands the same NOMAD-#### to a
+    future job and creates duplicate brand codes (NOMAD-1583 incident, 2026-08-29).
+    """
+    state_data = job.state_data or {}
+    results = {
+        "job_id": job_id,
+        "youtube": {"status": "skipped", "reason": "no youtube_url in state_data"},
+        "dropbox": {"status": "skipped", "reason": "no brand_code or dropbox_path"},
+        "gdrive": {"status": "skipped", "reason": "no gdrive_files in state_data"},
+    }
+
+    # Clean up YouTube
+    youtube_url = state_data.get('youtube_url')
+    if youtube_url:
+        try:
+            # Extract video ID from URL (format: https://youtu.be/VIDEO_ID or https://www.youtube.com/watch?v=VIDEO_ID)
+            import re
+            video_id_match = re.search(r'(?:youtu\.be/|youtube\.com/watch\?v=)([^&\s]+)', youtube_url)
+            if video_id_match:
+                video_id = video_id_match.group(1)
+
+                # Import and use karaoke_finalise for YouTube deletion
+                from karaoke_gen.karaoke_finalise.karaoke_finalise import KaraokeFinalise
+                from backend.services.youtube_service import get_youtube_service
+
+                youtube_service = get_youtube_service()
+                if youtube_service.is_configured:
+                    # Create minimal KaraokeFinalise instance for deletion
+                    finalise = KaraokeFinalise(
+                        dry_run=False,
+                        non_interactive=True,
+                        enable_youtube=True,
+                        user_youtube_credentials=youtube_service.get_credentials_dict()
+                    )
+                    success = finalise.delete_youtube_video(video_id)
+                    results["youtube"] = {
+                        "status": "success" if success else "failed",
+                        "video_id": video_id
+                    }
+                else:
+                    results["youtube"] = {"status": "failed", "reason": "YouTube credentials not configured"}
+            else:
+                results["youtube"] = {"status": "failed", "reason": f"Could not extract video ID from {youtube_url}"}
+        except Exception as e:
+            logger.error(f"Error cleaning up YouTube for job {job_id}: {e}", exc_info=True)
+            results["youtube"] = {"status": "error", "error": str(e)}
+
+    # Clean up Dropbox
+    brand_code = state_data.get('brand_code')
+    dropbox_path = getattr(job, 'dropbox_path', None)
+    dropbox_cleaned = False
+    if brand_code and dropbox_path:
+        try:
+            from backend.services.dropbox_service import get_dropbox_service
+            dropbox = get_dropbox_service()
+            if dropbox.is_configured:
+                base_name = f"{job.artist} - {job.title}"
+                folder_name = f"{brand_code} - {base_name}"
+                full_path = f"{dropbox_path}/{folder_name}"
+                success = dropbox.delete_folder(full_path)
+                dropbox_cleaned = success
+                results["dropbox"] = {
+                    "status": "success" if success else "failed",
+                    "path": full_path
+                }
+            else:
+                results["dropbox"] = {"status": "failed", "reason": "Dropbox credentials not configured"}
+        except Exception as e:
+            logger.error(f"Error cleaning up Dropbox for job {job_id}: {e}", exc_info=True)
+            results["dropbox"] = {"status": "error", "error": str(e)}
+
+    # Clean up Google Drive
+    # Use tracked file IDs if available; otherwise fall back to searching by brand code.
+    # This handles old jobs where gdrive_files was not persisted (e.g., uploaded before
+    # file ID tracking was implemented, or when GDrive upload silently failed and a
+    # previous test run left files behind).
+    gdrive_files = state_data.get('gdrive_files')
+    gdrive_folder_id = getattr(job, 'gdrive_folder_id', None)
+    gdrive_cleaned = False
+
+    if gdrive_files or (gdrive_folder_id and brand_code):
+        try:
+            from backend.services.gdrive_service import get_gdrive_service
+            gdrive = get_gdrive_service()
+            if gdrive.is_configured:
+                file_ids: list = []
+                gdrive_method = None  # track how files were located for response
+
+                if gdrive_files and isinstance(gdrive_files, dict):
+                    # Fast path: delete using tracked file IDs from state_data
+                    file_ids = [v for v in gdrive_files.values() if v]
+                    logger.info(
+                        f"GDrive cleanup for job {job_id}: "
+                        f"using {len(file_ids)} tracked file IDs"
+                    )
+
+                if not file_ids and gdrive_folder_id and brand_code:
+                    # Fallback: search by brand code prefix in CDG/, MP4/, MP4-720p/ subfolders.
+                    # Handles jobs where gdrive_files was not tracked (old jobs, or jobs where
+                    # GDrive upload succeeded but file IDs were lost).
+                    logger.info(
+                        f"GDrive cleanup for job {job_id}: "
+                        f"no tracked file IDs, searching by brand_code '{brand_code}'"
+                    )
+                    file_ids = gdrive.find_files_by_brand_code(gdrive_folder_id, brand_code)
+                    gdrive_method = "brand_code_search"
+
+                if file_ids:
+                    delete_results = gdrive.delete_files(file_ids)
+                    all_success = all(delete_results.values())
+                    gdrive_cleaned = all_success
+                    results["gdrive"] = {
+                        "status": "success" if all_success else "partial",
+                        "files": delete_results,
+                    }
+                    if gdrive_method:
+                        results["gdrive"]["method"] = gdrive_method
+                else:
+                    gdrive_cleaned = True  # Nothing to delete
+                    results["gdrive"] = {
+                        "status": "skipped",
+                        "reason": "no files found to delete",
+                    }
+
+                # Remove the Nomad 720p master(s) from the GCS fast-sync mirror too, so a
+                # re-finalise (incl. artist/title rename) doesn't leave the old cut on
+                # kjbox. Prefix-keyed by brand_code (covers renames); the subsequent
+                # re-run's push re-adds the new master. Non-fatal, Nomad-only.
+                if brand_code:
+                    from backend.services.nomad_master_mirror import cleanup_nomad_masters
+                    cleanup_nomad_masters(brand_code)
+            else:
+                results["gdrive"] = {
+                    "status": "failed",
+                    "reason": "Google Drive credentials not configured",
+                }
+        except Exception as e:
+            logger.error(
+                f"Error cleaning up Google Drive for job {job_id}: {e}", exc_info=True
+            )
+            results["gdrive"] = {"status": "error", "error": str(e)}
+    else:
+        if not gdrive_folder_id:
+            results["gdrive"]["reason"] = "no gdrive_folder_id on job and no tracked file IDs"
+
+    # Recycle the brand code so it can be reused — but only after GDrive is confirmed clean.
+    # If we recycle before GDrive cleanup, a new job could claim the same brand code and
+    # collide with leftover files on GDrive (duplicate brand code in public share).
+    from backend.services.brand_code_service import is_preserved_brand_code
+    if dropbox_cleaned and brand_code and gdrive_cleaned and not is_preserved_brand_code(job, brand_code):
+        try:
+            from backend.services.brand_code_service import (
+                BrandCodeService, get_brand_code_service
+            )
+            prefix, number = BrandCodeService.parse_brand_code(brand_code)
+            get_brand_code_service().recycle_brand_code(prefix, number)
+            results["dropbox"]["recycled_brand_code"] = True
+            logger.info(f"Recycled brand code {brand_code} after full distribution cleanup")
+        except (ValueError, Exception) as e:
+            logger.warning(f"Failed to recycle brand code {brand_code}: {e}")
+            results["dropbox"]["recycled_brand_code"] = False
+    elif dropbox_cleaned and brand_code:
+        logger.warning(
+            f"Brand code {brand_code} NOT recycled: GDrive cleanup did not confirm success "
+            f"(gdrive_cleaned={gdrive_cleaned}). Brand code will remain reserved to prevent "
+            f"collisions with leftover GDrive files."
+        )
+
+
+    return results
+
+
+@router.post("/{job_id}/cleanup-distribution")
+def cleanup_distribution(
+    job_id: str,
+    request: Request,
+    delete_job: bool = True,
+    auth_result: AuthResult = Depends(require_admin)
+) -> dict:
+    """
+    Clean up all distributed content for a job (YouTube, Dropbox, Google Drive).
+
+    This admin-only endpoint is designed for E2E test cleanup. It:
+    1. Deletes YouTube video (if uploaded)
+    2. Deletes Dropbox folder (if uploaded)
+    3. Deletes Google Drive files (if uploaded)
+    4. Optionally deletes the job itself
+
+    Args:
+        job_id: Job ID to clean up
+        delete_job: If True, also delete the job after cleaning up distribution
+
+    Returns:
+        Cleanup results for each service
+    """
+    locale = get_locale_from_request(request)
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    results = _run_distribution_cleanup(job_id, job)
+    results["job_deleted"] = False
+
+    # Delete the job if requested
+    if delete_job:
+        try:
+            job_manager.delete_job(job_id, delete_files=True)
+            results["job_deleted"] = True
+            logger.info(f"Deleted job {job_id} after distribution cleanup")
+        except Exception as e:
+            logger.error(f"Error deleting job {job_id}: {e}", exc_info=True)
+            results["job_deleted"] = False
+            results["job_delete_error"] = str(e)
+
+    return results
+
+
+# ============================================================================
+# Guided Flow: Create job from search session
+# ============================================================================
+
+class CreateFromSearchRequest(BaseModel):
+    """Request to create a job from a completed standalone search session."""
+    search_session_id: str = Field(..., description="Session ID returned by /api/audio-search/search-standalone")
+    selection_index: int = Field(..., description="Index of the selected audio source from search results")
+    artist: str = Field(..., description="Search artist name (from Step 1)")
+    title: str = Field(..., description="Search title (from Step 1)")
+    display_artist: Optional[str] = Field(None, description="Display artist override for title screens/filenames")
+    display_title: Optional[str] = Field(None, description="Display title override for title screens/filenames")
+    is_private: bool = Field(False, description="Private track: Dropbox only, no YouTube/GDrive")
+    requires_audio_edit: bool = Field(False, description="Pause after download for user to edit input audio")
+    review_mode: str = Field("auto", description="'auto' (skip review when confident) or 'always_review'")
+    backing_preference: str = Field("auto", description="'auto' (retain backing where safe), 'clean', or 'review'")
+    translation_language: Optional[str] = Field(None, description="Translated lyrics language code (e.g. 'es') shown beneath each line; omit for none")
+
+    @validator('display_artist', 'display_title')
+    def strip_whitespace(cls, v):
+        if v is not None:
+            return v.strip() or None
+        return v
+
+
+@router.post("/create-from-search", response_model=JobResponse)
+async def create_job_from_search(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: CreateFromSearchRequest,
+    auth_result: AuthResult = Depends(require_auth)
+) -> JobResponse:
+    """Create a job from a search session — see ``_create_job_from_search_sync``.
+
+    The work is almost all sync Firestore/GCS I/O (theme prep's upload_json
+    stalled the loop 5-9s), so it runs in a worker thread; only the audio
+    download trigger runs back on the loop.
+    """
+    loop = asyncio.get_running_loop()
+    return await run_in_body_thread(
+        _create_job_from_search_sync, request, background_tasks, body, auth_result, loop
+    )
+
+
+def _create_job_from_search_sync(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: CreateFromSearchRequest,
+    auth_result: AuthResult,
+    loop: asyncio.AbstractEventLoop,
+) -> JobResponse:
+    """
+    Create a karaoke job from a previously completed standalone search session.
+
+    This is the second half of the guided job creation flow:
+    1. POST /api/audio-search/search-standalone  → search_session_id + results
+    2. User picks a result (Step 2 of wizard)
+    3. User confirms job settings (Step 3 of wizard)
+    4. POST /api/jobs/create-from-search         → job_id (this endpoint)
+
+    The job is created with all final field values at creation time (including
+    is_private and display overrides).  It skips AWAITING_AUDIO_SELECTION and
+    goes directly to DOWNLOADING_AUDIO, then triggers workers.
+
+    Credit deduction happens here (inside job_manager.create_job).
+    """
+    locale = get_locale_from_request(request)
+
+    # Lazy imports from audio_search to avoid circular imports at module level
+    from backend.api.routes.audio_search import (
+        _validate_and_prepare_selection,
+        extract_request_metadata,
+    )
+    from backend.middleware.tenant import get_tenant_config_from_request
+
+    try:
+        user_email = auth_result.user_email
+        if not user_email:
+            raise HTTPException(status_code=401, detail=t(locale, "jobs.authError"))
+
+        # Read the session non-destructively for validation.
+        # consume_search_session (atomic read+delete) is called later, just before job creation,
+        # so that a 4xx validation error leaves the session intact for the user to retry.
+        firestore_service = FirestoreService()
+        session = firestore_service.get_search_session(body.search_session_id)
+        if not session:
+            raise HTTPException(
+                status_code=404,
+                detail="Search expired — please search again"
+            )
+
+        # Verify the session belongs to the requesting user (or admin)
+        if not auth_result.is_admin and session.get('user_email') != user_email:
+            raise HTTPException(status_code=403, detail="You don't have permission to use this search session")
+
+        # Verify tenant consistency — session must have been created in the same tenant context
+        request_tenant_id = getattr(request.state, 'tenant_id', None)
+        if session.get('tenant_id') != request_tenant_id:
+            raise HTTPException(status_code=403, detail="You don't have permission to use this search session")
+
+        # Check TTL (belt-and-suspenders — Firestore TTL may not delete immediately)
+        ttl_expiry = session.get('ttl_expiry')
+        if ttl_expiry:
+            if isinstance(ttl_expiry, str):
+                try:
+                    ttl_expiry = datetime.fromisoformat(ttl_expiry)
+                except ValueError:
+                    ttl_expiry = None
+            if ttl_expiry and datetime.utcnow() > ttl_expiry.replace(tzinfo=None):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Search expired — please search again"
+                )
+
+        search_results = session.get('results', [])
+        if not search_results:
+            raise HTTPException(status_code=400, detail="Search session has no results")
+
+        if body.selection_index < 0 or body.selection_index >= len(search_results):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid selection index {body.selection_index}. Valid range: 0-{len(search_results)-1}"
+            )
+
+        # Apply server defaults (same as existing search endpoint)
+        settings_obj = get_settings()
+        effective_dropbox_path = settings_obj.default_dropbox_path
+        effective_gdrive_folder_id = settings_obj.default_gdrive_folder_id
+        effective_discord_webhook_url = settings_obj.default_discord_webhook_url
+        effective_enable_youtube_upload = settings_obj.default_enable_youtube_upload
+        effective_brand_prefix = settings_obj.default_brand_prefix
+        effective_youtube_description = settings_obj.default_youtube_description
+
+        # Apply default theme
+        theme_service = get_theme_service()
+        effective_theme_id = theme_service.get_default_theme_id()
+        if effective_theme_id:
+            logger.info(f"Applying default theme: {effective_theme_id}")
+
+        from backend.services.job_defaults_service import resolve_cdg_txt_defaults
+        resolved_cdg, resolved_txt = resolve_cdg_txt_defaults(effective_theme_id, None, None)
+
+        # Determine display values.
+        # The session stores the ORIGINAL search query (e.g. "hard-fi"). body.artist/
+        # body.title carry whatever is currently in the wizard's artist/title fields,
+        # which reflect a "Use official formatting" correction the user may have applied
+        # after searching. The displayed job name must honour that correction, so prefer
+        # the request body over the stored query. An explicit display override wins above all.
+        session_artist = session.get('artist', body.artist)
+        session_title = session.get('title', body.title)
+        # body.artist/body.title are required but unvalidated for whitespace, so strip
+        # them and fall back to the stored query if blank (display_* is pre-stripped to
+        # None by its validator). This keeps a stray "   " from becoming the job name.
+        body_artist = (body.artist or "").strip()
+        body_title = (body.title or "").strip()
+        effective_display_artist = body.display_artist or body_artist or session_artist
+        effective_display_title = body.display_title or body_title or session_title
+
+        tenant_id = session.get('tenant_id') or ""
+
+        request_metadata = extract_request_metadata(request, created_from="guided_flow")
+
+        # All validation passed — atomically consume (read+delete) the session to prevent
+        # a second concurrent request from creating a duplicate job.
+        consumed_session = firestore_service.consume_search_session(body.search_session_id)
+        if not consumed_session:
+            # Another concurrent request already consumed the session
+            raise HTTPException(
+                status_code=404,
+                detail="Search expired — please search again"
+            )
+
+        # Create the job with all final values
+        job_create = JobCreate(
+            artist=effective_display_artist,
+            title=effective_display_title,
+            theme_id=effective_theme_id,
+            enable_cdg=resolved_cdg,
+            enable_txt=resolved_txt,
+            brand_prefix=effective_brand_prefix,
+            enable_youtube_upload=effective_enable_youtube_upload,
+            youtube_description=effective_youtube_description,
+            youtube_description_template=effective_youtube_description,
+            discord_webhook_url=effective_discord_webhook_url,
+            dropbox_path=effective_dropbox_path,
+            gdrive_folder_id=effective_gdrive_folder_id,
+            user_email=user_email,
+            audio_search_artist=session_artist,
+            audio_search_title=session_title,
+            request_metadata=request_metadata,
+            is_private=body.is_private,
+            review_mode=body.review_mode,
+            backing_preference=body.backing_preference,
+            translation_language=body.translation_language,
+            tenant_id=tenant_id,
+            locale=get_full_locale_from_request(request),
+        )
+        job = job_manager.create_job(job_create, is_admin=auth_result.is_admin)
+        job_id = job.job_id
+
+        # Store client IP on job for anti-abuse correlation
+        creation_ip = get_client_ip(request)
+        if creation_ip:
+            FirestoreService().update_job(job_id, {"creation_ip": creation_ip})
+
+        logger.info(f"Created job {job_id} from search session {body.search_session_id}")
+
+        # Trace attributes for observability
+        add_span_attribute("job_id", job_id)
+        add_span_attribute("job.source", "guided_search")
+        add_span_attribute("job.is_private", body.is_private)
+
+        metrics.record_job_created(job_id, source="guided_search")
+
+        # Apply default theme style to job (copy style_params.json to job folder)
+        if effective_theme_id:
+            from backend.api.routes.file_upload import _prepare_theme_for_job
+            try:
+                style_params_path, theme_style_assets, youtube_desc = _prepare_theme_for_job(
+                    job_id, effective_theme_id, {}, locale=locale
+                )
+                theme_update = {
+                    'style_params_gcs_path': style_params_path,
+                    'style_assets': theme_style_assets,
+                }
+                if youtube_desc and not effective_youtube_description:
+                    theme_update['youtube_description_template'] = youtube_desc
+                job_manager.update_job(job_id, theme_update)
+            except Exception as e:
+                logger.warning(f"Failed to prepare theme '{effective_theme_id}' for job {job_id}: {e}")
+
+        # Store search results and remote_search_id in job state_data
+        # (required by _download_audio_and_trigger_workers).
+        # Dotted paths MERGE into state_data — never write the whole map here:
+        # create_job already recorded credits_charged / payment_bypassed, and
+        # wiping them made reconcile and confirm-duration disagree on the charge.
+        state_data_update: Dict[str, Any] = {
+            'state_data.audio_search_results': search_results,
+            'state_data.audio_search_count': len(search_results),
+        }
+        if session.get('remote_search_id'):
+            state_data_update['state_data.remote_search_id'] = session['remote_search_id']
+        if body.requires_audio_edit:
+            state_data_update['state_data.requires_audio_edit'] = True
+        job_manager.update_job(job_id, state_data_update)
+
+        # Transition to DOWNLOADING_AUDIO (skips AWAITING_AUDIO_SELECTION entirely)
+        _validate_and_prepare_selection(
+            job_id=job_id,
+            selection_index=body.selection_index,
+        )
+
+        # Trigger audio download as a Cloud Run Job (survives instance shutdown)
+        worker_service = get_worker_service()
+        triggered = run_on_loop(loop, worker_service.trigger_audio_download_worker(job_id))
+        if not triggered:
+            job_manager.fail_job(job_id, "Failed to trigger audio download worker")
+            raise HTTPException(status_code=500, detail="Failed to trigger audio download worker")
+
+        return JobResponse(
+            status="success",
+            job_id=job_id,
+            message="Job created successfully. Audio download starting."
+        )
+
+    except HTTPException:
+        raise
+    except InsufficientCreditsError:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating job from search: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# =============================================================================
+# Change Visibility Endpoint
+# =============================================================================
+
+@router.post("/{job_id}/change-visibility", response_model=ChangeVisibilityResponse)
+async def change_visibility(
+    job_id: str,
+    request: ChangeVisibilityRequest,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Change job visibility between public and private.
+
+    Public -> Private (fast, ~1-2 min):
+    - Removes YouTube/GDrive/Dropbox outputs
+    - Redistributes existing files to private destination
+
+    Private -> Public (slow, ~15-30 min):
+    - Resets custom styling to default Nomad theme
+    - Regenerates screens, re-renders video, publishes publicly
+    """
+    locale = get_locale_from_request(http_request)
+    job_manager = JobManager()
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    user_email = auth_result.user_email or "unknown"
+    is_admin = auth_result.is_admin
+
+    from backend.services.visibility_change_service import VisibilityChangeInProgress, VisibilityChangeService
+    service = VisibilityChangeService(job_manager)
+
+    # Validate (skip job-exists check since we already handled it)
+    error = service.validate_change(job, user_email, is_admin, request.target_visibility)
+    if error:
+        status_code = 403 if "your own jobs" in error else 400
+        raise HTTPException(status_code=status_code, detail=error)
+
+    current_is_private = getattr(job, 'is_private', False)
+    previous_visibility = "private" if current_is_private else "public"
+
+    try:
+        if request.target_visibility == "private":
+            result = await service.change_to_private(job_id, job, user_email)
+        else:
+            result = await service.change_to_public(job_id, job, user_email)
+
+        return ChangeVisibilityResponse(
+            status=result["status"],
+            job_id=job_id,
+            message=result["message"],
+            previous_visibility=previous_visibility,
+            new_visibility=request.target_visibility,
+            reprocessing_required=result["reprocessing_required"],
+        )
+
+    except RerenderError as e:
+        # Old track whose finals were archived and can't be regenerated right now.
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    except VisibilityChangeInProgress as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error changing visibility for job {job_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to change visibility: {str(e)}")
+
+
+# =============================================================================
+# Regenerate (storage retention) Endpoint
+# =============================================================================
+
+@router.post("/{job_id}/regenerate")
+async def regenerate_job_outputs(
+    job_id: str,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Regenerate a finished track's video files after storage retention archived them.
+
+    Old tracks keep their 720p video and CDG/TXT packages; the other formats
+    (4K, lossless, with-vocals, ...) and, for some, the separated audio stems
+    are archived after 30 days. This rebuilds them in storage — re-running audio
+    separation first if needed — from the track's existing reviewed lyrics,
+    instrumental choice and style. Nothing is re-published (YouTube, Dropbox,
+    Google Drive stay as they are). The owner is emailed when it's ready.
+    Rate-limited per track and per user (admins exempt).
+    """
+    locale = get_locale_from_request(http_request)
+    job_manager = JobManager()
+    job = await asyncio.to_thread(job_manager.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionModify"))
+
+    from backend.services.regenerate_service import (
+        RegenerateService,
+        check_and_record_rate_limit,
+        renders_missing,
+        validate_regenerate,
+    )
+
+    reason = validate_regenerate(job)
+    if not reason and not auth_result.is_admin and not renders_missing(job):
+        reason = "This track's video files are all available — there's nothing to regenerate."
+    if reason:
+        conflict = any(marker in reason for marker in ("already", "right now", "in progress"))
+        raise HTTPException(status_code=409 if conflict else 400, detail=reason)
+
+    requested_by = auth_result.user_email or "unknown"
+    if not auth_result.is_admin:
+        refusal = await asyncio.to_thread(
+            check_and_record_rate_limit, job_manager.firestore.db, job, requested_by, get_settings(),
+        )
+        if refusal:
+            raise HTTPException(status_code=429, detail=refusal)
+
+    source = "admin" if auth_result.is_admin else "customer"
+    client_id = (http_request.headers.get("X-Client-Id") or "").strip().lower()
+    if client_id == "kjbox":
+        source = "kjbox"
+    try:
+        result = await RegenerateService(job_manager).start(
+            job, requested_by=requested_by, source=source,
+            # The owner is always told when their track is ready again (kjbox /
+            # admin triggers too — the files are theirs).
+            notify_customer=True,
+        )
+    except RerenderError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+    logger.info(f"[job:{job_id}] Regenerate started by {requested_by} (source={source}, needs_stems={result['needs_stems']})")
+    return {
+        "status": "processing",
+        "job_id": job_id,
+        "needs_stems": result["needs_stems"],
+        "message": "Regenerating your video files. This usually takes 10-30 minutes; we'll email you when they're ready.",
+    }
+
+
+# =============================================================================
+# Re-render With Current Theme Endpoint
+# =============================================================================
+
+@router.post("/{job_id}/rerender")
+async def rerender_with_current_theme(
+    job_id: str,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Re-render a finished tenant track with the tenant's current theme.
+
+    Regenerates title/end screens, the lyrics video, final encodes and CDG/TXT
+    packages from the already-reviewed lyrics and instrumental selection — no
+    review step. Used after a tenant edits their theme. Free (tenant jobs are
+    never charged); only the job owner (still on the tenant allowlist) or an
+    admin may trigger it.
+    """
+    locale = get_locale_from_request(http_request)
+    job_manager = JobManager()
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+    if not _check_job_ownership(job, auth_result):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    from backend.services.tenant_admin_service import _theme_id_for
+    from backend.services.tenant_service import get_tenant_service
+    from backend.services.theme_rerender_service import (
+        RerenderError,
+        ThemeRerenderService,
+        validate_rerender,
+    )
+
+    reason = validate_rerender(job)
+    if reason:
+        raise HTTPException(status_code=400, detail=reason)
+
+    tenant = await asyncio.to_thread(get_tenant_service().get_tenant_config, job.tenant_id)
+    if tenant is None or not tenant.is_active:
+        raise HTTPException(status_code=400, detail="This track's portal is no longer active.")
+    # Re-rendering is free work, so (like tenant billing) require the caller to
+    # still be on the tenant's allowlist — X-Tenant-ID alone proves nothing.
+    if not auth_result.is_admin and not tenant.is_email_allowed(auth_result.user_email or ""):
+        raise HTTPException(status_code=403, detail=t(locale, "jobs.noPermissionAccess"))
+
+    theme_id = _theme_id_for(tenant)
+    try:
+        await ThemeRerenderService(job_manager).start(
+            job, theme_id=theme_id, requested_by=auth_result.user_email or "unknown"
+        )
+    except RerenderError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+    return {"status": "processing", "job_id": job_id, "theme_id": theme_id}
+
+
+# =============================================================================
+# Duration Confirmation Endpoint
+# =============================================================================
+
+class ConfirmDurationRequest(BaseModel):
+    """Request body for POST /jobs/{job_id}/confirm-duration."""
+    acknowledged_credits: int
+
+
+# Keep a set of background tasks alive to prevent GC (mirrors complete_review pattern)
+_duration_confirm_tasks: set = set()
+
+
+@router.post("/{job_id}/confirm-duration")
+async def confirm_duration(
+    job_id: str,
+    body: ConfirmDurationRequest,
+    http_request: Request,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Confirm duration-based credit charge and resume job processing.
+
+    Called when a job is paused in AWAITING_DURATION_CONFIRM state.
+
+    The only pause reason currently used is ``reconcile``: the actual measured
+    duration costs more than was already charged; ``state_data.pending_additional_credits``
+    holds the delta owed. This applies to URL, upload, and audio-search jobs alike.
+
+    The caller must pass ``acknowledged_credits`` equal to the total credit cost
+    the user has agreed to pay. If the figure has changed (race condition) a 409
+    is returned so the frontend can refresh and re-show the dialog.
+    """
+    locale = get_locale_from_request(http_request)
+
+    # 1. Load job — 404 if not found or not owned by this user.
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    if not _check_job_ownership(job, auth_result):
+        # Return 404 (not 403) to avoid leaking job existence to non-owners.
+        raise HTTPException(status_code=404, detail=t(locale, "jobs.notFound"))
+
+    # 2. Status guard.
+    if job.status != JobStatus.AWAITING_DURATION_CONFIRM:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not awaiting duration confirmation (status: {job.status})",
+        )
+
+    # 3. Compute owed credits and expected total.
+    #
+    # - credits_charged: total already deducted from the user's account
+    # - pending_additional_credits: exactly how many MORE credits are owed to clear the pause
+    #
+    # The reconcile engine is responsible for computing and storing pending_additional_credits.
+    # confirm_duration never needs to call duration_to_credits.
+    state_data = job.state_data or {}
+    reason = state_data.get("duration_confirm_reason", "reconcile")
+    from backend.services.job_credits import get_credits_charged
+    credits_charged = get_credits_charged(job)  # same default as reconcile/refunds
+    owed = int(state_data.get("pending_additional_credits", 0))
+    expected_total = credits_charged + owed
+
+    # 4. Acknowledged-credits mismatch guard (figure may have changed; client refreshes).
+    if body.acknowledged_credits != expected_total:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"acknowledged_credits ({body.acknowledged_credits}) does not match "
+                f"expected total ({expected_total}). Please refresh and confirm again."
+            ),
+        )
+
+    # 5. Deduct credits if any are owed.
+    if owed > 0:
+        user_email = job.user_email
+        if not user_email:
+            raise HTTPException(status_code=500, detail="Job has no associated user email")
+
+        user_svc = get_user_service()
+        success, _remaining, _msg = user_svc.deduct_credits(
+            user_email,
+            job_id,
+            amount=owed,
+            reason="duration_confirm",
+            count_as_job_creation=False,  # job was already counted at create_job()
+        )
+        if not success:
+            raise InsufficientCreditsError(
+                message=f"Insufficient credits to confirm processing ({owed} credit(s) required).",
+                credits_available=_remaining,
+                credits_required=owed,
+            )
+
+        # Update credits_charged in state_data to reflect the new total.
+        job_manager.update_job(
+            job_id,
+            {
+                "state_data.credits_charged": credits_charged + owed,
+                "state_data.duration_confirmed": True,
+                "state_data.pending_additional_credits": 0,
+            },
+        )
+    else:
+        # owed == 0: nothing to charge, just mark confirmed (and persist the
+        # resolved charge so legacy jobs carry the explicit field from now on).
+        job_manager.update_job(
+            job_id,
+            {
+                "state_data.credits_charged": credits_charged,
+                "state_data.duration_confirmed": True,
+                "state_data.pending_additional_credits": 0,
+            },
+        )
+
+    # 6. Transition job OUT of AWAITING_DURATION_CONFIRM before triggering workers.
+    #
+    # This is the idempotency guard: if a duplicate confirm POST arrives (e.g. a
+    # double-click) the status guard at step 2 will now 409 immediately, preventing
+    # a second pair of worker launches.  We go back to DOWNLOADING — the prep-phase
+    # status every other path runs the parallel audio + lyrics workers in. It must
+    # be a PREP_PHASE_STATUSES member: the lyrics worker only advances a job to
+    # screens/review from there. (This used to be SEPARATING_STAGE1, which can only
+    # move to SEPARATING_STAGE2/FAILED, so every confirmed job stalled before
+    # review. Found by the local-stack E2E, 2026-10-15.)
+    job_manager.transition_to_state(
+        job_id,
+        new_status=JobStatus.DOWNLOADING,
+        progress=20,
+        message="Cost confirmed, processing",
+    )
+
+    # 7. Resume processing: trigger both parallel workers in background.
+    # Use asyncio.create_task (mirrors complete_review in review.py) so the HTTP
+    # response returns immediately without waiting for Cloud Run job submission.
+    ws = get_worker_service()
+
+    async def _trigger_workers_after_confirm():
+        try:
+            await asyncio.gather(
+                ws.trigger_audio_worker(job_id),
+                ws.trigger_lyrics_worker(job_id),
+            )
+        except Exception as exc:
+            logger.error(f"Job {job_id}: Failed to trigger workers after duration confirm: {exc}")
+
+    task = asyncio.create_task(_trigger_workers_after_confirm())
+    _duration_confirm_tasks.add(task)
+    task.add_done_callback(_duration_confirm_tasks.discard)
+
+    logger.info(
+        f"Job {job_id}: duration confirmed (reason={reason}, owed={owed}); workers triggered"
+    )
+
+    # 8. Return the updated job.
+    updated_job = job_manager.get_job(job_id)
+    if updated_job is None:
+        # Should not happen, but be safe.
+        return {"job_id": job_id, "status": "confirmed"}
+    return updated_job
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/estimate — URL duration probe
+# ---------------------------------------------------------------------------
+
+
+class EstimateRequest(BaseModel):
+    url: HttpUrl
+
+
+@router.post("/estimate")
+async def estimate_duration(
+    body: EstimateRequest,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Probe a URL to estimate its duration and compute the credit cost,
+    WITHOUT creating a job or downloading any audio.
+
+    Returns duration_seconds (or None if unknown), source, credits, and
+    whether the duration exceeds the supported ceiling (blocked).
+    """
+    info = await get_youtube_download_service().check_availability(str(body.url))
+    seconds = (info or {}).get("duration")
+    if seconds is None:
+        return {
+            "duration_seconds": None,
+            "source": "unknown",
+            "credits": 1,
+            "blocked": False,
+        }
+    return {
+        "duration_seconds": seconds,
+        "source": "youtube_metadata",
+        "credits": duration_to_credits(seconds),
+        "blocked": is_blocked(seconds),
+    }

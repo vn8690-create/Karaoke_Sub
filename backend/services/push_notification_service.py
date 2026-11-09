@@ -1,0 +1,521 @@
+"""
+Push Notification Service for Web Push Notifications.
+
+Handles sending push notifications to users' browsers/devices using the Web Push protocol.
+Uses pywebpush library for VAPID authentication and push message encryption.
+"""
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional, List
+
+from google.cloud.firestore_v1 import ArrayRemove
+from pywebpush import webpush, WebPushException
+
+from backend.config import get_settings
+from backend.models.user import User, PushSubscription, effective_push_prefs
+from backend.i18n import t
+
+
+logger = logging.getLogger(__name__)
+
+# Per-request timeout for a Web Push send (seconds).
+WEBPUSH_TIMEOUT_S = 10
+
+
+class SubscriptionGoneError(Exception):
+    """Raised when a push subscription is no longer valid (410 Gone)."""
+    pass
+
+
+class PushNotificationService:
+    """
+    Service for sending Web Push notifications.
+
+    Requires VAPID keys to be configured in Secret Manager:
+    - vapid-public-key: Base64-encoded public key
+    - vapid-private-key: Base64-encoded private key
+    """
+
+    def __init__(self, db=None):
+        """
+        Initialize the push notification service.
+
+        Args:
+            db: Firestore client (optional, will use singleton if not provided)
+        """
+        self.settings = get_settings()
+        self._vapid_private_key: Optional[str] = None
+        self._vapid_public_key: Optional[str] = None
+        self._db = db
+
+    @property
+    def db(self):
+        """Get Firestore client (lazy initialization)."""
+        if self._db is None:
+            from google.cloud import firestore
+            self._db = firestore.Client()
+        return self._db
+
+    @property
+    def vapid_private_key(self) -> Optional[str]:
+        """Get VAPID private key from Secret Manager (cached)."""
+        if self._vapid_private_key is None:
+            self._vapid_private_key = self.settings.get_secret("vapid-private-key")
+        return self._vapid_private_key
+
+    @property
+    def vapid_public_key(self) -> Optional[str]:
+        """Get VAPID public key from Secret Manager (cached)."""
+        if self._vapid_public_key is None:
+            self._vapid_public_key = self.settings.get_secret("vapid-public-key")
+        return self._vapid_public_key
+
+    def is_enabled(self) -> bool:
+        """Check if push notifications are enabled and properly configured."""
+        return (
+            self.settings.enable_push_notifications and
+            self.vapid_private_key is not None and
+            self.vapid_public_key is not None
+        )
+
+    def get_public_key(self) -> Optional[str]:
+        """Get the VAPID public key for client-side subscription."""
+        if not self.settings.enable_push_notifications:
+            return None
+        return self.vapid_public_key
+
+    async def send_push(
+        self,
+        user_email: str,
+        title: str,
+        body: str,
+        url: str = "/app/",
+        tag: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> int:
+        """Async entry point: runs ``send_push_sync`` in a worker thread.
+
+        The body is all blocking I/O (a Firestore read, one ``webpush`` HTTP POST
+        per device, maybe a Firestore update). Running it on the API event loop
+        froze every request on the instance (loop watchdog, 2026-10-13:
+        ``push_notification_service.py:166 in send_push`` with a request waiting).
+        """
+        return await asyncio.to_thread(
+            self.send_push_sync, user_email, title, body, url, tag, tenant_id, kind
+        )
+
+    def send_push_sync(
+        self,
+        user_email: str,
+        title: str,
+        body: str,
+        url: str = "/app/",
+        tag: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> int:
+        """
+        Send a push notification to a user's subscribed devices for a specific tenant.
+
+        Only sends to subscriptions matching the given tenant_id to prevent
+        cross-tenant notification leakage.
+
+        Args:
+            user_email: The user's email address
+            title: Notification title
+            body: Notification body text
+            url: URL to open when notification is clicked
+            tag: Optional tag for notification grouping (replaces notifications with same tag)
+            tenant_id: Tenant scope - only send to subscriptions for this tenant
+                       (None or "" = consumer/default portal)
+            kind: Notification type ("ready", "review" or "problems"). When the user
+                  turned that type off (``push_prefs``), nothing is sent.
+
+        Returns:
+            Number of notifications successfully sent
+        """
+        if not self.is_enabled():
+            logger.debug("Push notifications not enabled, skipping")
+            return 0
+
+        # Get user from Firestore
+        user_doc = self.db.collection("gen_users").document(user_email).get()
+        if not user_doc.exists:
+            logger.warning(f"User {user_email} not found for push notification")
+            return 0
+
+        user_data = user_doc.to_dict()
+        if kind and not effective_push_prefs(user_data.get("push_prefs")).get(kind, True):
+            logger.debug(f"Web push '{kind}' suppressed by preference for {user_email}")
+            return 0
+        all_subscriptions = user_data.get("push_subscriptions", [])
+
+        # Filter subscriptions to only those matching the target tenant
+        # Normalize: None and "" both mean "consumer/default portal"
+        target_tenant = tenant_id or None
+        subscriptions = [
+            sub for sub in all_subscriptions
+            if (sub.get("tenant_id") or None) == target_tenant
+        ]
+
+        if not subscriptions and all_subscriptions:
+            # Migration path: if no subscriptions match and none have tenant_id set,
+            # it means they're legacy subscriptions created before tenant scoping.
+            # Send to legacy subscriptions (those without tenant_id) only if
+            # the target is the consumer portal (no tenant).
+            has_any_tenant_scoped = any(sub.get("tenant_id") for sub in all_subscriptions)
+            if not has_any_tenant_scoped and target_tenant is None:
+                subscriptions = all_subscriptions
+                logger.debug(f"Using legacy unscoped subscriptions for {user_email}")
+            else:
+                logger.debug(
+                    f"No matching subscriptions for tenant={target_tenant} "
+                    f"(user has {len(all_subscriptions)} total subscriptions)"
+                )
+
+        if not subscriptions:
+            logger.debug(f"User {user_email} has no push subscriptions")
+            return 0
+
+        # Build notification payload
+        import json
+        payload = json.dumps({
+            "title": title,
+            "body": body,
+            "url": url,
+            "tag": tag or "default",
+            "icon": "/nomad-logo.png"
+        })
+
+        # Send to each subscription
+        success_count = 0
+        invalid_subscriptions = []
+
+        for sub in subscriptions:
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": sub["endpoint"],
+                        "keys": sub["keys"]
+                    },
+                    data=payload,
+                    vapid_private_key=self.vapid_private_key,
+                    vapid_claims={
+                        "sub": self.settings.vapid_subject
+                    },
+                    # Bounded, so a hung push service can't hold a worker
+                    # thread (and a Cloud Run Job's exit) indefinitely.
+                    timeout=WEBPUSH_TIMEOUT_S,
+                )
+                success_count += 1
+                logger.debug(f"Push sent to {sub.get('device_name', 'unknown device')}")
+
+            except WebPushException as e:
+                logger.warning(f"Push failed: {e}")
+                # Check if subscription is gone (410) or unauthorized (401/403)
+                if e.response and e.response.status_code in (404, 410):
+                    logger.info(f"Subscription gone, will remove: {sub['endpoint'][:50]}...")
+                    invalid_subscriptions.append(sub["endpoint"])
+                elif e.response and e.response.status_code in (401, 403):
+                    logger.warning(f"Push auth failed for {sub['endpoint'][:50]}...")
+
+            except Exception as e:
+                logger.error(f"Unexpected error sending push: {e}")
+
+        # Remove invalid subscriptions
+        if invalid_subscriptions:
+            self._remove_invalid_subscriptions(user_email, invalid_subscriptions)
+
+        logger.info(f"Push notifications sent to {success_count}/{len(subscriptions)} devices for {user_email}")
+        return success_count
+
+    def _remove_invalid_subscriptions(self, user_email: str, endpoints: List[str]) -> None:
+        """Remove invalid subscriptions from user's list."""
+        try:
+            user_ref = self.db.collection("gen_users").document(user_email)
+            user_doc = user_ref.get()
+            if not user_doc.exists:
+                return
+
+            user_data = user_doc.to_dict()
+            current_subs = user_data.get("push_subscriptions", [])
+
+            stale = [s for s in current_subs if s["endpoint"] in endpoints]
+
+            if stale:
+                # ArrayRemove deletes exactly these entries server-side, so a device
+                # registered concurrently (add_subscription) isn't overwritten by a
+                # whole-array rewrite. send_push_sync runs in a worker thread, so the
+                # two can now overlap within one instance too.
+                user_ref.update({"push_subscriptions": ArrayRemove(stale)})
+                logger.info(f"Removed {len(stale)} invalid subscriptions for {user_email}")
+
+        except Exception as e:
+            logger.error(f"Failed to remove invalid subscriptions: {e}")
+
+    async def send_blocking_notification(
+        self,
+        job: dict,
+        action_type: str  # "lyrics" or "instrumental"
+    ) -> int:
+        """
+        Send notification when a job enters a blocking state requiring user action.
+
+        Args:
+            job: Job dictionary with job_id, user_email, artist, title, tenant_id
+            action_type: Type of action needed ("lyrics" or "instrumental")
+
+        Returns:
+            Number of notifications sent
+        """
+        user_email = job.get("user_email")
+        if not user_email:
+            return 0
+
+        job_id = job.get("job_id", "unknown")
+        artist = job.get("artist", "Unknown Artist")
+        title = job.get("title", "Unknown Title")
+        tenant_id = job.get("tenant_id") or None
+        locale = job.get("locale", "en")
+
+        if action_type == "lyrics":
+            notif_title = t(locale, "pushNotifications.reviewLyricsTitle")
+            notif_body = t(locale, "pushNotifications.reviewLyricsBody", title=title, artist=artist)
+            url = f"/app/jobs#/{job_id}/review"
+            tag = f"lyrics-{job_id}"
+        elif action_type == "duration_confirm":
+            notif_title = t(locale, "pushNotifications.confirmDurationTitle")
+            notif_body = t(locale, "pushNotifications.confirmDurationBody", title=title, artist=artist)
+            url = "/app"
+            tag = f"duration-confirm-{job_id}"
+        else:  # instrumental
+            notif_title = t(locale, "pushNotifications.selectInstrumentalTitle")
+            notif_body = t(locale, "pushNotifications.selectInstrumentalBody", title=title, artist=artist)
+            url = f"/app/jobs#/{job_id}/instrumental"
+            tag = f"instrumental-{job_id}"
+
+        return await self.send_push(
+            user_email=user_email,
+            title=notif_title,
+            body=notif_body,
+            url=url,
+            tag=tag,
+            tenant_id=tenant_id,
+            kind="review",
+        )
+
+    async def send_problem_notification(self, job: dict) -> int:
+        """Send notification when a job failed."""
+        user_email = job.get("user_email")
+        if not user_email:
+            return 0
+
+        job_id = job.get("job_id", "unknown")
+        artist = job.get("artist", "Unknown Artist")
+        title = job.get("title", "Unknown Title")
+        locale = job.get("locale") or "en"
+
+        if job.get("stalled_download"):
+            notif_title = t(locale, "pushNotifications.jobProblemTitle")
+            notif_body = t(locale, "pushNotifications.jobStalledBody", title=title, artist=artist)
+        else:
+            notif_title = t(locale, "pushNotifications.jobProblemTitle")
+            notif_body = t(locale, "pushNotifications.jobProblemBody", title=title, artist=artist)
+
+        return await self.send_push(
+            user_email=user_email,
+            title=notif_title,
+            body=notif_body,
+            url=f"/app/jobs#/{job_id}",
+            tag=f"problem-{job_id}",
+            tenant_id=job.get("tenant_id") or None,
+            kind="problems",
+        )
+
+    async def send_completion_notification(self, job: dict) -> int:
+        """
+        Send notification when a job completes successfully.
+
+        Args:
+            job: Job dictionary with job_id, user_email, artist, title, tenant_id
+
+        Returns:
+            Number of notifications sent
+        """
+        user_email = job.get("user_email")
+        if not user_email:
+            return 0
+
+        job_id = job.get("job_id", "unknown")
+        artist = job.get("artist", "Unknown Artist")
+        title = job.get("title", "Unknown Title")
+        tenant_id = job.get("tenant_id") or None
+        locale = job.get("locale", "en")
+
+        return await self.send_push(
+            user_email=user_email,
+            title=t(locale, "pushNotifications.videoReadyTitle"),
+            body=t(locale, "pushNotifications.videoReadyBody", title=title, artist=artist),
+            url=f"/app/?job={job_id}",
+            tag=f"complete-{job_id}",
+            tenant_id=tenant_id,
+            kind="ready",
+        )
+
+    async def add_subscription(
+        self,
+        user_email: str,
+        endpoint: str,
+        keys: dict,
+        device_name: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> bool:
+        """
+        Add a push subscription for a user, scoped to a tenant.
+
+        Enforces max subscriptions per user - oldest removed if limit exceeded.
+
+        Args:
+            user_email: User's email address
+            endpoint: Push service endpoint URL
+            keys: Encryption keys (p256dh, auth)
+            device_name: Optional device identifier
+            tenant_id: Tenant scope (None = consumer/default portal)
+
+        Returns:
+            True if subscription was added successfully
+        """
+        try:
+            user_ref = self.db.collection("gen_users").document(user_email)
+            user_doc = user_ref.get()
+
+            if not user_doc.exists:
+                logger.warning(f"User {user_email} not found")
+                return False
+
+            user_data = user_doc.to_dict()
+            subscriptions = user_data.get("push_subscriptions", [])
+
+            # Check if this endpoint already exists (update it)
+            existing_idx = None
+            for i, sub in enumerate(subscriptions):
+                if sub["endpoint"] == endpoint:
+                    existing_idx = i
+                    break
+
+            new_sub = {
+                "endpoint": endpoint,
+                "keys": keys,
+                "device_name": device_name,
+                "tenant_id": tenant_id or None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "last_used_at": None
+            }
+
+            if existing_idx is not None:
+                # Update existing subscription
+                subscriptions[existing_idx] = new_sub
+                logger.info(f"Updated existing push subscription for {user_email}")
+            else:
+                # Add new subscription
+                subscriptions.append(new_sub)
+                logger.info(f"Added new push subscription for {user_email}")
+
+            # Enforce max subscriptions (remove oldest)
+            max_subs = self.settings.max_push_subscriptions_per_user
+            if len(subscriptions) > max_subs:
+                # Sort by created_at and keep only the newest
+                subscriptions.sort(key=lambda s: s.get("created_at", ""), reverse=True)
+                removed = subscriptions[max_subs:]
+                subscriptions = subscriptions[:max_subs]
+                logger.info(f"Removed {len(removed)} old subscriptions for {user_email} (max {max_subs})")
+
+            user_ref.update({"push_subscriptions": subscriptions})
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to add subscription for {user_email}: {e}")
+            return False
+
+    async def remove_subscription(self, user_email: str, endpoint: str) -> bool:
+        """
+        Remove a push subscription for a user.
+
+        Args:
+            user_email: User's email address
+            endpoint: Push service endpoint URL to remove
+
+        Returns:
+            True if subscription was removed
+        """
+        try:
+            user_ref = self.db.collection("gen_users").document(user_email)
+            user_doc = user_ref.get()
+
+            if not user_doc.exists:
+                return False
+
+            user_data = user_doc.to_dict()
+            subscriptions = user_data.get("push_subscriptions", [])
+
+            # Filter out the subscription
+            new_subs = [s for s in subscriptions if s["endpoint"] != endpoint]
+
+            if len(new_subs) < len(subscriptions):
+                user_ref.update({"push_subscriptions": new_subs})
+                logger.info(f"Removed push subscription for {user_email}")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to remove subscription for {user_email}: {e}")
+            return False
+
+    async def list_subscriptions(self, user_email: str) -> List[dict]:
+        """
+        List all push subscriptions for a user.
+
+        Args:
+            user_email: User's email address
+
+        Returns:
+            List of subscription info (endpoint, device_name, created_at, last_used_at)
+        """
+        try:
+            user_doc = self.db.collection("gen_users").document(user_email).get()
+
+            if not user_doc.exists:
+                return []
+
+            user_data = user_doc.to_dict()
+            subscriptions = user_data.get("push_subscriptions", [])
+
+            # Return safe subset of subscription data
+            return [
+                {
+                    "endpoint": s["endpoint"],
+                    "device_name": s.get("device_name"),
+                    "created_at": s.get("created_at"),
+                    "last_used_at": s.get("last_used_at")
+                }
+                for s in subscriptions
+            ]
+
+        except Exception as e:
+            logger.error(f"Failed to list subscriptions for {user_email}: {e}")
+            return []
+
+
+# Singleton instance
+_push_service: Optional[PushNotificationService] = None
+
+
+def get_push_notification_service(db=None) -> PushNotificationService:
+    """Get the push notification service singleton."""
+    global _push_service
+    if _push_service is None:
+        _push_service = PushNotificationService(db)
+    return _push_service

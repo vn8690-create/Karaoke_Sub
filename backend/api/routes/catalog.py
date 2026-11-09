@@ -1,0 +1,229 @@
+"""
+Catalog API routes for song/artist lookup and community version detection.
+
+Provides autocomplete data from karaoke-decide's MusicBrainz + Spotify catalog,
+and checks karaokenerds.com for existing community karaoke versions.
+"""
+
+import logging
+import time
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
+
+from backend.api.dependencies import require_auth
+from backend.services.auth_service import AuthResult
+from backend.i18n import t, get_locale_from_request
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/catalog", tags=["catalog"])
+
+# Simple per-user rate limiting: 20 requests/minute
+# { user_email: [timestamp, timestamp, ...] }
+_rate_limit_windows: dict[str, list[float]] = {}
+RATE_LIMIT_MAX_REQUESTS = 20
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+
+def _check_rate_limit(user_email: str, locale: str = "en") -> None:
+    """Check per-user rate limit. Raises 429 if exceeded."""
+    now = time.monotonic()
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
+
+    # Get or create window for this user
+    if user_email not in _rate_limit_windows:
+        _rate_limit_windows[user_email] = []
+
+    # Remove expired entries
+    timestamps = _rate_limit_windows[user_email]
+    _rate_limit_windows[user_email] = [ts for ts in timestamps if ts > window_start]
+
+    if len(_rate_limit_windows[user_email]) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=t(locale, "catalog.rateLimitExceeded", max_requests=RATE_LIMIT_MAX_REQUESTS),
+        )
+
+    _rate_limit_windows[user_email].append(now)
+
+
+# --- Response Models ---
+
+
+class ArtistResult(BaseModel):
+    """Artist search result from MusicBrainz/Spotify catalog."""
+    name: str
+    mbid: Optional[str] = None
+    disambiguation: Optional[str] = None
+    artist_type: Optional[str] = None
+    spotify_id: Optional[str] = None
+    popularity: Optional[int] = None
+    genres: Optional[list[str]] = None
+    tags: Optional[list[str]] = None
+
+
+class TrackResult(BaseModel):
+    """Track search result from Spotify catalog."""
+    track_name: str
+    artist_name: str
+    track_id: Optional[str] = None
+    artist_id: Optional[str] = None
+    popularity: Optional[int] = None
+    duration_ms: Optional[int] = None
+    explicit: Optional[bool] = None
+
+
+class CommunityTrack(BaseModel):
+    """A community-approved karaoke track from karaokenerds."""
+    brand_name: str
+    brand_code: str
+    youtube_url: str
+    is_community: bool = True
+
+
+class CommunityCheckSong(BaseModel):
+    """A song with community karaoke tracks."""
+    title: str
+    artist: str
+    community_tracks: list[CommunityTrack]
+
+
+class CommunityCheckRequest(BaseModel):
+    """Request body for community version check."""
+    artist: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+
+
+class CommunityCheckResponse(BaseModel):
+    """Response for community version check."""
+    has_community: bool
+    songs: list[CommunityCheckSong]
+    best_youtube_url: Optional[str] = None
+
+
+class MatchJudgeRequest(BaseModel):
+    """Request body for the artist/title match judge."""
+    artist: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    # The audio search's confidence tier (1=strong..3=weak), so the judge can
+    # tell whether weak results hint at a typo. Optional.
+    audio_confidence_tier: Optional[int] = Field(None, ge=1, le=3)
+    # "fast" = catalog-only pass (no AI, no tier needed) the client fires in
+    # parallel with the audio search; "full" = complete pipeline once the tier is
+    # known. Defaults to "full" so a single legacy call still works.
+    stage: Literal["fast", "full"] = "full"
+
+
+class MatchJudgeAlternative(BaseModel):
+    artist: str
+    title: str
+
+
+class MatchJudgeResponse(BaseModel):
+    """Verdict on a typed artist/title — formatting + match acceptance."""
+    kind: str  # "cosmetic" | "content" | "ambiguous" | "none"
+    confident: bool
+    canonical_artist: str
+    canonical_title: str
+    alternatives: list[MatchJudgeAlternative] = []
+    engine: str  # "deterministic" | "catalog" | "ai"
+    reason: str = ""
+    # Set by a "fast" pass that couldn't decide — the client should follow up with
+    # a "full" call once the audio tier is known.
+    needs_ai: bool = False
+
+
+# --- Routes ---
+
+
+@router.get("/artists", response_model=list[ArtistResult])
+async def search_artists(
+    request: Request,
+    q: str = Query(..., min_length=2, description="Artist name search query"),
+    limit: int = Query(10, ge=1, le=50, description="Maximum results"),
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Search for artists by name. Returns canonical MusicBrainz/Spotify artist data
+    for autocomplete in job creation forms.
+    """
+    locale = get_locale_from_request(request)
+    _check_rate_limit(auth_result.user_email or auth_result.token_id or "unknown", locale)
+
+    from backend.services.catalog_proxy_service import search_artists
+    results = await search_artists(q, limit)
+    return results
+
+
+@router.get("/tracks", response_model=list[TrackResult])
+async def search_tracks(
+    request: Request,
+    q: str = Query(..., min_length=2, description="Track name search query"),
+    artist: Optional[str] = Query(None, description="Filter by artist name"),
+    limit: int = Query(10, ge=1, le=50, description="Maximum results"),
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Search for tracks by name, optionally filtered by artist.
+    Returns canonical Spotify track data for autocomplete in job creation forms.
+    """
+    locale = get_locale_from_request(request)
+    _check_rate_limit(auth_result.user_email or auth_result.token_id or "unknown", locale)
+
+    from backend.services.catalog_proxy_service import search_tracks
+    results = await search_tracks(q, artist, limit)
+    return results
+
+
+@router.post("/community-check", response_model=CommunityCheckResponse)
+async def check_community_versions(
+    request: Request,
+    body: CommunityCheckRequest,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Check if a song already has community-approved karaoke versions on YouTube
+    via karaokenerds.com. Non-blocking — just informs the user.
+    """
+    locale = get_locale_from_request(request)
+    _check_rate_limit(auth_result.user_email or auth_result.token_id or "unknown", locale)
+
+    from backend.services.karaokenerds_service import check_community_versions
+    result = await check_community_versions(body.artist, body.title)
+    return result
+
+
+@router.post("/match-judge", response_model=MatchJudgeResponse)
+async def match_judge(
+    request: Request,
+    body: MatchJudgeRequest,
+    auth_result: AuthResult = Depends(require_auth),
+):
+    """
+    Judge a typed artist/title: decide official formatting + whether it matches a
+    real song. Deterministic + catalog layers run first; a light AI model fires
+    only when those aren't confident. Never blocks the submission flow — failures
+    degrade to a "none" verdict.
+    """
+    locale = get_locale_from_request(request)
+    _check_rate_limit(auth_result.user_email or auth_result.token_id or "unknown", locale)
+
+    from backend.services.fake_workers import fake_workers_enabled
+    if fake_workers_enabled():
+        # Local E2E stack: scripted verdict (per-user fake config), no catalog/Gemini.
+        from backend.services.fake_workers.judge import fake_match_verdict
+        return fake_match_verdict(body.artist, body.title, auth_result.user_email, stage=body.stage).to_dict()
+
+    from backend.services.match_judge.service import judge_match
+    verdict = await judge_match(
+        body.artist, body.title,
+        audio_tier=body.audio_confidence_tier,
+        stage=body.stage,
+    )
+    logger.info(
+        "match-judge stage=%s kind=%s engine=%s confident=%s needs_ai=%s",
+        body.stage, verdict.kind, verdict.engine, verdict.confident, verdict.needs_ai,
+    )
+    return verdict.to_dict()
