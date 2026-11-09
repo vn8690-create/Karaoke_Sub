@@ -1,3 +1,13 @@
+# Bản cập nhật mới nhất: lời chuẩn và video nền
+
+[Tải ZIP cập nhật đầy đủ phần local](https://github.com/vn8690-create/Karaoke_Sub/raw/refs/heads/main/downloads/Karaoke_Sub-cap-nhat-toi-uu.zip).
+
+Dừng START → giải nén đè vào thư mục Karaoke_Sub hiện có → chạy **windows\UPDATE.bat** một lần → START → **Ctrl+F5**. UPDATE thêm thư viện căn lời chuẩn vào môi trường hiện có; không ép cài lại PyTorch, không thay dự án/model.
+
+Có TXT/dán lời để căn theo giọng hát, dịch thời gian toàn bài, font/màu/vị trí/lề, chọn nền từ thư mục hoặc Commons/Pexels. [Hướng dẫn sử dụng](../docs/LOCAL-USAGE.md). Pexels cần key; Commons dùng được không cần key.
+
+Các gói cũ phía dưới chỉ giữ để tham khảo, không có toàn bộ chức năng mới.
+
 # Cập nhật Karaoke Sub
 
 ## Thêm mục Hướng dẫn sử dụng

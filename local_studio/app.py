@@ -8,7 +8,9 @@ import mimetypes
 import os
 import re
 import shutil
+import sys
 import threading
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import APP_ID, pipeline
+from . import APP_ID, alignment, pipeline
 
 log = logging.getLogger("local_studio")
 ROOT = Path(os.environ.get("KARAOKE_DATA_DIR", Path(__file__).resolve().parents[1] / ".local-data")).resolve()
@@ -153,9 +155,26 @@ class Transcribe(Device):
     separate: bool = True
 
 
+class ReferenceText(StrictModel):
+    text: str = Field(min_length=1, max_length=100000)
+
+
+class Align(Transcribe):
+    text: str = Field(min_length=1, max_length=100000)
+
+
+class Timing(StrictModel):
+    offset_seconds: float = Field(ge=-30, le=30)
+
+
 class SubtitleOptions(StrictModel):
     resolution: Literal["720p", "1080p"] = "1080p"
     font_size: int = Field(default=54, ge=24, le=100)
+    font_family: Literal["Arial", "Tahoma", "Segoe UI", "Times New Roman"] = "Arial"
+    text_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
+    highlight_color: str = Field(default="#FFE800", pattern=r"^#[0-9A-Fa-f]{6}$")
+    position: Literal["bottom", "center", "top"] = "bottom"
+    margin_percent: int = Field(default=9, ge=5, le=25)
 
 
 class Render(SubtitleOptions):
@@ -302,21 +321,31 @@ def save_lyrics(project_id: str, body: Lyrics):
             raise HTTPException(400, "Lời vượt quá thời lượng bài hát.")
         discard_exports(project_dir(project_id), p)
         p.update(segments=[s.model_dump() for s in body.segments], error=None, status="ready", message="Đã lưu lời")
+        if p.get("alignment"):
+            p["alignment"]["manually_edited"] = True
         save(project_dir(project_id), p)
         return p
 
 
-def ensure_instrumental(project_id: str, device: str):
+def ensure_instrumental(project_id: str, device: str, require_vocals: bool = False):
     p = load(project_id)
     folder = project_dir(project_id)
-    if "instrumental" not in p["files"]:
-        pipeline.separate_audio(folder / p["files"]["audio"], folder, device,
-                                lambda msg: update(project_id, message=msg))
-        p = load(project_id)
-        p["files"]["instrumental"] = "instrumental.wav"
-        if (folder / "vocals.wav").is_file():
+    if "instrumental" not in p["files"] or (require_vocals and "vocals" not in p["files"]):
+        # Stage stems separately: an uploaded beat must not be replaced when only
+        # vocals are needed for alignment, or when separation fails halfway.
+        with tempfile.TemporaryDirectory(prefix="stems-", dir=folder) as scratch:
+            staging = Path(scratch)
+            pipeline.separate_audio(folder / p["files"]["audio"], staging, device,
+                                    lambda msg: update(project_id, message=msg))
+            if not (staging / "vocals.wav").is_file() or not (staging / "instrumental.wav").is_file():
+                raise ValueError("Tách giọng chưa tạo đủ vocal và instrumental.")
+            p = load(project_id)
+            shutil.copy2(staging / "vocals.wav", folder / "vocals.wav")
             p["files"]["vocals"] = "vocals.wav"
-        save(folder, p)
+            if "instrumental" not in p["files"]:
+                shutil.copy2(staging / "instrumental.wav", folder / "instrumental.wav")
+                p["files"]["instrumental"] = "instrumental.wav"
+            save(folder, p)
 
 
 @app.post("/api/projects/{project_id}/separate", status_code=202)
@@ -324,7 +353,7 @@ def separate(project_id: str, options: Device):
     require_tools()
     def operation():
         update(project_id, status="processing", progress=10, message="Đang tách giọng hát…")
-        ensure_instrumental(project_id, options.device)
+        ensure_instrumental(project_id, options.device, require_vocals=True)
     return submit(project_id, operation)
 
 
@@ -334,7 +363,7 @@ def transcribe(project_id: str, options: Transcribe):
     def operation():
         update(project_id, status="processing", progress=5, message="Đang chuẩn bị nhận diện lời…")
         if options.separate:
-            ensure_instrumental(project_id, options.device)
+            ensure_instrumental(project_id, options.device, require_vocals=True)
         p = load(project_id)
         folder = project_dir(project_id)
         input_audio = folder / p["files"].get("vocals", p["files"]["audio"])
@@ -351,8 +380,121 @@ def transcribe(project_id: str, options: Transcribe):
         p = load(project_id)
         discard_exports(folder, p)
         p["segments"] = [s.model_dump() for s in validated.segments]
+        p["alignment"] = {"source": "asr", "engine": "whisper-timestamped", "warnings": [],
+                          "reference_text": None, "stale": bool(p.get("reference_lyrics", {}).get("text"))}
+        p["reference_pending"] = bool(p.get("reference_lyrics", {}).get("text"))
         save(folder, p)
     return submit(project_id, operation)
+
+
+def parse_reference(text: str) -> dict:
+    try:
+        cleaned = alignment.clean_lyrics(text)
+        if not cleaned.get("text") or not cleaned.get("lines"):
+            raise ValueError("Lời chuẩn không có câu hát sau khi bỏ chỉ dẫn trong ngoặc vuông.")
+        if len(cleaned["text"].split()) > 20000:
+            raise ValueError("Lời quá dài (tối đa 20.000 từ).")
+        if any(len(word) > 300 for word in cleaned["text"].split()):
+            raise ValueError("Một từ dài quá 300 ký tự. Hãy kiểm tra lại nội dung TXT.")
+        return {**cleaned, "raw_text": text}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def store_reference(project_id: str, p: dict, reference: dict):
+    changed = reference["text"] != p.get("reference_lyrics", {}).get("text")
+    p["reference_lyrics"] = reference
+    aligned_text = p.get("alignment", {}).get("reference_text")
+    p["reference_pending"] = reference["text"] != aligned_text
+    if p.get("alignment"):
+        p["alignment"]["stale"] = p["reference_pending"]
+    if changed:
+        discard_exports(project_dir(project_id), p)
+    (project_dir(project_id) / "lyrics-reference.txt").write_text(reference["text"] + "\n", encoding="utf-8")
+    p["files"]["reference"] = "lyrics-reference.txt"
+    save(project_dir(project_id), p)
+
+
+@app.put("/api/projects/{project_id}/reference")
+def save_reference(project_id: str, body: ReferenceText):
+    reference = parse_reference(body.text)
+    with LOCK:
+        p = idle(project_id)
+        p.update(status="ready", error=None, message="Đã lưu lời chuẩn; nhấn Căn lời theo giọng hát để tạo mốc thời gian.")
+        store_reference(project_id, p, reference)
+        return p
+
+
+@app.post("/api/projects/{project_id}/align", status_code=202)
+def align_reference(project_id: str, options: Align):
+    require_tools()
+    reference = parse_reference(options.text)
+    with LOCK:
+        p = idle(project_id)
+        store_reference(project_id, p, reference)
+        def operation():
+            update(project_id, status="processing", progress=5, message="Đang chuẩn bị căn lời chuẩn theo giọng hát…")
+            if options.separate:
+                ensure_instrumental(project_id, options.device, require_vocals=True)
+            p = load(project_id)
+            folder = project_dir(project_id)
+            audio = folder / p["files"].get("vocals", p["files"]["audio"])
+            update(project_id, progress=40, message="Đang căn từng từ trong lời chuẩn vào giọng hát…")
+            result = alignment.align_lyrics(audio, reference["text"], options.model,
+                                           options.language, options.device,
+                                           lambda msg: update(project_id, message=msg))
+            validated = Lyrics(segments=result["segments"])
+            if not validated.segments:
+                raise ValueError("Không tìm được mốc thời gian cho lời chuẩn. Kiểm tra lại bài hát và nội dung TXT.")
+            actual = [w.text for segment in validated.segments for w in segment.words]
+            if " ".join(actual).split() != reference["text"].split():
+                raise ValueError("Kết quả căn chưa giữ đủ lời chuẩn. Không thay lời cũ; hãy kiểm tra nội dung TXT và thử lại.")
+            if validated.segments[-1].end > p["duration"] + 0.1:
+                raise ValueError("Thời gian căn vượt độ dài bài hát; lời cũ được giữ nguyên.")
+            p = load(project_id)
+            discard_exports(folder, p)
+            p["segments"] = [segment.model_dump() for segment in validated.segments]
+            p["alignment"] = {"source": "reference", "engine": result.get("engine", "stable-ts"),
+                              "warnings": result.get("warnings", []), "reference_text": reference["text"],
+                              "stale": False, "manually_edited": False, "offset_seconds": 0,
+                              "language": result.get("language", options.language)}
+            p["reference_pending"] = False
+            save(folder, p)
+        return submit(project_id, operation)
+
+
+@app.post("/api/projects/{project_id}/timing")
+def shift_timing(project_id: str, options: Timing):
+    with LOCK:
+        p = idle(project_id)
+        require_lyrics(p)
+        offset = options.offset_seconds
+        if offset == 0:
+            return p
+        for segment in p["segments"]:
+            segment["start"] = round(segment["start"] + offset, 3)
+            segment["end"] = round(segment["end"] + offset, 3)
+            for word in segment["words"]:
+                word["start"] = round(word["start"] + offset, 3)
+                word["end"] = round(word["end"] + offset, 3)
+        if p["segments"][0]["start"] < 0 or p["segments"][-1]["end"] > p["duration"]:
+            raise HTTPException(400, "Dịch mốc làm lời vượt đầu/cuối bài hát. Hãy chọn số giây nhỏ hơn.")
+        try:
+            validated = Lyrics(segments=p["segments"])
+        except ValueError as exc:
+            raise HTTPException(400, "Mốc thời gian không hợp lệ sau khi dịch.") from exc
+        p["segments"] = [segment.model_dump() for segment in validated.segments]
+        discard_exports(project_dir(project_id), p)
+        if p.get("alignment"):
+            p["alignment"]["offset_seconds"] = round(p["alignment"].get("offset_seconds", 0) + offset, 3)
+        p.update(status="ready", error=None, message=f"Đã dịch lời {offset:+g} giây. Xuất lại video để áp dụng.")
+        save(project_dir(project_id), p)
+        return p
+
+
+def subtitle_style(options: SubtitleOptions) -> dict:
+    return {key: getattr(options, key) for key in
+            ("font_family", "text_color", "highlight_color", "position", "margin_percent")}
 
 
 @app.post("/api/projects/{project_id}/subtitles")
@@ -361,7 +503,8 @@ def subtitles(project_id: str, options: SubtitleOptions):
         p = idle(project_id)
         require_lyrics(p)
         outputs = pipeline.write_subtitles(p["segments"], project_dir(project_id), options.font_size,
-                                           RESOLUTIONS[options.resolution])
+                                           RESOLUTIONS[options.resolution], style=subtitle_style(options))
+        p["subtitle_style"] = {**subtitle_style(options), "font_size": options.font_size, "resolution": options.resolution}
         p["files"].update(outputs)
         save(project_dir(project_id), p)
         return p
@@ -379,7 +522,8 @@ def render(project_id: str, options: Render):
             folder = project_dir(project_id)
             p = load(project_id)
             update(project_id, status="rendering", progress=10, message="Đang xuất phụ đề và video…")
-            outputs = pipeline.write_subtitles(p["segments"], folder, options.font_size, RESOLUTIONS[options.resolution])
+            outputs = pipeline.write_subtitles(p["segments"], folder, options.font_size, RESOLUTIONS[options.resolution],
+                                               style=subtitle_style(options))
             audio_key = {"original": "audio", "instrumental": "instrumental", "silent": None}[options.audio_mode]
             audio = folder / p["files"][audio_key] if audio_key else None
             background = folder / p["files"]["background"] if "background" in p["files"] else None
@@ -394,6 +538,7 @@ def render(project_id: str, options: Render):
             p = load(project_id)
             p["files"].update(outputs, video="karaoke.mp4")
             p["last_render"] = options.model_dump()
+            p["subtitle_style"] = {**subtitle_style(options), "font_size": options.font_size, "resolution": options.resolution}
             save(folder, p)
         return submit(project_id, operation)
 
@@ -416,6 +561,10 @@ def get_file(project_id: str, filename: str):
     media = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return FileResponse(path, media_type=media, filename=filename)
 
+
+# The background library shares the same loopback/origin guards and job queue.
+from .media_api import create_router
+app.include_router(create_router(sys.modules[__name__]))
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="assets")
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")

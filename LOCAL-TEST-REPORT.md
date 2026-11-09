@@ -35,3 +35,16 @@ Các bài unittest dùng media tổng hợp và mock ASR ở lớp API để ổ
 - Chromium/Playwright đã kiểm tra mở/đóng, nút bắt đầu đưa con trỏ tới tên dự án, trạng thái `aria-expanded`, bàn phím Enter và phần hỏi đáp.
 - Mở hướng dẫn không làm mất tên/file đang chọn hoặc lời chưa lưu. Đã thử tạo dự án, thêm câu thủ công và lưu lời sau khi mở/đóng hướng dẫn.
 - Đã kiểm tra ở chiều rộng **1440, 390 và 320 px**, không tràn ngang trang hoặc khung hướng dẫn, không lỗi JavaScript. Các hướng dẫn không thay đổi luồng xử lý AI hay xuất video.
+
+
+## Lời chuẩn, nguồn nền và sửa sub — 2026-11-10
+
+- **66 bài unittest đạt**: thêm căn lời chuẩn, làm sạch nhãn đoạn, giữ đủ chữ/câu lặp, xử lý thất bại không thay thời gian cũ, dịch mốc và từ chối vượt bài, giữ beat riêng khi tách vocal, nguồn video và API settings.
+- **Forced alignment thật bằng stable-ts trên CPU**: 22 từ trong ba câu; thêm 2 giây im lặng khiến mốc từ đầu đổi **0,32 → 2,32 giây**, trung vị các mốc dịch đúng 2 giây (khoảng 1,94–2,06). Model còn cảnh báo một từ cần nghe lại; kết quả không được coi là chính xác tuyệt đối.
+- Cài toàn bộ `requirements-local.txt` trong môi trường Python sạch với PyTorch/torchaudio 2.5.1 CPU: **kiểm tra dependency tương thích đạt** và chạy lại forced alignment thật đạt. Không sử dụng phụ thuộc cloud của upstream.
+- **Chromium/Playwright**: nhập TXT UTF-16 có BOM trước khi tạo dự án, tự chọn nền từ thư mục, tự lưu lời chuẩn, căn model thật, sửa mốc toàn bài, màu/font/vị trí, xuất MP4 thật và khôi phục thiết lập khi mở lại. Đã thử 1440/390/320 px, không tràn ngang, không lỗi JavaScript.
+- **Nguồn online thật**: tìm bằng API Commons, tải video WebM có thông tin giấy phép, kiểm tra bằng ffprobe, gắn vào dự án và xuất MP4 bằng môi trường sạch. Đổi nền không làm mất lời; bản video cũ được bỏ khỏi danh sách tải để xuất lại với nền mới. Pexels được kiểm tra bằng dữ liệu/API mô phỏng; chưa kiểm tra key Pexels thật.
+- Kiểm tra pixel MP4 xác nhận màu chạy tôn trọng mốc từng từ và khoảng nghỉ; landmark âm thanh sau mã hóa AAC lệch không quá 40 ms trong mẫu tổng hợp. Kiểm tra vị trí trên/dưới bằng pixel và giới hạn kiểu chữ chống chèn ASS.
+- Windows UPDATE được kiểm tra cú pháp bằng PowerShell thật; các phép thử helper cập nhật/mã lỗi chạy trên Linux. Bộ cài không ép cài lại PyTorch và không thay dữ liệu/model đã có.
+
+Các phép thử model thật dùng tiếng nói tiếng Anh trên Linux CPU, **chưa đo độ chính xác trên bản thu karaoke tiếng Việt của người dùng hoặc GPU RTX 3060**. Lời TXT phải khớp đúng phiên bản, đủ đoạn lặp; cần nghe lại từ kéo dài/không rõ. Nền online hiện dùng một clip lặp, chưa tự dựng nhiều cảnh theo nội dung bài hát.

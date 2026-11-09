@@ -31,7 +31,7 @@ def _run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def probe(path: Path) -> dict:
-    result = _run(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(Path(path).resolve())])
+    result = _run(["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-show_format", "-show_streams", "-of", "json", str(Path(path).resolve())])
     data = json.loads(result.stdout)
     try:
         duration = float(data.get("format", {}).get("duration", 0))
@@ -46,7 +46,7 @@ def probe(path: Path) -> dict:
 def extract_audio(source: Path, output: Path) -> float:
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(Path(source).resolve()),
+    _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-i", str(Path(source).resolve()),
           "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(output)])
     duration = probe(output)["duration"]
     if duration <= 0:
@@ -180,11 +180,11 @@ def render_video(audio: Path | None, background: Path | None, ass: Path, output:
         shutil.copy2(ass, Path(scratch) / "lyrics.ass")
         args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
         if background:
-            args += ["-stream_loop", "-1", "-i", str(Path(background).resolve())]
+            args += ["-protocol_whitelist", "file,pipe", "-stream_loop", "-1", "-i", str(Path(background).resolve())]
         else:
             args += ["-f", "lavfi", "-i", f"color=c=0x101426:s={width}x{height}:r=30"]
         if audio:
-            args += ["-i", str(Path(audio).resolve())]
+            args += ["-protocol_whitelist", "file,pipe", "-i", str(Path(audio).resolve())]
         filters = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                    f"crop={width}:{height},setsar=1,fps=30,ass=lyrics.ass")
         args += ["-map", "0:v:0", "-vf", filters]

@@ -1,6 +1,7 @@
 """Small, dependency-free subtitle writers for the local desktop workflow."""
 
 from pathlib import Path
+import math
 import re
 
 
@@ -39,17 +40,58 @@ def _lines(segments: list[dict]):
             yield {"start": chunk[0]["start"], "end": chunk[-1]["end"], "words": chunk}
 
 
+_FONTS = {"Arial", "Tahoma", "Segoe UI", "Times New Roman"}
+_ALIGNMENTS = {"bottom": 2, "center": 5, "top": 8}
+_STYLE_DEFAULTS = {"font_family": "Arial", "text_color": "#FFFFFF",
+                   "highlight_color": "#FFE800", "position": "bottom", "margin_percent": 9}
+
+
+def _style_params(style: dict | None) -> dict:
+    """Validate public style fields before placing anything in an ASS header."""
+    if style is not None and not isinstance(style, dict):
+        raise ValueError("Kiểu chữ phải là một nhóm tuỳ chọn hợp lệ.")
+    supplied = style if style is not None else {}
+    if set(supplied) - set(_STYLE_DEFAULTS):
+        raise ValueError("Có tuỳ chọn kiểu phụ đề không được hỗ trợ.")
+    options = {**_STYLE_DEFAULTS, **supplied}
+    font = options["font_family"]
+    if not isinstance(font, str) or font not in _FONTS:
+        raise ValueError("Font chữ phải là Arial, Tahoma, Segoe UI hoặc Times New Roman.")
+    position = options["position"]
+    if not isinstance(position, str) or position not in _ALIGNMENTS:
+        raise ValueError("Vị trí chữ phải là bottom, center hoặc top.")
+    margin = options["margin_percent"]
+    if (isinstance(margin, bool) or not isinstance(margin, (int, float))
+            or not math.isfinite(margin) or not 5 <= margin <= 25):
+        raise ValueError("Khoảng cách mép phải từ 5 đến 25 phần trăm chiều cao.")
+
+    def ass_color(value):
+        if not isinstance(value, str) or re.fullmatch(r"#[0-9A-Fa-f]{6}", value) is None:
+            raise ValueError("Màu chữ phải có dạng #RRGGBB.")
+        # ASS stores alpha, blue, green, red; UI colors use red, green, blue.
+        red, green, blue = value[1:3], value[3:5], value[5:7]
+        return f"&H00{blue}{green}{red}".upper()
+
+    return {"font": font, "alignment": _ALIGNMENTS[position], "margin": margin,
+            "primary": ass_color(options["highlight_color"]),
+            "secondary": ass_color(options["text_color"])}
+
+
 def write_subtitles(segments: list, output_dir: Path, font_size: int = 54,
-                    resolution: tuple = (1920, 1080)) -> dict:
+                    resolution: tuple = (1920, 1080), style: dict | None = None) -> dict:
     """Write UTF-8 ASS (word sweep), SRT and word-enhanced LRC exports.
 
     Times are seconds. Words are expected to be validated and monotonically
     ordered by the API. Line breaks are automatically added to long segments.
+    Optional style settings apply to ASS/MP4; SRT/LRC remain plain timed lyrics.
     """
+    options = _style_params(style)
+    if isinstance(font_size, bool) or not isinstance(font_size, int) or not 24 <= font_size <= 100:
+        raise ValueError("Cỡ chữ phải là số nguyên từ 24 đến 100.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     width, height = resolution
-    margin = max(24, round(height * 0.09))
+    margin = max(24, round(height * options["margin"] / 100))
     # Scale the UI's 1080p font-size setting together with output dimensions.
     size = max(14, round(font_size * height / 1080))
     header = f"""[Script Info]
@@ -61,7 +103,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Karaoke,Arial,{size},&H0000E8FF,&H00FFFFFF,&H00101020,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,60,60,{margin},1
+Style: Karaoke,{options["font"]},{size},{options["primary"]},{options["secondary"]},&H00101020,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,{options["alignment"]},60,60,{margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

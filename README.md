@@ -15,20 +15,28 @@ Bản tùy biến từ [Nomad Karaoke / karaoke-gen](https://github.com/nomadkar
 
 [Xem hướng dẫn Windows, yêu cầu và xử lý lỗi](README-WINDOWS.md).
 
+## Cập nhật từ bản đã cài
+
+Dừng START, cập nhật mã vào thư mục Karaoke_Sub hiện có và giữ `.venv-local`/`.local-data`. Chạy **`windows\UPDATE.bat`** một lần để cài thư viện căn lời từ TXT, sau đó chạy **`windows\START.bat`** và nhấn **Ctrl+F5** trong trình duyệt. Không cần chạy lại SETUP nếu môi trường đã hoạt động.
+
 ## Làm một bài karaoke
 
-- Nhập bài hát từ MP3/WAV/FLAC hoặc video; tùy chọn thêm video/ảnh nền và beat có sẵn.
-- Chọn tiếng Việt, thiết bị **Auto**, model **small**, rồi tạo lời tự động. Có thể tách giọng bằng **Demucs** trước khi nhận diện bằng **Whisper**.
-- Nghe thử, sửa từng từ và thời gian bắt đầu/kết thúc, lưu lời. AI có thể nghe sai lời hát; kiểm tra trước khi xuất.
+- Nhập bài hát từ MP3/WAV/FLAC hoặc video; thêm nền/beat có sẵn, hoặc **tự chọn video nền từ thư mục máy tính hay online**. Tìm video Commons không cần key; Pexels dùng API key miễn phí nhập trong app local.
+- Nếu có lời chuẩn, chọn TXT hoặc dán vào **Lời chuẩn từ TXT**, rồi nhấn **Căn lời theo giọng hát**. App giữ lời bạn cung cấp và dùng giọng hát để tìm mốc thời gian từng từ; tự bỏ các nhãn như `[Verse]`, `[Chorus]` và chỉ dẫn trong ngoặc vuông.
+- Chọn tiếng Việt, thiết bị **Auto**, model **small**. Có thể tách giọng bằng **Demucs** trước khi căn lời; khi chưa có TXT, vẫn dùng **Tạo lời & canh thời gian** để nhận diện bằng **Whisper**.
+- Nghe thử, sửa từng từ và thời gian bắt đầu/kết thúc, lưu lời. Nếu cả bài lệch cùng một lượng, dùng **Dịch thời gian toàn bài (giây)**: số dương cho chữ xuất hiện muộn hơn, số âm cho sớm hơn. Việc căn tự động vẫn cần được rà lại, nhất là điệp khúc lặp hoặc file lời khác phiên bản bài hát.
 - Hát theo phần lời đổi màu. Chọn bài gốc hoặc nhạc không giọng; **Mute** tắt toàn bộ âm thanh nghe thử. Muốn bỏ giọng mà giữ nhạc, dùng **Tách vocal** hoặc nhập beat.
+- Chỉnh font **Arial/Tahoma/Segoe UI/Times New Roman**, cỡ chữ, màu chữ/màu karaoke, vị trí trên/giữa/dưới và lề. Kiểu chữ áp dụng trong preview và khi xuất MP4/ASS.
 - Xuất **MP4 720p/1080p** với sub karaoke cháy chữ, nền lặp theo độ dài bài hát. Chọn âm thanh gốc, instrumental hoặc video không tiếng; Mute nghe thử không thay đổi lựa chọn âm thanh xuất.
 - Tải thêm **ASS, SRT, LRC**, và JSON của dự án. Dự án và file được lưu trong `.local-data/projects`; giữ cả thư mục để tiếp tục chỉnh sửa. JSON chỉ chứa lời và thông tin, không chứa các tệp media.
+
+Tự chọn nền hiện ghép **một clip lặp đủ bài**. Với video online, app giữ tác giả/trang nguồn/giấy phép trong thông tin dự án và JSON nguồn; khi xuất bản, dùng các thông tin đó để ghi công theo giấy phép. Pexels key chỉ nhập trên app local, không đưa lên GitHub.
 
 GPU dùng cho tách giọng và nhận diện; xuất video dùng FFmpeg/libx264 trên CPU. Model `small` là mặc định an toàn cho RTX 3060 6 GB; `medium` phù hợp khi đủ VRAM. Nếu hết VRAM, đóng ứng dụng chiếm GPU, giảm model hoặc chọn CPU.
 
 ## Kiến trúc
 
-Chế độ mới nằm trong `local_studio/`: API FastAPI chạy ở loopback, giao diện HTML/CSS/JavaScript, Whisper-timestamped, Demucs và FFmpeg. Bộ cài dùng **`requirements-local.txt`**; không cài toàn bộ backend cloud của bản gốc. Không cần Docker, Google Cloud, Stripe hoặc khóa API để sử dụng chế độ này. Lần đầu thư viện AI tải trọng số từ Internet, các lần sau dùng cache local.
+Chế độ mới nằm trong `local_studio/`: API FastAPI chạy ở loopback, giao diện HTML/CSS/JavaScript, Whisper-timestamped, stable-ts để căn lời chuẩn theo giọng hát, Demucs và FFmpeg. Bộ cài dùng **`requirements-local.txt`**; không cài toàn bộ backend cloud của bản gốc. Không cần Docker, Google Cloud, Stripe hoặc khóa API để sử dụng chế độ này. Lần đầu thư viện AI tải trọng số từ Internet, các lần sau dùng cache local.
 
 Chạy thủ công sau khi cài dependency/FFmpeg:
 

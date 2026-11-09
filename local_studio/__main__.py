@@ -86,6 +86,8 @@ def main():
             threading.Thread(target=open_when_ready, args=(url, instance_id, stop), daemon=True).start()
         try:
             server.run(sockets=[listener])
+        except KeyboardInterrupt:
+            pass
         finally:
             stop.set()
 

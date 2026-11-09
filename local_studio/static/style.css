@@ -36,3 +36,65 @@
 .guide-faq details p{margin:8px 0 3px;color:#a797b8;line-height:1.85;max-width:960px}
 @media(max-width:1100px){.guide-steps{grid-template-columns:repeat(2,minmax(0,1fr))}.guide-bottom{align-items:flex-start}.guide-shortcuts{gap:8px 14px}.guide-shortcuts strong{flex-basis:100%}.header-right{gap:8px}}
 @media(max-width:800px){.app-header{height:auto;min-height:74px;flex-wrap:wrap;gap:10px;padding-top:13px;padding-bottom:13px}.header-right{margin-left:auto}.help-toggle{font-size:10px;padding:7px 8px;gap:5px}.help-toggle>span{width:14px;height:14px;font-size:9px}.device-pill{max-width:140px}.guide-panel{padding:19px}.guide-heading h2{font-size:21px}.guide-heading p:not(.eyebrow){font-size:11px}.guide-steps{grid-template-columns:1fr;gap:21px}.guide-steps h3{font-size:13px}.guide-steps p{font-size:12px}.guide-steps small{font-size:11px}.guide-bottom{flex-direction:column;align-items:stretch}.guide-bottom .button{width:100%}.guide-preset{padding:13px;gap:10px}.guide-faq details{font-size:12px}.quick-help{font-size:11px;line-height:1.6}}
+
+/* Supplied lyrics remain separate from the timed lyric editor. */
+.reference-panel{margin:20px 0 18px;padding:15px 12px;border:1px solid #524165;border-radius:10px;background:linear-gradient(145deg,#2a1e3a66,#13111c)}
+.reference-heading{display:flex;flex-direction:column;gap:3px;margin-bottom:10px}
+.reference-heading h3{margin:0;color:#e5d4fc;font-size:13px;font-weight:650}
+.reference-heading>span{font-size:9px;color:#a28ab9}
+.reference-intro{font-size:10px;line-height:1.8;color:#b3a2c4;margin:0 0 12px}
+.reference-file-label{position:relative;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:5px;border:1px dashed #67517d;background:#281f34;border-radius:7px;padding:9px 10px;overflow:hidden;cursor:pointer}
+.reference-file-label>span{font-size:10px;font-weight:600;color:#d4b8f7}
+.reference-file-label>small{font-size:8px;color:#9983ad;max-width:100%;overflow-wrap:anywhere}
+.reference-file-label input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%}
+#reference-lyrics{font-size:11px;line-height:1.8;min-height:170px;overflow-wrap:anywhere;white-space:pre-wrap}
+.reference-help{margin-top:8px}
+.reference-actions{display:flex;flex-direction:column;gap:8px;margin-top:13px}
+.reference-actions .button{width:100%;font-size:10px;padding:9px 7px}
+.reference-status{font-size:9px;line-height:1.75;color:#ae9bbf;margin:10px 0 0}
+.reference-preview{margin-top:10px;border-top:1px solid #3c2d4a;padding-top:8px}
+.reference-preview summary{color:#bf9fe0;font-size:9px;cursor:pointer;line-height:1.7}
+.reference-preview pre{font:inherit;font-size:10px;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere;background:#110e18;border:1px solid #3b2b48;border-radius:6px;padding:10px;max-height:200px;overflow:auto;color:#d8c6e9;margin:8px 0 0}
+.alignment-notice{margin-top:10px;padding:9px 10px;border-left:2px solid #c2a35a;background:#32282088;border-radius:4px}
+.alignment-notice p{font-size:9px;line-height:1.8;color:#d4bd8a;margin:0}
+.alignment-notice p+p{margin-top:6px}
+.alignment-notice .alignment-success{color:#99d8c7}
+.asr-alternative{display:flex;align-items:center;gap:9px;margin:17px 0 11px;font-size:9px;color:#887395}
+.asr-alternative:before,.asr-alternative:after{content:"";height:1px;flex:1;background:#392a47}
+.timing-tools{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:13px 14px;margin-bottom:17px;border:1px solid #3d314c;border-radius:8px;background:#1b1524}
+.timing-tools label{font-size:11px;color:#cbb7df;font-weight:550}
+.timing-tools p{font-size:9px;color:#9481a5;line-height:1.8;margin:4px 0 0;max-width:490px}
+.timing-action{display:flex;align-items:center;gap:7px;flex-shrink:0}
+#timing-offset{width:95px;min-height:32px;font-size:11px}
+.timing-action .button{white-space:nowrap}
+.current-lyric,.next-lyric{width:100%;min-width:0;overflow-wrap:anywhere;word-break:normal}
+.lyric-word{min-width:0;max-width:100%;overflow-wrap:anywhere}
+@media(max-width:1100px){.timing-tools{flex-wrap:wrap;gap:10px}.timing-action{margin-left:auto}}
+@media(max-width:800px){.reference-panel{padding:15px}.reference-intro{font-size:11px}.reference-heading h3{font-size:14px}.reference-status,.reference-preview summary{font-size:10px}.alignment-notice p{font-size:10px}.reference-actions .button{font-size:11px}.timing-tools{padding:12px}.timing-tools label{font-size:11px}.timing-tools p{font-size:10px}.timing-action{width:100%;justify-content:flex-end}}
+
+/* Background library and subtitle controls. */
+.background-results{display:grid;gap:12px;max-height:600px;overflow-y:auto;margin-top:12px;scrollbar-width:thin;scrollbar-color:#594269 transparent}
+.background-card{border:1px solid #45324f;border-radius:9px;background:#17121f;padding:10px;min-width:0;overflow:hidden}
+.background-thumb{display:block;width:100%;height:135px;object-fit:cover;background:#090810;border-radius:6px;margin-bottom:9px}
+.background-card-title{display:block;color:#d8c8e9;font-size:11px;line-height:1.6;overflow-wrap:anywhere}
+.background-credit{font-size:9px;color:#a18daf;line-height:1.7;overflow-wrap:anywhere;margin:5px 0}
+.background-links{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;color:#c0a2e3;margin:7px 0}
+.background-links a,.background-attribution a{text-decoration:underline;text-underline-offset:3px}
+.background-card .use-background{width:100%;margin-top:8px}
+.background-status{color:#ad97bf;font-size:10px;line-height:1.75;overflow-wrap:anywhere;margin:12px 0}
+.provider-settings{margin-top:13px;color:#a998bb;font-size:10px;line-height:1.8}
+.provider-settings summary{cursor:pointer;color:#c5afd9}
+.provider-settings .button{margin-top:10px}
+.background-attribution{padding:12px;border:1px solid #42324d;border-radius:8px;background:#21172b;margin-top:15px;overflow-wrap:anywhere;font-size:10px;color:#c7b0dd}
+.background-attribution p{margin:5px 0}.background-attribution a{display:inline-block;margin:5px 12px 0 0;color:#c6a6ed}
+.subtitle-colors{margin-top:14px}.subtitle-colors input[type=color]{width:100%;height:36px;border:1px solid #45334f;border-radius:7px;background:#21172b;padding:4px;cursor:pointer}
+.subtitle-position{margin-top:14px}
+.stage{--lyric-text:#ffffff;--lyric-highlight:#ffe800}
+.stage-lyrics{padding-left:3.125%;padding-right:3.125%}
+.current-lyric{color:var(--lyric-text);letter-spacing:normal;line-height:1.2}
+.lyric-word.sung{color:var(--lyric-highlight)}
+.lyric-word.singing{background:linear-gradient(90deg,var(--lyric-highlight) var(--word-progress,0%),var(--lyric-text) var(--word-progress,0%));background-clip:text;-webkit-background-clip:text;color:transparent;transform:none}
+.lyric-context{position:absolute;top:15px;left:12px;right:12px;margin:0;font-size:10px;line-height:1.5}
+.player-controls>.next-lyric{font-size:11px;line-height:1.6;font-weight:400;margin:0 0 12px;min-height:0;text-align:center;color:#9e8bb0;text-shadow:none}
+.player-controls>.next-lyric:empty{display:none}
+@media(max-width:800px){.background-panel{order:3}.background-thumb{height:160px}.background-card-title{font-size:12px}.background-status,.background-credit,.provider-settings,.background-attribution{font-size:11px}.background-links{font-size:11px}.stage-lyrics{padding-left:3.125%;padding-right:3.125%}.player-controls>.next-lyric{font-size:10px}}

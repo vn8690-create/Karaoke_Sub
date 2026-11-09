@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { project: null, projects: [], segments: [], dirty: false, pending: false, muted: false, poll: null, generation: 0, revision: 0, lyricKey: "", previewRevision: -1, previewLines: [], activeRow: -1, toastTimer: null };
+const state = { project: null, projects: [], segments: [], dirty: false, referenceDirty: false, mediaPending: false, backgroundAssets: [], backgroundProviders: [], pending: false, muted: false, poll: null, generation: 0, revision: 0, lyricKey: "", previewRevision: -1, previewLines: [], activeRow: -1, toastTimer: null };
 const audio = $("audio");
 const backgroundVideo = $("background-video");
 const busyStatuses = new Set(["queued", "processing", "rendering", "transcribing", "separating"]);
@@ -66,12 +66,288 @@ async function api(path, options = {}) {
   return data;
 }
 
+function referenceText() { return $("reference-lyrics").value; }
+
+function syncReference(project, { changed = false, preserveDraft = false } = {}) {
+  const saved = project.reference_lyrics || {};
+  if (changed && preserveDraft && referenceText().trim()) {
+    state.referenceDirty = true;
+  } else if (changed || !state.referenceDirty) {
+    $("reference-lyrics").value = saved.raw_text || "";
+    state.referenceDirty = false;
+  }
+  if (changed) {
+    $("reference-file").value = "";
+    $("reference-file-name").textContent = "UTF-8 / UTF-16 · tối đa 200 KB";
+    $("timing-offset").value = "0";
+  }
+  updateReferenceStatus();
+}
+
+function updateReferenceStatus() {
+  const project = state.project;
+  const saved = project?.reference_lyrics;
+  const hasText = Boolean(referenceText().trim());
+  const status = $("reference-status");
+  if (!project) status.textContent = hasText ? "Đã nhập lời. Tạo hoặc chọn dự án để lưu và căn thời gian." : "Có thể nhập lời trước, rồi tạo hoặc chọn dự án.";
+  else if (state.referenceDirty) status.textContent = "Lời chuẩn chưa lưu. Lưu để xem phần chữ đã bỏ chỉ dẫn, hoặc căn trực tiếp theo giọng hát.";
+  else if (saved?.text) status.textContent = `Đã lưu lời chuẩn · ${saved.lines?.length || saved.text.split("\n").length} câu · bỏ ${saved.ignored_lines || 0} dòng chỉ dẫn.`;
+  else status.textContent = "Chọn TXT hoặc dán lời đúng, rồi lưu hoặc căn theo giọng hát.";
+  $("reference-preview").hidden = !saved?.text;
+  $("reference-cleaned").textContent = saved?.text || "";
+  $("reference-preview-label").textContent = state.referenceDirty ? "Lời chuẩn đã lưu trước đó (chưa gồm phần đang sửa)" : "Xem lời đã bỏ chỉ dẫn";
+
+  const notice = $("alignment-notice");
+  notice.replaceChildren();
+  const alignment = project?.alignment;
+  const stale = Boolean(project?.segments?.length && (state.referenceDirty || project.reference_pending || alignment?.stale ||
+    (saved?.text && (!alignment || alignment.source !== "reference" || (alignment.reference_text && alignment.reference_text !== saved.text)))));
+  if (stale) notice.append(node("p", "", "Lời chuẩn và mốc hiện tại chưa khớp nhau. Nhấn Căn lời theo giọng hát để tạo lại thời gian; lời đang hiện trong trình sửa vẫn là bản trước đó."));
+  if (!stale && alignment?.source === "reference") notice.append(node("p", "alignment-success", "Đã căn theo lời chuẩn. Nghe kiểm tra các mốc trước khi xuất."));
+  if (Array.isArray(alignment?.warnings)) for (const warning of alignment.warnings) notice.append(node("p", "", warning));
+  notice.hidden = !notice.childNodes.length;
+  notice.classList.toggle("stale", stale);
+}
+
+async function saveReference(showToast = true) {
+  if (!state.project || !state.referenceDirty) return;
+  const text = referenceText();
+  if (!text.trim()) return;
+  const projectId = state.project.id;
+  const project = await api(`/api/projects/${encodeURIComponent(projectId)}/reference`, { method: "PUT", body: { text } });
+  if (state.project?.id !== projectId) return;
+  if (referenceText() === text) state.referenceDirty = false;
+  updateProject(project);
+  if (showToast) toast("Đã lưu lời chuẩn. Nhấn Căn lời theo giọng hát để tạo thời gian từ âm thanh.");
+  return project;
+}
+
+$("reference-lyrics").addEventListener("input", () => {
+  state.referenceDirty = referenceText() !== (state.project?.reference_lyrics?.raw_text || "");
+  updateReferenceStatus(); updateButtons();
+});
+$("reference-file").addEventListener("change", async () => {
+  const file = $("reference-file").files[0];
+  if (!file) return;
+  const generation = state.generation;
+  try {
+    if (!/\.txt$/i.test(file.name)) throw new Error("Vui lòng chọn file .txt chứa lời bài hát.");
+    if (file.size > 200 * 1024) throw new Error("File lời tối đa 200 KB. Chỉ giữ lời bài hát cần căn.");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (state.generation !== generation) return;
+    const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? "utf-16le" : bytes[0] === 0xfe && bytes[1] === 0xff ? "utf-16be" : "utf-8";
+    let text;
+    try { text = new TextDecoder(encoding, { fatal: true }).decode(bytes).replace(/^\uFEFF/, ""); }
+    catch (_) { throw new Error("Không đọc được mã chữ. Hãy lưu TXT dạng UTF-8 (hoặc UTF-16 có BOM) rồi thử lại."); }
+    if (text.length > 100000) throw new Error("Lời tối đa 100.000 ký tự.");
+    if (text.includes("\u0000")) throw new Error("File có dữ liệu không phải văn bản. Hãy lưu lời thành TXT UTF-8 rồi thử lại.");
+    $("reference-lyrics").value = text;
+    $("reference-file-name").textContent = file.name;
+    $("reference-lyrics").dispatchEvent(new Event("input"));
+    toast("Đã đọc TXT. Nhấn Lưu lời chuẩn hoặc Căn lời theo giọng hát.");
+  } catch (error) { $("reference-file").value = ""; toast(error.message, true); }
+});
+$("save-reference").addEventListener("click", async () => {
+  if (isBusy()) return;
+  state.pending = true; updateButtons();
+  try { await saveReference(); }
+  catch (error) { toast(error.message, true); }
+  finally { state.pending = false; updateButtons(); updateDownloads(); }
+});
+$("align-button").addEventListener("click", () => projectAction("align", {
+  text: referenceText(), model: $("model").value, language: $("language").value,
+  device: $("device").value, separate: $("separate-first").checked,
+}));
+$("timing-offset").addEventListener("input", updateButtons);
+$("apply-timing").addEventListener("click", async () => {
+  const offset = Number($("timing-offset").value);
+  if (!Number.isFinite(offset) || offset < -30 || offset > 30 || !offset) return toast("Nhập số giây cần dịch từ -30 đến 30, khác 0.", true);
+  const project = await projectAction("timing", { offset_seconds: offset });
+  if (project) { $("timing-offset").value = "0"; updateButtons(); toast(`Đã dịch toàn bài ${offset > 0 ? "+" : ""}${offset} giây. Nghe lại trước khi xuất.`); }
+});
+
+function safeMediaUrl(value) {
+  if (typeof value !== "string" || !value) return null;
+  try {
+    const url = new URL(value, window.location.origin);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : null;
+  } catch (_) { return null; }
+}
+
+function providerConfigured() {
+  const id = $("background-provider").value;
+  return id === "commons" || Boolean(state.backgroundProviders.find((provider) => provider.id === id)?.configured);
+}
+
+function updateBackgroundMode() {
+  const mode = $("background-mode").value;
+  $("background-manual").hidden = mode !== "manual";
+  $("background-local").hidden = mode !== "local";
+  $("background-online").hidden = mode !== "online";
+  if (mode === "manual") $("background-auto").checked = false;
+  $("provider-status").textContent = $("background-provider").value === "pexels" ? providerConfigured() ? "Pexels đã được cấu hình. Key không được hiển thị lại." : "Pexels chưa có key. Có thể dùng Wikimedia Commons ngay." : "Wikimedia Commons không cần API key.";
+  updateBackgroundButtons();
+}
+
+function updateBackgroundButtons() {
+  const mode = $("background-mode").value;
+  const unavailable = mode === "online" && !providerConfigured();
+  $("background-mode").disabled = state.mediaPending || state.pending;
+  $("background-provider").disabled = state.mediaPending;
+  $("background-folder").disabled = state.mediaPending;
+  $("background-query").disabled = state.mediaPending;
+  $("background-recursive").disabled = state.mediaPending;
+  $("scan-backgrounds").disabled = state.mediaPending || !$("background-folder").value.trim();
+  $("search-backgrounds").disabled = state.mediaPending || !$("background-query").value.trim() || !providerConfigured();
+  $("save-provider-key").disabled = state.mediaPending || !$("pexels-key").value.trim();
+  $("background-auto").disabled = mode === "manual" || state.mediaPending || state.pending;
+  $("auto-background-button").disabled = !state.project || isBusy() || state.mediaPending || mode === "manual" || unavailable;
+  document.querySelectorAll(".use-background").forEach((button) => { button.disabled = !state.project || Boolean(isBusy()) || state.mediaPending; });
+}
+
+function backgroundRequest() {
+  const mode = $("background-mode").value;
+  if (mode === "local") {
+    const folder = $("background-folder").value.trim();
+    if (!folder) throw new Error("Nhập đường dẫn thư mục video trên máy chạy app trước.");
+    return { mode: "local", folder, recursive: $("background-recursive").checked };
+  }
+  if (mode === "online") {
+    const query = $("background-query").value.trim();
+    if (!query) throw new Error("Nhập từ khóa tìm video nền trước.");
+    if (!providerConfigured()) throw new Error("Pexels chưa có API key. Lưu key hoặc chọn Wikimedia Commons.");
+    return { mode: "online", provider: $("background-provider").value, query };
+  }
+  throw new Error("Chọn nguồn Thư mục video trên máy hoặc Kho video online để tự lấy nền.");
+}
+
+function renderBackgroundResults(assets) {
+  state.backgroundAssets = Array.isArray(assets) ? assets : [];
+  const box = $("background-results"); box.replaceChildren();
+  for (const asset of state.backgroundAssets) {
+    const card = node("article", "background-card");
+    const preview = safeMediaUrl(asset.preview_url);
+    if (preview) {
+      const media = node(asset.provider === "local" ? "video" : "img", "background-thumb");
+      media.src = preview;
+      if (asset.provider === "local") { media.controls = true; media.muted = true; media.preload = "none"; }
+      else { media.alt = asset.title || "Video nền"; media.loading = "lazy"; }
+      card.append(media);
+    }
+    card.append(node("strong", "background-card-title", asset.title || "Video nền"));
+    const credit = [asset.author, asset.license].filter(Boolean).join(" · ");
+    if (credit) card.append(node("p", "background-credit", credit));
+    const links = node("div", "background-links");
+    for (const [value, label] of [[asset.source_url, "Xem nguồn"], [asset.license_url, "Giấy phép"]]) {
+      const href = safeMediaUrl(value);
+      if (href) { const link = node("a", "", label); link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer"; links.append(link); }
+    }
+    if (links.childNodes.length) card.append(links);
+    const use = node("button", "button small secondary use-background", "Dùng nền này");
+    use.type = "button";
+    use.addEventListener("click", async () => {
+      const project = await projectAction("background", { mode: "selected", asset_id: asset.id });
+      if (project) $("background-status").textContent = "Đang chuẩn bị nền đã chọn. Theo dõi tiến độ xử lý của dự án.";
+    });
+    card.append(use); box.append(card);
+  }
+  $("background-status").textContent = state.backgroundAssets.length ? `Tìm được ${state.backgroundAssets.length} video. Xem nguồn/giấy phép, rồi dùng clip phù hợp.` : "Chưa tìm thấy video. Thử từ khóa hoặc thư mục khác.";
+  updateBackgroundButtons();
+}
+
+function updateBackgroundAttribution() {
+  const info = state.project?.background_info;
+  const box = $("background-attribution"); box.replaceChildren();
+  box.hidden = !info;
+  if (!info) return;
+  box.append(node("strong", "", "Nền đang dùng"), node("p", "", info.title || "Video nền"));
+  const credit = [info.provider, info.author, info.license].filter(Boolean).join(" · ");
+  if (credit) box.append(node("p", "background-credit", credit));
+  for (const [value, label] of [[info.source_url, "Nguồn video"], [info.license_url, "Giấy phép"]]) {
+    const href = safeMediaUrl(value);
+    if (href) { const link = node("a", "", label); link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer"; box.append(link); }
+  }
+}
+
+async function loadBackgroundProviders() {
+  const data = await api("/api/backgrounds/providers");
+  state.backgroundProviders = data.providers || [];
+  updateBackgroundMode();
+}
+
+$("background-mode").addEventListener("change", updateBackgroundMode);
+$("background-provider").addEventListener("change", updateBackgroundMode);
+for (const id of ["background-folder", "background-query", "pexels-key"]) $(id).addEventListener("input", updateBackgroundButtons);
+$("scan-backgrounds").addEventListener("click", async () => {
+  if (state.mediaPending) return;
+  try {
+    const body = { folder: $("background-folder").value.trim(), recursive: $("background-recursive").checked };
+    if (!body.folder) throw new Error("Nhập đường dẫn thư mục video trước.");
+    state.mediaPending = true; updateBackgroundButtons();
+    $("background-status").textContent = "Đang quét video trong thư mục…";
+    const data = await api("/api/backgrounds/local/scan", { method: "POST", body });
+    renderBackgroundResults(data.assets);
+  } catch (error) { $("background-status").textContent = error.message; toast(error.message, true); }
+  finally { state.mediaPending = false; updateBackgroundButtons(); }
+});
+$("search-backgrounds").addEventListener("click", async () => {
+  if (state.mediaPending) return;
+  try {
+    const query = $("background-query").value.trim();
+    if (!query) throw new Error("Nhập từ khóa tìm video trước.");
+    state.mediaPending = true; updateBackgroundButtons();
+    $("background-status").textContent = "Đang tìm video online…";
+    const data = await api("/api/backgrounds/search", { method: "POST", body: { query, provider: $("background-provider").value, limit: 6 } });
+    renderBackgroundResults(data.assets);
+  } catch (error) { $("background-status").textContent = error.message; toast(error.message, true); }
+  finally { state.mediaPending = false; updateBackgroundButtons(); }
+});
+$("save-provider-key").addEventListener("click", async () => {
+  if (state.mediaPending) return;
+  try {
+    const key = $("pexels-key").value.trim();
+    if (!key) return;
+    state.mediaPending = true; updateBackgroundButtons();
+    const data = await api("/api/backgrounds/settings", { method: "PUT", body: { pexels_api_key: key } });
+    $("pexels-key").value = "";
+    if (Array.isArray(data.providers)) state.backgroundProviders = data.providers;
+    else await loadBackgroundProviders();
+    updateBackgroundMode(); toast("Đã lưu API key vào cấu hình local.");
+  } catch (error) { toast(error.message, true); }
+  finally { state.mediaPending = false; updateBackgroundButtons(); }
+});
+$("auto-background-button").addEventListener("click", async () => {
+  try {
+    const project = await projectAction("background", backgroundRequest());
+    if (project) $("background-status").textContent = "Đang tự chọn và chuẩn bị video nền. Theo dõi tiến độ xử lý của dự án.";
+  } catch (error) { toast(error.message, true); }
+});
+
+const subtitleStyleIds = ["font-size", "font-family", "text-color", "highlight-color", "subtitle-position", "margin-percent"];
+function restoreSubtitleStyle(project) {
+  const saved = { ...(project.last_render || {}), ...(project.subtitle_style || {}) };
+  if (!saved) return;
+  const controls = { font_size: "font-size", font_family: "font-family", text_color: "text-color", highlight_color: "highlight-color", position: "subtitle-position", margin_percent: "margin-percent" };
+  for (const [key, id] of Object.entries(controls)) if (saved[key] !== undefined) $(id).value = saved[key];
+  if (saved.resolution) $("resolution").value = saved.resolution;
+  resizePreview();
+}
+
 function updateButtons() {
   const available = Boolean(state.project);
   const blocked = !available || isBusy();
   $("create-button").disabled = state.pending;
+  $("project-select").disabled = state.pending;
+  $("new-project").disabled = state.pending;
   $("transcribe-button").disabled = blocked;
   $("separate-button").disabled = blocked;
+  const hasReference = Boolean(referenceText().trim());
+  $("align-button").disabled = blocked || !hasReference;
+  $("save-reference").disabled = blocked || !hasReference || !state.referenceDirty;
+  $("reference-lyrics").disabled = Boolean(isBusy());
+  $("reference-file").disabled = Boolean(isBusy());
+  $("timing-offset").disabled = blocked || !state.segments.length;
+  $("apply-timing").disabled = blocked || !state.segments.length || !Number($("timing-offset").value);
   $("add-segment").disabled = blocked;
   $("save-lyrics").disabled = blocked || !state.dirty;
   $("render-button").disabled = blocked || !state.segments.length;
@@ -83,6 +359,7 @@ function updateButtons() {
     option.disabled = !state.project?.files?.instrumental;
   }
   document.querySelectorAll(".word-row input,.word-row button,.delete-line,.add-word").forEach((item) => { item.disabled = Boolean(isBusy()); });
+  updateBackgroundButtons();
 }
 
 function markDirty() {
@@ -107,10 +384,13 @@ async function refreshProjects() {
   updateProjectSelect();
 }
 
-function updateProject(project, force = false) {
+function updateProject(project, force = false, { preserveReference = false } = {}) {
   const changed = state.project?.id !== project.id;
   if (!state.project?.files?.instrumental && project.files?.instrumental) $("export-mode").value = "instrumental";
   state.project = project;
+  syncReference(project, { changed, preserveDraft: preserveReference });
+  if (changed) restoreSubtitleStyle(project);
+  updateBackgroundAttribution();
   if (force || changed || !state.dirty) {
     const next = project.segments || [];
     if (changed || force || JSON.stringify(next) !== JSON.stringify(state.segments)) {
@@ -439,10 +719,12 @@ async function saveLyrics(showToast = true) {
 async function projectAction(action, body) {
   if (!state.project || isBusy()) return;
   try {
-    await saveLyrics(false);
     state.pending = true; updateButtons();
+    await saveLyrics(false);
     const project = await api(`/api/projects/${encodeURIComponent(state.project.id)}/${action}`, { method: "POST", body });
+    if (action === "align" && referenceText() === body.text) state.referenceDirty = false;
     updateProject(project);
+    return project;
   } catch (error) { toast(error.message, true); }
   finally { state.pending = false; updateButtons(); updateDownloads(); }
 }
@@ -451,6 +733,7 @@ $("upload-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (state.pending || !$("source").files.length) return;
   try {
+    const automaticBackground = $("background-auto").checked ? backgroundRequest() : null;
     await saveLyrics(false);
     state.pending = true; updateButtons();
     $("create-button").textContent = "Đang tải bài hát lên máy…";
@@ -463,8 +746,15 @@ $("upload-form").addEventListener("submit", async (event) => {
     audio.pause();
     $("audio-mode").value = "original";
     $("export-mode").value = project.files?.instrumental ? "instrumental" : "original";
-    updateProject(project, true);
-    toast("Đã tạo dự án. Tiếp theo, nhấn “Tạo lời & canh thời gian”.");
+    updateProject(project, true, { preserveReference: true });
+    if (state.referenceDirty && referenceText().trim()) await saveReference(false);
+    if (automaticBackground) {
+      const withBackground = await api(`/api/projects/${encodeURIComponent(state.project.id)}/background`, { method: "POST", body: automaticBackground });
+      updateProject(withBackground);
+      toast("Đã tạo dự án. Đang tự chọn nền; chờ xử lý xong trước khi căn lời hoặc xuất video.");
+      return;
+    }
+    toast(referenceText().trim() ? "Đã tạo dự án và lưu lời chuẩn. Tiếp theo, nhấn Căn lời theo giọng hát." : "Đã tạo dự án. Nhập TXT để căn lời chuẩn hoặc dùng Tạo lời & canh thời gian.");
   } catch (error) { toast(error.message, true); }
   finally { state.pending = false; $("create-button").replaceChildren(document.createTextNode("Tạo dự án "), node("span", "", "↗")); updateButtons(); updateDownloads(); }
 });
@@ -473,7 +763,9 @@ $("project-select").addEventListener("change", async (event) => {
   const id = event.target.value;
   if (!id || id === state.project?.id) return;
   try {
+    state.pending = true; updateButtons();
     await saveLyrics(false);
+    await saveReference(false);
     const project = await api(`/api/projects/${encodeURIComponent(id)}`);
     state.generation += 1;
     state.dirty = false;
@@ -482,11 +774,14 @@ $("project-select").addEventListener("change", async (event) => {
     $("export-mode").value = project.files?.instrumental ? "instrumental" : "original";
     updateProject(project, true);
   } catch (error) { toast(error.message, true); updateProjectSelect(); }
+  finally { state.pending = false; updateButtons(); updateDownloads(); }
 });
 
 $("new-project").addEventListener("click", async () => {
   try {
+    state.pending = true; updateButtons();
     await saveLyrics(false);
+    await saveReference(false);
     clearTimeout(state.poll);
     state.generation += 1; state.project = null; state.segments = []; state.dirty = false;
     audio.pause(); audio.removeAttribute("src"); audio.load();
@@ -497,10 +792,17 @@ $("new-project").addEventListener("click", async () => {
     $("result-panel").hidden = true;
     $("downloads").hidden = true;
     $("upload-form").reset();
+    $("reference-lyrics").value = ""; $("reference-file").value = "";
+    $("reference-file-name").textContent = "UTF-8 / UTF-16 · tối đa 200 KB";
+    state.referenceDirty = false;
+    $("timing-offset").value = "0";
+    updateReferenceStatus();
+    updateBackgroundAttribution();
     resetFileLabels();
     updateProjectSelect(); renderEditor(); renderPreview(); updateProgress(); updateButtons();
     $("title").focus();
   } catch (error) { toast(error.message, true); }
+  finally { state.pending = false; updateButtons(); updateDownloads(); }
 });
 
 function resetFileLabels() {
@@ -529,7 +831,11 @@ $("save-lyrics").addEventListener("click", async () => { try { await saveLyrics(
 function exportSettings() {
   const fontSize = Number($("font-size").value);
   if (!Number.isFinite(fontSize) || fontSize < 24 || fontSize > 100) throw new Error("Cỡ chữ cần nằm trong khoảng 24–100.");
-  return { resolution: $("resolution").value, font_size: Math.round(fontSize) };
+  const margin = Number($("margin-percent").value);
+  if (!Number.isFinite(margin) || margin < 5 || margin > 25) throw new Error("Lề chữ cần nằm trong khoảng 5–25%.");
+  return { resolution: $("resolution").value, font_size: Math.round(fontSize), font_family: $("font-family").value,
+    text_color: $("text-color").value, highlight_color: $("highlight-color").value,
+    position: $("subtitle-position").value, margin_percent: margin };
 }
 $("render-button").addEventListener("click", () => {
   try {
@@ -594,19 +900,32 @@ $("add-form").addEventListener("submit", (event) => {
 });
 
 function resizePreview() {
-  const width = $("stage").clientWidth;
+  const stage = $("stage");
+  const width = stage.clientWidth;
   const size = Number($("font-size").value) || 54;
-  $("current-lyric").style.fontSize = `${Math.max(15, width * size / 1920)}px`;
+  const margin = Math.max(5, Math.min(25, Number($("margin-percent").value) || 9));
+  const position = $("subtitle-position").value;
+  $("current-lyric").style.fontSize = `${Math.max(1, width * size / 1920)}px`;
+  $("current-lyric").style.fontFamily = $("font-family").value;
+  stage.style.setProperty("--lyric-text", $("text-color").value);
+  stage.style.setProperty("--lyric-highlight", $("highlight-color").value);
+  const lyrics = $("stage-lyrics");
+  const horizontalMargin = width * 60 / ($("resolution").value === "720p" ? 1280 : 1920);
+  lyrics.style.paddingLeft = `${horizontalMargin}px`;
+  lyrics.style.paddingRight = `${horizontalMargin}px`;
+  lyrics.style.paddingTop = `${stage.clientHeight * margin / 100}px`;
+  lyrics.style.paddingBottom = `${stage.clientHeight * margin / 100}px`;
+  lyrics.style.justifyContent = position === "top" ? "flex-start" : position === "center" ? "center" : "flex-end";
 }
 window.addEventListener("resize", resizePreview);
 document.addEventListener("fullscreenchange", resizePreview);
-$("font-size").addEventListener("input", resizePreview);
+for (const id of subtitleStyleIds) $(id).addEventListener("input", resizePreview);
 $("resolution").addEventListener("change", resizePreview);
-window.addEventListener("beforeunload", (event) => { if (state.dirty) { event.preventDefault(); event.returnValue = ""; } });
+window.addEventListener("beforeunload", (event) => { if (state.dirty || state.referenceDirty) { event.preventDefault(); event.returnValue = ""; } });
 
 async function initialize() {
-  resizePreview(); renderEditor(); updateButtons();
-  const results = await Promise.allSettled([api("/api/system"), refreshProjects()]);
+  resizePreview(); renderEditor(); updateReferenceStatus(); updateBackgroundMode(); updateButtons();
+  const results = await Promise.allSettled([api("/api/system"), refreshProjects(), loadBackgroundProviders()]);
   if (results[0].status === "fulfilled") {
     const info = results[0].value;
     $("gpu-status").textContent = info.cuda ? `CUDA · ${info.gpu || "NVIDIA GPU"}` : info.torch ? "CPU · chưa có CUDA" : "Chưa cài AI · xem hướng dẫn";
@@ -615,5 +934,6 @@ async function initialize() {
   } else { $("gpu-status").textContent = "Chưa kết nối máy chủ"; toast(`Không kiểm tra được hệ thống: ${results[0].reason.message}`, true); }
   if (results[1].status === "fulfilled" && state.projects.length === 0) showGuide(true);
   if (results[1].status === "rejected") toast(`Không tải được dự án: ${results[1].reason.message}`, true);
+  if (results[2].status === "rejected") $("background-status").textContent = `Chưa tải được danh sách kho video: ${results[2].reason.message}`;
 }
 initialize();
