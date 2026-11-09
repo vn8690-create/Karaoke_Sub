@@ -9,6 +9,8 @@ Sau khi chạy `windows\START.bat`, nhấn **Hướng dẫn** ở đầu giao di
 3. Chờ xử lý xong; nghe lại, mở **Chỉnh từng từ** để sửa chỗ sai, rồi nhấn **Lưu lời**.
 4. Trong mục **Âm thanh video xuất**, chọn **Nhạc beat · không vocal**. Thử **720p · nhẹ hơn**, nhấn **Xuất video karaoke**, rồi **Tải MP4**.
 
+**Tạo dự án chỉ nhập các file, chưa tạo sub hoặc video.** Bạn cần tiếp tục bước nhận diện lời và xuất thành phẩm.
+
 Lần đầu, app cần tải model từ Internet. Bạn có thể thử một đoạn hát ngắn trước khi làm cả bài; AI vẫn cần được nghe và rà lại lời.
 
 ## 1. Mở đúng ứng dụng
@@ -49,6 +51,23 @@ Nếu đã nhập beat riêng, bạn có thể bỏ dấu tích tách giọng v�
 Lần đầu tải model có thể lâu tùy mạng. Giữ cửa sổ START mở và theo dõi thông báo tiến độ. Khi model đã lưu trên máy, các lần sau dùng lại cache.
 
 Model `medium` có thể cho kết quả khác nhưng dùng nhiều VRAM hơn. Hãy thử `small` trước; nếu hết VRAM, chuyển xuống `base` hoặc chọn **CPU**. Nếu tự động dùng CPU dù có RTX 3060, chạy `windows\CHECK.bat` để kiểm tra CUDA và driver.
+
+### Lời viết sẵn có [Intro], [Verse], [Chorus]
+
+Lời bài hát có thể đi kèm cấu trúc và chỉ dẫn, ví dụ:
+
+```text
+[Intro]
+[Sound of rain pouring, slow acoustic blues guitar]
+[Verse 1]
+Rót thêm một chén... chén này ta tự lau nước mắt
+[Chorus]
+Chén đắng nhân gian này, ta nếm đủ rồi người ơi!
+```
+
+Khi làm sub hát, bỏ những dòng chỉ dẫn trong ngoặc vuông như `[Verse 1]`, `[Chorus]`, `[Beat stops]` hoặc `[End]`; chỉ giữ những câu thực sự được hát. Đoạn intro chỉ có tiếng mưa/guitar thì không cần lời chạy trên màn hình. Dấu `...` là cách viết ngắt câu; thời gian kéo dài và khoảng nghỉ cần khớp giọng hát trong file nhạc.
+
+Bản hiện tại **nhận diện lời từ âm thanh**, chưa có chức năng dán toàn bộ lời viết sẵn rồi tự căn thời gian theo bài. Dùng văn bản này để đối chiếu, sửa trong **Chỉnh từng từ** hoặc **Thêm câu** cho đoạn thiếu, rồi nghe và chỉnh thời gian. Không đưa nguyên dòng mô tả âm thanh vào câu hát.
 
 ## 4. Nghe, sửa lời và canh từng từ
 
