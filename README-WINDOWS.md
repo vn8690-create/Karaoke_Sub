@@ -74,4 +74,4 @@ Không đưa `.venv-local`, `.local-data`, model, file bài hát hoặc video xu
 
 Dựa trên [nomadkaraoke/karaoke-gen](https://github.com/nomadkaraoke/karaoke-gen), snapshot nguồn `d59b5bf`, giấy phép MIT của Nomad Karaoke LLC được giữ trong [LICENSE](LICENSE). Local Studio là phần bổ sung cho cách dùng local.
 
-Các kết quả kiểm thử tự động của bản bổ sung được ghi riêng trong repo. Môi trường phát triển là Linux, không có RTX 3060 thật: kiểm thử trên đó không xác nhận đã chạy trực tiếp bộ cài Windows hoặc suy luận CUDA trên card của bạn. **CHECK.bat** giúp xác minh môi trường thực sau khi cài; nên thử bài ngắn trước khi xử lý cả thư viện.
+Kết quả chi tiết nằm ở [LOCAL-TEST-REPORT.md](LOCAL-TEST-REPORT.md). Bộ kiểm thử API/xuất video đã qua trên cả Windows và Linux trong GitHub Actions; Whisper/Demucs thật đã chạy thử trên Linux CPU. Chưa chạy trọn bộ cài trên PC Windows của người dùng hoặc suy luận CUDA trên RTX 3060 thật. **CHECK.bat** giúp xác minh môi trường thực sau khi cài; nên thử bài ngắn trước khi xử lý cả thư viện.

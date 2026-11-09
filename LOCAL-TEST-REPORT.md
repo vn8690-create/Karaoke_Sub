@@ -4,6 +4,7 @@ Ngày kiểm thử: **2026-11-09**. Nguồn upstream: `d59b5bf3bd05a434563e38bb8
 
 ## Đã xác minh
 
+- **GitHub Actions trên Windows và Linux đều đạt**: [run kiểm thử](https://github.com/vn8690-create/Karaoke_Sub/actions/runs/42636885984), gồm API, xuất video bằng FFmpeg thật và kiểm tra cú pháp Windows PowerShell. Không tải model AI trong CI.
 - **16 bài unittest đạt** với `python -m unittest discover -s tests/local_studio -v`.
 - API: nhập file, lưu dự án, tải file, sửa lời/thời gian, chặn timeline sai, chặn sửa khi đang xử lý, lưu lỗi và cho chạy lại, xóa export cũ sau khi sửa lời.
 - Phụ đề: UTF-8 tiếng Việt; ASS chạy màu theo từ, giữ khoảng nghỉ giữa các từ, xử lý làm tròn mốc thời gian; SRT và LRC.
@@ -17,6 +18,6 @@ Ngày kiểm thử: **2026-11-09**. Nguồn upstream: `d59b5bf3bd05a434563e38bb8
 
 ## Giới hạn còn lại
 
-Môi trường kiểm thử là **Linux CPU**. Chưa chạy trực tiếp bộ cài trên Windows, Windows PowerShell 5.1, GPU RTX 3060 hoặc CUDA. Script `windows/CHECK.bat` kiểm tra các điều kiện đó trên máy thật. Không khẳng định tốc độ/VRAM hay chất lượng nhận diện lời hát tiếng Việt dựa trên mẫu tiếng Anh ngắn; cần nghe và rà lại từng bài trước khi xuất.
+Suy luận AI và kiểm thử trình duyệt được chạy trên **Linux CPU**; bộ unittest cũng đã qua trên **Windows runner** của GitHub Actions, cùng kiểm tra cú pháp PowerShell. Chưa chạy trọn bộ cài trên PC Windows của người dùng, GPU RTX 3060 hoặc CUDA. Script `windows/CHECK.bat` kiểm tra các điều kiện đó trên máy thật. Không khẳng định tốc độ/VRAM hay chất lượng nhận diện lời hát tiếng Việt dựa trên mẫu tiếng Anh ngắn; cần nghe và rà lại từng bài trước khi xuất.
 
 Các bài unittest dùng media tổng hợp và mock ASR ở lớp API để ổn định; phần suy luận Whisper/Demucs thật ở trên đã chạy riêng, không bị thay bằng mock. CI mẫu không tải model nhiều GB. Không đưa model, media thử hoặc dữ liệu người dùng vào repo.
