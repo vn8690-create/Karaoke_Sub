@@ -16,7 +16,7 @@ RTX 3060 có bản 6 GB và 12 GB VRAM. Bắt đầu với Whisper **small** và
 
 1. Tải repo dưới dạng ZIP bằng **Code → Download ZIP**, rồi giải nén. Chạy từ thư mục đã giải nén, không mở file ngay bên trong ZIP.
 2. Mở thư mục `windows`, nhấp đúp **SETUP.bat**. Bước này tạo `.venv-local`, cài thư viện, chọn CUDA nếu nhận diện được NVIDIA, và kiểm tra FFmpeg. Quá trình tải PyTorch/model có thể lâu tùy mạng; để cửa sổ chạy đến khi báo hoàn tất.
-3. Nhấp đúp **START.bat**. Trình duyệt mở tại **http://127.0.0.1:8765**.
+3. Nhấp đúp **START.bat**. Cổng mặc định là **http://127.0.0.1:8776** để tránh trùng Cover Studio ở cổng 8765. Nếu cổng 8776 cũng đang dùng, app tự chọn cổng trống khác, in địa chỉ thực trong cửa sổ START và mở đúng ứng dụng Karaoke Sub.
 4. Giữ cửa sổ chạy app mở trong lúc làm karaoke. Nhấn `Ctrl+C` để dừng.
 
 Không cần cài Node.js, Docker, Poetry, Google Cloud hay toàn bộ dependency trong `pyproject.toml` cho Local Studio. Mã cloud và CLI gốc vẫn được giữ để tham khảo.
@@ -67,7 +67,7 @@ Không đưa `.venv-local`, `.local-data`, model, file bài hát hoặc video xu
 | Tải model lỗi hoặc chưa có mạng | Kiểm tra Internet và dung lượng trống rồi thử lại. Không có model đã cache thì chưa thể chạy AI offline. |
 | Lời lệch/nhận sai | Chọn đúng ngôn ngữ, thử nhận diện sau tách vocal, sửa từ/mốc thời gian trước xuất. |
 | Beat vẫn còn giọng bè | Tách vocal bằng AI không đảm bảo loại bỏ hết giọng. Beat riêng thường cho kết quả tốt hơn. |
-| Không mở được trang | Kiểm tra cửa sổ START còn chạy, mở `http://127.0.0.1:8765`; đóng phiên app cũ nếu cổng đang bị chiếm. |
+| Không mở được trang | Kiểm tra cửa sổ START còn chạy và mở đúng địa chỉ sau dòng `Karaoke Sub:` (mặc định `http://127.0.0.1:8776`, có thể đổi khi cổng bị chiếm). Nếu đang thấy Cover Studio ở 8765, tải bản Karaoke Sub mới rồi chạy START; không cần đóng Cover Studio. |
 | Xuất video lâu | libx264 dùng CPU; thử 720p và video nền nhỏ hơn. Theo dõi tiến trình trong app. |
 
 ## Nguồn và phạm vi kiểm thử

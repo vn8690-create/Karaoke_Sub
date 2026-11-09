@@ -21,3 +21,10 @@ Ngày kiểm thử: **2026-11-09**. Nguồn upstream: `d59b5bf3bd05a434563e38bb8
 Suy luận AI và kiểm thử trình duyệt được chạy trên **Linux CPU**; bộ unittest cũng đã qua trên **Windows runner** của GitHub Actions, cùng kiểm tra cú pháp PowerShell. Chưa chạy trọn bộ cài trên PC Windows của người dùng, GPU RTX 3060 hoặc CUDA. Script `windows/CHECK.bat` kiểm tra các điều kiện đó trên máy thật. Không khẳng định tốc độ/VRAM hay chất lượng nhận diện lời hát tiếng Việt dựa trên mẫu tiếng Anh ngắn; cần nghe và rà lại từng bài trước khi xuất.
 
 Các bài unittest dùng media tổng hợp và mock ASR ở lớp API để ổn định; phần suy luận Whisper/Demucs thật ở trên đã chạy riêng, không bị thay bằng mock. CI mẫu không tải model nhiều GB. Không đưa model, media thử hoặc dữ liệu người dùng vào repo.
+
+## Bản sửa trùng cổng — 2026-11-10
+
+- Đổi cổng ưu tiên sang **8776**, không dùng cổng 8765 của Cover Studio nữa. Nếu cổng ưu tiên bận, chọn và giữ một socket trống để tránh xung đột giữa lúc kiểm tra và khởi động server.
+- Trình duyệt chỉ mở khi health check khớp cả mã ứng dụng và mã phiên khởi động. Phản hồi từ Cover Studio, app khác hoặc phiên cũ không làm trình duyệt mở nhầm.
+- **23 bài unittest đạt**, gồm 7 hồi quy mới về trùng cổng, socket, health check và tiến trình Uvicorn thật.
+- Kiểm thử Chromium với dịch vụ giả lập chiếm cổng 8776: Karaoke Sub chạy tại **8777**, tải đúng giao diện; dịch vụ giả lập vẫn trả lời bình thường. Không dừng tiến trình hoặc đóng ứng dụng đang chiếm cổng.

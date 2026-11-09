@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import pipeline
+from . import APP_ID, pipeline
 
 log = logging.getLogger("local_studio")
 ROOT = Path(os.environ.get("KARAOKE_DATA_DIR", Path(__file__).resolve().parents[1] / ".local-data")).resolve()
@@ -203,7 +203,7 @@ def submit(project_id: str, operation):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "app": APP_ID, "instance": os.environ.get("KARAOKE_INSTANCE_ID", "")}
 
 
 @app.get("/api/system")

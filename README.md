@@ -9,7 +9,7 @@ Bản tùy biến từ [Nomad Karaoke / karaoke-gen](https://github.com/nomadkar
 1. Tải ZIP của repo này và giải nén vào đường dẫn ngắn, ví dụ `D:\Karaoke_Sub`.
 2. Cài **Python 3.11 64-bit**, bật tùy chọn **Add Python to PATH**; cập nhật driver NVIDIA.
 3. Nhấp đúp **`windows\setup.bat`** để cài môi trường và kiểm tra FFmpeg/CUDA. Cần Internet để tải thư viện và model lần đầu.
-4. Nhấp đúp **`windows\start.bat`**. Trình duyệt mở `http://127.0.0.1:8765`.
+4. Nhấp đúp **`windows\start.bat`**. Trình duyệt mở `http://127.0.0.1:8776`. Nếu cổng này đang dùng, app tự chọn cổng trống khác và in đúng địa chỉ trong cửa sổ START; không cần tắt Cover Studio.
 
 [Xem hướng dẫn Windows, yêu cầu và xử lý lỗi](README-WINDOWS.md).
 
@@ -32,7 +32,7 @@ Chạy thủ công sau khi cài dependency/FFmpeg:
 
 ```console
 python -m local_studio
-python -m local_studio --no-browser --port 8765
+python -m local_studio --no-browser --port 8776
 ```
 
 ## Mã nguồn gốc và giấy phép
