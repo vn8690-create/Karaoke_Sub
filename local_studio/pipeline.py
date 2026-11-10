@@ -200,6 +200,9 @@ def render_video(audio: Path | None, background: Path | None, ass: Path, output:
             from .render_control import render_with_progress
             render_with_progress(args, cwd=scratch, duration=duration,
                                  on_progress=on_progress, cancel_event=cancel_event)
+            # Never report success for a cut-off or audio-less render.
+            from .render_quality import verify_output
+            verify_output(output, duration, resolution, audio is not None, probe)
         except Exception:
             output.unlink(missing_ok=True)
             raise
