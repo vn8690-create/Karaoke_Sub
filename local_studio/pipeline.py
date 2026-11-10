@@ -160,7 +160,9 @@ def transcribe_audio(audio: Path, model: str = "small", language: str | None = "
 
 
 def render_video(audio: Path | None, background: Path | None, ass: Path, output: Path, duration: float,
-                 resolution: tuple = (1920, 1080), progress: Callable[[str], None] | None = None) -> None:
+                 resolution: tuple = (1920, 1080), progress: Callable[[str], None] | None = None,
+                 on_progress: Callable[[int], None] | None = None,
+                 cancel_event=None) -> None:
     """Render a bounded MP4, looping the background and never mixing its audio."""
     duration = float(duration)
     if not math.isfinite(duration) or duration <= 0:
@@ -195,7 +197,9 @@ def render_video(audio: Path | None, background: Path | None, ass: Path, output:
         args += ["-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                  "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
         try:
-            _run(args, cwd=scratch)
+            from .render_control import render_with_progress
+            render_with_progress(args, cwd=scratch, duration=duration,
+                                 on_progress=on_progress, cancel_event=cancel_event)
             # Never report success for a cut-off or audio-less render.
             from .render_quality import verify_output
             verify_output(output, duration, resolution, audio is not None, probe)
