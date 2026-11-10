@@ -2,12 +2,12 @@
 export type JobState = 'idle' | 'model-missing' | 'downloading-model' | 'analyzing' | 'recognizing' | 'aligning' | 'done' | 'error' | 'cancelled';
 export interface WordTiming { text: string; start: number; end: number }
 export interface LineTiming { text: string; start: number; end: number; words: WordTiming[] }
-export interface AlignRequest { audioPath: string; language: 'vi' | 'ja' | 'en' | 'auto'; lyrics?: string; engine: 'whisper' | 'karaoke-gen' }
+export interface AlignRequest { audioPath: string; language: 'vi' | 'ja' | 'en' | 'auto'; lyrics?: string; engine: 'whisper' | 'karaoke-gen' | 'backend' | 'mock'; durationSec?: number; projectId?: string }
 export interface AlignResult { lines: LineTiming[]; engine: string; mock: boolean }
 export interface JobProgress { jobId: string; state: JobState; percent: number; message?: string }
 export interface AIAdapter {
   align(req: AlignRequest, onProgress: (p: JobProgress) => void, signal?: AbortSignal): Promise<AlignResult>;
-  separateVocals(audioPath: string, onProgress: (p: JobProgress) => void, signal?: AbortSignal): Promise<{ vocalPath: string; instrumentalPath: string }>;
+  separateVocals?(audioPath: string, onProgress: (p: JobProgress) => void, signal?: AbortSignal): Promise<{ vocalPath: string; instrumentalPath: string }>;
 }
 export interface RenderSettings { codec: 'h264' | 'h265'; width: number; height: number; fps: 24 | 25 | 30 | 60; bitrateKbps: number; gpu: boolean; outputDir: string }
 export interface RenderAdapter {
