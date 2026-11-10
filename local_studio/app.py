@@ -566,5 +566,9 @@ def get_file(project_id: str, filename: str):
 from .media_api import create_router
 app.include_router(create_router(sys.modules[__name__]))
 
+# Portable project ZIP backup and restore; no frontend modifications.
+from .project_backup import create_router as create_backup_router
+app.include_router(create_backup_router(sys.modules[__name__]))
+
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="assets")
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
