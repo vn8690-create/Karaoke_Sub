@@ -33,7 +33,7 @@ PROJECTS.mkdir(parents=True, exist_ok=True)
 ACTIVE = {"queued", "processing", "rendering"}
 LOCK = threading.RLock()
 WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="karaoke")
-# Render cancellation is intentionally independent of transcribe/alignment jobs.
+# Render cancellation is independent of the AI task queue.
 RENDER_CANCEL: dict[str, threading.Event] = {}
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
@@ -578,6 +578,32 @@ def cancel_render(project_id: str):
         return {"status": "cancelling", "message": "Đã yêu cầu hủy. Đang dừng FFmpeg an toàn."}
 
 
+@app.get("/api/projects/{project_id}/quality")
+def render_quality_report(project_id: str):
+    """Inspect a completed MP4 without touching media or re-running AI."""
+    from .render_quality import analyze_probe
+    p = load(project_id)
+    filename = p.get("files", {}).get("video")
+    folder = project_dir(project_id).resolve()
+    if (not isinstance(filename, str) or Path(filename).name != filename
+            or not (folder / filename).resolve().is_file()
+            or (folder / filename).resolve().parent != folder):
+        raise HTTPException(404, "Dự án chưa có video MP4 để kiểm tra.")
+    try:
+        info = pipeline.probe(folder / filename)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, "Không kiểm tra được file MP4. Hãy xuất lại video.") from exc
+    recorded = p.get("last_render") or {}
+    resolution = RESOLUTIONS.get(recorded.get("resolution"))
+    if resolution is None:
+        # Older projects did not store render options: don't invent a target.
+        video = next((v for v in info.get("streams", []) if v.get("codec_type") == "video"), {})
+        resolution = (video.get("width"), video.get("height"))
+    mode = recorded.get("audio_mode")
+    expect_audio = (mode != "silent") if mode in ("original", "instrumental", "silent") else None
+    return analyze_probe(info, float(p["duration"]), resolution, expect_audio)
+
+
 @app.get("/api/projects/{project_id}/download")
 def download_project(project_id: str):
     p = load(project_id)
@@ -600,6 +626,10 @@ def get_file(project_id: str, filename: str):
 # The background library shares the same loopback/origin guards and job queue.
 from .media_api import create_router
 app.include_router(create_router(sys.modules[__name__]))
+
+# Portable project ZIP backup and restore; no frontend modifications.
+from .project_backup import create_router as create_backup_router
+app.include_router(create_backup_router(sys.modules[__name__]))
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="assets")
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
