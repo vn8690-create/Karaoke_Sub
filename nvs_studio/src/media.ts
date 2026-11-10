@@ -6,7 +6,9 @@ export async function importFile(f: File): Promise<Media> {
     const ctx = new AudioContext(); const buf = await ctx.decodeAudioData(await f.arrayBuffer()); await ctx.close();
     const d = buf.getChannelData(0), N = 400, step = Math.floor(d.length / N) || 1, peaks: number[] = [];
     for (let i = 0; i < N; i++) { let m = 0; for (let j = i * step; j < Math.min(d.length, (i + 1) * step); j += 16) m = Math.max(m, Math.abs(d[j])); peaks.push(m); }
-    return { ...base, kind: 'audio', dur: buf.duration, peaks };
+    const RATE = 50, sp = Math.max(1, Math.floor(buf.sampleRate / RATE)), hp: number[] = [];
+    for (let i = 0; i < Math.ceil(buf.duration * RATE); i++) { let m = 0; for (let j = i * sp; j < Math.min(d.length, (i + 1) * sp); j += 8) m = Math.max(m, Math.abs(d[j])); hp.push(Math.round(m * 1000) / 1000); }
+    return { ...base, kind: 'audio', dur: buf.duration, peaks, hp };
   }
   if (f.type.startsWith('video')) {
     const dur = await new Promise<number>((res, rej) => { const v = document.createElement('video'); v.onloadedmetadata = () => res(v.duration); v.onerror = () => rej(new Error('Không đọc được video')); v.src = url; });

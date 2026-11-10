@@ -35,7 +35,7 @@ export default function TopBar() {
       <button className="btn" title="Hoàn tác (Ctrl+Z)" disabled={!s.past.length} onClick={s.undo}><Undo2 size={15} /></button>
       <button className="btn" title="Làm lại (Ctrl+Y)" disabled={!s.future.length} onClick={s.redo}><Redo2 size={15} /></button>
       <span className="w-px h-6 bg-line mx-1" />
-      <button className="btn" title="Cần AI backend" onClick={() => nope('Auto Karaoke')}><Wand2 size={15} />{t('tb.auto')}</button>
+      <button className="btn" title="Auto Karaoke Wizard (engine MOCK hoặc backend local_studio)" onClick={() => s.set({ wizard: true })}><Wand2 size={15} />{t('tb.auto')}</button>
       <div className="flex-1" />
       <div className="flex items-center gap-1 text-mute text-[11px]" title="Thông tin do trình duyệt báo cáo. Chưa đo VRAM/RAM thật (cần backend)."><Cpu size={14} />GPU: {gpu.slice(0, 38)} · {navigator.hardwareConcurrency} luồng CPU{mem ? ` · ≥${mem} GB RAM` : ''}</div>
       <button className="btn" title="Cần RenderAdapter + FFmpeg" onClick={() => nope('Xuất video')}><Download size={15} />{t('tb.export')}</button>

@@ -45,7 +45,7 @@ export default function Timeline() {
     const r = e.currentTarget.getBoundingClientRect(); st.addClip({ track: tr.id, start: Math.max(0, (e.clientX - r.left) / st.zoom), dur: m.dur, off: 0, label: m.name, kind: tr.kind, src: m.url, x: .5, y: .5, scale: 1, opacity: 1 });
   };
   return (
-    <section style={{ height: s.tlH }} className="bg-pane border-t border-line flex flex-col shrink-0">
+    <section className="bg-pane flex flex-col flex-1 min-h-0">
       <div className="flex items-center gap-2 px-2 py-1 border-b border-line">
         <button className="btn !py-0.5" title="Cắt tại playhead (S)" disabled={!s.sel} onClick={() => s.sel && s.split(s.sel, s.playhead)}><Scissors size={14} />Cắt</button>
         <button className="btn !py-0.5" title="Xoá (Delete)" disabled={!s.sel} onClick={() => s.sel && s.remove(s.sel)}><Trash2 size={14} />Xoá</button>

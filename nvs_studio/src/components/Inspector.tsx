@@ -1,14 +1,17 @@
 import { Scissors, Trash2 } from 'lucide-react';
 import { useStudio, type Clip } from '../store';
+import { useKaraoke } from '../karaokeStore';
+import KaraokeStylePanel from './KaraokeStylePanel';
 
 const Row = ({ label, children }: { label: string; children: React.ReactNode }) => <label className="flex items-center gap-2 mb-2"><span className="w-20 text-mute shrink-0">{label}</span>{children}</label>;
 export default function Inspector() {
-  const s = useStudio(); const c = s.clips.find((x) => x.id === s.sel);
+  const s = useStudio(); const hasK = useKaraoke((x) => x.lines.length > 0); const c = s.clips.find((x) => x.id === s.sel);
   const num = (k: 'start' | 'dur' | 'x' | 'y' | 'scale' | 'opacity', min: number, max: number, step: number, range?: boolean) => (c &&
     <input type={range ? 'range' : 'number'} min={min} max={max} step={step} value={Number(c[k].toFixed(3))} className="flex-1 min-w-0 bg-ink border border-line rounded px-1 py-0.5 accent-[#8b5cf6]"
       onPointerDown={() => s.commit()} onFocus={() => s.commit()} onChange={(e) => s.patch(c.id, { [k]: Math.min(max, Math.max(min, Number(e.target.value))) } as Partial<Clip>)} />);
   return (
     <aside style={{ width: s.rightW }} className="bg-pane border-l border-line overflow-auto p-3 shrink-0">
+      {hasK && <KaraokeStylePanel />}
       <h3 className="font-bold mb-3">Thuộc tính</h3>
       {!c ? <p className="text-mute">Chọn một clip trên timeline để chỉnh thuộc tính.</p> : (<>
         <div className="mb-3 truncate text-cy" title={c.label}>{c.label}</div>
