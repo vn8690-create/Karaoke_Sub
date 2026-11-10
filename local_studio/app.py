@@ -33,6 +33,8 @@ PROJECTS.mkdir(parents=True, exist_ok=True)
 ACTIVE = {"queued", "processing", "rendering"}
 LOCK = threading.RLock()
 WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="karaoke")
+# Render cancellation is independent of the AI task queue.
+RENDER_CANCEL: dict[str, threading.Event] = {}
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
@@ -205,17 +207,30 @@ def discard_exports(folder: Path, p: dict):
             (folder / filename).unlink(missing_ok=True)
 
 
-def submit(project_id: str, operation):
+def submit(project_id: str, operation, cancel_event: threading.Event | None = None):
+    from .render_control import RenderCancelled
     with LOCK:
         idle(project_id)
         result = update(project_id, status="queued", progress=0, error=None, message="Đang chờ xử lý…")
         def execute():
             try:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelled("Đã hủy tác vụ xuất video.")
                 operation()
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelled("Đã hủy tác vụ xuất video.")
                 update(project_id, status="ready", progress=100, error=None, message="Hoàn tất")
+            except RenderCancelled:
+                update(project_id, status="cancelled", progress=0, error=None,
+                       message="Đã hủy xuất video. Có thể xuất lại bất cứ lúc nào.")
             except Exception as exc:
                 log.exception("Local job failed: %s", project_id)
                 update(project_id, status="error", message="Xử lý thất bại", error=str(exc)[:2000])
+            finally:
+                if cancel_event is not None:
+                    with LOCK:
+                        if RENDER_CANCEL.get(project_id) is cancel_event:
+                            RENDER_CANCEL.pop(project_id, None)
         WORKER.submit(execute)
         return result
 
@@ -518,6 +533,8 @@ def render(project_id: str, options: Render):
         require_lyrics(p)
         if options.audio_mode == "instrumental" and "instrumental" not in p["files"]:
             raise HTTPException(400, "Hãy tách vocal hoặc nhập beat trước khi xuất chế độ nhạc nền.")
+        cancel_event = threading.Event()
+        RENDER_CANCEL[project_id] = cancel_event
         def operation():
             folder = project_dir(project_id)
             p = load(project_id)
@@ -531,7 +548,14 @@ def render(project_id: str, options: Render):
             try:
                 pipeline.render_video(audio, background, folder / outputs["ass"], temp_output,
                                       p["duration"], RESOLUTIONS[options.resolution],
-                                      lambda msg: update(project_id, message=msg))
+                                      lambda msg: update(project_id, message=msg),
+                                      on_progress=lambda percent: update(
+                                          project_id, progress=10 + int(percent * 0.88),
+                                          message=f"Đang xuất video MP4: {percent}%"
+                                      ), cancel_event=cancel_event)
+                if cancel_event.is_set():
+                    from .render_control import RenderCancelled
+                    raise RenderCancelled("Đã hủy tác vụ xuất video.")
                 temp_output.replace(folder / "karaoke.mp4")
             finally:
                 temp_output.unlink(missing_ok=True)
@@ -540,7 +564,18 @@ def render(project_id: str, options: Render):
             p["last_render"] = options.model_dump()
             p["subtitle_style"] = {**subtitle_style(options), "font_size": options.font_size, "resolution": options.resolution}
             save(folder, p)
-        return submit(project_id, operation)
+        return submit(project_id, operation, cancel_event=cancel_event)
+
+
+@app.post("/api/projects/{project_id}/render/cancel")
+def cancel_render(project_id: str):
+    with LOCK:
+        project = load(project_id)
+        event = RENDER_CANCEL.get(project_id)
+        if event is None or project["status"] not in {"queued", "rendering"}:
+            raise HTTPException(409, "Dự án không có tác vụ render đang chờ hoặc chạy.")
+        event.set()
+        return {"status": "cancelling", "message": "Đã yêu cầu hủy. Đang dừng FFmpeg an toàn."}
 
 
 @app.get("/api/projects/{project_id}/quality")
