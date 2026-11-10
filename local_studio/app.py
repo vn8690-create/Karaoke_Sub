@@ -543,6 +543,32 @@ def render(project_id: str, options: Render):
         return submit(project_id, operation)
 
 
+@app.get("/api/projects/{project_id}/quality")
+def render_quality_report(project_id: str):
+    """Inspect a completed MP4 without touching media or re-running AI."""
+    from .render_quality import analyze_probe
+    p = load(project_id)
+    filename = p.get("files", {}).get("video")
+    folder = project_dir(project_id).resolve()
+    if (not isinstance(filename, str) or Path(filename).name != filename
+            or not (folder / filename).resolve().is_file()
+            or (folder / filename).resolve().parent != folder):
+        raise HTTPException(404, "Dự án chưa có video MP4 để kiểm tra.")
+    try:
+        info = pipeline.probe(folder / filename)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(422, "Không kiểm tra được file MP4. Hãy xuất lại video.") from exc
+    recorded = p.get("last_render") or {}
+    resolution = RESOLUTIONS.get(recorded.get("resolution"))
+    if resolution is None:
+        # Older projects did not store render options: don't invent a target.
+        video = next((v for v in info.get("streams", []) if v.get("codec_type") == "video"), {})
+        resolution = (video.get("width"), video.get("height"))
+    mode = recorded.get("audio_mode")
+    expect_audio = (mode != "silent") if mode in ("original", "instrumental", "silent") else None
+    return analyze_probe(info, float(p["duration"]), resolution, expect_audio)
+
+
 @app.get("/api/projects/{project_id}/download")
 def download_project(project_id: str):
     p = load(project_id)
