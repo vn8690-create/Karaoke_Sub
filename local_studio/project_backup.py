@@ -56,7 +56,7 @@ def _name(name: str) -> str:
             or ":" in name or "\x00" in name or name[-1] in {" ", "."}
             or any(ord(c) < 32 for c in name)):
         raise ValueError("Tên tệp trong bản sao lưu không hợp lệ.")
-    if name.lower().split(".")[0] in {"con", "prn", "aux", "nul", "com1", "lpt1"}:
+    if re.fullmatch(r"(con|prn|aux|nul|com[1-9]|lpt[1-9])", name.lower().split(".")[0]):
         raise ValueError("Tên tệp bị Windows dành riêng.")
     return name
 
@@ -97,8 +97,9 @@ def create_backup(folder: Path, project: dict, destination: Path) -> None:
     total = 0
     safe_folder = folder.resolve()
     for name in names:
-        path = (safe_folder / name).resolve()
-        if path.parent != safe_folder or not path.is_file() or path.is_symlink():
+        candidate = safe_folder / name
+        path = candidate.resolve()
+        if candidate.is_symlink() or path.parent != safe_folder or not path.is_file():
             raise ValueError(f"Thiếu file dự án hoặc đường dẫn không an toàn: {name}.")
         size = path.stat().st_size
         if size > MAX_FILE:
@@ -142,6 +143,8 @@ def restore_backup(archive_path: Path, destination: Path, project_id: str, lyric
                     raise ValueError("ZIP chứa file ngoài thư mục media.")
                 _name(filename[6:])
             lookup[filename.casefold()] = member
+        if "manifest.json" not in {member.filename for member in members}:
+            raise ValueError("ZIP thiếu manifest.json.")
         info = source.getinfo("manifest.json")
         if info.file_size > MAX_MANIFEST:
             raise ValueError("Manifest quá lớn.")
