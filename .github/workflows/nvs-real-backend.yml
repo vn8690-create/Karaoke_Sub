@@ -1,0 +1,66 @@
+name: NVS Real Backend Smoke
+
+on:
+  pull_request:
+    paths:
+      - 'nvs_studio/**'
+      - 'local_studio/**'
+      - '.github/workflows/nvs-real-backend.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'nvs_studio/**'
+      - 'local_studio/**'
+      - '.github/workflows/nvs-real-backend.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  real-backend:
+    name: Actual FastAPI / FFmpeg / TypeScript client
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Ensure FFmpeg is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+      - name: Install API dependencies
+        run: python -m pip install 'fastapi>=0.115.12,<1' 'pydantic>=2.10,<3' 'python-multipart>=0.0.22,<1' 'uvicorn>=0.34,<1' httpx
+      - name: Install NVS frontend dependencies
+        working-directory: nvs_studio
+        run: npm ci --no-audit --no-fund
+      - name: Start actual local backend
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/nvs-data"
+          KARAOKE_DATA_DIR="$RUNNER_TEMP/nvs-data" python -m uvicorn local_studio.app:app --host 127.0.0.1 --port 8776 >"$RUNNER_TEMP/nvs-backend.log" 2>&1 &
+          for i in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:8776/api/health >/dev/null; then
+              echo "Local Studio API is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/nvs-backend.log"
+          exit 1
+      - name: Real audio upload through MP4 render and ZIP backup
+        working-directory: nvs_studio
+        env:
+          NVS_REAL_BACKEND_URL: http://127.0.0.1:8776
+        run: npx vitest run tests/real-backend.test.ts
+      - name: Backend diagnostics (on failure)
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/nvs-backend.log" ]; then tail -100 "$RUNNER_TEMP/nvs-backend.log"; fi
