@@ -494,6 +494,7 @@ function restoreSubtitleStyle(project) {
   const saved = { ...(project.last_render || {}), ...(project.subtitle_style || {}) };
   if (!saved) return;
   const controls = { font_size: "font-size", font_family: "font-family", text_color: "text-color", highlight_color: "highlight-color", position: "subtitle-position", margin_percent: "margin-percent" };
+  $("countdown-enabled").checked = Boolean(saved.countdown);
   for (const [key, id] of Object.entries(controls)) if (saved[key] !== undefined) $(id).value = saved[key];
   if (saved.resolution) $("resolution").value = saved.resolution;
   resizePreview();
@@ -816,6 +817,7 @@ function renderPreview() {
   $("duration").textContent = timeLabel(total);
   $("seek").value = total > 0 ? position / total * 1000 : 0;
   if (!state.project || !state.segments.length) {
+    $("countdown-overlay").hidden = true;
     $("stage-empty").hidden = false;
     $("stage-lyrics").hidden = true;
     $("stage-empty").querySelector("p").textContent = state.project ? state.project.title : "Sân khấu đang chờ bài hát của bạn";
@@ -825,7 +827,22 @@ function renderPreview() {
   $("stage-empty").hidden = true;
   $("stage-lyrics").hidden = false;
   const lines = previewLines();
-  if (!lines.length) return;
+  if (!lines.length) { $("countdown-overlay").hidden = true; return; }
+  // Same three-second gap rule used by ASS exporter. No countdown over lyrics.
+  let precedingEnd = 0;
+  let countdownNumber = 0;
+  if ($("countdown-enabled").checked) {
+    for (const segment of lines) {
+      if (segment.start - precedingEnd >= 3 - 1e-9 &&
+          position >= segment.start - 3 && position < segment.start) {
+        countdownNumber = Math.max(1, Math.min(3, Math.ceil(segment.start - position)));
+        break;
+      }
+      precedingEnd = Math.max(precedingEnd, segment.end);
+    }
+  }
+  $("countdown-overlay").hidden = !countdownNumber;
+  if (countdownNumber) $("countdown-digit").textContent = String(countdownNumber);
   let index = lines.findIndex((segment) => position >= segment.start && position <= segment.end);
   let upcoming = false;
   if (index < 0) {
@@ -1013,7 +1030,8 @@ function exportSettings() {
   if (!Number.isFinite(margin) || margin < 5 || margin > 25) throw new Error("Lề chữ cần nằm trong khoảng 5–25%.");
   return { resolution: $("resolution").value, font_size: Math.round(fontSize), font_family: $("font-family").value,
     text_color: $("text-color").value, highlight_color: $("highlight-color").value,
-    position: $("subtitle-position").value, margin_percent: margin };
+    position: $("subtitle-position").value, margin_percent: margin,
+    countdown: $("countdown-enabled").checked };
 }
 $("render-button").addEventListener("click", () => {
   try {
@@ -1098,6 +1116,7 @@ function resizePreview() {
 window.addEventListener("resize", resizePreview);
 document.addEventListener("fullscreenchange", resizePreview);
 for (const id of subtitleStyleIds) $(id).addEventListener("input", resizePreview);
+$("countdown-enabled").addEventListener("change", renderPreview);
 $("resolution").addEventListener("change", resizePreview);
 window.addEventListener("beforeunload", (event) => { if (state.dirty || state.referenceDirty) { event.preventDefault(); event.returnValue = ""; } });
 

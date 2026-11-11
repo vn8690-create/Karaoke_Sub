@@ -139,3 +139,11 @@
 .smart-panel{padding:12px}
 .smart-rows{max-height:500px}
 }
+
+
+/* Karaoke countdown 3→2→1. Only shown inside a >=3s instrumental gap. */
+.countdown-overlay{position:absolute;inset:0;z-index:4;display:grid;place-items:center;pointer-events:none}
+.countdown-overlay span{display:grid;place-items:center;min-width:1.45em;height:1.45em;padding:.08em;border-radius:50%;border:2px solid #ffffffbb;background:#241a3bcb;box-shadow:0 0 26px #a98dff77,0 8px 38px #0009;color:#fff;text-shadow:0 2px 8px #000;font-size:clamp(54px,7vw,115px);line-height:1;font-weight:800;font-variant-numeric:tabular-nums}
+.countdown-option{border:1px solid #55436f;border-radius:9px;padding:12px;background:#251c34a8}
+.countdown-option strong{color:#d4bfff;font-size:11px}
+.countdown-option small{font-size:10px;line-height:1.6}
