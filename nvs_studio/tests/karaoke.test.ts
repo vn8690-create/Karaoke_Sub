@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { distribute, editText, fromSegments, insertAfter, lEnd, lStart, lineAt, makeLine, moveEdge, plainToLines, shiftAll, shiftLine, splitWords, toSegments, validateForBackend, type KLine } from '../src/karaoke';
+import { distribute, editText, fromSegments, insertAfter, lEnd, lStart, lineAt, makeLine, moveEdge, plainToLines, referenceRows, canonicalReference, overlayReferenceText, shiftAll, shiftLine, splitWords, toSegments, validateForBackend, type KLine } from '../src/karaoke';
 import { detectFormat, parseAny, parseASS, parseLRC, parseSRT, toASS, toLRC, toSRT } from '../src/formats';
 
 const mk = (text: string, a: number, b: number) => makeLine(text, a, b)!;
@@ -35,6 +35,50 @@ describe('chỉnh sửa thời gian', () => {
   it('tách từ tiếng Nhật và giữ nguyên chữ', () => { const r = splitWords('お母さんは怖いですね'); expect(r.sep).toBe(''); expect(r.words.length).toBeGreaterThan(2); expect(r.words.join('')).toBe('お母さんは怖いですね'); });
   it('văn bản thường chia đều theo độ dài và bỏ nhãn [Verse]', () => { const L = plainToLines('[Verse]\nMột hai ba\nBốn năm', 20); expect(L).toHaveLength(2); expect(lEnd(L[1])).toBeCloseTo(20, 1); });
 });
+describe('TXT chuẩn bảo vệ lời gốc và mốc thời gian đã chỉnh', () => {
+  it('bỏ hướng dẫn nhạc nhưng giữ chính xác dấu và chữ Unicode', () => {
+    const text = '\uFEFF[Intro]\\\n[Verse 1]\\\nXin [đệm] chào...\n[Chorus]\nNGƯỜI ơi!';
+    expect(referenceRows(text)).toEqual(['Xin chào...', 'NGƯỜI ơi!']);
+    expect(canonicalReference(text)).toBe(canonicalReference('Xin chào...\nNGƯỜI ơi!'));
+    expect(canonicalReference('Xin chao')).not.toBe(canonicalReference('Xin chào'));
+  });
+  it('thay chữ theo TXT khi số câu và từ bằng nhau, giữ từng mốc chính xác', () => {
+    const before = [mk('Xin chao cac ban', 1, 4), mk('Tam biet nhe', 5, 9)];
+    before[0].words[1].start = 1.777;
+    before[1].words[1].end = 7.333;
+    const r = overlayReferenceText(before, '[Verse]\nXin chào các bạn\nTạm biệt nhé');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.lines.map((l) => l.words.map((w) => w.text))).toEqual([['Xin', 'chào', 'các', 'bạn'], ['Tạm', 'biệt', 'nhé']]);
+    expect(r.lines[0].words[1].start).toBe(1.777);
+    expect(r.lines[1].words[1].end).toBe(7.333);
+    expect(before[0].words[1].text).toBe('chao');
+    expect(r.lines[0].id).toBe(before[0].id);
+  });
+  it('khác số câu/từ thì không sửa lời và không giả lập thời gian', () => {
+    const before = [mk('Xin chao ban', 1, 3), mk('Tam biet', 4, 6)];
+    const beforeJson = JSON.stringify(before);
+    const rows = overlayReferenceText(before, 'Xin chào bạn!\nMột câu thừa\nTạm biệt');
+    expect(rows.ok).toBe(false);
+    if (!rows.ok) expect(rows.message).toContain('3 câu');
+    const words = overlayReferenceText(before, 'Xin chào\nTạm biệt');
+    expect(words.ok).toBe(false);
+    if (!words.ok) expect(words.message).toContain('Câu 1');
+    expect(JSON.stringify(before)).toBe(beforeJson);
+  });
+  it('TXT Nhật giữ chữ gốc nếu phân tách trùng với timestamp cũ', () => {
+    const source = 'お母さんは怖いですね';
+    const line = mk(source, 2, 7);
+    const replaced = overlayReferenceText([line], source, 'ja');
+    expect(replaced.ok).toBe(true);
+    if (replaced.ok) {
+      expect(replaced.lines[0].words.map((w) => w.text).join('')).toBe(source);
+      expect(replaced.lines[0].words.map((w) => [w.start, w.end]))
+        .toEqual(line.words.map((w) => [w.start, w.end]));
+    }
+  });
+});
+
 describe('định dạng', () => {
   it('Enhanced LRC khứ hồi, kể cả khoảng lặng giữa các từ', () => {
     const L = demo(); L[0].words[1].end -= 0.3; same(L, parseLRC(toLRC(L, 0, true)));
