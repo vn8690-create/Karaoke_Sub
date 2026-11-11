@@ -101,5 +101,23 @@ class CachedWhisperRepairTests(unittest.TestCase):
                 cached_whisper_checkpoints(cache, "../other")
 
 
+
+class DemucsArchiveDiagnosticsTests(unittest.TestCase):
+    def test_demucs_corrupt_checkpoint_explains_cache_location_without_deleting(self):
+        from local_studio import pipeline
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            checkpoints = folder / "models" / "torch" / "hub" / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            old_model = checkpoints / "cached-demucs.th"
+            old_model.write_bytes(b"damaged")
+            with patch.object(pipeline, "_device", return_value="cpu"), \
+                 patch.object(pipeline, "_model_dir", return_value=folder / "models"), \
+                 patch.object(pipeline, "_run", side_effect=BROKEN_ARCHIVE):
+                with self.assertRaisesRegex(RuntimeError, "Checkpoint model tách giọng Demucs bị hỏng"):
+                    pipeline.separate_audio(folder / "song.wav", folder / "stems")
+            self.assertEqual(old_model.read_bytes(), b"damaged")
+
+
 if __name__ == "__main__":
     unittest.main()
