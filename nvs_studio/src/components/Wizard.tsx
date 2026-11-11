@@ -21,6 +21,7 @@ async function attachAudio(client: BackendClient, p: BackendProject) {
 export default function Wizard() {
   const m = useStudio(), k = useKaraoke(); const client = useMemo(() => new BackendClient(), []); const ctl = useRef<AbortController | null>(null);
   const [step, setStep] = useState(0), [engine, setEngine] = useState<'mock' | 'backend'>('mock'), [lang, setLang] = useState<'vi' | 'ja' | 'en' | 'auto'>('vi'), [lyrics, setLyrics] = useState('');
+  const [separate, setSeparate] = useState(true);
   const [audioId, setAudioId] = useState(''), [projects, setProjects] = useState<BackendProject[]>([]), [pid, setPid] = useState(''), [health, setHealth] = useState<'checking' | 'ok' | 'down'>('checking');
   const [uploadFile, setUploadFile] = useState<File | null>(null), [uploading, setUploading] = useState(false), [uploadError, setUploadError] = useState('');
   const [prog, setProg] = useState<JobProgress | null>(null), [err, setErr] = useState(''), [result, setResult] = useState<AlignResult | null>(null);
@@ -66,7 +67,7 @@ export default function Wizard() {
   };
   const run = async () => {
     setErr(''); setResult(null); setProg({ jobId: '', state: 'analyzing', percent: 0 }); setStep(2); ctl.current = new AbortController();
-    const req: AlignRequest = { audioPath: media?.name ?? proj?.title ?? '', language: lang, lyrics: lyrics.trim() || undefined, engine, durationSec: media?.dur ?? proj?.duration ?? 60, projectId: pid || undefined };
+    const req: AlignRequest = { audioPath: media?.name ?? proj?.title ?? '', language: lang, lyrics: lyrics.trim() || undefined, engine, durationSec: media?.dur ?? proj?.duration ?? 60, projectId: pid || undefined, separate };
     const ad: AIAdapter = engine === 'mock' ? new MockAIAdapter() : new BackendAIAdapter(client);
     try { const r = await ad.align(req, setProg, ctl.current.signal); setResult(r); setStep(3); }
     catch (e) { const ab = (e as Error).name === 'AbortError'; setProg((p) => ({ jobId: p?.jobId ?? '', state: ab ? 'cancelled' : 'error', percent: p?.percent ?? 0 })); setErr(ab ? 'Đã hủy xử lý.' : (e as Error).message); }
@@ -111,6 +112,7 @@ export default function Wizard() {
             </label>
             {txtFile && <p className="text-cy text-xs">Đã nạp lời chuẩn: {txtFile}. Backend sẽ dùng lời này để CĂN THỜI GIAN, không tự viết lại lời.</p>}
             {txtError && <p role="alert" className="text-pink-300 text-xs">{txtError}</p>}
+            {engine === 'backend' && <label className="flex gap-2 items-center text-xs text-mute"><input type="checkbox" checked={separate} onChange={(e) => setSeparate(e.target.checked)} /> Tách giọng bằng Demucs trước khi căn (nặng; bỏ chọn để thử ngay trên nhạc gốc nếu model Demucs lỗi)</label>}
             <textarea value={lyrics} onChange={(e) => { setLyrics(e.target.value); setTxtFile(''); }} placeholder="Nhập TXT hoặc dán lời chuẩn (mỗi câu một dòng). Để trống = nhận diện lời bằng Whisper." className="h-40 bg-ink border border-line rounded-lg p-2" />
             <p className="text-mute text-[11px]">{engine === 'backend' ? 'Có lời → căn lời theo giọng hát (giữ nguyên lời bạn nhập). Không có lời → Whisper nhận diện. Backend hỗ trợ vi/en/ja/auto.' : 'MOCK: nếu để trống sẽ dùng vài dòng lời mẫu.'}</p></div>}
           {step >= 2 && <div className="flex flex-col gap-3">

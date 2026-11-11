@@ -14,6 +14,7 @@ import re
 import unicodedata
 
 from .pipeline import _device, _free_cuda, _model_dir, probe
+from .model_cache import load_whisper_with_repair
 
 _MAX_TEXT = 100_000
 _MODELS = {"tiny", "base", "small", "medium", "large-v3"}
@@ -201,13 +202,10 @@ def align_lyrics(audio: Path, text: str, model: str = "small", language: str = "
         raise ValueError("Không đọc được thời lượng âm thanh để căn lời.")
     cache = _model_dir() / "whisper"
     cache.mkdir(parents=True, exist_ok=True)
-    # Older whisper-timestamped caches one extra `whisper` directory. Both use
-    # the same OpenAI checkpoint; reuse it instead of downloading another copy.
-    checkpoint = next((str(p) for p in (cache / f"{model}.pt", cache / "whisper" / f"{model}.pt") if p.is_file()), model)
     network = None
     try:
         progress(f"Đang tải Whisper {model} ({device}) để căn lời chuẩn; lần đầu cần mạng tải model.")
-        network = stable_whisper.load_model(checkpoint, device=device, download_root=str(cache))
+        network = load_whisper_with_repair(stable_whisper.load_model, model, device, cache, progress)
         detection_warning = None
         if language == "auto":
             progress("Đang nhận diện ngôn ngữ từ giọng hát…")

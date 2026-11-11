@@ -100,7 +100,7 @@ class ForcedAlignmentAdapterTests(unittest.TestCase):
                     patch.object(network, "align", wraps=network.align) as align, \
                     patch.object(fake, "load_model", wraps=fake.load_model) as load:
                 output = alignment.align_lyrics(Path(temp) / "vocal.wav", "[Verse 1]\nXin chào!", device="cpu")
-            self.assertEqual(load.call_args.args[0], str(checkpoint))
+            self.assertEqual(Path(load.call_args.args[0]).resolve(), checkpoint.resolve())
             self.assertEqual(align.call_args.args[1], "Xin chào!")
             self.assertTrue(align.call_args.kwargs["original_split"])
             self.assertFalse(align.call_args.kwargs["remove_instant_words"])

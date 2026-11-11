@@ -10,7 +10,7 @@ export class BackendAIAdapter implements AIAdapter {
     if (!req.projectId) throw new Error('Cần chọn một dự án backend (đã tải nhạc lên local_studio).');
     const language = req.language, text = req.lyrics?.trim();
     onProgress({ jobId: req.projectId, state: 'analyzing', percent: 1, message: 'Gửi yêu cầu tới backend…' });
-    if (text) await this.client.align(req.projectId, { text, language }); else await this.client.transcribe(req.projectId, { language });
+    if (text) await this.client.align(req.projectId, { text, language, separate: req.separate ?? true }); else await this.client.transcribe(req.projectId, { language, separate: req.separate ?? true });
     const done = await this.client.wait(req.projectId, (p) => onProgress({ jobId: req.projectId!, state: text ? 'aligning' : 'recognizing', percent: Math.max(1, Math.min(99, p.progress ?? 0)), message: p.message }), signal, this.pollMs);
     if (text) {
       const expected = canonicalReference(text);
