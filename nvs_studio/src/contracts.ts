@@ -2,7 +2,7 @@
 export type JobState = 'idle' | 'model-missing' | 'downloading-model' | 'analyzing' | 'recognizing' | 'aligning' | 'done' | 'error' | 'cancelled';
 export interface WordTiming { text: string; start: number; end: number }
 export interface LineTiming { text: string; start: number; end: number; words: WordTiming[] }
-export interface AlignRequest { audioPath: string; language: 'vi' | 'ja' | 'en' | 'auto'; lyrics?: string; engine: 'whisper' | 'karaoke-gen' | 'backend' | 'mock'; durationSec?: number; projectId?: string }
+export interface AlignRequest { audioPath: string; language: 'vi' | 'ja' | 'en' | 'auto'; lyrics?: string; engine: 'whisper' | 'karaoke-gen' | 'backend' | 'mock'; durationSec?: number; projectId?: string; separate?: boolean }
 export interface AlignResult { lines: LineTiming[]; engine: string; mock: boolean }
 export interface JobProgress { jobId: string; state: JobState; percent: number; message?: string }
 export interface AIAdapter {
