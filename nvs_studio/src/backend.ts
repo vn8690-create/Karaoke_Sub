@@ -18,7 +18,7 @@ export class BackendClient {
   private async response<T>(method: string, path: string, body?: BodyInit, json = false, signal?: AbortSignal): Promise<T> {
     let r: Response;
     try { r = await this.f(this.base + path, { method, headers: json ? { 'Content-Type': 'application/json' } : undefined, body, signal }); }
-    catch { if (signal?.aborted) throw new DOMException('Đã hủy', 'AbortError'); throw new BackendError(0, 'Không kết nối được backend local_studio. Hãy chạy windows\start.bat rồi thử lại.'); }
+    catch { if (signal?.aborted) throw new DOMException('Đã hủy', 'AbortError'); throw new BackendError(0, 'Không kết nối được backend local_studio. Hãy chạy windows\\start.bat rồi thử lại.'); }
     if (!r.ok) {
       let msg = r.statusText || 'Backend báo lỗi';
       try { const j = await r.json(); msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail ?? j); } catch { /* keep HTTP status */ }
