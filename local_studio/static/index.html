@@ -80,7 +80,8 @@
           <label class="field-label" for="reference-lyrics">Nội dung lời chuẩn</label>
           <textarea id="reference-lyrics" rows="8" maxlength="100000" placeholder="[Verse 1]&#10;Rót thêm một chén...&#10;&#10;[Chorus]&#10;Chén đắng nhân gian này..."></textarea>
           <p class="helper reference-help">Các dòng [Intro], [Verse], [Chorus] và chỉ dẫn [Sound of rain…] được bỏ. Mỗi dòng nên là một câu hát; điệp khúc lặp thì nhập đủ từng lần.</p>
-          <div class="reference-actions"><button id="save-reference" class="button secondary" type="button" disabled>Lưu lời chuẩn</button><button id="align-button" class="button accent" type="button" disabled>Căn lời theo giọng hát</button></div>
+          <div class="reference-actions"><button id="save-reference" class="button secondary" type="button" disabled>Lưu lời chuẩn</button><button id="apply-reference" class="button accent" type="button" disabled>Áp dụng chữ TXT với thời gian cũ</button><button id="align-button" class="button secondary" type="button" disabled>Căn lời theo giọng hát (AI)</button></div>
+          <label class="check-row"><input id="reference-allow-estimate" type="checkbox"><span>Cho phép ước lượng lại mốc từ khi số câu/từ khác nhau<small>Chỉ chọn khi không thể dùng AI. Vị trí từ sẽ là ước lượng, cần nghe kiểm tra lại. Mốc chính xác hiện có được sao lưu trước khi thay.</small></span></label>
           <p id="reference-status" class="reference-status" role="status" aria-live="polite">Có thể nhập lời trước, rồi tạo hoặc chọn dự án.</p>
           <details id="reference-preview" class="reference-preview" hidden><summary id="reference-preview-label">Lời dùng để căn thời gian</summary><pre id="reference-cleaned"></pre></details>
           <div id="alignment-notice" class="alignment-notice" role="status" aria-live="polite" hidden></div>
