@@ -42,7 +42,7 @@ beforeAll(async () => {
     }
     if (req.method === 'POST' && (url === '/api/projects/p1/align' || url === '/api/projects/p1/transcribe')) {
       const b = JSON.parse((await body(req)) || '{}'); polls = 0; proj.status = 'processing'; proj.progress = 40; proj.message = 'Đang căn…';
-      proj.segments = toSegments([makeLine(b.text ?? 'Lời nhận diện thử', 1, 6)!]); return send(202, proj);
+      proj.segments = toSegments([makeLine(b.text?.includes('Lời đúng trong TXT') ? 'Whisper trả lời sai' : (b.text ?? 'Lời nhận diện thử'), 1, 6)!]); return send(202, proj);
     }
     send(404, { detail: 'Không tìm thấy' });
   });
@@ -60,6 +60,13 @@ describe('BackendClient + BackendAIAdapter (máy chủ giả)', () => {
   it('căn lời thật: gửi align, đọc tiến độ rồi trả lời đã giữ nguyên chữ', async () => {
     const ev: JobProgress[] = []; const r = await new BackendAIAdapter(new BackendClient(base), 1).align({ audioPath: '', language: 'vi', engine: 'backend', projectId: 'p1', lyrics: 'Một hai ba' }, (p) => ev.push(p));
     expect(r.mock).toBe(false); expect(r.lines[0].text).toBe('Một hai ba'); expect(ev[0].state).toBe('analyzing'); expect(ev.at(-1)!.state).toBe('done'); expect(ev.some((e) => e.state === 'aligning')).toBe(true);
+  });
+  it('TXT là lời chuẩn: backend trả khác dù timestamp hợp lệ thì không chấp nhận', async () => {
+    const ad = new BackendAIAdapter(new BackendClient(base), 1);
+    await expect(ad.align({
+      audioPath: '', language: 'vi', engine: 'backend', projectId: 'p1',
+      lyrics: '[Intro]\\nLời đúng trong TXT',
+    }, () => undefined)).rejects.toThrow(/khác nội dung TXT chuẩn/);
   });
   it('không lời → dùng transcribe', async () => {
     const ev: JobProgress[] = []; await new BackendAIAdapter(new BackendClient(base), 1).align({ audioPath: '', language: 'auto', engine: 'backend', projectId: 'p1' }, (p) => ev.push(p)); expect(ev.some((e) => e.state === 'recognizing')).toBe(true);
