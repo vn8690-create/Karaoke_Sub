@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 from .subtitles import write_subtitles
+from .model_cache import is_corrupt_checkpoint, load_whisper_with_repair
 
 
 def _run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -95,8 +96,19 @@ def separate_audio(audio: Path, output_dir: Path, device: str = "auto", progress
     environment["TORCH_HOME"] = str(_model_dir() / "torch")
     # A separate process returns all model VRAM to the OS before transcription.
     with tempfile.TemporaryDirectory(prefix="separate-", dir=output_dir) as scratch:
-        _run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs", "-d", device,
-              "--segment", "5", "--shifts", "1", "-o", scratch, str(audio)], env=environment)
+        try:
+            _run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs", "-d", device,
+                  "--segment", "5", "--shifts", "1", "-o", scratch, str(audio)], env=environment)
+        except RuntimeError as exc:
+            if is_corrupt_checkpoint(exc):
+                cache = _model_dir() / "torch" / "hub" / "checkpoints"
+                raise RuntimeError(
+                    "Checkpoint model tách giọng Demucs bị hỏng hoặc tải thiếu. "
+                    "Đóng ứng dụng, kiểm tra các file .th trong: " + str(cache)
+                    + ". Chỉ xóa cache model lỗi rồi chạy lại để tải mới; "
+                    "không xóa dự án, lời TXT hay cài lại PyTorch."
+                ) from exc
+            raise
         stems = Path(scratch) / "htdemucs" / audio.stem
         instrumental = stems / "no_vocals.wav"
         vocals = stems / "vocals.wav"
@@ -121,7 +133,9 @@ def transcribe_audio(audio: Path, model: str = "small", language: str | None = "
     network = None
     samples = None
     try:
-        network = whisper.load_model(model, device=device, download_root=str(_model_dir() / "whisper"))
+        network = load_whisper_with_repair(
+            whisper.load_model, model, device, _model_dir() / "whisper", progress
+        )
         progress("Đang nhận diện lời hát và thời gian từng từ…")
         samples = whisper.load_audio(str(Path(audio).resolve()))
         audio_duration = len(samples) / 16000  # Whisper's loader always resamples to 16 kHz.
