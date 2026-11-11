@@ -42,7 +42,7 @@ class CachedWhisperRepairTests(unittest.TestCase):
             loaded = load_whisper_with_repair(loader, "small", "cpu", cache, messages.append)
             self.assertEqual(loaded, "OK")
             self.assertFalse(nested.exists())
-            self.assertEqual(calls[0][0], str(nested))
+            self.assertEqual(Path(calls[0][0]).resolve(), nested.resolve())
             self.assertEqual(calls[1][0], "small")
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[1][1]["download_root"], str(cache.resolve()))
