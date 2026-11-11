@@ -631,5 +631,10 @@ app.include_router(create_router(sys.modules[__name__]))
 from .project_backup import create_router as create_backup_router
 app.include_router(create_backup_router(sys.modules[__name__]))
 
+# Optional built React Studio: same-origin /nvs/ -> /api, no permissive CORS needed.
+_nvs_dist = Path(__file__).resolve().parents[1] / "nvs_studio" / "dist"
+if _nvs_dist.is_dir():
+    app.mount("/nvs", StaticFiles(directory=_nvs_dist, html=True), name="nvs_studio")
+
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="assets")
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="ui")
