@@ -102,7 +102,9 @@ function updateReferenceStatus() {
   const alignment = project?.alignment;
   const stale = Boolean(project?.segments?.length && (state.referenceDirty || project.reference_pending || alignment?.stale ||
     (saved?.text && (!alignment || alignment.source !== "reference" || (alignment.reference_text && alignment.reference_text !== saved.text)))));
-  if (stale) notice.append(node("p", "", "Lời chuẩn và mốc hiện tại chưa khớp nhau. Nhấn Căn lời theo giọng hát để tạo lại thời gian; lời đang hiện trong trình sửa vẫn là bản trước đó."));
+  if (stale) notice.append(node("p", "", alignment?.engine === "smart-sync"
+    ? "Smart Sync đã sửa một phần lời; những câu chưa được duyệt vẫn giữ nguyên. Hãy kiểm tra câu đỏ/vàng hoặc chỉnh tay. Không cần căn lại toàn bài."
+    : "Lời chuẩn và mốc hiện tại chưa khớp nhau. Hãy thử Smart Lyrics Sync để ghép chữ TXT với thời gian đã có, hoặc dùng Căn lời theo giọng hát để căn lại."));
   if (!stale && alignment?.source === "reference" && alignment?.engine !== "manual-estimate") {
     notice.append(node("p", "alignment-success", alignment?.engine === "manual-preserve"
       ? "Đã dùng đúng chữ TXT, GIỮ NGUYÊN thời gian từng từ trước đó."
