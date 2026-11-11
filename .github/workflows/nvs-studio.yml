@@ -1,0 +1,34 @@
+name: NVS Studio Frontend
+
+on:
+  pull_request:
+    paths:
+      - 'nvs_studio/**'
+  push:
+    branches: [main]
+    paths:
+      - 'nvs_studio/**'
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: TypeScript / Unit Tests / Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nvs_studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: TypeScript typecheck
+        run: npm run typecheck
+      - name: Vitest
+        run: npm test
+      - name: Production build
+        run: npm run build
