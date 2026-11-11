@@ -25,6 +25,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import APP_ID, alignment, pipeline
+from .reference_timing import apply_reference_to_existing
 
 log = logging.getLogger("local_studio")
 ROOT = Path(os.environ.get("KARAOKE_DATA_DIR", Path(__file__).resolve().parents[1] / ".local-data")).resolve()
@@ -159,6 +160,10 @@ class Transcribe(Device):
 
 class ReferenceText(StrictModel):
     text: str = Field(min_length=1, max_length=100000)
+
+
+class ApplyReference(StrictModel):
+    estimate: bool = False  # True only after an explicit UI opt-in.
 
 
 class Align(Transcribe):
@@ -437,6 +442,63 @@ def save_reference(project_id: str, body: ReferenceText):
         p = idle(project_id)
         p.update(status="ready", error=None, message="Đã lưu lời chuẩn; nhấn Căn lời theo giọng hát để tạo mốc thời gian.")
         store_reference(project_id, p, reference)
+        return p
+
+
+@app.post("/api/projects/{project_id}/reference/apply-timing")
+def apply_saved_reference_timing(project_id: str, body: ApplyReference):
+    """Use TXT as display text with existing timestamps, even if AI is unavailable.
+
+    The default requires identical line/word counts and preserves every word
+    interval. Explicit estimate=True is approximate and clearly marked.
+    Neither mode fabricates model results or alters original source audio.
+    """
+    with LOCK:
+        p = idle(project_id)
+        reference = p.get("reference_lyrics") or {}
+        if not reference.get("text") or not reference.get("lines"):
+            raise HTTPException(400, "Hãy chọn TXT và nhấn Lưu lời chuẩn trước.")
+        if not p.get("segments"):
+            raise HTTPException(400, "Chưa có mốc thời gian cũ để ghép TXT. Hãy căn lời trước.")
+        try:
+            segments, estimated = apply_reference_to_existing(
+                p["segments"], reference["lines"], estimate=body.estimate
+            )
+            validated = Lyrics(segments=segments)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if validated.segments and validated.segments[-1].end > p["duration"] + 0.1:
+            raise HTTPException(409, "Mốc thời gian hiện tại vượt độ dài bài hát; không thay đổi lời cũ.")
+        folder = project_dir(project_id)
+        # Keep one recoverable snapshot of the prior lyrics, not just an undo in UI.
+        original = folder / "lyrics-before-txt.json"
+        if not original.exists():
+            original.write_text(
+                json.dumps({"segments": p["segments"]}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        p["files"]["lyrics_before_txt"] = original.name
+        discard_exports(folder, p)
+        p["segments"] = [segment.model_dump() for segment in validated.segments]
+        p["alignment"] = {
+            "source": "reference",
+            "engine": "manual-estimate" if estimated else "manual-preserve",
+            "reference_text": reference["text"],
+            "stale": False,
+            "manually_edited": True,
+            "estimated": estimated,
+            "warnings": (
+                ["Mốc từng từ đã ƯỚC LƯỢNG từ thời gian cũ vì số câu/từ không trùng TXT. "
+                 "Hãy nghe kiểm tra và chỉnh từng từ trước khi xuất MP4."]
+                if estimated else
+                ["Đã áp dụng đúng chữ TXT và giữ nguyên từng mốc thời gian cũ."]
+            ),
+        }
+        p["reference_pending"] = False
+        p.update(status="ready", progress=100, error=None,
+                 message="Đã áp dụng lời TXT (mốc từng từ ước lượng)." if estimated
+                 else "Đã áp dụng lời TXT, giữ nguyên từng mốc thời gian.")
+        save(folder, p)
         return p
 
 
