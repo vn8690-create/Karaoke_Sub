@@ -24,6 +24,20 @@ export default function Wizard() {
   const [audioId, setAudioId] = useState(''), [projects, setProjects] = useState<BackendProject[]>([]), [pid, setPid] = useState(''), [health, setHealth] = useState<'checking' | 'ok' | 'down'>('checking');
   const [uploadFile, setUploadFile] = useState<File | null>(null), [uploading, setUploading] = useState(false), [uploadError, setUploadError] = useState('');
   const [prog, setProg] = useState<JobProgress | null>(null), [err, setErr] = useState(''), [result, setResult] = useState<AlignResult | null>(null);
+  const [txtFile, setTxtFile] = useState(''), [txtError, setTxtError] = useState('');
+  useEffect(() => {
+    if (!m.wizard) return;
+    const draft = useKaraoke.getState().referenceDraft;
+    if (draft) { setLyrics(draft); setTxtFile('TXT đã nhập từ Karaoke Editor'); }
+  }, [m.wizard]);
+  const importTxt = async (f?: File) => {
+    if (!f) return;
+    try {
+      const content = await f.text();
+      if (!content.trim() || content.includes('\uFFFD')) throw new Error('TXT rỗng hoặc không phải UTF-8. Hãy lưu lại với mã UTF-8.');
+      setLyrics(content); setTxtFile(f.name); setTxtError('');
+    } catch (e) { setTxtError((e as Error).message); }
+  };
   useEffect(() => { if (!m.wizard) return; setHealth('checking'); client.health().then(() => client.projects()).then((p) => { setProjects(p); setHealth('ok'); }).catch(() => setHealth('down')); }, [m.wizard, client]);
   if (!m.wizard) return null;
   const proj = projects.find((p) => p.id === pid), media = m.media.find((x) => x.id === audioId), audios = m.media.filter((x) => x.kind === 'audio');
@@ -91,7 +105,13 @@ export default function Wizard() {
           </div>}
           {step === 1 && <div className="flex flex-col gap-3">
             <div className="flex gap-2">{(['vi', 'ja', 'en', 'auto'] as const).map((l) => <button key={l} onClick={() => setLang(l)} className={`btn ${lang === l ? '!border-vio' : ''}`}>{{ vi: 'Tiếng Việt', ja: '日本語', en: 'English', auto: 'Tự nhận' }[l]}</button>)}</div>
-            <textarea value={lyrics} onChange={(e) => setLyrics(e.target.value)} placeholder="Dán lời chuẩn (mỗi câu một dòng). Để trống = nhận diện lời bằng Whisper (chỉ backend)." className="h-40 bg-ink border border-line rounded-lg p-2" />
+            <label className="text-mute text-xs flex flex-col gap-1">
+              Nhập lời chuẩn TXT (UTF-8)
+              <input type="file" accept=".txt,text/plain" className="text-xs" onChange={(e) => { void importTxt(e.target.files?.[0]); e.target.value = ''; }} />
+            </label>
+            {txtFile && <p className="text-cy text-xs">Đã nạp lời chuẩn: {txtFile}. Backend sẽ dùng lời này để CĂN THỜI GIAN, không tự viết lại lời.</p>}
+            {txtError && <p role="alert" className="text-pink-300 text-xs">{txtError}</p>}
+            <textarea value={lyrics} onChange={(e) => { setLyrics(e.target.value); setTxtFile(''); }} placeholder="Nhập TXT hoặc dán lời chuẩn (mỗi câu một dòng). Để trống = nhận diện lời bằng Whisper." className="h-40 bg-ink border border-line rounded-lg p-2" />
             <p className="text-mute text-[11px]">{engine === 'backend' ? 'Có lời → căn lời theo giọng hát (giữ nguyên lời bạn nhập). Không có lời → Whisper nhận diện. Backend hỗ trợ vi/en/ja/auto.' : 'MOCK: nếu để trống sẽ dùng vài dòng lời mẫu.'}</p></div>}
           {step >= 2 && <div className="flex flex-col gap-3">
             <div className="flex items-center gap-2">{busy ? <Loader2 className="animate-spin text-cy" size={18} /> : prog?.state === 'done' ? <Check className="text-emerald-400" size={18} /> : null}<b>{prog ? LABEL[prog.state] : ''}</b>{engine === 'mock' && <span className="text-[10px] bg-amber-600 rounded px-1.5">MOCK</span>}</div>

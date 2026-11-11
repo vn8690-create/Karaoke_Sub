@@ -31,8 +31,52 @@ export function makeLine(text: string, start: number, end: number, lang?: string
   const { words, sep } = splitWords(text, lang); if (!words.length) return null;
   return { id: lid(), words: evenWords(words, start, end), sep, est: true };
 }
+/** Return only sung TXT lines. Preserve visible spelling, accents and punctuation.
+ * Bracketed [Verse]/[Chorus]/[sound] directions are not lyrics, even inline.
+ */
+export function referenceRows(text: string): string[] {
+  return text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n').flatMap((row) => {
+    let depth = 0, visible = '';
+    for (const c of row.replace(/\\+\s*$/, '')) {
+      if (c === '[') { if (depth++ === 0) visible += ' '; }
+      else if (c === ']' && depth > 0) depth--;
+      else if (depth === 0) visible += c;
+    }
+    const cleaned = visible.trim().replace(/\s+/g, ' ');
+    return cleaned && /[\p{L}\p{N}]/u.test(cleaned) ? [cleaned] : [];
+  });
+}
+/** Use only to check if AI returned exactly the same lyrics, ignoring spacing/tokenization. */
+export function canonicalReference(text: string): string {
+  return referenceRows(text).join('').normalize('NFC').replace(/\s+/g, '');
+}
+export type ReferenceMatch = { ok: true; lines: KLine[] } | { ok: false; message: string };
+/** Correct Whisper spelling without sacrificing trusted word timestamps.
+ * Refuse mismatched line/word counts; forcing timing by equal spacing would silently
+ * replace accurate manual timing with fabricated timing.
+ */
+export function overlayReferenceText(timed: KLine[], reference: string, language?: string): ReferenceMatch {
+  const rows = referenceRows(reference);
+  if (!rows.length) return { ok: false, message: 'TXT không có câu hát hợp lệ.' };
+  if (rows.length !== timed.length)
+    return { ok: false, message: 'TXT có ' + rows.length + ' câu, nhưng bản căn thời gian có ' + timed.length + ' câu. Hãy căn lại bằng Auto Karaoke → TXT chuẩn.' };
+  const mapped: KLine[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const tokens = splitWords(rows[i], language);
+    const original = timed[i];
+    if (tokens.words.length !== original.words.length)
+      return { ok: false, message: 'Câu ' + (i + 1) + ': TXT có ' + tokens.words.length +
+        ' từ, nhưng mốc hiện tại có ' + original.words.length +
+        ' từ. Để giữ đúng thời gian, hãy dùng Auto Karaoke → TXT chuẩn để căn lại.' };
+    mapped.push({
+      ...original, sep: tokens.sep,
+      words: original.words.map((w, j) => ({ ...w, text: tokens.words[j] })),
+    });
+  }
+  return { ok: true, lines: mapped };
+}
 export function plainToLines(text: string, duration: number, lang?: string): KLine[] {
-  const rows = text.split(/\r?\n/).map((r) => r.trim()).filter((r) => r && !/^\[[^\]]*\]$/.test(r));
+  const rows = referenceRows(text);
   const wt = rows.map(weight), total = wt.reduce((a, b) => a + b, 0) || 1; let acc = 0;
   return rows.flatMap((r, i) => { const a = (duration * acc) / total; acc += wt[i]; const l = makeLine(r, a, (duration * acc) / total, lang); return l ? [l] : []; });
 }
