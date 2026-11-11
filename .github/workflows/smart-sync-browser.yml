@@ -1,0 +1,44 @@
+name: Smart Lyrics Sync Browser
+
+on:
+  pull_request:
+    paths:
+      - 'local_studio/**'
+      - 'tests/browser/**'
+      - '.github/workflows/smart-sync-browser.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'local_studio/**'
+      - 'tests/browser/**'
+      - '.github/workflows/smart-sync-browser.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  chrome-ui:
+    name: Real Chrome / TXT review / Apply / Undo
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install local FastAPI and Playwright client
+        run: python -m pip install 'fastapi>=0.115.12,<1' 'pydantic>=2.10,<3' 'python-multipart>=0.0.22,<1' 'uvicorn>=0.34,<1' httpx playwright
+      - name: Check Chrome browser is preinstalled
+        shell: pwsh
+        run: |
+          $paths = @(
+            'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'
+          )
+          if (-not ($paths | Where-Object { Test-Path $_ })) {
+            throw "Chrome is not installed on this Windows runner"
+          }
+      - name: Test original Karaoke UI against actual FastAPI in Chrome
+        env:
+          PYTHONUTF8: '1'
+        run: python tests/browser/test_smart_sync_browser.py

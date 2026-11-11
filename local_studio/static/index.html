@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Karaoke Studio • Local</title>
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/app.js?v=txt-reference-1" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=smart-sync-1">
+  <script src="/static/app.js?v=smart-sync-1" defer></script>
 </head>
 <body>
   <header class="app-header">
@@ -85,6 +85,8 @@
           <p id="reference-status" class="reference-status" role="status" aria-live="polite">Có thể nhập lời trước, rồi tạo hoặc chọn dự án.</p>
           <details id="reference-preview" class="reference-preview" hidden><summary id="reference-preview-label">Lời dùng để căn thời gian</summary><pre id="reference-cleaned"></pre></details>
           <div id="alignment-notice" class="alignment-notice" role="status" aria-live="polite" hidden></div>
+          <button id="smart-preview" class="button primary full" type="button" disabled>✦ Smart Lyrics Sync · So khớp lời TXT</button>
+          <p class="helper">Không dùng AI. Tìm câu tương ứng, sửa chữ nhưng ưu tiên giữ các mốc đã căn; câu thiếu từ được đánh dấu để bạn duyệt.</p>
           <p class="helper">Cần file có giọng hát. Căn theo âm thanh, không chia đều thời gian cả bài; vẫn cần nghe kiểm tra các từ kéo dài hoặc khó rõ. Dùng <strong>windows\UPDATE.bat</strong> một lần nếu bản cũ báo thiếu stable-ts.</p>
         </div>
         <div class="asr-alternative"><span>Chưa có lời chuẩn?</span></div>
@@ -122,6 +124,19 @@
       <section class="panel lyrics-panel">
         <div class="lyrics-heading"><div><p class="eyebrow">TINH CHỈNH TRƯỚC KHI XUẤT</p><h2>Lời &amp; thời gian <span id="lyrics-count" class="count-badge">0 câu</span></h2></div><div class="editor-actions"><span id="save-state" class="save-state"></span><button id="add-segment" class="button small secondary" disabled>＋ Thêm câu</button><button id="save-lyrics" class="button small accent" disabled>Lưu lời</button></div></div>
         <p class="editor-tip">Nhấn một câu để phát từ vị trí đó. Mở “Chỉnh từng từ” để sửa lời và mốc thời gian (giây).</p>
+        <section id="smart-panel" class="smart-panel" aria-label="Xem trước đồng bộ lời TXT" hidden>
+          <div class="smart-heading">
+            <div><h3>✦ SMART LYRICS SYNC</h3><p>Whisper cung cấp mốc thời gian · TXT cung cấp chữ chuẩn. Chỉ cập nhật các câu bạn chọn.</p></div>
+            <button id="smart-undo" class="button secondary small" type="button" disabled>↶ Hoàn tác lần ghép gần nhất</button>
+          </div>
+          <p id="smart-summary" class="smart-summary" role="status"></p>
+          <div class="smart-legend"><span>● Xanh: giữ mốc cũ</span><span>● Vàng: cần duyệt/ước lượng</span><span>● Đỏ: cần sửa tay, không tự xóa</span></div>
+          <div id="smart-rows" class="smart-rows"></div>
+          <div class="smart-actions">
+            <button id="smart-apply" class="button primary" type="button" disabled>Áp dụng câu đã chọn</button>
+            <small>Những câu đỏ được giữ nguyên. Nếu chọn câu vàng, hãy nghe lại đoạn đó sau khi áp dụng.</small>
+          </div>
+        </section>
         <div class="timing-tools"><div><label for="timing-offset">Dịch thời gian toàn bài (giây)</label><p>Chữ sớm: dùng số dương để hiện muộn hơn. Chữ trễ: dùng số âm. Sửa từng từ nếu chỉ lệch một đoạn.</p></div><div class="timing-action"><input id="timing-offset" type="number" min="-30" max="30" step="0.1" value="0" aria-label="Dịch thời gian toàn bài, đơn vị giây"><button id="apply-timing" class="button small secondary" type="button" disabled>Áp dụng</button></div></div>
         <div id="lyrics-list" class="lyrics-list"><div class="editor-empty"><span>≋</span><h3>Mỗi lời ca, đúng một nhịp</h3><p>Tạo sub tự động hoặc thêm câu thủ công.<br>Bạn có thể chỉnh lời và thời gian trước khi xuất.</p></div></div>
       </section>

@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { project: null, projects: [], segments: [], dirty: false, referenceDirty: false, mediaPending: false, backgroundAssets: [], backgroundProviders: [], pending: false, muted: false, poll: null, generation: 0, revision: 0, lyricKey: "", previewRevision: -1, previewLines: [], activeRow: -1, toastTimer: null };
+const state = { project: null, projects: [], segments: [], dirty: false, referenceDirty: false, mediaPending: false, backgroundAssets: [], backgroundProviders: [], pending: false, muted: false, poll: null, generation: 0, revision: 0, lyricKey: "", previewRevision: -1, previewLines: [], activeRow: -1, toastTimer: null, smartPreview: null };
 const audio = $("audio");
 const backgroundVideo = $("background-video");
 const busyStatuses = new Set(["queued", "processing", "rendering", "transcribing", "separating"]);
@@ -102,9 +102,13 @@ function updateReferenceStatus() {
   const alignment = project?.alignment;
   const stale = Boolean(project?.segments?.length && (state.referenceDirty || project.reference_pending || alignment?.stale ||
     (saved?.text && (!alignment || alignment.source !== "reference" || (alignment.reference_text && alignment.reference_text !== saved.text)))));
-  if (stale) notice.append(node("p", "", "Lời chuẩn và mốc hiện tại chưa khớp nhau. Nhấn Căn lời theo giọng hát để tạo lại thời gian; lời đang hiện trong trình sửa vẫn là bản trước đó."));
+  if (stale) notice.append(node("p", "", alignment?.engine === "smart-sync"
+    ? "Smart Sync đã sửa một phần lời; những câu chưa được duyệt vẫn giữ nguyên. Hãy kiểm tra câu đỏ/vàng hoặc chỉnh tay. Không cần căn lại toàn bài."
+    : "Lời chuẩn và mốc hiện tại chưa khớp nhau. Hãy thử Smart Lyrics Sync để ghép chữ TXT với thời gian đã có, hoặc dùng Căn lời theo giọng hát để căn lại."));
   if (!stale && alignment?.source === "reference" && alignment?.engine !== "manual-estimate") {
-    notice.append(node("p", "alignment-success", alignment?.engine === "manual-preserve"
+    notice.append(node("p", "alignment-success", alignment?.engine === "smart-sync"
+      ? "Đã dùng chữ TXT qua Smart Sync. Những mốc ước lượng vẫn cần nghe kiểm tra."
+      : alignment?.engine === "manual-preserve"
       ? "Đã dùng đúng chữ TXT, GIỮ NGUYÊN thời gian từng từ trước đó."
       : "Đã căn theo lời chuẩn. Nghe kiểm tra các mốc trước khi xuất."));
   }
@@ -179,6 +183,141 @@ $("apply-reference").addEventListener("click", async () => {
   } catch (error) {
     toast(error.message, true);
   } finally { state.pending = false; updateButtons(); updateDownloads(); }
+});
+
+
+const smartLabels = { safe: "Xanh · giữ mốc", review: "Vàng · cần duyệt",
+  blocked: "Đỏ · chưa ghép", same: "Không đổi" };
+
+function smartSelectedRows() {
+  return [...$("smart-rows").querySelectorAll("input[type=checkbox]:checked")].map((item) => item.value);
+}
+
+function renderSmartPanel() {
+  const preview = state.smartPreview;
+  const canUndo = Boolean(state.project?.smart_sync?.can_undo);
+  $("smart-panel").hidden = !preview && !canUndo;
+  const container = $("smart-rows");
+  container.replaceChildren();
+  if (!preview) {
+    $("smart-summary").textContent = canUndo
+      ? "Đã cập nhật lời bằng Smart Sync. Có thể hoàn tác trước khi chỉnh tay thêm."
+      : "";
+    updateButtons();
+    return;
+  }
+  const counts = preview.counts;
+  $("smart-summary").textContent =
+    counts.safe + " câu xanh · " + counts.review + " câu vàng · "
+    + counts.blocked + " câu đỏ · " + counts.same + " câu đã đúng. "
+    + "Xanh được chọn trước, vàng phải tự chọn. Đỏ không thể áp dụng tự động.";
+  for (const item of preview.items) {
+    const row = node("article", "smart-row smart-" + item.status);
+    const heading = node("div", "smart-row-heading");
+    const badge = node("strong", "smart-status", smartLabels[item.status] || "Kiểm tra");
+    heading.append(badge);
+    if (item.old_index !== null) {
+      const listen = node("button", "smart-listen", "▶ " + exactTime(item.start));
+      listen.type = "button";
+      listen.title = "Nghe đoạn trước khi chấp nhận sửa lời";
+      listen.addEventListener("click", () => {
+        seekTo(item.start);
+        audio.play().catch((e) => toast("Không phát được: " + e.message, true));
+      });
+      heading.append(listen);
+    }
+    if (item.status === "safe" || item.status === "review") {
+      const label = node("label", "smart-check");
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = item.id;
+      input.checked = item.status === "safe";
+      input.addEventListener("change", updateButtons);
+      label.append(input, node("span", "", "Chọn sửa"));
+      heading.append(label);
+    }
+    row.append(heading);
+    const compare = node("div", "smart-compare");
+    const before = node("div", "smart-compare-pane");
+    before.append(node("small", "", "Whisper / lời đang có"),
+                  node("p", "", item.old_text || "(Chưa có câu trong audio)"));
+    const after = node("div", "smart-compare-pane");
+    after.append(node("small", "", "Lời từ TXT chuẩn"),
+                 node("p", "", item.new_text || "(Không tìm thấy lời TXT tương ứng)"));
+    compare.append(before, after);
+    row.append(compare);
+    row.append(node("p", "smart-explain", item.reason
+      + (item.score ? " · Độ tương đồng chữ: " + item.score + "%" : "")));
+    container.append(row);
+  }
+  updateButtons();
+}
+
+$("smart-preview").addEventListener("click", async () => {
+  if (isBusy() || !state.project || state.dirty) {
+    toast("Hãy Lưu lời đang chỉnh trước khi chạy Smart Sync.", true);
+    return;
+  }
+  const projectId = state.project.id;
+  state.pending = true;
+  updateButtons();
+  try {
+    if (state.referenceDirty) await saveReference(false);
+    const result = await api("/api/projects/" + encodeURIComponent(projectId) + "/smart-sync/preview",
+                             { method: "POST" });
+    if (state.project?.id !== projectId) return;
+    state.smartPreview = {
+      ...result, projectId,
+      segmentKey: JSON.stringify(state.project.segments || []),
+      referenceText: state.project.reference_lyrics?.text || "",
+    };
+    renderSmartPanel();
+    $("smart-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (error) {
+    toast("Smart Sync: " + error.message, true);
+  } finally { state.pending = false; updateButtons(); }
+});
+
+$("smart-apply").addEventListener("click", async () => {
+  const preview = state.smartPreview;
+  if (isBusy() || state.dirty || !preview || !state.project) return;
+  const selected = smartSelectedRows();
+  if (!selected.length) return toast("Chưa chọn câu để sửa.", true);
+  const selectedReview = preview.items.filter((row) => selected.includes(row.id) && row.status === "review");
+  if (selectedReview.length && !window.confirm(
+    "Bạn đã chọn " + selectedReview.length + " câu VÀNG cần kiểm tra. "
+    + "Có thể có từ được ước lượng thời gian. Áp dụng rồi nghe lại từng đoạn nhé?"
+  )) return;
+  const projectId = state.project.id;
+  state.pending = true; updateButtons();
+  try {
+    const updated = await api("/api/projects/" + encodeURIComponent(projectId) + "/smart-sync/apply", {
+      method: "POST", body: { revision: preview.revision, selected },
+    });
+    if (state.project?.id !== projectId) return;
+    state.smartPreview = null;
+    updateProject(updated, true);
+    toast("Đã áp dụng " + selected.length + " câu từ TXT; các câu đỏ giữ nguyên. "
+      + "Có thể Hoàn tác nếu cần.");
+  } catch (error) { toast(error.message, true); }
+  finally { state.pending = false; updateButtons(); }
+});
+
+$("smart-undo").addEventListener("click", async () => {
+  if (isBusy() || !state.project || state.dirty || !state.project.smart_sync?.can_undo) return;
+  if (!window.confirm("Hoàn tác Smart Sync gần nhất? Mốc và lời trước đó sẽ được khôi phục.")) return;
+  const projectId = state.project.id;
+  state.pending = true; updateButtons();
+  try {
+    const restored = await api("/api/projects/" + encodeURIComponent(projectId) + "/smart-sync/undo", {
+      method: "POST",
+    });
+    if (state.project?.id !== projectId) return;
+    state.smartPreview = null;
+    updateProject(restored, true);
+    toast("Đã hoàn tác Smart Sync, phục hồi lời và mốc cũ.");
+  } catch (error) { toast(error.message, true); }
+  finally { state.pending = false; updateButtons(); }
 });
 
 $("align-button").addEventListener("click", () => projectAction("align", {
@@ -371,6 +510,10 @@ function updateButtons() {
   const hasReference = Boolean(referenceText().trim());
   $("align-button").disabled = blocked || !hasReference;
   $("save-reference").disabled = blocked || !hasReference || !state.referenceDirty;
+  $("smart-preview").disabled = blocked || state.dirty || !hasReference || !state.segments.length;
+  $("smart-apply").disabled = blocked || state.dirty || !state.smartPreview
+    || !smartSelectedRows().length;
+  $("smart-undo").disabled = blocked || state.dirty || !state.project?.smart_sync?.can_undo;
   $("apply-reference").disabled = blocked || !hasReference || !state.segments.length;
   $("reference-allow-estimate").disabled = blocked || !hasReference || !state.segments.length;
   $("reference-lyrics").disabled = Boolean(isBusy());
@@ -415,6 +558,11 @@ async function refreshProjects() {
 
 function updateProject(project, force = false, { preserveReference = false } = {}) {
   const changed = state.project?.id !== project.id;
+  if (state.smartPreview && (
+    state.smartPreview.projectId !== project.id
+    || state.smartPreview.segmentKey !== JSON.stringify(project.segments || [])
+    || state.smartPreview.referenceText !== (project.reference_lyrics?.text || "")
+  )) state.smartPreview = null;
   if (!state.project?.files?.instrumental && project.files?.instrumental) $("export-mode").value = "instrumental";
   state.project = project;
   syncReference(project, { changed, preserveDraft: preserveReference });
@@ -440,6 +588,7 @@ function updateProject(project, force = false, { preserveReference = false } = {
   updateDownloads();
   updateButtons();
   renderPreview();
+  renderSmartPanel();
   schedulePoll();
 }
 
@@ -812,7 +961,7 @@ $("new-project").addEventListener("click", async () => {
     await saveLyrics(false);
     await saveReference(false);
     clearTimeout(state.poll);
-    state.generation += 1; state.project = null; state.segments = []; state.dirty = false;
+    state.generation += 1; state.project = null; state.segments = []; state.dirty = false; state.smartPreview = null; renderSmartPanel();
     audio.pause(); audio.removeAttribute("src"); audio.load();
     backgroundVideo.pause(); backgroundVideo.removeAttribute("src"); backgroundVideo.load();
     backgroundVideo.hidden = true; $("background-image").hidden = true;
@@ -953,7 +1102,7 @@ $("resolution").addEventListener("change", resizePreview);
 window.addEventListener("beforeunload", (event) => { if (state.dirty || state.referenceDirty) { event.preventDefault(); event.returnValue = ""; } });
 
 async function initialize() {
-  resizePreview(); renderEditor(); updateReferenceStatus(); updateBackgroundMode(); updateButtons();
+  resizePreview(); renderEditor(); updateReferenceStatus(); updateBackgroundMode(); renderSmartPanel(); updateButtons();
   const results = await Promise.allSettled([api("/api/system"), refreshProjects(), loadBackgroundProviders()]);
   if (results[0].status === "fulfilled") {
     const info = results[0].value;

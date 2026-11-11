@@ -26,6 +26,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import APP_ID, alignment, pipeline
 from .reference_timing import apply_reference_to_existing
+from .smart_sync import build_preview, apply_selection, revision_for, segments_revision
 
 log = logging.getLogger("local_studio")
 ROOT = Path(os.environ.get("KARAOKE_DATA_DIR", Path(__file__).resolve().parents[1] / ".local-data")).resolve()
@@ -164,6 +165,11 @@ class ReferenceText(StrictModel):
 
 class ApplyReference(StrictModel):
     estimate: bool = False  # True only after an explicit UI opt-in.
+
+
+class SmartSyncApply(StrictModel):
+    revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    selected: list[str] = Field(min_length=1, max_length=240)
 
 
 class Align(Transcribe):
@@ -499,6 +505,114 @@ def apply_saved_reference_timing(project_id: str, body: ApplyReference):
                  message="Đã áp dụng lời TXT (mốc từng từ ước lượng)." if estimated
                  else "Đã áp dụng lời TXT, giữ nguyên từng mốc thời gian.")
         save(folder, p)
+        return p
+
+
+@app.post("/api/projects/{project_id}/smart-sync/preview")
+def preview_smart_sync(project_id: str):
+    """Read-only preview. Never change a subtitle or fabricate a timestamp."""
+    with LOCK:
+        p = idle(project_id)
+        reference = p.get("reference_lyrics") or {}
+        if not reference.get("text") or not reference.get("lines"):
+            raise HTTPException(400, "Hãy chọn file TXT và Lưu lời chuẩn trước.")
+        try:
+            result = build_preview(p.get("segments", []), reference["lines"], reference["text"])
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"revision": result["revision"], "items": result["items"],
+                "counts": result["counts"], "project_id": project_id}
+
+
+@app.post("/api/projects/{project_id}/smart-sync/apply")
+def apply_smart_sync(project_id: str, body: SmartSyncApply):
+    """Apply only explicitly approved green/yellow text changes.
+
+    Rebuild the proposal from current project state; a changed TXT or timeline
+    invalidates the preview. Red/unmatched lines are never auto-deleted.
+    """
+    with LOCK:
+        p = idle(project_id)
+        reference = p.get("reference_lyrics") or {}
+        if not reference.get("text") or not reference.get("lines"):
+            raise HTTPException(400, "TXT chuẩn chưa được lưu.")
+        try:
+            preview = build_preview(p.get("segments", []), reference["lines"], reference["text"])
+            if body.revision != preview["revision"]:
+                raise HTTPException(409, "Lời hoặc mốc thời gian đã thay đổi. Hãy bấm Xem trước lại.")
+            proposed = apply_selection(p["segments"], preview, body.selected)
+            validated = Lyrics(segments=proposed)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if validated.segments and validated.segments[-1].end > p["duration"] + 0.1:
+            raise HTTPException(409, "Lời ghép vượt độ dài bài hát; chưa áp dụng.")
+        full = all(row["status"] == "same" or row["id"] in body.selected
+                   for row in preview["items"])
+        estimated = any(row.get("estimated_words", 0) > 0
+                        for row in preview["items"] if row["id"] in body.selected)
+        backup = {
+            "segments": p["segments"], "alignment": p.get("alignment"),
+            "reference_pending": p.get("reference_pending", False),
+        }
+        folder = project_dir(project_id)
+        snapshot = folder / "lyrics-before-smart-sync.json"
+        snapshot.write_text(json.dumps(backup, ensure_ascii=False, indent=2), encoding="utf-8")
+        discard_exports(folder, p)
+        p["files"]["smart_sync_backup"] = snapshot.name
+        p["segments"] = [segment.model_dump() for segment in validated.segments]
+        p["alignment"] = {
+            "source": "reference" if full else "smart-sync",
+            "engine": "smart-sync",
+            "reference_text": reference["text"] if full else None,
+            "stale": not full,
+            "manually_edited": True,
+            "estimated": estimated,
+            "warnings": [
+                f"Smart Sync đã sửa {len(body.selected)} câu; "
+                + ("còn những câu chưa ghép, xem lại chữ hoặc thêm mốc thủ công." if not full
+                   else "đã ghép toàn bộ lời TXT.")
+                + (" Có mốc ước lượng, hãy nghe kiểm tra." if estimated else "")
+            ],
+        }
+        p["reference_pending"] = not full
+        p["smart_sync"] = {
+            "can_undo": True, "applied_sha": segments_revision(p["segments"]),
+            "changed_lines": len(body.selected), "estimated": estimated,
+            "unresolved_lines": preview["counts"]["blocked"],
+        }
+        p.update(status="ready", progress=100, error=None,
+                 message=f"Smart Sync đã cập nhật {len(body.selected)} câu. "
+                         "Nhấn Hoàn tác nếu chưa đúng.")
+        save(folder, p)
+        return p
+
+
+@app.post("/api/projects/{project_id}/smart-sync/undo")
+def undo_smart_sync(project_id: str):
+    """Single-step undo. Never overwrite edits made after a Smart Sync apply."""
+    with LOCK:
+        p = idle(project_id)
+        info = p.get("smart_sync") or {}
+        snapshot = project_dir(project_id) / "lyrics-before-smart-sync.json"
+        if not info.get("can_undo") or not snapshot.is_file():
+            raise HTTPException(409, "Không có bản Smart Sync để hoàn tác.")
+        if info.get("applied_sha") != segments_revision(p["segments"]):
+            raise HTTPException(409, "Đã có chỉnh sửa mới sau Smart Sync. "
+                                "Không hoàn tác tự động để tránh mất phần đã sửa tay.")
+        old = json.loads(snapshot.read_text(encoding="utf-8"))
+        validated = Lyrics(segments=old["segments"])
+        discard_exports(project_dir(project_id), p)
+        p["segments"] = [segment.model_dump() for segment in validated.segments]
+        if old.get("alignment") is None:
+            p.pop("alignment", None)
+        else:
+            p["alignment"] = old["alignment"]
+        p["reference_pending"] = old.get("reference_pending", False)
+        p.pop("smart_sync", None)
+        p["files"].pop("smart_sync_backup", None)
+        p.update(status="ready", progress=100, error=None,
+                 message="Đã hoàn tác Smart Sync; lời và mốc cũ được phục hồi.")
+        save(project_dir(project_id), p)
         return p
 
 

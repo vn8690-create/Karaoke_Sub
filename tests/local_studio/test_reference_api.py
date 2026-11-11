@@ -330,5 +330,96 @@ class ReferenceApiTests(unittest.TestCase):
 
 
 
+    def test_smart_sync_preview_is_read_only_and_apply_preserves_exact_times(self):
+        p = self.save_timed(self.create(), segments=SEGMENTS)
+        prefix = self.endpoint(p)
+        ref = "Xin chào! \nngười ơi!"
+        self.assertEqual(self.client.put(prefix + "/reference", json={"text": ref}).status_code, 200)
+        manifest = self.projects / p["id"] / "project.json"
+        before = manifest.read_bytes()
+        preview = self.client.post(prefix + "/smart-sync/preview")
+        self.assertEqual(preview.status_code, 200, preview.text)
+        data = preview.json()
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertEqual(data["counts"]["safe"], 1)
+        self.assertEqual(data["counts"]["same"], 1)
+        self.assertEqual(len(data["revision"]), 64)
+        applied = self.client.post(prefix + "/smart-sync/apply", json={
+            "revision": data["revision"], "selected": ["line-0"],
+        })
+        self.assertEqual(applied.status_code, 200, applied.text)
+        done = applied.json()
+        self.assertEqual(done["segments"][0]["words"][1]["text"], "chào!")
+        self.assertEqual(
+            [(w["start"], w["end"]) for seg in done["segments"] for w in seg["words"]],
+            [(w["start"], w["end"]) for seg in SEGMENTS for w in seg["words"]],
+        )
+        self.assertFalse(done["reference_pending"])
+        self.assertEqual(done["alignment"]["engine"], "smart-sync")
+        self.assertTrue(done["smart_sync"]["can_undo"])
+        self.assertTrue((self.projects / p["id"] / "lyrics-before-smart-sync.json").is_file())
+        self.assertEqual(self.client.post(prefix + "/subtitles", json={}).status_code, 200)
+        self.assertIn("Xin chào!", self.client.get(prefix + "/files/lyrics.srt").text)
+        undo = self.client.post(prefix + "/smart-sync/undo")
+        self.assertEqual(undo.status_code, 200, undo.text)
+        restored = undo.json()
+        self.assertEqual(restored["segments"], SEGMENTS)
+        self.assertNotIn("smart_sync", restored)
+        self.assertEqual(self.client.post(prefix + "/smart-sync/undo").status_code, 409)
+
+    def test_smart_sync_partial_review_and_stale_revision_guard(self):
+        p = self.save_timed(self.create(), segments=SEGMENTS)
+        prefix = self.endpoint(p)
+        self.assertEqual(
+            self.client.put(prefix + "/reference", json={"text": "Xin thật chào...\nngười ơi!"}).status_code, 200
+        )
+        preview = self.client.post(prefix + "/smart-sync/preview").json()
+        self.assertEqual(preview["counts"]["review"], 1)
+        word = next(item for item in preview["items"] if item["id"] == "line-0")
+        self.assertGreater(word.get("estimated_words", 0), 0)
+        self.assertEqual(self.client.post(prefix + "/smart-sync/apply", json={
+            "revision": preview["revision"], "selected": ["missing-0"],
+        }).status_code, 409)
+        self.assertEqual(
+            self.client.put(prefix + "/reference", json={"text": "Xin khác chào!\nngười ơi!"}).status_code, 200
+        )
+        stale = self.client.post(prefix + "/smart-sync/apply", json={
+            "revision": preview["revision"], "selected": ["line-0"],
+        })
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("Xem trước lại", stale.json()["detail"])
+        self.assertEqual(self.client.get(prefix).json()["segments"], SEGMENTS)
+
+    def test_smart_sync_undo_cannot_destroy_later_manual_edits(self):
+        p = self.save_timed(self.create(), segments=SEGMENTS)
+        prefix = self.endpoint(p)
+        self.assertEqual(
+            self.client.put(prefix + "/reference", json={"text": "Xin chào!\nngười ơi!"}).status_code, 200
+        )
+        preview = self.client.post(prefix + "/smart-sync/preview").json()
+        self.assertEqual(
+            self.client.post(prefix + "/smart-sync/apply", json={
+                "revision": preview["revision"], "selected": ["line-0"],
+            }).status_code, 200
+        )
+        manual = self.client.get(prefix).json()["segments"]
+        manual[0]["words"][0]["text"] = "Tôi"
+        self.assertEqual(self.client.put(prefix + "/lyrics", json={"segments": manual}).status_code, 200)
+        rejected = self.client.post(prefix + "/smart-sync/undo")
+        self.assertEqual(rejected.status_code, 409)
+        self.assertIn("chỉnh sửa mới", rejected.json()["detail"])
+        self.assertEqual(self.client.get(prefix).json()["segments"], manual)
+
+    def test_smart_sync_rejects_no_reference_and_no_timestamps(self):
+        p = self.create()
+        prefix = self.endpoint(p)
+        self.assertEqual(self.client.post(prefix + "/smart-sync/preview").status_code, 400)
+        self.assertEqual(
+            self.client.put(prefix + "/reference", json={"text": "Xin chào bạn"}).status_code, 200
+        )
+        self.assertEqual(self.client.post(prefix + "/smart-sync/preview").status_code, 409)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
