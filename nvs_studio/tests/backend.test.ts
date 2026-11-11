@@ -8,7 +8,7 @@ import type { JobProgress } from '../src/contracts';
 
 // Máy chủ giả mô phỏng đúng hình dạng API local_studio (xem local_studio/app.py): không phải backend thật.
 let srv: http.Server, base = '', polls = 0, mode: 'ok' | 'fail' = 'ok';
-const proj = { id: 'p1', title: 'Bài thử', status: 'ready', progress: 100, message: '', error: null as string | null, duration: 20, files: { audio: 'audio.mp3' }, segments: [] as unknown[] };
+const proj = { id: 'p1', title: 'Bài thử', status: 'ready', progress: 100, message: '', error: null as string | null, duration: 20, files: { audio: 'audio.mp3' } as Record<string, string>, segments: [] as unknown[] };
 const body = (req: http.IncomingMessage) => new Promise<string>((res) => { let d = ''; req.on('data', (c) => (d += c)); req.on('end', () => res(d)); });
 beforeAll(async () => {
   srv = http.createServer(async (req, res) => {
