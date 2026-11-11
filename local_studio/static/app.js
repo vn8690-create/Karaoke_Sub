@@ -103,7 +103,11 @@ function updateReferenceStatus() {
   const stale = Boolean(project?.segments?.length && (state.referenceDirty || project.reference_pending || alignment?.stale ||
     (saved?.text && (!alignment || alignment.source !== "reference" || (alignment.reference_text && alignment.reference_text !== saved.text)))));
   if (stale) notice.append(node("p", "", "Lời chuẩn và mốc hiện tại chưa khớp nhau. Nhấn Căn lời theo giọng hát để tạo lại thời gian; lời đang hiện trong trình sửa vẫn là bản trước đó."));
-  if (!stale && alignment?.source === "reference") notice.append(node("p", "alignment-success", "Đã căn theo lời chuẩn. Nghe kiểm tra các mốc trước khi xuất."));
+  if (!stale && alignment?.source === "reference" && alignment?.engine !== "manual-estimate") {
+    notice.append(node("p", "alignment-success", alignment?.engine === "manual-preserve"
+      ? "Đã dùng đúng chữ TXT, GIỮ NGUYÊN thời gian từng từ trước đó."
+      : "Đã căn theo lời chuẩn. Nghe kiểm tra các mốc trước khi xuất."));
+  }
   if (Array.isArray(alignment?.warnings)) for (const warning of alignment.warnings) notice.append(node("p", "", warning));
   notice.hidden = !notice.childNodes.length;
   notice.classList.toggle("stale", stale);
@@ -154,6 +158,29 @@ $("save-reference").addEventListener("click", async () => {
   catch (error) { toast(error.message, true); }
   finally { state.pending = false; updateButtons(); updateDownloads(); }
 });
+$("apply-reference").addEventListener("click", async () => {
+  if (isBusy() || !state.project || !referenceText().trim()) return;
+  const estimate = $("reference-allow-estimate").checked;
+  if (estimate && !window.confirm("Số câu/từ khác nhau sẽ làm mốc từng từ thành ƯỚC LƯỢNG. Dự án giữ bản sao lời cũ. Tiếp tục ghép TXT?")) return;
+  state.pending = true; updateButtons();
+  try {
+    if (state.referenceDirty) await saveReference(false);
+    if (!state.project) throw new Error("Hãy chọn dự án trước.");
+    const projectId = state.project.id;
+    const project = await api(`/api/projects/${encodeURIComponent(projectId)}/reference/apply-timing`, {
+      method: "POST", body: { estimate },
+    });
+    if (state.project?.id !== projectId) return;
+    $("reference-allow-estimate").checked = false;
+    updateProject(project, true);
+    toast(estimate
+      ? "Đã ghép đúng chữ TXT bằng mốc ƯỚC LƯỢNG. Hãy nghe và chỉnh từng từ trước khi xuất."
+      : "Đã ghép đúng chữ TXT và giữ nguyên TOÀN BỘ mốc từng từ!");
+  } catch (error) {
+    toast(error.message, true);
+  } finally { state.pending = false; updateButtons(); updateDownloads(); }
+});
+
 $("align-button").addEventListener("click", () => projectAction("align", {
   text: referenceText(), model: $("model").value, language: $("language").value,
   device: $("device").value, separate: $("separate-first").checked,
@@ -344,6 +371,8 @@ function updateButtons() {
   const hasReference = Boolean(referenceText().trim());
   $("align-button").disabled = blocked || !hasReference;
   $("save-reference").disabled = blocked || !hasReference || !state.referenceDirty;
+  $("apply-reference").disabled = blocked || !hasReference || !state.segments.length;
+  $("reference-allow-estimate").disabled = blocked || !hasReference || !state.segments.length;
   $("reference-lyrics").disabled = Boolean(isBusy());
   $("reference-file").disabled = Boolean(isBusy());
   $("timing-offset").disabled = blocked || !state.segments.length;
