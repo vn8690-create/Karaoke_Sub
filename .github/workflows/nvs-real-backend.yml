@@ -41,6 +41,9 @@ jobs:
       - name: Install NVS frontend dependencies
         working-directory: nvs_studio
         run: npm ci --no-audit --no-fund
+      - name: Build the NVS production UI for same-origin serving
+        working-directory: nvs_studio
+        run: npm run build
       - name: Start actual local backend
         shell: bash
         run: |
