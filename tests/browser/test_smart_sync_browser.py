@@ -33,18 +33,17 @@ def fixture(directory):
     ident = uuid4().hex
     folder = directory / "projects" / ident
     folder.mkdir(parents=True)
-    # Three seconds of silent WAV is enough for browser media fetch; our
-    # manifest's 30-second duration is used by the editor for lyric timing.
+    # Full-duration silent WAV allows real browser seeking for countdown verification.
     with wave.open(str(folder / "audio.wav"), "wb") as audio:
         audio.setnchannels(1)
         audio.setsampwidth(2)
         audio.setframerate(16000)
-        audio.writeframes(b"\x00\x00" * 48000)
+        audio.writeframes(b"\x00\x00" * 480000)
     segments = [
         line("Vì vậy hãy đoán cho chúng ta một lần nữa", 0.1),
         line("Vì vậy hãy đoán cho chúng ta một lần nữa", 4.0),
         line("Hẹn gặp ngày mai", 9.0),
-        line("Em là người tôi yêu", 13.0),
+        line("Em là người tôi yêu", 18.0),
     ]
     manifest = {"id": ident, "title": "Smart Sync UI Smoke", "status": "ready",
                 "progress": 100, "message": "Ready", "error": None, "duration": 30.0,
@@ -86,6 +85,30 @@ def check():
                     expect(page.locator("#project-select option[value='" + project_id + "']")).to_be_attached(timeout=20000)
                     page.locator("#project-select").select_option(project_id)
                     expect(page.locator("#project-name")).to_have_text("Smart Sync UI Smoke")
+                    # Countdown requires an explicit opt-in and a >=3s gap.
+                    expect(page.locator("#countdown-enabled")).not_to_be_checked()
+                    page.locator("#countdown-enabled").check()
+                    page.evaluate("""() => {
+                      const a = document.getElementById('audio');
+                      a.currentTime = 15.5;
+                      a.dispatchEvent(new Event('seeked'));
+                    }""")
+                    expect(page.locator("#countdown-overlay")).to_be_visible()
+                    expect(page.locator("#countdown-digit")).to_have_text("3")
+                    page.evaluate("""() => {
+                      const a = document.getElementById('audio');
+                      a.currentTime = 16.5;
+                      a.dispatchEvent(new Event('seeked'));
+                    }""")
+                    expect(page.locator("#countdown-digit")).to_have_text("2")
+                    page.evaluate("""() => {
+                      const a = document.getElementById('audio');
+                      a.currentTime = 17.5;
+                      a.dispatchEvent(new Event('seeked'));
+                    }""")
+                    expect(page.locator("#countdown-digit")).to_have_text("1")
+                    page.locator("#countdown-enabled").uncheck()
+                    expect(page.locator("#countdown-overlay")).to_be_hidden()
                     page.locator("#reference-lyrics").fill("[Intro]\nHẹn gặp ngày mai!\nEm là người anh yêu")
                     page.locator("#save-reference").click()
                     expect(page.locator("#reference-status")).to_contain_text("Đã lưu")
