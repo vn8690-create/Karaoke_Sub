@@ -188,6 +188,7 @@ class SubtitleOptions(StrictModel):
     highlight_color: str = Field(default="#FFE800", pattern=r"^#[0-9A-Fa-f]{6}$")
     position: Literal["bottom", "center", "top"] = "bottom"
     margin_percent: int = Field(default=9, ge=5, le=25)
+    countdown: bool = False
 
 
 class Render(SubtitleOptions):
@@ -694,7 +695,8 @@ def subtitles(project_id: str, options: SubtitleOptions):
         p = idle(project_id)
         require_lyrics(p)
         outputs = pipeline.write_subtitles(p["segments"], project_dir(project_id), options.font_size,
-                                           RESOLUTIONS[options.resolution], style=subtitle_style(options))
+                                           RESOLUTIONS[options.resolution], style=subtitle_style(options),
+                                           countdown=options.countdown)
         p["subtitle_style"] = {**subtitle_style(options), "font_size": options.font_size, "resolution": options.resolution}
         p["files"].update(outputs)
         save(project_dir(project_id), p)
@@ -716,7 +718,7 @@ def render(project_id: str, options: Render):
             p = load(project_id)
             update(project_id, status="rendering", progress=10, message="Đang xuất phụ đề và video…")
             outputs = pipeline.write_subtitles(p["segments"], folder, options.font_size, RESOLUTIONS[options.resolution],
-                                               style=subtitle_style(options))
+                                               style=subtitle_style(options), countdown=options.countdown)
             audio_key = {"original": "audio", "instrumental": "instrumental", "silent": None}[options.audio_mode]
             audio = folder / p["files"][audio_key] if audio_key else None
             background = folder / p["files"]["background"] if "background" in p["files"] else None
