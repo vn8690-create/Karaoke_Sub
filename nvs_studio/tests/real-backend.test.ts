@@ -25,6 +25,9 @@ describe('NVS client connected to actual FastAPI local_studio (no mock)', () => 
       const client = new BackendClient(process.env.NVS_REAL_BACKEND_URL);
       const health = await client.health();
       expect(health.ok).toBe(true);
+      const page = await fetch(process.env.NVS_REAL_BACKEND_URL + '/nvs/');
+      expect(page.ok).toBe(true);
+      expect(await page.text()).toContain('/nvs/assets/');
 
       const created = await client.createProject(makeWav(), 'NVS Bridge Smoke Test');
       expect(created.id).toMatch(/^[a-f0-9]{32}$/);
