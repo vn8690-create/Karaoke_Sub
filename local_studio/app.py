@@ -153,7 +153,7 @@ class Device(StrictModel):
 
 class Transcribe(Device):
     model: Literal["tiny", "base", "small", "medium", "large-v3"] = "small"
-    language: Literal["vi", "en", "auto"] = "vi"
+    language: Literal["vi", "en", "ja", "auto"] = "vi"
     separate: bool = True
 
 
