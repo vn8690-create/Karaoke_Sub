@@ -49,7 +49,7 @@ def fixture(directory):
     manifest = {"id": ident, "title": "Smart Sync UI Smoke", "status": "ready",
                 "progress": 100, "message": "Ready", "error": None, "duration": 30.0,
                 "segments": segments, "files": {"audio": "audio.wav", "source": "audio.wav"},
-                "created_at": time.time(), "version": 1}
+                "created_at": time.time(), "updated_at": time.time(), "version": 1}
     (folder / "project.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return ident
 
