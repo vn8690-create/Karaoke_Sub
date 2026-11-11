@@ -38,9 +38,9 @@ export default function Wizard() {
     const lines = result.lines.map((l) => ({ id: lid(), sep: guessSep(l.words.map((w) => w.text)), words: l.words.map((w) => ({ ...w })) }));
     k.load(lines, result.mock ? 'mock' : 'backend', { projectId: engine === 'backend' ? pid : undefined, duration: proj?.duration ?? media?.dur, title: proj?.title });
     if (engine === 'backend' && proj) { try { await attachAudio(client, proj); } catch (e) { m.notify((e as Error).message); } }
-    m.set({ wizard: false, bottomTab: 'karaoke', tlH: Math.max(m.tlH, 400) });
+    m.set({ wizard: false, bottomTab: 'karaoke', tlH: Math.max(m.tlH, 400) }); setStep(0); setProg(null); setErr(''); setResult(null);
   };
-  const close = () => { ctl.current?.abort(); m.set({ wizard: false }); setStep(0); setProg(null); setErr(''); };
+  const close = () => { ctl.current?.abort(); m.set({ wizard: false }); setStep(0); setProg(null); setErr(''); setResult(null); };
   const canNext = step === 0 ? (engine === 'mock' || !!pid) : true;
   const busy = step === 2 && !err && prog?.state !== 'done';
   return (

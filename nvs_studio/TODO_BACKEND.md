@@ -1,9 +1,8 @@
-# TODO backend / bước tiếp theo
-- [ ] Auto Karaoke Wizard 10 bước + trạng thái (chưa tải model, đang tải, đang phân tích, nhận diện lời, căn thời gian, thành công, lỗi, hủy).
-- [ ] Karaoke Editor: kéo ranh giới từng từ trên sóng âm, offset toàn bài, auto align.
-- [ ] Import/Export LRC, Enhanced LRC, ASS, SRT.
-- [ ] Thư viện preset (10 mẫu) + hiệu ứng: vinyl, spectrum, particle, zoom theo bass, glow/RGB/glitch, chuyển cảnh, motion blur, speed ramp, keyframe.
-- [ ] Export Center + RenderAdapter (H.264/H.265, độ phân giải, fps, bitrate, GPU, hàng đợi, tạm dừng/hủy, log lỗi).
-- [ ] Easy Mode (Automatic Video Factory) và Pro Mode.
-- [ ] Proxy preview, cache, đo VRAM/RAM, cảnh báo thiếu tài nguyên.
-- [ ] Đóng gói Tauri 2, ESLint, kiểm thử giao diện (Playwright).
+# Việc còn lại
+- [ ] Chạy Wizard/lưu lời với backend local_studio thật; sửa lệch hợp đồng nếu có.
+- [ ] Backend: hỗ trợ tiếng Nhật; hủy job align/transcribe; báo trạng thái tải model; phục vụ tĩnh bản build NVS hoặc bật CORS.
+- [ ] Nối Export Center với render/progress/kiểm tra MP4 sẵn có; truyền kiểu chữ Karaoke sang ASS/render.
+- [ ] Tạo dự án và tải nhạc lên từ NVS; chọn nguồn vocals/audio để vẽ waveform.
+- [ ] Karaoke Editor: tách/gộp từ, chọn nhiều mép, snap theo đỉnh âm lượng, phát lặp đoạn, hiển thị phiên âm.
+- [ ] Preset hiệu ứng (10 mẫu), keyframe, preview video, proxy preview, đo VRAM/RAM thật.
+- [ ] Tauri 2, ESLint, thử Safari/Firefox/cảm ứng.

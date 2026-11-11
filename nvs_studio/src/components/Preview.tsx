@@ -13,7 +13,7 @@ export const fmt = (t: number) => `${String(Math.floor(t / 60)).padStart(2, '0')
 const end = () => Math.max(0, ...useStudio.getState().clips.map((c) => c.start + c.dur));
 
 export default function Preview() {
-  const s = useStudio(); const kl = useKaraoke(); const ref = useRef<HTMLCanvasElement>(null); const [tick, setTick] = useState(0); const [w, h] = SIZES[s.aspect] ?? SIZES['16:9'];
+  const s = useStudio(); const kl = useKaraoke(); const ref = useRef<HTMLCanvasElement>(null); const wrap = useRef<HTMLDivElement>(null); const [avail, setAvail] = useState({ w: 600, h: 300 }); const [tick, setTick] = useState(0); const [w, h] = SIZES[s.aspect] ?? SIZES['16:9'];
   useEffect(() => {
     const cv = ref.current; const ctx = cv?.getContext('2d'); if (!cv || !ctx) return;
     cv.width = w; cv.height = h; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
@@ -34,6 +34,8 @@ export default function Preview() {
     if (s.grid) for (let i = 1; i < 3; i++) { ctx.beginPath(); ctx.moveTo(w * i / 3, 0); ctx.lineTo(w * i / 3, h); ctx.moveTo(0, h * i / 3); ctx.lineTo(w, h * i / 3); ctx.stroke(); }
     if (s.safe) { ctx.setLineDash([6, 4]); ctx.strokeRect(w * .05, h * .05, w * .9, h * .9); ctx.setLineDash([]); }
   }, [s.playhead, s.clips, s.tracks, s.media, s.aspect, s.grid, s.safe, tick, w, h, kl.lines, kl.offset, kl.style]);
+  useEffect(() => { const el = wrap.current; if (!el) return; const f = () => setAvail({ w: Math.max(60, el.clientWidth - 24), h: Math.max(60, el.clientHeight - 24) }); const ro = new ResizeObserver(f); ro.observe(el); f(); return () => ro.disconnect(); }, []);
+  const sc = Math.max(0.05, Math.min(avail.w / w, avail.h / h));
   useEffect(() => {
     if (!s.playing) { syncAudio(false, 0); return; }
     let last = performance.now(), id = 0;
@@ -51,7 +53,7 @@ export default function Preview() {
         <button className={`btn !py-0.5 ${s.safe ? '!border-cy' : ''}`} title="Vùng an toàn" onClick={() => s.set({ safe: !s.safe })}><Square size={14} /></button>
         <button className="btn !py-0.5" title="Toàn màn hình" onClick={() => void ref.current?.requestFullscreen()}><Maximize size={14} /></button>
       </div>
-      <div className="flex-1 min-h-0 grid place-items-center p-3"><canvas ref={ref} className="max-w-full max-h-full rounded-md border border-line" style={{ aspectRatio: `${w}/${h}` }} /></div>
+      <div ref={wrap} className="flex-1 min-h-0 grid place-items-center p-3 overflow-hidden"><canvas ref={ref} className="rounded-md border border-line" style={{ width: w * sc, height: h * sc }} /></div>
       <div className="flex items-center justify-center gap-2 py-2 border-t border-line">
         <button className="btn" title="Về đầu" onClick={() => seek(0)}><SkipBack size={15} /></button>
         <button className="btn" title="Lùi 1 khung" onClick={() => seek(s.playhead - 1 / 30)}><StepBack size={15} /></button>

@@ -8,7 +8,7 @@ import { edgeGet, lEnd, lStart, lText, plainToLines, validateForBackend, wordFil
 import { parseAny, toASS, toLRC, toSRT } from '../formats';
 import { fmt } from './Preview';
 
-const H = 170, B0 = 108, B1 = 156;
+const BH = 48;
 const sec = (t: number) => t.toFixed(3) + ' s';
 function dl(name: string, text: string) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' })); a.download = name; a.click(); }
 
@@ -16,14 +16,14 @@ export default function KaraokeEditor() {
   const k = useKaraoke(), m = useStudio();
   const scroller = useRef<HTMLDivElement>(null), cv = useRef<HTMLCanvasElement>(null), list = useRef<HTMLDivElement>(null), file = useRef<HTMLInputElement>(null);
   const drag = useRef<{ id: string; idx: number } | null>(null), seeking = useRef(false), lastNudge = useRef(0);
-  const [vw, setVw] = useState(800), [scroll, setScroll] = useState(0), [draft, setDraft] = useState<{ id: string; text: string } | null>(null), [add, setAdd] = useState('');
-  const off = k.offset, Z = k.zoom;
+  const col = useRef<HTMLDivElement>(null); const [vw, setVw] = useState(800), [H, setH] = useState(170), [scroll, setScroll] = useState(0), [draft, setDraft] = useState<{ id: string; text: string } | null>(null), [add, setAdd] = useState('');
+  const off = k.offset, Z = k.zoom, B1 = H - 16, B0 = B1 - BH, mid = (20 + B0 - 6) / 2, amp = Math.max(10, (B0 - 26) / 2 - 2);
   const audio = useMemo(() => { const c = m.clips.find((x) => x.kind === 'audio' && x.src); const med = c && m.media.find((x) => x.url === c.src); return c && med?.hp ? { c, hp: med.hp } : null; }, [m.clips, m.media]);
   const audioEnd = m.clips.filter((c) => c.kind === 'audio').reduce((a, c) => Math.max(a, c.start + c.dur), 0);
   const total = Math.max(10, k.lines.length ? lEnd(k.lines[k.lines.length - 1]) + off : 0, audioEnd) + 2, W = Math.ceil(total * Z);
   const X = (t: number) => t * Z - scroll;
 
-  useEffect(() => { const el = scroller.current; if (!el) return; const ro = new ResizeObserver(() => setVw(Math.max(200, el.clientWidth))); ro.observe(el); setVw(Math.max(200, el.clientWidth)); return () => ro.disconnect(); }, []);
+  useEffect(() => { const el = scroller.current; if (!el) return; const f = () => { setVw(Math.max(200, el.clientWidth)); if (col.current) setH(Math.max(170, Math.min(420, col.current.clientHeight - 14 - 46))); }; const ro = new ResizeObserver(f); ro.observe(el); if (col.current) ro.observe(col.current); f(); return () => ro.disconnect(); }, []);
   useEffect(() => {
     const el = scroller.current; if (!el) return;
     const f = (e: WheelEvent) => { if (!e.ctrlKey) return; e.preventDefault(); const z = useKaraoke.getState().zoom, nz = Math.min(400, Math.max(30, z * (e.deltaY < 0 ? 1.15 : 1 / 1.15))), r = el.getBoundingClientRect(), tt = (e.clientX - r.left + el.scrollLeft) / z; useKaraoke.getState().set({ zoom: nz }); requestAnimationFrame(() => { el.scrollLeft = tt * nz - (e.clientX - r.left); }); };
@@ -37,8 +37,8 @@ export default function KaraokeEditor() {
     g.fillStyle = '#0b0e1a'; g.fillRect(0, 0, vw, H);
     const step = Z >= 240 ? 0.5 : Z >= 100 ? 1 : Z >= 40 ? 5 : 10; g.font = '10px sans-serif';
     for (let t = Math.floor(scroll / Z / step) * step; X(t) < vw; t += step) { const x = X(t); g.fillStyle = '#262c4a'; g.fillRect(x, 0, 1, H); g.fillStyle = '#8d94b8'; g.fillText(`${t}s`, x + 3, 11); }
-    if (audio) { g.fillStyle = 'rgba(34,211,238,.55)'; const rate = 50; for (let px = 0; px < vw; px++) { const a = Math.floor(((px + scroll) / Z - audio.c.start + audio.c.off) * rate), b = Math.ceil(((px + 1 + scroll) / Z - audio.c.start + audio.c.off) * rate); let mx = 0; for (let i = Math.max(0, a); i < Math.min(audio.hp.length, Math.max(b, a + 1)); i++) if (audio.hp[i] > mx) mx = audio.hp[i]; if (mx > 0) g.fillRect(px, 60 - mx * 38, 1, mx * 76); } }
-    else { g.fillStyle = '#8d94b8'; g.fillText('Chưa có sóng âm: nhập file nhạc vào track Nhạc để căn mốc theo âm thanh.', 10, 60); }
+    if (audio) { g.fillStyle = 'rgba(34,211,238,.55)'; const rate = 50; for (let px = 0; px < vw; px++) { const a = Math.floor(((px + scroll) / Z - audio.c.start + audio.c.off) * rate), b = Math.ceil(((px + 1 + scroll) / Z - audio.c.start + audio.c.off) * rate); let mx = 0; for (let i = Math.max(0, a); i < Math.min(audio.hp.length, Math.max(b, a + 1)); i++) if (audio.hp[i] > mx) mx = audio.hp[i]; if (mx > 0) g.fillRect(px, mid - mx * amp, 1, mx * amp * 2); } }
+    else { g.fillStyle = '#8d94b8'; g.fillText('Chưa có sóng âm: nhập file nhạc vào track Nhạc để căn mốc theo âm thanh.', 10, mid); }
     const ph = m.playhead - off;
     k.lines.forEach((l) => {
       const s = X(lStart(l) + off), e = X(lEnd(l) + off); if (e < -10 || s > vw + 10) return; const sel = l.id === k.sel;
@@ -47,13 +47,13 @@ export default function KaraokeEditor() {
         const ws = X(w.start + off), we = X(w.end + off), bw = Math.max(1, we - ws - 1);
         g.fillStyle = sel ? '#6d4ad6' : '#3b4280'; g.fillRect(ws, B0 + 4, bw, B1 - B0 - 8);
         const f = wordFill(w, ph); if (f > 0) { g.fillStyle = 'rgba(34,211,238,.8)'; g.fillRect(ws, B0 + 4, bw * f, B1 - B0 - 8); }
-        if (bw > 14) { g.save(); g.beginPath(); g.rect(ws, B0 + 4, bw, B1 - B0 - 8); g.clip(); g.fillStyle = '#fff'; g.font = '12px "Segoe UI","Yu Gothic UI",sans-serif'; g.fillText(w.text, ws + 3, 134); g.restore(); }
+        if (bw > 14) { g.save(); g.beginPath(); g.rect(ws, B0 + 4, bw, B1 - B0 - 8); g.clip(); g.fillStyle = '#fff'; g.font = '12px "Segoe UI","Yu Gothic UI",sans-serif'; g.fillText(w.text, ws + 3, B0 + 27); g.restore(); }
         if (sel) for (const idx of [wi * 2, wi * 2 + 1]) { const x = X(edgeGet(l, idx) + off); g.fillStyle = idx === k.selEdge ? '#ec4899' : 'rgba(232,234,246,.85)'; g.fillRect(x - 1, B0, 2, B1 - B0); }
       });
       if (l.est) { g.strokeStyle = '#f59e0b'; g.setLineDash([4, 3]); g.strokeRect(s + 0.5, B0 + 0.5, Math.max(1, e - s), B1 - B0); g.setLineDash([]); }
     });
     const px = X(m.playhead); g.fillStyle = '#ec4899'; g.fillRect(px, 0, 1.5, H);
-  }, [k.lines, k.sel, k.selEdge, Z, scroll, vw, m.playhead, audio, off]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [k.lines, k.sel, k.selEdge, Z, scroll, vw, H, m.playhead, audio, off]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const pt = (e: React.PointerEvent) => { const r = cv.current!.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
   const hit = (x: number, y: number) => {
@@ -63,7 +63,7 @@ export default function KaraokeEditor() {
   };
   const seek = (x: number) => m.set({ playhead: Math.max(0, (x + scroll) / Z) });
   const onDown = (e: React.PointerEvent) => {
-    const { x, y } = pt(e), h = hit(x, y); (e.target as Element).setPointerCapture(e.pointerId); (e.currentTarget.parentElement?.parentElement?.parentElement?.parentElement as HTMLElement | null)?.focus();
+    const { x, y } = pt(e), h = hit(x, y); (e.target as Element).setPointerCapture(e.pointerId); e.currentTarget.closest<HTMLElement>('[tabindex]')?.focus();
     if (h) { k.commit(); k.set({ sel: h.id, selEdge: h.idx }); drag.current = { id: h.id, idx: h.idx }; return; }
     const t = (x + scroll) / Z - off, l = y >= B0 && y <= B1 ? k.lines.find((q) => t >= lStart(q) && t <= lEnd(q)) : undefined;
     if (y >= B0 && y <= B1) k.set({ sel: l?.id, selEdge: undefined }); seeking.current = true; seek(x);
@@ -138,7 +138,7 @@ export default function KaraokeEditor() {
           {!!k.lines.length && <div className="flex gap-1 p-1.5"><input value={add} onChange={(e) => setAdd(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && add.trim()) { k.insert(k.sel ?? k.lines.at(-1)?.id, add); setAdd(''); } }} placeholder="Thêm câu sau câu đang chọn…" className="flex-1 min-w-0 bg-ink border border-line rounded px-1.5 py-1" />
             <button className="btn !p-1" disabled={!add.trim()} onClick={() => { k.insert(k.sel ?? k.lines.at(-1)?.id, add); setAdd(''); }}><Plus size={13} /></button></div>}
         </div>
-        <div className="flex-1 min-w-0 flex flex-col">
+        <div ref={col} className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div ref={scroller} onScroll={(e) => setScroll(e.currentTarget.scrollLeft)} className="overflow-x-auto overflow-y-hidden" style={{ height: H + 14 }}>
             <div style={{ width: W, height: H, position: 'relative' }}>
               <canvas ref={cv} width={vw} height={H} style={{ position: 'sticky', left: 0, display: 'block', touchAction: 'none' }} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} />
