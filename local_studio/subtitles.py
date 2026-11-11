@@ -77,8 +77,25 @@ def _style_params(style: dict | None) -> dict:
             "secondary": ass_color(options["text_color"])}
 
 
+def countdown_cues(segments: list[dict], enabled: bool = False) -> list[tuple[float, float, str]]:
+    """Three full seconds 3→2→1 before a lyric only if the previous line has ended."""
+    if not enabled:
+        return []
+    result = []
+    preceding_end = 0.0
+    for line in _lines(segments):
+        start = float(line["start"])
+        if start - preceding_end >= 3.0 - 1e-9:
+            for i, digit in enumerate(("3", "2", "1")):
+                at = start - 3.0 + i
+                result.append((round(at, 3), round(at + 1.0, 3), digit))
+        preceding_end = max(preceding_end, float(line["end"]))
+    return result
+
+
 def write_subtitles(segments: list, output_dir: Path, font_size: int = 54,
-                    resolution: tuple = (1920, 1080), style: dict | None = None) -> dict:
+                    resolution: tuple = (1920, 1080), style: dict | None = None,
+                    countdown: bool = False) -> dict:
     """Write UTF-8 ASS (word sweep), SRT and word-enhanced LRC exports.
 
     Times are seconds. Words are expected to be validated and monotonically
@@ -140,6 +157,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         enhanced = " ".join(f"<{lrc_time(word['start'])}>{str(word['text']).strip()}" for word in line["words"])
         lrc_lines.append(f"[{lrc_time(start)}]{enhanced}<{lrc_time(end)}>")
+    if countdown:
+        # Countdown only appears in ASS/MP4, not lyric-only SRT/LRC.
+        countdown_style = (
+            f"Style: Countdown,{options['font']},{max(28, round(size * 1.65))},"
+            f"{options['primary']},{options['secondary']},&H00101020,&H80000000,"
+            f"-1,0,0,0,100,100,0,0,1,4,2,5,60,60,0,1\n"
+        )
+        header = header.replace("[Events]\n", countdown_style + "\n[Events]\n")
+        for start, end, digit in countdown_cues(segments, enabled=True):
+            ass_lines.append(
+                f"Dialogue: 1,{_clock(start)},{_clock(end)},Countdown,,0,0,0,,"
+                f"{{\\fad(120,120)}}{digit}"
+            )
     (output_dir / "lyrics.ass").write_text(header + "\n".join(ass_lines) + "\n", encoding="utf-8")
     (output_dir / "lyrics.srt").write_text("\n".join(srt_lines), encoding="utf-8")
     (output_dir / "lyrics.lrc").write_text("\n".join(lrc_lines) + "\n", encoding="utf-8")
