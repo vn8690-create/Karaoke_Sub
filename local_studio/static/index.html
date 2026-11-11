@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Karaoke Studio • Local</title>
-  <link rel="stylesheet" href="/static/style.css?v=smart-sync-1">
-  <script src="/static/app.js?v=smart-sync-1" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=countdown-1">
+  <script src="/static/app.js?v=countdown-1" defer></script>
 </head>
 <body>
   <header class="app-header">
@@ -100,6 +100,7 @@
         <label class="field-label" for="font-family">Font chữ</label><select id="font-family"><option value="Arial">Arial</option><option value="Tahoma">Tahoma</option><option value="Segoe UI">Segoe UI</option><option value="Times New Roman">Times New Roman</option></select>
         <div class="two-fields subtitle-colors"><div><label class="field-label" for="text-color">Màu chữ chưa hát</label><input id="text-color" type="color" value="#ffffff"></div><div><label class="field-label" for="highlight-color">Màu chữ đang hát</label><input id="highlight-color" type="color" value="#ffe800"></div></div>
         <div class="two-fields subtitle-position"><div><label class="field-label" for="subtitle-position">Vị trí lời</label><select id="subtitle-position"><option value="bottom">Phía dưới</option><option value="center">Chính giữa</option><option value="top">Phía trên</option></select></div><div><label class="field-label" for="margin-percent">Lề trên/dưới (%)</label><input id="margin-percent" type="number" min="5" max="25" step="1" value="9"></div></div>
+        <label class="check-row countdown-option"><input id="countdown-enabled" type="checkbox"><span><strong>🎤 Đếm ngược 3 · 2 · 1 trước câu hát</strong><small>Chỉ hiện nếu trước câu hát có ít nhất 3 giây trống. Có trong preview và video MP4/ASS; không làm thay đổi thời gian lời.</small></span></label>
         <label class="field-label" for="export-mode">Âm thanh video xuất</label><select id="export-mode"><option value="original">Bài hát gốc</option><option value="instrumental">Nhạc beat · không vocal</option><option value="silent">Không âm thanh</option></select>
         <button id="render-button" class="button primary full" disabled>Xuất video karaoke <span>↓</span></button>
         <button id="subtitles-button" class="button secondary full" disabled>Xuất sub ASS / SRT / LRC</button>
@@ -115,6 +116,7 @@
           <div class="stage-shade"></div><div class="stage-grain"></div>
           <div id="stage-empty" class="stage-empty"><div class="record"><span>♫</span></div><p>Sân khấu đang chờ bài hát của bạn</p><small>Tải bài hát lên để bắt đầu một dự án mới</small></div>
           <div id="stage-lyrics" class="stage-lyrics" hidden><p id="lyric-context" class="lyric-context"></p><div id="current-lyric" class="current-lyric"></div></div>
+          <div id="countdown-overlay" class="countdown-overlay" hidden aria-label="Đếm ngược trước khi hát"><span id="countdown-digit">3</span></div>
           <span id="stage-badge" class="stage-badge">YOUR MUSIC. YOUR STAGE.</span><div class="stage-corner">K<span>•</span>S</div>
         </div>
         <audio id="audio" preload="metadata"></audio>
