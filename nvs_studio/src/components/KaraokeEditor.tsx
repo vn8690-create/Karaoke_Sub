@@ -99,7 +99,7 @@ export default function KaraokeEditor() {
     };
     if (format === 'plain') {
       if (!referenceRows(txt).length) { m.notify('TXT không chứa câu hát hợp lệ.'); return; }
-      if (state.lines.length && state.lines.every((l) => !l.est)) {
+      if (state.lines.length) {
         const matched = overlayReferenceText(state.lines, txt);
         if (!matched.ok) {
           state.set({ referenceDraft: txt });
