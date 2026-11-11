@@ -247,5 +247,88 @@ class ReferenceApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(self.endpoint(p) + "/files/vocals.wav").status_code, 200)
 
 
+    def test_apply_txt_exact_keeps_every_word_timestamp_without_ai(self):
+        p = self.save_timed(self.create(), segments=[
+            {"start": 0.4, "end": 1.1, "words": [
+                {"text": "Sai", "start": 0.4, "end": 0.6},
+                {"text": "chữ", "start": 0.8, "end": 1.1},
+            ]},
+            {"start": 1.6, "end": 2.2, "words": [
+                {"text": "Lời", "start": 1.6, "end": 1.9},
+                {"text": "cũ", "start": 2.0, "end": 2.2},
+            ]},
+        ])
+        before = copy.deepcopy(p["segments"])
+        saved = self.client.put(self.endpoint(p) + "/reference", json={"text": REFERENCE})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        with patch.object(studio.alignment, "align_lyrics", side_effect=AssertionError("Should not run AI")):
+            result = self.client.post(self.endpoint(p) + "/reference/apply-timing", json={"estimate": False})
+        self.assertEqual(result.status_code, 200, result.text)
+        final = result.json()
+        self.assertEqual([w["text"] for x in final["segments"] for w in x["words"]],
+                         ["Xin", "chào...", "người", "ơi!"])
+        self.assertEqual([(w["start"], w["end"]) for x in final["segments"] for w in x["words"]],
+                         [(w["start"], w["end"]) for x in before for w in x["words"]])
+        self.assertFalse(final["reference_pending"])
+        self.assertFalse(final["alignment"]["estimated"])
+        self.assertEqual(final["alignment"]["engine"], "manual-preserve")
+        snapshot = self.projects / p["id"] / final["files"]["lyrics_before_txt"]
+        self.assertEqual(__import__("json").loads(snapshot.read_text(encoding="utf-8"))["segments"], before)
+
+    def test_apply_txt_requires_explicit_estimation_when_lines_differ(self):
+        p = self.save_timed(self.create())
+        save = self.client.put(self.endpoint(p) + "/reference", json={"text": REFERENCE})
+        self.assertEqual(save.status_code, 200, save.text)
+        before = self.client.get(self.endpoint(p)).json()
+        strict = self.client.post(self.endpoint(p) + "/reference/apply-timing", json={"estimate": False})
+        self.assertEqual(strict.status_code, 409, strict.text)
+        self.assertIn("ƯỚC LƯỢNG", strict.json()["detail"])
+        self.assertEqual(before["segments"], self.client.get(self.endpoint(p)).json()["segments"])
+        self.assertFalse((self.projects / p["id"] / "lyrics-before-txt.json").exists())
+        estimate = self.client.post(self.endpoint(p) + "/reference/apply-timing", json={"estimate": True})
+        self.assertEqual(estimate.status_code, 200, estimate.text)
+        result = estimate.json()
+        self.assertEqual(
+            [w["text"] for segment in result["segments"] for w in segment["words"]],
+            ["Xin", "chào...", "người", "ơi!"],
+        )
+        self.assertAlmostEqual(result["segments"][0]["start"], OLD_SEGMENTS[0]["start"], places=3)
+        self.assertAlmostEqual(result["segments"][-1]["end"], OLD_SEGMENTS[-1]["end"], places=3)
+        self.assertTrue(result["alignment"]["estimated"])
+        self.assertFalse(result["reference_pending"])
+        self.assertEqual(result["alignment"]["engine"], "manual-estimate")
+        self.assertIn("ƯỚC LƯỢNG", result["alignment"]["warnings"][0])
+        # TXT is now the display source, subtitles must export its spelling.
+        export = self.client.post(self.endpoint(p) + "/subtitles", json={})
+        self.assertEqual(export.status_code, 200, export.text)
+        srt = self.client.get(self.endpoint(p) + "/files/lyrics.srt").text
+        self.assertIn("Xin", srt)
+        self.assertIn("người", srt)
+
+    def test_apply_txt_estimation_with_same_line_count_preserves_phrase_boundaries(self):
+        p = self.save_timed(self.create(), segments=SEGMENTS)
+        reference = "Xin thật nhiều người ơi\nCâu thứ hai"
+        self.assertEqual(self.client.put(self.endpoint(p) + "/reference", json={"text": reference}).status_code, 200)
+        r = self.client.post(self.endpoint(p) + "/reference/apply-timing", json={"estimate": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        segments = r.json()["segments"]
+        self.assertEqual(len(segments), 2)
+        self.assertEqual((segments[0]["start"], segments[0]["end"]),
+                         (SEGMENTS[0]["start"], SEGMENTS[0]["end"]))
+        self.assertEqual((segments[1]["start"], segments[1]["end"]),
+                         (SEGMENTS[1]["start"], SEGMENTS[1]["end"]))
+        self.assertEqual(" ".join(w["text"] for seg in segments for w in seg["words"]),
+                         "Xin thật nhiều người ơi Câu thứ hai")
+
+    def test_apply_txt_rejects_no_project_or_no_reference_or_no_timing(self):
+        p = self.create()
+        endpoint = self.endpoint(p) + "/reference/apply-timing"
+        self.assertEqual(self.client.post(endpoint, json={}).status_code, 400)
+        self.assertEqual(self.client.put(self.endpoint(p) + "/reference", json={"text": "Xin chào"}).status_code, 200)
+        self.assertEqual(self.client.post(endpoint, json={"estimate": True}).status_code, 400)
+        self.assertEqual(self.client.post(endpoint, json={"estimate": "invalid"}).status_code, 422)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
