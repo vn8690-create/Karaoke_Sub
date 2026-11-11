@@ -91,8 +91,14 @@ export default function KaraokeEditor() {
   const onImport = async (f?: File) => {
     if (!f) return; const txt = await f.text(); if (txt.includes('\uFFFD')) m.notify('Cảnh báo: file có thể không phải UTF-8, chữ có dấu có thể lỗi.');
     const { format, lines } = parseAny(txt);
-    if (lines.length) { k.load(lines, 'file', { title: f.name.replace(/\.[^.]+$/, '') }); m.notify(`Đã nhập ${lines.length} câu (${format.toUpperCase()}).${lines.some((l) => l.est) ? ' Mốc từng từ là ước lượng, hãy chỉnh trên waveform.' : ''}`); }
-    else if (txt.trim()) { k.load(plainToLines(txt, audioEnd || k.duration || 180), 'file', { title: f.name.replace(/\.[^.]+$/, '') }); m.notify('File không có mốc thời gian: đã chia đều theo độ dài bài (ước lượng).'); } else m.notify('File rỗng hoặc không đọc được.');
+    // Importing new LRC into an opened backend project must keep its project ID.
+    const linked = !!k.projectId;
+    const loadImported = (items: KLine[]) => {
+      k.load(items, linked ? 'backend' : 'file', { projectId: k.projectId, duration: k.duration, title: linked ? k.title : f.name.replace(/\.[^.]+$/, '') });
+      if (linked) useKaraoke.getState().set({ dirty: true });
+    };
+    if (lines.length) { loadImported(lines); m.notify(`Đã nhập ${lines.length} câu (${format.toUpperCase()}).${lines.some((l) => l.est) ? ' Mốc từng từ là ước lượng, hãy chỉnh trên waveform.' : ''}`); }
+    else if (txt.trim()) { loadImported(plainToLines(txt, audioEnd || k.duration || 180)); m.notify('File không có mốc thời gian: đã chia đều theo độ dài bài (ước lượng).'); } else m.notify('File rỗng hoặc không đọc được.');
   };
   const name = (k.title || 'karaoke').replace(/[^\w\u00C0-\u1EF9\u3040-\u9FFF-]+/g, '_');
   const exp = (kind: 'lrc' | 'elrc' | 'srt' | 'ass') => { if (!k.lines.length) { m.notify('Chưa có lời để xuất.'); return; } if (kind === 'lrc') dl(`${name}.lrc`, toLRC(k.lines, off)); else if (kind === 'elrc') dl(`${name}.enhanced.lrc`, toLRC(k.lines, off, true)); else if (kind === 'srt') dl(`${name}.srt`, toSRT(k.lines, off)); else dl(`${name}.ass`, toASS(k.lines, off, { font: 'Arial', size: 64, fill: k.style.fill, unsung: k.style.unsung, outline: k.style.outline })); };

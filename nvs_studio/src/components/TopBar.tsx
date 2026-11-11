@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { Cpu, Download, FilePlus, FolderOpen, Redo2, Save, Settings, Undo2, Wand2 } from 'lucide-react';
 import { useStudio, type Clip, type Track } from '../store';
 import { t } from '../i18n';
+import { useKaraoke } from '../karaokeStore';
 
 function gpuName() {
   try { const g = document.createElement('canvas').getContext('webgl'); const e = g?.getExtension('WEBGL_debug_renderer_info'); return e && g ? String(g.getParameter(e.UNMASKED_RENDERER_WEBGL)) : 'không rõ'; } catch { return 'không rõ'; }
@@ -27,7 +28,7 @@ export default function TopBar() {
     <header className="flex items-center gap-2 px-3 h-12 bg-pane border-b border-line">
       <div className="flex items-center gap-2 mr-3"><div className="w-7 h-7 rounded-lg bg-gradient-to-br from-vio to-mag grid place-items-center font-black text-xs">N</div>
         <div className="leading-tight"><b className="tracking-wide">NVS Karaoke Studio</b> <span className="text-cy text-[10px] font-bold">PRO</span></div></div>
-      <button className="btn" title="Dự án mới" onClick={() => { s.reset(); s.notify('Đã tạo dự án mới.'); }}><FilePlus size={15} />{t('tb.new')}</button>
+      <button className="btn" title="Dự án mới" onClick={() => { s.reset(); useKaraoke.getState().clear(); s.notify('Đã tạo dự án mới.'); }}><FilePlus size={15} />{t('tb.new')}</button>
       <button className="btn" title="Mở dự án (.nvs.json)" onClick={() => open.current?.click()}><FolderOpen size={15} />{t('tb.open')}</button>
       <input ref={open} type="file" accept=".json" hidden onChange={(e) => { void onOpen(e.target.files?.[0]); e.target.value = ''; }} />
       <button className="btn" title="Lưu (Ctrl+S)" onClick={saveProject}><Save size={15} />{t('tb.save')}</button>
@@ -38,7 +39,7 @@ export default function TopBar() {
       <button className="btn" title="Auto Karaoke Wizard (engine MOCK hoặc backend local_studio)" onClick={() => s.set({ wizard: true })}><Wand2 size={15} />{t('tb.auto')}</button>
       <div className="flex-1" />
       <div className="flex items-center gap-1 text-mute text-[11px]" title="Thông tin do trình duyệt báo cáo. Chưa đo VRAM/RAM thật (cần backend)."><Cpu size={14} />GPU: {gpu.slice(0, 38)} · {navigator.hardwareConcurrency} luồng CPU{mem ? ` · ≥${mem} GB RAM` : ''}</div>
-      <button className="btn" title="Cần RenderAdapter + FFmpeg" onClick={() => nope('Xuất video')}><Download size={15} />{t('tb.export')}</button>
+      <button className="btn" title="Xuất MP4, phụ đề và backup qua local_studio" onClick={() => s.set({ renderDialog: true })}><Download size={15} />{t('tb.export')}</button>
       <button className="btn" title="Cài đặt" onClick={() => nope('Cài đặt')}><Settings size={15} /></button>
     </header>
   );

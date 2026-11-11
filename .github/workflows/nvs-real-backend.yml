@@ -1,0 +1,75 @@
+name: NVS Real Backend Smoke
+
+on:
+  pull_request:
+    paths:
+      - 'nvs_studio/**'
+      - 'local_studio/**'
+      - '.github/workflows/nvs-real-backend.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'nvs_studio/**'
+      - 'local_studio/**'
+      - '.github/workflows/nvs-real-backend.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  real-backend-windows:
+    name: Windows FastAPI / FFmpeg / NVS client
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install FFmpeg + ffprobe on Windows
+        shell: powershell
+        run: |
+          choco install ffmpeg --no-progress -y
+          $env:Path += ';C:\ProgramData\chocolatey\bin'
+          'C:\ProgramData\chocolatey\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install FastAPI local dependencies
+        run: python -m pip install 'fastapi>=0.115.12,<1' 'pydantic>=2.10,<3' 'python-multipart>=0.0.22,<1' 'uvicorn>=0.34,<1' httpx
+      - name: Install Node dependencies
+        working-directory: nvs_studio
+        run: npm ci --no-audit --no-fund
+      - name: Build production NVS Studio
+        working-directory: nvs_studio
+        run: npm run build
+      - name: Real WAV upload, subtitles, MP4 render, QC and ZIP on Windows
+        shell: pwsh
+        run: |
+          # Keep the server and client test in the SAME Actions step.
+          # Windows runners may terminate background children between separate steps.
+          $env:KARAOKE_DATA_DIR = Join-Path $env:RUNNER_TEMP 'nvs-data'
+          New-Item -ItemType Directory -Path $env:KARAOKE_DATA_DIR -Force | Out-Null
+          $out = Join-Path $env:RUNNER_TEMP 'nvs-backend.log'
+          $err = Join-Path $env:RUNNER_TEMP 'nvs-backend.err'
+          $server = Start-Process -FilePath python -ArgumentList @('-m','uvicorn','local_studio.app:app','--host','127.0.0.1','--port','8776') -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try {
+                $r = Invoke-RestMethod -Uri 'http://127.0.0.1:8776/api/health' -TimeoutSec 2
+                if ($r.ok) { $ready = $true; break }
+              } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) { throw 'FastAPI backend failed to start.' }
+            Write-Host 'FastAPI backend and FFmpeg ready'
+            $env:NVS_REAL_BACKEND_URL = 'http://127.0.0.1:8776'
+            Push-Location nvs_studio
+            try {
+              & npx vitest run tests/real-backend.test.ts
+              if ($LASTEXITCODE -ne 0) { throw 'Real backend integration smoke failed.' }
+            } finally { Pop-Location }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            if (Test-Path $err) { Get-Content $err -Tail 80 }
+          }

@@ -8,6 +8,7 @@ import Inspector from './components/Inspector';
 import Timeline from './components/Timeline';
 import KaraokeEditor from './components/KaraokeEditor';
 import Wizard from './components/Wizard';
+import RenderDialog from './components/RenderDialog';
 
 const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
 function Resizer({ axis, onDelta }: { axis: 'x' | 'y'; onDelta: (d: number) => void }) {
@@ -52,6 +53,7 @@ export default function App() {
         {s.bottomTab === 'timeline' ? <Timeline /> : <KaraokeEditor />}
       </div>
       <Wizard />
+      <RenderDialog />
       {s.toast && <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-pane2 border border-vio rounded-lg px-4 py-2 shadow-xl z-[60] max-w-[80vw]">{s.toast}</div>}
     </div>
   );
