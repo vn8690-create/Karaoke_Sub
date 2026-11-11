@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Download, Loader2, X } from 'lucide-react';
-import { BackendClient, type BackendProject, type RenderOptions } from '../backend';
+import { BackendClient, type BackendProject, type RenderOptions, type SubtitleOptions } from '../backend';
 import { useKaraoke } from '../karaokeStore';
 import { useStudio } from '../store';
 
@@ -9,7 +9,7 @@ export default function RenderDialog() {
   const [project, setProject] = useState<BackendProject | null>(null);
   const [resolution, setResolution] = useState<'720p' | '1080p'>('1080p');
   const [mode, setMode] = useState<'original' | 'instrumental' | 'silent'>('original');
-  const [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const [busy, setBusy] = useState(false), [rendering, setRendering] = useState(false), [error, setError] = useState('');
   const [progress, setProgress] = useState(0), [message, setMessage] = useState('');
   const [completed, setCompleted] = useState(false);
   const control = useRef<AbortController | null>(null);
@@ -26,8 +26,8 @@ export default function RenderDialog() {
 
   if (!studio.renderDialog) return null;
 
-  const options = (): RenderOptions => ({
-    audio_mode: mode, resolution,
+  const styleOptions = (): SubtitleOptions => ({
+    resolution,
     font_size: 54, font_family: 'Arial',
     text_color: karaoke.style.unsung, highlight_color: karaoke.style.fill,
     position: karaoke.style.y <= 0.38 ? 'top' : karaoke.style.y < 0.63 ? 'center' : 'bottom',
@@ -47,9 +47,9 @@ export default function RenderDialog() {
     setError(''); setCompleted(false); setProgress(0);
     try {
       const id = check();
-      setBusy(true); control.current = new AbortController();
+      setBusy(true); setRendering(true); control.current = new AbortController();
       setMessage('Gửi yêu cầu xuất MP4…');
-      await client.render(id, options());
+      await client.render(id, { ...styleOptions(), audio_mode: mode });
       const result = await client.wait(id, (p) => {
         setProgress(Math.round(p.progress || 0));
         setMessage(p.message || p.status);
@@ -61,7 +61,7 @@ export default function RenderDialog() {
       setCompleted(true); setMessage('Đã xuất MP4 và kiểm tra chất lượng thành công.');
     } catch (e) {
       setError((e as Error).name === 'AbortError' ? 'Đã dừng theo dõi tác vụ.' : (e as Error).message);
-    } finally { setBusy(false); control.current = null; }
+    } finally { setBusy(false); setRendering(false); control.current = null; }
   };
 
   const subtitles = async () => {
@@ -69,14 +69,14 @@ export default function RenderDialog() {
     try {
       const id = check();
       setBusy(true); setMessage('Đang tạo LRC, SRT, ASS…');
-      const p = await client.subtitles(id, options());
+      const p = await client.subtitles(id, styleOptions());
       setProject(p); setMessage('Đã xuất phụ đề trên backend.');
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   };
 
   const cancel = async () => {
-    if (!pid || !busy) return;
+    if (!pid || !rendering) return;
     try {
       setMessage('Đang gửi lệnh hủy FFmpeg…');
       await client.cancelRender(pid);
@@ -107,7 +107,7 @@ export default function RenderDialog() {
         <div className="flex flex-wrap gap-2">
           <button className="btn pri" disabled={busy || !pid} onClick={() => void render()}>Xuất MP4</button>
           <button className="btn" disabled={busy || !pid} onClick={() => void subtitles()}>Tạo LRC / SRT / ASS</button>
-          {busy && <button className="btn" onClick={() => void cancel()}>Hủy render</button>}
+          {rendering && <button className="btn" onClick={() => void cancel()}>Hủy render</button>}
           {completed && project?.files.video && <a className="btn pri" href={url(project.files.video)} download><Download size={14}/> Tải MP4</a>}
         </div>
         {!!project && <div className="flex flex-wrap gap-2 text-xs">
