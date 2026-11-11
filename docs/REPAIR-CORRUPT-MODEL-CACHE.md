@@ -15,6 +15,14 @@ không phải lỗi TXT hay phụ đề.
   \`.local-data/models/torch/hub/checkpoints\`. Không tự động xóa các model
   Demucs khác vì chưa xác định checkpoint nào hỏng.
 
+## Tránh Demucs để thử ngay
+
+Trong NVS Studio → Auto Karaoke → Backend, ở bước **Ngôn ngữ & lời**,
+bỏ chọn **Tách giọng bằng Demucs trước khi căn** rồi chọn TXT chuẩn.
+Backend sẽ dùng audio gốc hoặc vocal đã có để căn, không tải lại Demucs.
+Cách này phù hợp để chẩn đoán checkpoint Demucs, nhưng tiếng nhạc đệm có thể
+khiến độ chính xác thấp hơn vocal đã tách.
+
 ## Chẩn đoán trên Windows (PowerShell)
 
 Chạy trong thư mục gốc Karaoke_Sub (không phải nvs_studio):
