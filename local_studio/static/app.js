@@ -106,7 +106,9 @@ function updateReferenceStatus() {
     ? "Smart Sync đã sửa một phần lời; những câu chưa được duyệt vẫn giữ nguyên. Hãy kiểm tra câu đỏ/vàng hoặc chỉnh tay. Không cần căn lại toàn bài."
     : "Lời chuẩn và mốc hiện tại chưa khớp nhau. Hãy thử Smart Lyrics Sync để ghép chữ TXT với thời gian đã có, hoặc dùng Căn lời theo giọng hát để căn lại."));
   if (!stale && alignment?.source === "reference" && alignment?.engine !== "manual-estimate") {
-    notice.append(node("p", "alignment-success", alignment?.engine === "manual-preserve"
+    notice.append(node("p", "alignment-success", alignment?.engine === "smart-sync"
+      ? "Đã dùng chữ TXT qua Smart Sync. Những mốc ước lượng vẫn cần nghe kiểm tra."
+      : alignment?.engine === "manual-preserve"
       ? "Đã dùng đúng chữ TXT, GIỮ NGUYÊN thời gian từng từ trước đó."
       : "Đã căn theo lời chuẩn. Nghe kiểm tra các mốc trước khi xuất."));
   }
