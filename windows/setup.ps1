@@ -32,7 +32,8 @@ try {
         }
         Invoke-Checked -Executable $python311 -Arguments @('-m', 'venv', '.venv-local')
     }
-    Invoke-Checked -Executable $VenvPython -Arguments @('-c', 'import sys; assert sys.version_info[:2] == (3,11), "This environment requires Python 3.11"')
+    # Avoid nested quotes with Windows PowerShell 5.1 native process invocation.
+    Invoke-Checked -Executable $VenvPython -Arguments @('-c', 'import sys; assert sys.version_info[:2] == (3,11)')
 
     if (-not (Test-Ffmpeg)) {
         if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -59,10 +60,10 @@ try {
     Invoke-Checked -Executable $VenvPython -Arguments @('-m', 'pip', 'install', '-r', 'requirements-local.txt')
     Invoke-Checked -Executable $VenvPython -Arguments @('-m', 'pip', 'check')
     Set-LocalEnvironment
-    Invoke-Checked -Executable $VenvPython -Arguments @('-c', 'import torch, torchaudio, whisper_timestamped, demucs, fastapi; print("PyTorch:", torch.__version__); print("CUDA available:", torch.cuda.is_available()); print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")')
-    if ($hasNvidia) {
-        Invoke-Checked -Executable $VenvPython -Arguments @('-c', 'import torch; assert torch.cuda.is_available(), "NVIDIA detected but CUDA is unavailable. Update the NVIDIA driver and rerun SETUP.bat, or run setup.ps1 -CpuOnly."')
-    }
+    # Use a .py file instead of python -c: PS 5.1 may strip quoted Python string literals.
+    $verifyArgs = @((Join-Path $PSScriptRoot 'verify_environment.py'))
+    if ($hasNvidia) { $verifyArgs += '--require-cuda' }
+    Invoke-Checked -Executable $VenvPython -Arguments $verifyArgs
     Write-Host 'Setup complete. Run START.bat to open Karaoke Sub.' -ForegroundColor Green
     exit 0
 } catch {
