@@ -8,6 +8,7 @@ import type { JobProgress } from '../src/contracts';
 
 // Máy chủ giả mô phỏng đúng hình dạng API local_studio (xem local_studio/app.py): không phải backend thật.
 let srv: http.Server, base = '', polls = 0, mode: 'ok' | 'fail' = 'ok';
+let lastSeparate: boolean | undefined;
 const proj = { id: 'p1', title: 'Bài thử', status: 'ready', progress: 100, message: '', error: null as string | null, duration: 20, files: { audio: 'audio.mp3' } as Record<string, string>, segments: [] as unknown[] };
 const body = (req: http.IncomingMessage) => new Promise<string>((res) => { let d = ''; req.on('data', (c) => (d += c)); req.on('end', () => res(d)); });
 beforeAll(async () => {
@@ -41,7 +42,7 @@ beforeAll(async () => {
       proj.segments = b.segments; return send(200, proj);
     }
     if (req.method === 'POST' && (url === '/api/projects/p1/align' || url === '/api/projects/p1/transcribe')) {
-      const b = JSON.parse((await body(req)) || '{}'); polls = 0; proj.status = 'processing'; proj.progress = 40; proj.message = 'Đang căn…';
+      const b = JSON.parse((await body(req)) || '{}'); lastSeparate = b.separate; polls = 0; proj.status = 'processing'; proj.progress = 40; proj.message = 'Đang căn…';
       proj.segments = toSegments([makeLine(b.text?.includes('Lời đúng trong TXT') ? 'Whisper trả lời sai' : (b.text ?? 'Lời nhận diện thử'), 1, 6)!]); return send(202, proj);
     }
     send(404, { detail: 'Không tìm thấy' });
@@ -67,6 +68,13 @@ describe('BackendClient + BackendAIAdapter (máy chủ giả)', () => {
       audioPath: '', language: 'vi', engine: 'backend', projectId: 'p1',
       lyrics: '[Intro]\\nLời đúng trong TXT',
     }, () => undefined)).rejects.toThrow(/khác nội dung TXT chuẩn/);
+  });
+  it('có thể bỏ bước Demucs khi model tách giọng bị hỏng', async () => {
+    const ad = new BackendAIAdapter(new BackendClient(base), 1);
+    await ad.align({ audioPath: '', language: 'vi', engine: 'backend', projectId: 'p1', lyrics: 'Xin chào', separate: false }, () => undefined);
+    expect(lastSeparate).toBe(false);
+    await ad.align({ audioPath: '', language: 'vi', engine: 'backend', projectId: 'p1', lyrics: 'Xin chào', separate: true }, () => undefined);
+    expect(lastSeparate).toBe(true);
   });
   it('không lời → dùng transcribe', async () => {
     const ev: JobProgress[] = []; await new BackendAIAdapter(new BackendClient(base), 1).align({ audioPath: '', language: 'auto', engine: 'backend', projectId: 'p1' }, (p) => ev.push(p)); expect(ev.some((e) => e.state === 'recognizing')).toBe(true);
