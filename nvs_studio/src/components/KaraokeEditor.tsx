@@ -4,7 +4,7 @@ import { useStudio } from '../store';
 import { useKaraoke } from '../karaokeStore';
 import { MOCK_TEXT } from '../adapters/mock';
 import { BackendClient } from '../backend';
-import { edgeGet, lEnd, lStart, lText, plainToLines, validateForBackend, wordFill, type KLine } from '../karaoke';
+import { edgeGet, lEnd, lStart, lText, overlayReferenceText, plainToLines, referenceRows, validateForBackend, wordFill, type KLine } from '../karaoke';
 import { parseAny, toASS, toLRC, toSRT } from '../formats';
 import { fmt } from './Preview';
 
@@ -89,16 +89,36 @@ export default function KaraokeEditor() {
   };
   const audition = (l: KLine) => { m.set({ playhead: Math.max(0, lStart(l) + off - 0.3), playing: true }); k.set({ sel: l.id, auditionEnd: lEnd(l) + off + 0.2 }); };
   const onImport = async (f?: File) => {
-    if (!f) return; const txt = await f.text(); if (txt.includes('\uFFFD')) m.notify('Cảnh báo: file có thể không phải UTF-8, chữ có dấu có thể lỗi.');
+    if (!f) return; const txt = await f.text();
+    if (txt.includes('\uFFFD')) { m.notify('Không đọc được UTF-8 chính xác. Hãy lưu TXT dạng UTF-8 rồi nhập lại.'); return; }
     const { format, lines } = parseAny(txt);
-    // Importing new LRC into an opened backend project must keep its project ID.
-    const linked = !!k.projectId;
+    const state = useKaraoke.getState(), linked = !!state.projectId;
     const loadImported = (items: KLine[]) => {
-      k.load(items, linked ? 'backend' : 'file', { projectId: k.projectId, duration: k.duration, title: linked ? k.title : f.name.replace(/\.[^.]+$/, '') });
+      state.load(items, linked ? 'backend' : 'file', { projectId: state.projectId, duration: state.duration, title: linked ? state.title : f.name.replace(/\.[^.]+$/, '') });
       if (linked) useKaraoke.getState().set({ dirty: true });
     };
-    if (lines.length) { loadImported(lines); m.notify(`Đã nhập ${lines.length} câu (${format.toUpperCase()}).${lines.some((l) => l.est) ? ' Mốc từng từ là ước lượng, hãy chỉnh trên waveform.' : ''}`); }
-    else if (txt.trim()) { loadImported(plainToLines(txt, audioEnd || k.duration || 180)); m.notify('File không có mốc thời gian: đã chia đều theo độ dài bài (ước lượng).'); } else m.notify('File rỗng hoặc không đọc được.');
+    if (format === 'plain') {
+      if (!referenceRows(txt).length) { m.notify('TXT không chứa câu hát hợp lệ.'); return; }
+      if (state.lines.length && state.lines.every((l) => !l.est)) {
+        const matched = overlayReferenceText(state.lines, txt);
+        if (!matched.ok) {
+          state.set({ referenceDraft: txt });
+          m.notify(matched.message);
+          return;
+        }
+        state.commit();
+        state.set({ lines: matched.lines, source: linked ? 'backend' : 'file', dirty: true, referenceDraft: txt });
+        m.notify('Đã thay đúng chữ theo TXT, giữ NGUYÊN mốc từng từ. Bấm Lưu backend để lưu.');
+        return;
+      }
+      // Without trusted timing, never imply equal-spacing positions were analyzed by AI.
+      loadImported(plainToLines(txt, audioEnd || state.duration || 180));
+      useKaraoke.getState().set({ referenceDraft: txt });
+      m.notify('Đã nhận TXT chuẩn. Thời gian hiện chỉ là ƯỚC LƯỢNG. Mở Auto Karaoke → Backend để căn lời thật.');
+      return;
+    }
+    if (lines.length) { loadImported(lines); m.notify('Đã nhập ' + lines.length + ' câu (' + format.toUpperCase() + ').' + (lines.some((l) => l.est) ? ' Mốc từng từ là ước lượng.' : '')); }
+    else m.notify('File rỗng hoặc không đọc được.');
   };
   const name = (k.title || 'karaoke').replace(/[^\w\u00C0-\u1EF9\u3040-\u9FFF-]+/g, '_');
   const exp = (kind: 'lrc' | 'elrc' | 'srt' | 'ass') => { if (!k.lines.length) { m.notify('Chưa có lời để xuất.'); return; } if (kind === 'lrc') dl(`${name}.lrc`, toLRC(k.lines, off)); else if (kind === 'elrc') dl(`${name}.enhanced.lrc`, toLRC(k.lines, off, true)); else if (kind === 'srt') dl(`${name}.srt`, toSRT(k.lines, off)); else dl(`${name}.ass`, toASS(k.lines, off, { font: 'Arial', size: 64, fill: k.style.fill, unsung: k.style.unsung, outline: k.style.outline })); };
@@ -122,6 +142,7 @@ export default function KaraokeEditor() {
         <span className="flex-1" />
         {k.source !== 'none' && <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${k.source === 'mock' ? 'bg-amber-600' : 'bg-cyan-700'}`}>{k.source === 'mock' ? 'MOCK: DỮ LIỆU GIẢ LẬP' : k.source === 'backend' ? 'BACKEND' : 'TỪ FILE'}{k.dirty ? ' • chưa lưu' : ''}</span>}
         {k.projectId && <button className={`${btn} pri`} onClick={() => void save()} title="Lưu lời lên backend local_studio (PUT /lyrics)"><Save size={13} />Lưu backend</button>}
+        {k.referenceDraft && <button className={btn} title="Dùng lời chuẩn TXT để căn lại từng từ bằng stable-ts" onClick={() => m.set({ wizard: true })}>TXT chuẩn → Căn lại</button>}
         <button className={btn} onClick={() => m.set({ wizard: true })}><Wand2 size={13} />Auto Karaoke</button>
       </div>
       <div className="flex flex-1 min-h-0">
