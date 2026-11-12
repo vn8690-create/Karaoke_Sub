@@ -85,6 +85,21 @@ def check():
                     expect(page.locator("#project-select option[value='" + project_id + "']")).to_be_attached(timeout=20000)
                     page.locator("#project-select").select_option(project_id)
                     expect(page.locator("#project-name")).to_have_text("Smart Sync UI Smoke")
+                    # Motion Engine is optional; presets and CSS previews work
+                    # even before HyperFrames/GSAP are installed via npm.
+                    page.locator("#motion-library summary").click()
+                    expect(page.locator("#motion-intro")).to_have_value("none")
+                    page.locator("#motion-intro").select_option("neon")
+                    page.locator("#motion-outro").select_option("retro")
+                    page.locator("#motion-transition").select_option("wipeleft")
+                    page.locator("#motion-title").fill("Đêm của chúng ta")
+                    page.locator("#motion-show-preview").click()
+                    expect(page.locator("#motion-preview-frame")).to_have_attribute("src", __import__("re").compile(r"/api/motion/preview"))
+                    expect(page.frame_locator("#motion-preview-frame").locator("#title")).to_contain_text("Đêm của chúng ta")
+                    page.locator("#motion-preview-kind").select_option("transition")
+                    expect(page.frame_locator("#motion-preview-frame").locator("#scene-b")).to_contain_text("CẢNH B")
+                    # Main Karaoke editor remains usable after opening previews.
+
                     # Countdown requires an explicit opt-in and a >=3s gap.
                     expect(page.locator("#countdown-enabled")).not_to_be_checked()
                     page.locator("#countdown-enabled").check()
