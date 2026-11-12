@@ -102,7 +102,60 @@ if (window.gsap) {{
     .to(["#title","#subtitle","#bar"],{{opacity:0,y:-20,duration:.5,ease:"power1.in"}},2.45);
   window.__timelines = window.__timelines || {{}};
   window.__timelines["nvs-motion"] = tl;
+  if (window.location.search.includes("preview=1")) tl.play();
 }}
+function fitPreview() {{
+  const scale = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+  document.getElementById("root").style.transformOrigin = "top left";
+  document.getElementById("root").style.transform = "scale(" + scale + ")";
+}}
+window.addEventListener("resize", fitPreview);
+fitPreview();
+</script></body></html>"""
+
+
+
+def transition_preview_html(transition: str, *, gsap_path: str = "/api/motion/gsap.js") -> str:
+    """Three-second two-panel visualization of the selected FFmpeg xfade mode."""
+    if transition not in TRANSITIONS:
+        raise ValueError("Hiệu ứng chuyển cảnh không hợp lệ.")
+    effect = {
+        "fade": "opacity:0",
+        "wipeleft": "clip-path:inset(0 0 0 100%)",
+        "smoothleft": "transform:translateX(100%)",
+    }[transition]
+    css_out = {
+        "fade": "opacity:1",
+        "wipeleft": "clip-path:inset(0 0 0 0)",
+        "smoothleft": "transform:translateX(0)",
+    }[transition]
+    return f"""<!doctype html><html lang="vi"><head><meta charset="utf-8"><style>
+html,body{{margin:0;width:100%;height:100%;background:#131021;overflow:hidden;font-family:Segoe UI,sans-serif}}
+#root{{position:relative;width:1920px;height:1080px;overflow:hidden}}
+.scene{{position:absolute;inset:0;display:grid;place-items:center;color:white;font-size:104px;font-weight:800}}
+#scene-a{{background:linear-gradient(120deg,#26153f,#6c3cb0)}}
+#scene-b{{background:linear-gradient(120deg,#113b3a,#2d88a7);{effect};animation:scene-in 1.6s ease-in-out .7s both}}
+@keyframes scene-in{{from{{{effect}}}to{{{css_out}}}}}
+</style></head><body><div id="root" data-composition-id="nvs-transition" data-start="0" data-width="1920" data-height="1080" data-duration="3">
+<div class="scene clip" id="scene-a" data-start="0" data-duration="3" data-track-index="0">CẢNH A</div>
+<div class="scene clip" id="scene-b" data-start="0" data-duration="3" data-track-index="1">CẢNH B</div>
+</div><script src="{escape(gsap_path, quote=True)}"></script><script>
+if (window.gsap) {{
+ const tl = gsap.timeline({{paused:true}});
+ const effect={transition!r};
+ if(effect==="fade") tl.fromTo("#scene-b",{{opacity:0}},{{opacity:1,duration:1.6}},.7);
+ if(effect==="wipeleft") tl.fromTo("#scene-b",{{clipPath:"inset(0 0 0 100%)"}},{{clipPath:"inset(0 0 0 0)",duration:1.6}},.7);
+ if(effect==="smoothleft") tl.fromTo("#scene-b",{{x:1920}},{{x:0,duration:1.6}},.7);
+ window.__timelines=window.__timelines||{{}};
+ window.__timelines["nvs-transition"]=tl;
+ if(window.location.search.includes("preview=1"))tl.play();
+}}
+function resizePreview() {{
+ const root=document.getElementById("root");
+ root.style.transformOrigin="top left";
+ root.style.transform="scale("+Math.min(innerWidth/1920,innerHeight/1080)+")";
+}}
+window.addEventListener("resize",resizePreview);resizePreview();
 </script></body></html>"""
 
 
