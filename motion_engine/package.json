@@ -1,0 +1,16 @@
+{
+  "name": "karaoke-motion-engine",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Optional local-only HyperFrames + GSAP renderer for Karaoke Studio",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@hyperframes/cli": "0.9.36",
+    "gsap": "3.13.0"
+  },
+  "scripts": {
+    "check": "hyperframes doctor"
+  }
+}
