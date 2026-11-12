@@ -35,7 +35,7 @@ nếu thiếu thư viện chỉ phần xuất Motion bị chặn với thông b�
 ## Cấu trúc
 
 - `motion_engine/core.py`: preset, dựng HTML composition và gọi binary cục bộ
-  `@hyperframes/cli` (không tự download khi bấm nút).
+  `hyperframes` (không tự download khi bấm nút).
 - `motion_engine/compositor.py`: FFmpeg xfade để ghép MP4 đã xuất.
 - `local_studio/app.py`: endpoint API presets, preview, GSAP nội bộ, và render tùy chọn.
 - `local_studio/static/motion_ui.js`: hiển thị UI mà không can thiệp script karaoke.
@@ -53,7 +53,7 @@ còn chuyển cảnh cuối cùng được dựng bởi FFmpeg, nên xuất th�
 khi làm video dài.
 
 Các preset chỉ gồm mã nguồn mới của dự án Karaoke, không sao chép toàn bộ repo
-HyperFrames; sử dụng CLI `@hyperframes/cli` chính thức và JS `gsap` từ npm.
+HyperFrames; sử dụng CLI `hyperframes` chính thức và JS `gsap` từ npm.
 Không có nhạc hoặc ảnh bên thứ ba được đi kèm.
 
 ## Bản quyền / đường dẫn
