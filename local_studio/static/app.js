@@ -842,7 +842,13 @@ function renderPreview() {
     }
   }
   $("countdown-overlay").hidden = !countdownNumber;
-  if (countdownNumber) $("countdown-digit").textContent = String(countdownNumber);
+  if (countdownNumber) {
+    const litNotes = 4 - countdownNumber;
+    $("countdown-overlay").querySelectorAll(".countdown-note").forEach((note, index) => {
+      note.classList.toggle("lit", index < litNotes);
+      note.classList.toggle("fresh", index === litNotes - 1);
+    });
+  }
   let index = lines.findIndex((segment) => position >= segment.start && position <= segment.end);
   let upcoming = false;
   if (index < 0) {
@@ -1112,6 +1118,12 @@ function resizePreview() {
   lyrics.style.paddingTop = `${stage.clientHeight * margin / 100}px`;
   lyrics.style.paddingBottom = `${stage.clientHeight * margin / 100}px`;
   lyrics.style.justifyContent = position === "top" ? "flex-start" : position === "center" ? "center" : "flex-end";
+  // Put the notes just above the actual lyric baseline at any subtitle position.
+  const overlay = $("countdown-overlay");
+  const offset = Math.max(36, $("current-lyric").getBoundingClientRect().height + 16);
+  overlay.style.bottom = position === "bottom" ? `calc(${margin}% + ${offset}px)` : "auto";
+  overlay.style.top = position === "top" ? `calc(${margin}% + ${offset}px)`
+    : position === "center" ? "calc(50% - 85px)" : "auto";
 }
 window.addEventListener("resize", resizePreview);
 document.addEventListener("fullscreenchange", resizePreview);

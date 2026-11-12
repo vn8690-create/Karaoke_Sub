@@ -141,9 +141,11 @@
 }
 
 
-/* Karaoke countdown 3→2→1. Only shown inside a >=3s instrumental gap. */
-.countdown-overlay{position:absolute;inset:0;z-index:4;display:grid;place-items:center;pointer-events:none}
-.countdown-overlay span{display:grid;place-items:center;min-width:1.45em;height:1.45em;padding:.08em;border-radius:50%;border:2px solid #ffffffbb;background:#241a3bcb;box-shadow:0 0 26px #a98dff77,0 8px 38px #0009;color:#fff;text-shadow:0 2px 8px #000;font-size:clamp(54px,7vw,115px);line-height:1;font-weight:800;font-variant-numeric:tabular-nums}
+/* Three quiet music notes above the next line, lit left to right once per beat. */
+.countdown-overlay{position:absolute;inset:auto 0 auto 0;z-index:4;display:flex;align-items:center;justify-content:center;gap:.45em;pointer-events:none;font-size:clamp(18px,2.3vw,32px);line-height:1.25;filter:drop-shadow(0 2px 5px #000b)}
+.countdown-note{font-weight:700;color:#d2c2e58c;transform:scale(.92);transition:color .15s ease,transform .15s ease,text-shadow .15s ease}
+.countdown-note.lit{color:#cfb4ff;transform:scale(1.08);text-shadow:0 0 12px #af8bff91}
+.countdown-note.fresh{color:#ffffff;transform:scale(1.2);text-shadow:0 0 14px #c9a8ff}
 .countdown-option{border:1px solid #55436f;border-radius:9px;padding:12px;background:#251c34a8}
 .countdown-option strong{color:#d4bfff;font-size:11px}
 .countdown-option small{font-size:10px;line-height:1.6}

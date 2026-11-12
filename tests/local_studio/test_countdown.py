@@ -45,6 +45,15 @@ class CountdownTests(unittest.TestCase):
             write_subtitles(segments, root, countdown=True)
             ass = (root / "lyrics.ass").read_text("utf-8")
             self.assertIn("Style: Countdown,", ass)
+            self.assertIn("♪  ", ass)
+            self.assertIn("♪", ass)
+            self.assertNotIn("}}3", ass)
+            self.assertNotIn("}}2", ass)
+            self.assertNotIn("}}1", ass)
+            styles = [line for line in ass.splitlines() if line.startswith("Style: Countdown,")]
+            self.assertEqual(len(styles), 1)
+            # Musical cues stay smaller than ordinary karaoke lyric lettering.
+            self.assertLess(int(styles[0].split(",")[2]), 54)
             self.assertIn("Dialogue: 1,0:00:02.00,0:00:03.00,Countdown", ass)
             self.assertIn("Dialogue: 1,0:00:04.00,0:00:05.00,Countdown", ass)
             self.assertIn("Dialogue: 1,0:00:09.00,0:00:10.00,Countdown", ass)
