@@ -7,7 +7,8 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
-from unittest.mock import patch, SimpleNamespace
+from unittest.mock import patch
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from local_studio.app import app
