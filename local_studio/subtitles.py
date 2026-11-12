@@ -159,16 +159,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         lrc_lines.append(f"[{lrc_time(start)}]{enhanced}<{lrc_time(end)}>")
     if countdown:
         # Countdown only appears in ASS/MP4, not lyric-only SRT/LRC.
+        # Use a small line of musical notes above the upcoming lyrics. Place
+        # notes relative to the actual lyric position rather than stage center.
+        note_size = max(17, round(size * 0.55))
+        margin_for_notes = margin + max(24, round(size * 1.9))
         countdown_style = (
-            f"Style: Countdown,{options['font']},{max(28, round(size * 1.65))},"
+            f"Style: Countdown,{options['font']},{note_size},"
             f"{options['primary']},{options['secondary']},&H00101020,&H80000000,"
-            f"-1,0,0,0,100,100,0,0,1,4,2,5,60,60,0,1\n"
+            f"-1,0,0,0,100,100,0,0,1,1,1,{options['alignment']},60,60,"
+            f"{margin_for_notes},1\n"
         )
         header = header.replace("[Events]\n", countdown_style + "\n[Events]\n")
         for start, end, digit in countdown_cues(segments, enabled=True):
+            active = 4 - int(digit)
+            # Active notes accumulate on each beat. Earlier ones fade into
+            # the softer lyric colour; the fresh note uses highlight colour.
+            notes = []
+            for index in range(3):
+                tint = options["primary"] if index < active else options["secondary"]
+                notes.append(f"{{\\c{tint}}}♪")
             ass_lines.append(
                 f"Dialogue: 1,{_clock(start)},{_clock(end)},Countdown,,0,0,0,,"
-                f"{{\\fad(120,120)}}{digit}"
+                f"{{\\fad(90,90)}}{'  '.join(notes)}"
             )
     (output_dir / "lyrics.ass").write_text(header + "\n".join(ass_lines) + "\n", encoding="utf-8")
     (output_dir / "lyrics.srt").write_text("\n".join(srt_lines), encoding="utf-8")
