@@ -706,14 +706,16 @@ def motion_presets():
 
 
 @app.get("/api/motion/preview", response_class=HTMLResponse)
-def motion_preview(kind: Literal["intro", "outro"] = "intro",
+def motion_preview(kind: Literal["intro", "outro", "transition"] = "intro",
                    preset: Literal["neon", "cinematic", "minimal", "retro"] = "neon",
+                   transition: Literal["fade", "wipeleft", "smoothleft"] = "fade",
                    title: str = "KARAOKE STUDIO", subtitle: str = ""):
     """Standalone HTML preview. Without npm it uses CSS; with GSAP it also runs timelines."""
     if len(title) > 100 or len(subtitle) > 100:
         raise HTTPException(422, "Tên bài và ca sĩ không được vượt 100 ký tự.")
-    html = motion_core.composition_html(
-        kind, preset, title, subtitle, gsap_path="/api/motion/gsap.js")
+    html = (motion_core.transition_preview_html(transition)
+            if kind == "transition" else
+            motion_core.composition_html(kind, preset, title, subtitle, gsap_path="/api/motion/gsap.js"))
     return HTMLResponse(html, headers={"Cache-Control": "no-store",
                                      "Content-Security-Policy":
                                      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; "
