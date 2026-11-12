@@ -1,0 +1,44 @@
+name: Optional HyperFrames Motion Engine
+
+on:
+  pull_request:
+    paths:
+      - 'motion_engine/**'
+      - 'local_studio/**'
+      - 'tests/local_studio/test_motion*'
+      - '.github/workflows/motion-engine.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'motion_engine/**'
+      - 'local_studio/**'
+      - '.github/workflows/motion-engine.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hyperframes-cli:
+    name: Node 22 / GSAP / Real 3-second HyperFrames MP4
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: FFmpeg tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install optional pinned packages
+        working-directory: motion_engine
+        run: npm install --no-audit --no-fund
+      - name: Verify installed GSAP and HyperFrames CLI
+        run: |
+          node --version
+          python -c "from motion_engine.core import installed; assert installed()['installed'], installed()"
+      - name: Generate HTML composition, render real MP4 and validate duration
+        run: python -m motion_engine.render_smoke

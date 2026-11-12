@@ -495,6 +495,13 @@ function restoreSubtitleStyle(project) {
   if (!saved) return;
   const controls = { font_size: "font-size", font_family: "font-family", text_color: "text-color", highlight_color: "highlight-color", position: "subtitle-position", margin_percent: "margin-percent" };
   $("countdown-enabled").checked = Boolean(saved.countdown);
+  // Motion settings belong to the last render, not ASR/lyric timing.
+  for (const [setting, id] of Object.entries({
+    motion_intro: "motion-intro", motion_outro: "motion-outro",
+    motion_transition: "motion-transition",
+  })) {
+    if (saved[setting] !== undefined) $(id).value = saved[setting];
+  }
   for (const [key, id] of Object.entries(controls)) if (saved[key] !== undefined) $(id).value = saved[key];
   if (saved.resolution) $("resolution").value = saved.resolution;
   resizePreview();
@@ -1042,7 +1049,14 @@ function exportSettings() {
 $("render-button").addEventListener("click", () => {
   try {
     if ($("export-mode").value === "instrumental" && !state.project?.files?.instrumental) throw new Error("Hãy tách vocal hoặc thêm nhạc beat trước khi xuất chế độ karaoke.");
-    projectAction("render", { ...exportSettings(), audio_mode: $("export-mode").value });
+    projectAction("render", {
+      ...exportSettings(),
+      audio_mode: $("export-mode").value,
+      motion_intro: $("motion-intro").value,
+      motion_outro: $("motion-outro").value,
+      motion_transition: $("motion-transition").value,
+      motion_title: $("motion-title").value.trim(),
+    });
   } catch (error) { toast(error.message, true); }
 });
 $("subtitles-button").addEventListener("click", () => { try { projectAction("subtitles", exportSettings()); } catch (error) { toast(error.message, true); } });

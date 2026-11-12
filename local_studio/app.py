@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.concurrency import run_in_threadpool
@@ -27,6 +27,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import APP_ID, alignment, pipeline
 from .reference_timing import apply_reference_to_existing
 from .smart_sync import build_preview, apply_selection, revision_for, segments_revision
+from motion_engine import core as motion_core
+from motion_engine.compositor import add_motion
 
 log = logging.getLogger("local_studio")
 ROOT = Path(os.environ.get("KARAOKE_DATA_DIR", Path(__file__).resolve().parents[1] / ".local-data")).resolve()
@@ -193,6 +195,10 @@ class SubtitleOptions(StrictModel):
 
 class Render(SubtitleOptions):
     audio_mode: Literal["original", "instrumental", "silent"] = "instrumental"
+    motion_intro: Literal["none", "neon", "cinematic", "minimal", "retro"] = "none"
+    motion_outro: Literal["none", "neon", "cinematic", "minimal", "retro"] = "none"
+    motion_transition: Literal["fade", "wipeleft", "smoothleft"] = "fade"
+    motion_title: str = Field(default="", max_length=100)
 
 
 def idle(project_id: str) -> dict:
@@ -689,6 +695,43 @@ def subtitle_style(options: SubtitleOptions) -> dict:
             ("font_family", "text_color", "highlight_color", "position", "margin_percent")}
 
 
+@app.get("/api/motion/presets")
+def motion_presets():
+    """Optional presets; the existing karaoke workflow never needs npm."""
+    return {
+        "presets": motion_core.PRESETS,
+        "transitions": motion_core.TRANSITIONS,
+        "engine": motion_core.installed(),
+        "optional": True,
+    }
+
+
+@app.get("/api/motion/preview", response_class=HTMLResponse)
+def motion_preview(kind: Literal["intro", "outro", "transition"] = "intro",
+                   preset: Literal["neon", "cinematic", "minimal", "retro"] = "neon",
+                   transition: Literal["fade", "wipeleft", "smoothleft"] = "fade",
+                   title: str = "KARAOKE STUDIO", subtitle: str = ""):
+    """Standalone HTML preview. Without npm it uses CSS; with GSAP it also runs timelines."""
+    if len(title) > 100 or len(subtitle) > 100:
+        raise HTTPException(422, "Tên bài và ca sĩ không được vượt 100 ký tự.")
+    html = (motion_core.transition_preview_html(transition)
+            if kind == "transition" else
+            motion_core.composition_html(kind, preset, title, subtitle, gsap_path="/api/motion/gsap.js"))
+    return HTMLResponse(html, headers={"Cache-Control": "no-store",
+                                     "Content-Security-Policy":
+                                     "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; "
+                                     "img-src 'self' data:; connect-src 'none'; frame-ancestors 'self'"})
+
+
+@app.get("/api/motion/gsap.js")
+def motion_gsap():
+    """Serve locally installed GSAP; never pull arbitrary scripts from the CDN."""
+    source = motion_core.ROOT / "node_modules" / "gsap" / "dist" / "gsap.min.js"
+    if not source.is_file():
+        raise HTTPException(404, "Chưa cài GSAP tùy chọn. Preview CSS vẫn hoạt động.")
+    return FileResponse(source, media_type="text/javascript")
+
+
 @app.post("/api/projects/{project_id}/subtitles")
 def subtitles(project_id: str, options: SubtitleOptions):
     with LOCK:
@@ -711,6 +754,8 @@ def render(project_id: str, options: Render):
         require_lyrics(p)
         if options.audio_mode == "instrumental" and "instrumental" not in p["files"]:
             raise HTTPException(400, "Hãy tách vocal hoặc nhập beat trước khi xuất chế độ nhạc nền.")
+        if (options.motion_intro != "none" or options.motion_outro != "none") and not motion_core.installed()["installed"]:
+            raise HTTPException(409, "Motion Engine chưa cài đặt. Cài Node.js 22+ rồi chạy npm install trong thư mục motion_engine, hoặc tắt intro/outro.")
         cancel_event = threading.Event()
         RENDER_CANCEL[project_id] = cancel_event
         def operation():
@@ -734,6 +779,29 @@ def render(project_id: str, options: Render):
                 if cancel_event.is_set():
                     from .render_control import RenderCancelled
                     raise RenderCancelled("Đã hủy tác vụ xuất video.")
+                if options.motion_intro != "none" or options.motion_outro != "none":
+                    if cancel_event.is_set():
+                        from .render_control import RenderCancelled
+                        raise RenderCancelled("Đã hủy Motion Engine.")
+                    update(project_id, progress=98, message="Motion Engine: dựng intro/outro với HyperFrames + GSAP…")
+                    enhanced = folder / "motion-rendered.mp4"
+                    try:
+                        add_motion(
+                            temp_output, enhanced,
+                            project_title=options.motion_title or p.get("title", "KARAOKE STUDIO"),
+                            subtitle="NVS KARAOKE",
+                            intro=options.motion_intro,
+                            outro=options.motion_outro,
+                            transition=options.motion_transition,
+                            song_duration=p["duration"],
+                            resolution=RESOLUTIONS[options.resolution],
+                            has_audio=audio is not None,
+                            on_progress=None,
+                            cancel_event=cancel_event,
+                        )
+                        enhanced.replace(temp_output)
+                    finally:
+                        enhanced.unlink(missing_ok=True)
                 temp_output.replace(folder / "karaoke.mp4")
             finally:
                 temp_output.unlink(missing_ok=True)

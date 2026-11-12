@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Karaoke Studio • Local</title>
-  <link rel="stylesheet" href="/static/style.css?v=notes-2">
-  <script src="/static/app.js?v=notes-2" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=motion-1">
+  <script src="/static/app.js?v=motion-1" defer></script>
+  <script src="/static/motion_ui.js?v=motion-1" defer></script>
 </head>
 <body>
   <header class="app-header">
@@ -101,6 +102,28 @@
         <div class="two-fields subtitle-colors"><div><label class="field-label" for="text-color">Màu chữ chưa hát</label><input id="text-color" type="color" value="#ffffff"></div><div><label class="field-label" for="highlight-color">Màu chữ đang hát</label><input id="highlight-color" type="color" value="#ffe800"></div></div>
         <div class="two-fields subtitle-position"><div><label class="field-label" for="subtitle-position">Vị trí lời</label><select id="subtitle-position"><option value="bottom">Phía dưới</option><option value="center">Chính giữa</option><option value="top">Phía trên</option></select></div><div><label class="field-label" for="margin-percent">Lề trên/dưới (%)</label><input id="margin-percent" type="number" min="5" max="25" step="1" value="9"></div></div>
         <label class="check-row countdown-option"><input id="countdown-enabled" type="checkbox"><span><strong>🎶 Ba nốt nhạc báo vào lời</strong><small>Ba nốt nhỏ lần lượt sáng trong 3 giây trước khi vào lời, nằm ngay gần dòng karaoke. Có trong Preview và MP4/ASS; không đổi thời gian lời.</small></span></label>
+        <details id="motion-library" class="motion-library">
+          <summary><span>✦ MOTION ENGINE</span><small>HyperFrames + GSAP · Intro / Outro / Chuyển cảnh</small></summary>
+          <p class="motion-help">Thư viện hiệu ứng tùy chọn. Không can thiệp vào Whisper, thời gian từng từ hay phụ đề ASS.</p>
+          <label class="field-label" for="motion-intro">Intro trước bài hát</label>
+          <select id="motion-intro"><option value="none">Không dùng intro</option><option value="neon">Neon Pulse</option><option value="cinematic">Cinema Gold</option><option value="minimal">Minimal Clean</option><option value="retro">Retro Wave</option></select>
+          <label class="field-label" for="motion-outro">Outro sau bài hát</label>
+          <select id="motion-outro"><option value="none">Không dùng outro</option><option value="neon">Neon Pulse</option><option value="cinematic">Cinema Gold</option><option value="minimal">Minimal Clean</option><option value="retro">Retro Wave</option></select>
+          <label class="field-label" for="motion-transition">Chuyển cảnh</label>
+          <select id="motion-transition"><option value="fade">Fade mượt</option><option value="wipeleft">Quét ngang</option><option value="smoothleft">Trượt mềm</option></select>
+          <label class="field-label" for="motion-title">Tiêu đề intro/outro (để trống lấy tên dự án)</label>
+          <input id="motion-title" maxlength="100" placeholder="Tên bài hát lấy tự động từ dự án">
+          <div class="motion-preview-controls">
+            <label for="motion-preview-kind">Xem trước</label>
+            <select id="motion-preview-kind"><option value="intro">Intro</option><option value="outro">Outro</option><option value="transition">Chuyển cảnh</option></select>
+            <button id="motion-show-preview" class="button secondary" type="button">▶ Xem hiệu ứng</button>
+          </div>
+          <div id="motion-preview-wrap" class="motion-preview-wrap" hidden>
+            <iframe id="motion-preview-frame" title="Xem trước hiệu ứng Motion Engine" sandbox="allow-scripts" loading="lazy"></iframe>
+          </div>
+          <p id="motion-engine-status" class="motion-engine-status" role="status">Đang kiểm tra HyperFrames và GSAP…</p>
+          <p class="motion-help">Intro/outro chỉ thêm khi xuất MP4. Nếu chưa cài engine: Node.js 22+ → mở thư mục <code>motion_engine</code> → chạy <code>npm install</code>. Không cần cài để làm karaoke như bình thường.</p>
+        </details>
         <label class="field-label" for="export-mode">Âm thanh video xuất</label><select id="export-mode"><option value="original">Bài hát gốc</option><option value="instrumental">Nhạc beat · không vocal</option><option value="silent">Không âm thanh</option></select>
         <button id="render-button" class="button primary full" disabled>Xuất video karaoke <span>↓</span></button>
         <button id="subtitles-button" class="button secondary full" disabled>Xuất sub ASS / SRT / LRC</button>
