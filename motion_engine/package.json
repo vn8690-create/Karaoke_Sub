@@ -7,8 +7,8 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@hyperframes/cli": "0.9.36",
-    "gsap": "3.13.0"
+    "gsap": "3.13.0",
+    "hyperframes": "0.9.33"
   },
   "scripts": {
     "check": "hyperframes doctor"
