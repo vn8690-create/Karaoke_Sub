@@ -94,19 +94,20 @@ def check():
                       a.dispatchEvent(new Event('seeked'));
                     }""")
                     expect(page.locator("#countdown-overlay")).to_be_visible()
-                    expect(page.locator("#countdown-digit")).to_have_text("3")
+                    expect(page.locator("#countdown-overlay .countdown-note")).to_have_count(3)
+                    expect(page.locator("#countdown-overlay .countdown-note.lit")).to_have_count(1)
                     page.evaluate("""() => {
                       const a = document.getElementById('audio');
                       a.currentTime = 16.5;
                       a.dispatchEvent(new Event('seeked'));
                     }""")
-                    expect(page.locator("#countdown-digit")).to_have_text("2")
+                    expect(page.locator("#countdown-overlay .countdown-note.lit")).to_have_count(2)
                     page.evaluate("""() => {
                       const a = document.getElementById('audio');
                       a.currentTime = 17.5;
                       a.dispatchEvent(new Event('seeked'));
                     }""")
-                    expect(page.locator("#countdown-digit")).to_have_text("1")
+                    expect(page.locator("#countdown-overlay .countdown-note.lit")).to_have_count(3)
                     page.locator("#countdown-enabled").uncheck()
                     expect(page.locator("#countdown-overlay")).to_be_hidden()
                     page.locator("#reference-lyrics").fill("[Intro]\nHẹn gặp ngày mai!\nEm là người anh yêu")
