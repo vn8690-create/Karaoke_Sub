@@ -198,6 +198,7 @@ class Render(SubtitleOptions):
     motion_intro: Literal["none", "neon", "cinematic", "minimal", "retro"] = "none"
     motion_outro: Literal["none", "neon", "cinematic", "minimal", "retro"] = "none"
     motion_transition: Literal["fade", "wipeleft", "smoothleft"] = "fade"
+    motion_title: str = Field(default="", max_length=100)
 
 
 def idle(project_id: str) -> dict:
@@ -753,6 +754,8 @@ def render(project_id: str, options: Render):
         require_lyrics(p)
         if options.audio_mode == "instrumental" and "instrumental" not in p["files"]:
             raise HTTPException(400, "Hãy tách vocal hoặc nhập beat trước khi xuất chế độ nhạc nền.")
+        if (options.motion_intro != "none" or options.motion_outro != "none") and not motion_core.installed()["installed"]:
+            raise HTTPException(409, "Motion Engine chưa cài đặt. Cài Node.js 22+ rồi chạy npm install trong thư mục motion_engine, hoặc tắt intro/outro.")
         cancel_event = threading.Event()
         RENDER_CANCEL[project_id] = cancel_event
         def operation():
@@ -785,7 +788,7 @@ def render(project_id: str, options: Render):
                     try:
                         add_motion(
                             temp_output, enhanced,
-                            project_title=p.get("title", "KARAOKE STUDIO"),
+                            project_title=options.motion_title or p.get("title", "KARAOKE STUDIO"),
                             subtitle="NVS KARAOKE",
                             intro=options.motion_intro,
                             outro=options.motion_outro,
