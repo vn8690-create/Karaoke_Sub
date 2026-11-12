@@ -94,7 +94,8 @@ def add_motion(song: Path, output: Path, *, project_title: str, subtitle: str,
         from local_studio.pipeline import probe
         from local_studio.render_quality import verify_output
         try:
-            render_with_progress(args, duration=total, on_progress=on_progress, cancel_event=cancel_event)
+            render_with_progress(args, cwd=str(scratch), duration=total,
+                                 on_progress=on_progress, cancel_event=cancel_event)
             verify_output(output, total, resolution, has_audio, probe)
         except Exception:
             output.unlink(missing_ok=True)
