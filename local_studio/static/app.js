@@ -1055,6 +1055,7 @@ $("render-button").addEventListener("click", () => {
       motion_intro: $("motion-intro").value,
       motion_outro: $("motion-outro").value,
       motion_transition: $("motion-transition").value,
+      motion_title: $("motion-title").value.trim(),
     });
   } catch (error) { toast(error.message, true); }
 });
